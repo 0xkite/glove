@@ -178,6 +178,7 @@ struct supervisor_capabilities {
     std::uint8_t schema_version = 0;
     receipt_audit_capabilities receipt_audit;
     session_control_capabilities session_control;
+    std::uint8_t agent_runtime_adapter_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
@@ -195,6 +196,7 @@ struct session_record_result {
     std::uint64_t policy_revision = 0;
     std::uint64_t expires_at_ms = 0;
     std::uint64_t created_at_ms = 0;
+    std::optional<std::string> profile_digest;
 };
 
 } // namespace wire_test
@@ -364,6 +366,7 @@ auto run() -> int {
     REQUIRE(!capabilities.session_control.detach);
     REQUIRE(!capabilities.session_control.stop_session);
     REQUIRE(!capabilities.session_control.cleanup_session);
+    REQUIRE(capabilities.agent_runtime_adapter_schema_version == 0);
     REQUIRE(capabilities.backends.size() == 2);
     for (const auto& backend : capabilities.backends) {
         REQUIRE(backend.resource_enforcement.cpu_time == "unavailable");

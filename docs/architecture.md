@@ -110,9 +110,10 @@ lifecycle:
 7. Append an authenticated terminal receipt before projecting terminal state.
 
 The local protocol exposes attach, input, resize, signal, detach, stop, and
-cleanup only when the runtime is constructed. Production service ownership,
-Sage lifecycle integration, prompt-library expansion, and a distinct local
-direct-write approval record remain remote-launch gates.
+cleanup only when the runtime is constructed. Sage now wires that lifecycle and
+receipt reconciliation, while production service ownership, prompt-library
+expansion, and a distinct local direct-write approval record remain
+remote-launch gates.
 
 ## Library projection
 

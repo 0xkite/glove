@@ -151,6 +151,7 @@ struct session_record_result {
     std::uint64_t policy_revision = 0;
     std::uint64_t expires_at_ms = 0;
     std::uint64_t created_at_ms = 0;
+    std::optional<std::string> profile_digest;
 };
 
 struct receipt_audit_capabilities {
@@ -193,6 +194,9 @@ struct supervisor_capabilities {
     std::uint8_t schema_version = 1;
     receipt_audit_capabilities receipt_audit;
     session_control_capabilities session_control;
+    // Zero until Glove creates a private agent home and expands exact Sage
+    // bundles into the selected harness's native discovery locations.
+    std::uint8_t agent_runtime_adapter_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
@@ -456,6 +460,7 @@ auto handle_capabilities(
                     .stop_session = state.session_runtime != nullptr,
                     .cleanup_session = state.session_runtime != nullptr,
                 },
+            .agent_runtime_adapter_schema_version = 0,
             .backends = {
                 backend_capabilities{
                     .backend = "linux_production",
@@ -474,7 +479,62 @@ auto handle_capabilities(
     return success_response(request_id, std::move(*result));
 }
 
-auto session_result(const session_record& record) -> session_record_result {
+auto session_profile_digest(const session_registry& sessions, const session_record& record)
+    -> std::expected<std::optional<std::string>, session_registry_error> {
+    switch (record.state) {
+    case session_state::created:
+    case session_state::preparing:
+        return std::nullopt;
+    case session_state::starting: {
+        auto status = sessions.starting_status(record.session_id);
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        return status->profile_digest;
+    }
+    case session_state::running: {
+        auto status = sessions.running_status(record.session_id);
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        return status->profile_digest;
+    }
+    case session_state::stopping: {
+        auto status = sessions.stopping_status(record.session_id);
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        return status->profile_digest;
+    }
+    case session_state::exited: {
+        auto status = sessions.exited_status(record.session_id);
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        return status->profile_digest;
+    }
+    case session_state::failed: {
+        auto status = sessions.failed_status(record.session_id);
+        if (!status) {
+            return std::unexpected(status.error());
+        }
+        return status->profile_digest;
+    }
+    }
+    return std::unexpected(
+        session_registry_error{
+            .code = session_registry_error_code::invalid_state,
+            .message = "unknown session state",
+        }
+    );
+}
+
+auto session_result(const session_registry& sessions, const session_record& record)
+    -> std::expected<session_record_result, session_registry_error> {
+    auto profile_digest = session_profile_digest(sessions, record);
+    if (!profile_digest) {
+        return std::unexpected(profile_digest.error());
+    }
     std::string state;
     switch (record.state) {
     case session_state::created:
@@ -499,7 +559,7 @@ auto session_result(const session_record& record) -> session_record_result {
         state = "failed";
         break;
     }
-    return {
+    return session_record_result{
         .schema_version = record.schema_version,
         .session_id = record.session_id,
         .controller_plan_digest = record.controller_plan_digest,
@@ -508,6 +568,7 @@ auto session_result(const session_record& record) -> session_record_result {
         .policy_revision = record.policy_revision,
         .expires_at_ms = record.expires_at_ms,
         .created_at_ms = record.created_at_ms,
+        .profile_digest = std::move(*profile_digest),
     };
 }
 
@@ -567,7 +628,11 @@ auto handle_create_session(
     if (!created) {
         return registry_error_response(request_id, created.error());
     }
-    auto result = encode_json(session_result(*created));
+    auto response = session_result(*state.sessions, *created);
+    if (!response) {
+        return registry_error_response(request_id, response.error());
+    }
+    auto result = encode_json(*response);
     if (!result) {
         return std::unexpected(result.error());
     }
@@ -595,7 +660,11 @@ auto handle_session_status(
     if (!status) {
         return registry_error_response(request_id, status.error());
     }
-    auto result = encode_json(session_result(*status));
+    auto response = session_result(*state.sessions, *status);
+    if (!response) {
+        return registry_error_response(request_id, response.error());
+    }
+    auto result = encode_json(*response);
     if (!result) {
         return std::unexpected(result.error());
     }
@@ -645,7 +714,11 @@ auto handle_start_session(
     if (!started) {
         return error_response(request_id, "session_start_failed", "session start was rejected");
     }
-    auto result = encode_json(session_result(*started));
+    auto response = session_result(*state.sessions, *started);
+    if (!response) {
+        return registry_error_response(request_id, response.error());
+    }
+    auto result = encode_json(*response);
     if (!result) {
         return std::unexpected(result.error());
     }
@@ -681,7 +754,11 @@ auto handle_stop_session(
     if (!status) {
         return registry_error_response(request_id, status.error());
     }
-    auto result = encode_json(session_result(*status));
+    auto response = session_result(*state.sessions, *status);
+    if (!response) {
+        return registry_error_response(request_id, response.error());
+    }
+    auto result = encode_json(*response);
     if (!result) {
         return std::unexpected(result.error());
     }

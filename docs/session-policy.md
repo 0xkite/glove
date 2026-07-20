@@ -17,10 +17,15 @@ variables, or raw secrets.
 Capabilities are derived from successfully constructed components. macOS does
 not advertise managed-session resource enforcement.
 
+`agent_runtime_adapter_schema_version` is independent of the raw process/PTY
+lifecycle. It remains `0` until Glove creates a private agent home, expands an
+exact Sage bundle into Codex/Pi-native locations, and commits the derived
+context to the launch profile and receipt. Sage requires version `1` before
+remote launch.
+
 Direct-write plans are rejected at start because Glove does not yet have a
-separate authenticated local-consent record. Sage must keep its aggregate remote
-launch gate closed until that approval contract and harness bundle expansion
-are implemented and reviewed.
+separate authenticated local-consent record. Harness bundle expansion is an
+independent gate for every remotely managed agent session.
 
 ## Protected files
 

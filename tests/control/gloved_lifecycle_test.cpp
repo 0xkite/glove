@@ -63,6 +63,7 @@ struct session_record_result {
     std::uint64_t policy_revision = 0;
     std::uint64_t expires_at_ms = 0;
     std::uint64_t created_at_ms = 0;
+    std::optional<std::string> profile_digest;
 };
 
 } // namespace wire_test

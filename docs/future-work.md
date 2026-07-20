@@ -9,10 +9,10 @@ version control, tests, and architecture documentation.
 |---|---|
 | Direct-write approval | A distinct authenticated local-consent record is persisted with approval class, actor identity, plan/session digests, scope, and expiry; start verifies it before any retained host write. |
 | Prompt-library expansion | A verified Sage bundle is parsed and projected into a bounded harness-native directory; launch binding and receipts commit every derived input. |
-| Sage lifecycle integration | Daemon and supervisor use capability discovery, create/start/attach/control/stop/cleanup, archive receipts before acknowledgement, and recover across either process restarting. |
+| Runtime adapter integration | A private session home, harness-native Codex/Pi bundle projection, and exact initial context are committed to the launch profile and receipt; capability schema v1 is advertised only then. |
 | Service ownership | `gloved` has installable service-manager units, a dedicated least-privilege identity where supported, protected key rotation, and documented upgrade/recovery procedures. |
 | macOS resource contract | CPU, memory, PID, wall-time, disk, and terminal-output limits are enforced and represented in authenticated receipts, or managed remote launch remains unavailable on macOS. |
-| Dynamic path exposure | Policy supports programmatic, session-scoped grants without accepting arbitrary remote host paths; resolution remains descriptor-based and receipts commit the effective mapping. |
+| Dynamic path exposure | Policy supports programmatic, session-scoped grant updates without accepting arbitrary remote host paths; resolution remains descriptor-based and receipts commit the effective mapping. |
 
 ## P1: protocol and integrity hardening
 

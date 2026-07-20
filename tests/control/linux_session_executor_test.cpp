@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -89,6 +90,7 @@ struct supervisor_capabilities {
     std::uint8_t schema_version = 0;
     glz::raw_json receipt_audit;
     session_control_capabilities session_control;
+    std::uint8_t agent_runtime_adapter_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
@@ -101,6 +103,7 @@ struct session_record_result {
     std::uint64_t policy_revision = 0;
     std::uint64_t expires_at_ms = 0;
     std::uint64_t created_at_ms = 0;
+    std::optional<std::string> profile_digest;
 };
 
 struct transcript_result {
@@ -570,6 +573,7 @@ auto run() -> int {
     REQUIRE(capabilities.session_control.signal);
     REQUIRE(capabilities.session_control.detach);
     REQUIRE(capabilities.session_control.cleanup_session);
+    REQUIRE(capabilities.agent_runtime_adapter_schema_version == 0);
     REQUIRE(capabilities.backends.size() == 2);
     REQUIRE(capabilities.backends[0].backend == "linux_production");
     REQUIRE(capabilities.backends[0].resource_enforcement.cpu_time == "cgroup_v2");
@@ -621,6 +625,13 @@ auto run() -> int {
     ));
     REQUIRE(interactive_running.session_id == interactive_created->session_id);
     REQUIRE(interactive_running.state == "running");
+    auto interactive_running_status =
+        shared_registry->running_status(interactive_created->session_id);
+    REQUIRE(interactive_running_status.has_value());
+    REQUIRE(
+        interactive_running.profile_digest ==
+        std::optional<std::string>{interactive_running_status->profile_digest}
+    );
     auto start_replay_frame = (*protocol)->handle_frame(
         make_request(
             "start-interactive-replay",
@@ -827,6 +838,7 @@ auto run() -> int {
     ));
     REQUIRE(stop_record.session_id == interactive_created->session_id);
     REQUIRE(stop_record.state == "stopping" || stop_record.state == "exited");
+    REQUIRE(stop_record.profile_digest == interactive_running.profile_digest);
     auto interactive_stopping = shared_registry->stopping_status(interactive_created->session_id);
     std::uint64_t stopping_at_ms = 0;
     if (interactive_stopping) {
