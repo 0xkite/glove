@@ -44,6 +44,8 @@ jobs:
         run: |
           brew install go llvm ninja
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "CC=/usr/bin/clang" >> "$GITHUB_ENV"
+          echo "CXX=/usr/bin/clang++" >> "$GITHUB_ENV"
 
       - name: Pin clang-format
         run: |
@@ -58,7 +60,8 @@ jobs:
         run: |
           cmake --version
           ninja --version
-          clang++ --version
+          "$CXX" --version
+          clang-tidy --version
           clang-format --version
           "$(go env GOPATH)/bin/actionlint" --version
 

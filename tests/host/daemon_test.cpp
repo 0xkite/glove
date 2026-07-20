@@ -58,7 +58,8 @@ auto run() -> int {
 
     const temporary_directory temporary;
     REQUIRE(!temporary.root().empty());
-    const environment values{.home = temporary.root().string()};
+    environment values{};
+    values.home = temporary.root().string();
     auto setup = plan_setup(setup_options{}, values);
     REQUIRE(setup.has_value());
     REQUIRE(execute_setup(*setup).has_value());

@@ -743,6 +743,10 @@ auto run() -> int {
         .runtime_directory = temp.root(),
         .audit_key = key_path,
         .receipt_journal = journal_path,
+        .session_policy = std::nullopt,
+        .session_store = std::nullopt,
+        .materialization_root = std::nullopt,
+        .library_bundle_root = std::nullopt,
         .path_exposure_policy = exposure_policy_path,
         .path_exposure_journal = exposure_journal_path,
     };

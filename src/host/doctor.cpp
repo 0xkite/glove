@@ -36,7 +36,7 @@ auto doctor_report::healthy() const -> bool {
 }
 
 auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
-    doctor_report report{.config_path = config_path};
+    doctor_report report{.config_path = config_path, .checks = {}};
     auto configured = load_config(config_path);
     if (!configured) {
         report.checks.push_back({
@@ -52,6 +52,7 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         .code = "config_valid",
         .status = doctor_status::passed,
         .message = "Trusted Glove configuration is valid.",
+        .recovery = {},
     });
     report.checks.push_back({
         .code = "runtime_directory",

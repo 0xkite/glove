@@ -48,7 +48,8 @@ auto run() -> int {
     using namespace glove::host;
     temporary_directory temporary;
     REQUIRE(!temporary.root().empty());
-    const environment values{.home = temporary.root().string()};
+    environment values{};
+    values.home = temporary.root().string();
     auto directories = resolve_directories(values);
     REQUIRE(directories.has_value());
     REQUIRE(directories->config == temporary.root() / ".config/glove");
@@ -56,13 +57,10 @@ auto run() -> int {
     REQUIRE(directories->runtime == temporary.root() / ".local/state/glove/runtime");
 
     const auto session_policy = temporary.root() / "session-policy.json";
-    auto managed_plan = plan_setup(
-        setup_options{
-            .session_policy = session_policy,
-            .dry_run = true,
-        },
-        values
-    );
+    setup_options managed_options{};
+    managed_options.session_policy = session_policy;
+    managed_options.dry_run = true;
+    auto managed_plan = plan_setup(managed_options, values);
     REQUIRE(managed_plan.has_value());
     REQUIRE(managed_plan->service.session_policy == session_policy);
     REQUIRE(managed_plan->service.session_store == directories->state / "sessions.journal");
@@ -72,10 +70,9 @@ auto run() -> int {
     const auto project_root = temporary.root() / "projects\"quoted";
     const auto project = project_root / "sage-protocol";
     REQUIRE(std::filesystem::create_directories(project));
-    setup_options options{
-        .protected_root = project_root,
-        .dry_run = true,
-    };
+    setup_options options{};
+    options.protected_root = project_root;
+    options.dry_run = true;
     auto dry_run = plan_setup(options, values);
     REQUIRE(dry_run.has_value());
     REQUIRE(execute_setup(*dry_run).has_value());
