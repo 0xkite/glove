@@ -303,6 +303,7 @@ auto doctor_command(std::span<char* const> arguments) -> int {
         doctor_report_wire encoded{
             .config_path = report.config_path.string(),
             .healthy = report.healthy(),
+            .checks = {},
         };
         for (const auto& check : report.checks) {
             encoded.checks.push_back({
@@ -397,9 +398,14 @@ auto init_command(std::span<char* const> arguments) -> int {
     }
     project_enrollment enrollment{
         .project = arguments.front(),
+        .exposure_id = {},
         .root_id = "projects",
+        .display_label = {},
         .access = project_access::read,
+        .max_bytes = 0,
+        .ttl_secs = 3'600,
         .runtime_template_ids = {"codex-safe", "pi-safe"},
+        .idempotency_key = {},
     };
     std::optional<std::filesystem::path> config_path;
     bool runtime_overridden = false;
