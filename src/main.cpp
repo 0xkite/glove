@@ -404,6 +404,11 @@ auto main(int argc, char** argv) -> int {
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }
+    if (sub == "daemon") {
+        return glove::host::daemon_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
     if (sub == "doctor") {
         return glove::host::doctor_command(
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
@@ -427,6 +432,7 @@ auto main(int argc, char** argv) -> int {
             "  run     spawn an MCP-client agent inside the container\n"
             "  exec    contain a real self-driving agent (e.g. pi); stdio + egress\n"
             "  setup   create trusted machine-local configuration and state\n"
+            "  daemon  install and manage the fixed gloved user service\n"
             "  doctor  verify configuration and local service readiness\n"
             "  config  inspect trusted machine-local configuration\n"
             "  init    enroll a project beneath a setup-approved protected root\n"

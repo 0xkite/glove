@@ -39,7 +39,13 @@ Requirements:
 - Linux: libseccomp development headers
 - macOS integration tests: `yams`
 
-Run the complete local gate:
+Build, test, and install Release to `${GLOVE_INSTALL_PREFIX:-$HOME/.local}`:
+
+```sh
+./setup.sh
+```
+
+Use `./setup.sh Debug` for a development build. Run the complete local gate:
 
 ```sh
 ./scripts/preflight.sh
@@ -88,7 +94,8 @@ write-capable sessions use isolated, quota-backed materializations.
 ```sh
 ./build/dev/src/glove setup --path-root "$HOME/work" --dry-run
 ./build/dev/src/glove setup --path-root "$HOME/work" --yes
-./build/dev/src/gloved --config "$(./build/dev/src/glove config path)"
+./build/dev/src/glove daemon start
+./build/dev/src/glove daemon status
 ```
 
 Add `--session-policy /absolute/owner-only/session-policy.json` during setup to

@@ -37,6 +37,7 @@ host security boundary.
 | Resources | Linux cgroup CPU/memory/PID limits, watchdog wall time, filesystem quotas, and aggregate terminal-output accounting |
 | Audit | Agent-inaccessible JSONL destination; HMAC-chained managed-session terminal receipts |
 | Remote plans | Identifier-only canonical plan matched against owner-local policy and dual digests |
+| Daemon lifecycle | Fixed local user-service name, protected config and executable paths, shell-free service-manager invocation, and authenticated readiness checks |
 | Recovery | Append-only state, exact replay, process identity beyond PID, and fail-closed reconciliation |
 
 Security-relevant append, policy, setup, and receipt failures terminate or reject

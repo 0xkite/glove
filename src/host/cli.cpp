@@ -2,6 +2,7 @@
 
 #include "glove/host/config.hpp"
 #include "glove/host/control_client.hpp"
+#include "glove/host/daemon.hpp"
 #include "glove/host/doctor.hpp"
 #include "glove/host/setup.hpp"
 
@@ -104,6 +105,14 @@ void print_setup_usage() {
     );
 }
 
+void print_daemon_usage() {
+    std::fprintf(
+        stderr,
+        "usage: glove daemon <install|start|stop|restart|status> "
+        "[--config <absolute-file>] [--gloved <absolute-file>]\n"
+    );
+}
+
 } // namespace
 
 auto setup_command(std::span<char* const> arguments) -> int {
@@ -188,10 +197,76 @@ auto setup_command(std::span<char* const> arguments) -> int {
     if (auto executed = execute_setup(*plan); !executed) {
         return print_error("setup_failed", executed.error(), "glove doctor");
     }
-    std::printf("Glove machine setup completed.\nNext:\n  glove doctor\n");
+    std::printf("Glove machine setup completed.\nNext:\n  glove daemon start\n  glove doctor\n");
     if (plan->canonical_protected_root) {
         std::printf("  glove init <project-path> --root %s\n", plan->root_id.c_str());
     }
+    return 0;
+}
+
+auto daemon_command(std::span<char* const> arguments) -> int {
+    if (arguments.empty() || std::string_view{arguments.front()} == "-h" ||
+        std::string_view{arguments.front()} == "--help") {
+        print_daemon_usage();
+        return arguments.empty() ? 2 : 0;
+    }
+    const std::string_view action{arguments.front()};
+    daemon_options options;
+    for (std::size_t index = 1; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (index + 1 >= arguments.size() || (argument != "--config" && argument != "--gloved")) {
+            print_daemon_usage();
+            return 2;
+        }
+        if (argument == "--config") {
+            options.config_path = arguments[index + 1];
+        } else {
+            options.gloved_path = arguments[index + 1];
+        }
+        index += 2;
+    }
+    if (action != "install" && action != "start" && action != "stop" && action != "restart" &&
+        action != "status") {
+        print_daemon_usage();
+        return 2;
+    }
+    auto plan = plan_daemon_service(options, current_environment());
+    if (!plan) {
+        return print_error("daemon_invalid", plan.error(), "glove setup --yes");
+    }
+    if (action == "status") {
+        auto active = daemon_service_is_active(*plan);
+        if (!active) {
+            return print_error("daemon_status_failed", active.error(), "glove daemon start");
+        }
+        std::printf(
+            "Glove daemon: %s (%s)\n", *active ? "running" : "stopped", plan->service_name.c_str()
+        );
+        return *active ? 0 : 3;
+    }
+    result<void> changed;
+    if (action == "install") {
+        changed = install_daemon_service(*plan);
+    } else if (action == "start") {
+        changed = start_daemon_service(*plan);
+    } else if (action == "stop") {
+        changed = stop_daemon_service(*plan);
+    } else {
+        changed = restart_daemon_service(*plan);
+    }
+    if (!changed) {
+        return print_error(
+            "daemon_" + std::string{action} + "_failed",
+            changed.error(),
+            action == "stop" ? "glove daemon status" : "glove doctor"
+        );
+    }
+    const std::string completed_action = action == "install"   ? "installed"
+                                         : action == "start"   ? "started"
+                                         : action == "stop"    ? "stopped"
+                                         : action == "restart" ? "restarted"
+                                                               : std::string{action};
+    std::printf("Glove daemon %s: %s\n", completed_action.c_str(), plan->service_name.c_str());
     return 0;
 }
 

@@ -48,20 +48,27 @@ glove doctor --json
 
 ## Service
 
-`gloved` reads only the protected configuration:
+Install and start the fixed per-user service after machine setup:
 
 ```sh
-gloved --config "$(glove config path)"
+glove daemon start
+glove daemon status
 ```
 
-For Sage activation, replace `@GLOVED_BINARY@` and `@GLOVE_CONFIG@` in the
-systemd or launchd template under `packaging/`, install it as a user service,
-and register the fixed service name in Sage. Setup does not register or start a
-service.
+`start` idempotently installs the service definition before starting it.
+`install`, `stop`, and `restart` are also available. Glove uses
+`sage-gloved.service` with the systemd user manager on Linux and
+`org.sage-protocol.gloved` with the launchd GUI domain on macOS. The service
+definition fixes the resolved local `gloved` binary and protected config path;
+no remote request can alter them.
+
+Use `--config <absolute-file>` for a non-default machine configuration and
+`--gloved <absolute-file>` only when the daemon binary is not installed beside
+the `glove` CLI.
 
 ## Project enrollment
 
-With `gloved` running:
+With the daemon running:
 
 ```sh
 glove init /absolute/project

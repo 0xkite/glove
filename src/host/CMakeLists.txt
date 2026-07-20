@@ -2,6 +2,7 @@ add_library(glove_host STATIC
     cli.cpp
     config.cpp
     control_client.cpp
+    daemon.cpp
     doctor.cpp
     setup.cpp
 )

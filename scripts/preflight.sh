@@ -34,6 +34,7 @@ if ! command -v actionlint >/dev/null; then
     fail "actionlint not on PATH"
 fi
 actionlint
+sh -n setup.sh
 ok "GitHub Actions workflows clean"
 
 # 2. format -----------------------------------------------------------------

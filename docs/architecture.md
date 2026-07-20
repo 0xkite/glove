@@ -104,6 +104,12 @@ key material, and an optional protected-root policy. `glove init` then creates
 a generation-bound exposure through the authenticated local control socket.
 Project files are never configuration input, and raw paths never cross P2P.
 
+`glove daemon` installs and controls a fixed per-user service through systemd
+on Linux or launchd on macOS. The CLI resolves the local `gloved` executable,
+binds it to the protected config, writes the service definition atomically, and
+invokes the service manager without a shell. It never accepts service labels,
+extra arguments, environment, or lifecycle requests from P2P.
+
 When Sage configures `glove_activation_mode = "user_service"`, `saged` first
 asks the platform user service manager to start the fixed local Glove unit. It
 waits for `gloved.sock` and `bootstrap-secret` before health and capability

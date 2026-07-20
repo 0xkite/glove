@@ -125,7 +125,7 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         .status = health ? doctor_status::passed : doctor_status::warning,
         .message = health ? "Glove control service is authenticated and responsive."
                           : "Glove control service is unavailable: " + health.error(),
-        .recovery = "Start the registered gloved user service, then rerun `glove doctor`.",
+        .recovery = "Run `glove daemon start`, then rerun `glove doctor`.",
     });
     return report;
 }

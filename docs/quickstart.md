@@ -11,6 +11,20 @@ CMake fetches Glaze during configuration.
 
 ## Build and verify
 
+Configure, build, test, and install a Release build to
+`${GLOVE_INSTALL_PREFIX:-$HOME/.local}`:
+
+```sh
+./setup.sh
+```
+
+Use `./setup.sh Debug` for an unoptimized development build or
+`./setup.sh Release` explicitly for the default. The script supports macOS and
+Linux and requires an absolute `GLOVE_INSTALL_PREFIX` when overriding the
+user-local default.
+
+For build-only iteration:
+
 ```sh
 cmake --preset dev
 cmake --build --preset dev
@@ -106,7 +120,8 @@ Use the host setup workflow instead of assembling daemon flags manually:
 ```sh
 ./build/dev/src/glove setup --path-root "$HOME/work" --dry-run
 ./build/dev/src/glove setup --path-root "$HOME/work" --yes
-./build/dev/src/gloved --config "$(./build/dev/src/glove config path)"
+./build/dev/src/glove daemon start
+./build/dev/src/glove daemon status
 ```
 
 Pass `--session-policy /absolute/owner-only/session-policy.json` to both setup
@@ -116,11 +131,9 @@ also requires `mkfs.ext4`, loop devices, and mount capability. See
 
 ### Sage-triggered user service
 
-Substitute `@GLOVED_BINARY@` and `@GLOVE_CONFIG@` in the platform template,
-then install and register it as a user service:
-
-- systemd: `packaging/systemd/sage-gloved.service.in`
-- launchd: `packaging/launchd/org.sage-protocol.gloved.plist.in`
+`glove daemon start` installs the fixed user-service definition and starts it.
+The templates under `packaging/` document the equivalent systemd and launchd
+definitions.
 
 Then configure and verify Sage:
 

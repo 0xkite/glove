@@ -6,6 +6,10 @@ add_executable(host_config_test host/config_test.cpp)
 target_link_libraries(host_config_test PRIVATE glove_host glove_supervisor)
 add_test(NAME host_config COMMAND host_config_test)
 
+add_executable(host_daemon_test host/daemon_test.cpp)
+target_link_libraries(host_daemon_test PRIVATE glove_host)
+add_test(NAME host_daemon COMMAND host_daemon_test)
+
 add_executable(thread_smoke_test thread_smoke_test.cpp)
 target_link_libraries(thread_smoke_test PRIVATE glove_kernel)
 add_test(NAME thread_smoke COMMAND thread_smoke_test)
