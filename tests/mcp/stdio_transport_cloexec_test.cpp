@@ -27,7 +27,23 @@ namespace {
         }                                                                                          \
     } while (0)
 
+auto inherited_descriptor_count() -> int {
+    glove::mcp::stdio_child_options counter{
+        .program = "/bin/sh",
+        .args = {"sh", "-c", "ls /dev/fd | wc -l"},
+    };
+    auto transport = glove::mcp::make_stdio_transport(counter);
+    if (!transport) {
+        return -1;
+    }
+    auto line = (*transport)->recv();
+    return line ? std::atoi(line->c_str()) : -1;
+}
+
 auto run() -> int {
+    const int baseline_count = inherited_descriptor_count();
+    REQUIRE(baseline_count > 0);
+
     // Hold several upstreams open. Each is a plain `cat` that we never talk to;
     // we only care about the parent-side fds make_stdio_transport keeps.
     std::vector<std::unique_ptr<glove::mcp::transport>> held;
@@ -41,26 +57,17 @@ auto run() -> int {
         held.push_back(std::move(*t_or));
     }
 
-    // Now spawn a counter through the same primitive. It prints how many
-    // entries are in /dev/fd, i.e. how many fds it actually inherited.
-    glove::mcp::stdio_child_options counter{
-        .program = "/bin/sh",
-        .args = {"sh", "-c", "ls /dev/fd | wc -l"},
-    };
-    auto c_or = glove::mcp::make_stdio_transport(counter);
-    REQUIRE(c_or.has_value());
-    std::unique_ptr<glove::mcp::transport> c = std::move(*c_or);
+    // Count again while the upstreams are held. Sanitizers may reserve their
+    // own descriptors, so the invariant is no growth rather than a platform-
+    // specific absolute count.
+    const int loaded_count = inherited_descriptor_count();
+    REQUIRE(loaded_count > 0);
 
-    auto line = c->recv();
-    REQUIRE(line.has_value());
-    const int count = std::atoi(line->c_str());
-
-    // With CLOEXEC the counter inherits only its own stdio (0,1,2) plus the
-    // descriptor `ls` opens to read the directory — a handful. Without the fix
-    // it would also inherit 8 leaked upstream fds, pushing the count past 6.
-    std::fprintf(stderr, "inherited fd count: %d\n", count);
-    REQUIRE(count > 0);
-    REQUIRE(count <= 6);
+    // Without CLOEXEC, four held upstreams add eight inherited pipe ends.
+    std::fprintf(
+        stderr, "inherited fd count: baseline=%d loaded=%d\n", baseline_count, loaded_count
+    );
+    REQUIRE(loaded_count == baseline_count);
     return 0;
 }
 

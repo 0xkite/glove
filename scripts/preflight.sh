@@ -28,6 +28,20 @@ bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 
+run_ctest() {
+    if [[ "${GLOVE_PRIVILEGED_TESTS:-0}" == "1" ]]; then
+        if [[ "$(uname -s)" != "Linux" ]]; then
+            fail "GLOVE_PRIVILEGED_TESTS is supported only on Linux"
+        fi
+        if ! command -v sudo >/dev/null; then
+            fail "GLOVE_PRIVILEGED_TESTS requires sudo"
+        fi
+        sudo --preserve-env=ASAN_OPTIONS,UBSAN_OPTIONS,TSAN_OPTIONS ctest "$@"
+        return
+    fi
+    ctest "$@"
+}
+
 # 1. GitHub Actions ---------------------------------------------------------
 bold "[1/5] actionlint"
 if ! command -v actionlint >/dev/null; then
@@ -142,7 +156,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    ctest --preset asan
+    run_ctest --preset asan
 ok "asan ok"
 
 # 5. tsan -------------------------------------------------------------------
@@ -150,7 +164,7 @@ bold "[5/5] tsan preset"
 cmake --preset tsan
 cmake --build --preset tsan
 TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
-    ctest --preset tsan
+    run_ctest --preset tsan
 ok "tsan ok"
 
 bold "all gates passed"
