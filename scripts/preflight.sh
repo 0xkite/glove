@@ -71,6 +71,10 @@ else
         if [[ ! -f build/dev/compile_commands.json ]]; then
             cmake --preset dev >/dev/null
         fi
+        # Ninja's C++ dependency scanner writes module-map response files that
+        # appear in compile_commands.json. A fresh checkout must build once
+        # before clang-tidy can consume those generated arguments.
+        cmake --build --preset dev
         # Apple clang's compile_commands omits -isysroot because the driver
         # implicitly knows the SDK; homebrew clang-tidy doesn't, so tell it.
         tidy_extra=()

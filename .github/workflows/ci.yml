@@ -41,7 +41,7 @@ jobs:
       - name: Install macOS toolchain
         if: runner.os == 'macOS'
         run: |
-          brew install llvm ninja
+          brew install go llvm ninja
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
       - name: Pin clang-format
