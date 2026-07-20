@@ -1,5 +1,6 @@
 #include "glove/control/receipt_audit_unix_server.hpp"
 #include "glove/control/session_registry.hpp"
+#include "glove/host/config.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/path_exposure_journal.hpp"
 #include "glove/supervisor/session_plan.hpp"
@@ -101,6 +102,23 @@ struct options {
 };
 
 auto parse_options(int argc, char** argv) -> std::expected<options, std::string> {
+    if (argc == 3 && std::string_view{argv[1]} == "--config") {
+        auto configured = glove::host::load_config(std::filesystem::path{argv[2]});
+        if (!configured) {
+            return std::unexpected(configured.error());
+        }
+        return options{
+            .runtime_directory = configured->runtime_directory,
+            .audit_key = configured->audit_key,
+            .journal = configured->receipt_journal,
+            .session_policy = configured->session_policy,
+            .session_store = configured->session_store,
+            .materialization_root = configured->materialization_root,
+            .library_bundle_root = configured->library_bundle_root,
+            .path_exposure_policy = configured->path_exposure_policy,
+            .path_exposure_journal = configured->path_exposure_journal,
+        };
+    }
     if (argc < 7 || argc > 19 || argc % 2 == 0) {
         return std::unexpected(std::string{"expected three required and up to six optional paths"});
     }
@@ -579,7 +597,8 @@ auto run(const options& configured) -> std::expected<void, std::string> {
 }
 
 void print_usage() {
-    std::cerr << "usage: gloved --runtime-dir <absolute-dir> --audit-key <absolute-file> "
+    std::cerr << "usage: gloved --config <owner-only-json>\n"
+                 "   or: gloved --runtime-dir <absolute-dir> --audit-key <absolute-file> "
                  "--journal <absolute-file> [--session-policy <owner-only-json> "
                  "[--session-store <owner-only-journal> "
                  "[--materialization-root <owner-only-directory>] "

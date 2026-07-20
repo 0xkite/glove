@@ -12,7 +12,7 @@ version control, tests, and architecture documentation.
 | Runtime adapter integration | A private session home, harness-native Codex/Pi bundle projection, and exact initial context are committed to the launch profile and receipt; capability schema v1 is advertised only then. |
 | Service ownership | Sage can activate the same-UID user-service templates. Production is complete when `gloved` uses a dedicated least-privilege identity, protected key rotation, and documented upgrade/recovery procedures. |
 | macOS resource contract | CPU, memory, PID, wall-time, disk, and terminal-output limits are enforced and represented in authenticated receipts, or managed remote launch remains unavailable on macOS. |
-| Dynamic path exposure | Policy supports programmatic, session-scoped grant updates without accepting arbitrary remote host paths; resolution remains descriptor-based and receipts commit the effective mapping. |
+| Exposure lifecycle hardening | Owner-local programmatic enrollment is implemented; production completion adds explicit renewal, revocation CLI/UX, and lifecycle receipts without accepting remote host paths. |
 
 ## P1: protocol and integrity hardening
 
@@ -38,9 +38,8 @@ version control, tests, and architecture documentation.
 
 ## P3: packaging and extensibility
 
-- Add install/export rules and a stable `find_package(glove)` surface.
+- Add exported CMake package targets and a stable `find_package(glove)` surface.
 - Add SPDX headers and contributor/release documentation.
-- Provide a strict configuration format for repeatable CLI and daemon setup.
 - Track MCP protocol changes, including HTTP transport and authentication,
   without weakening stdio framing or policy behavior.
 - Revisit compile-time reflection when the required C++ support is available.

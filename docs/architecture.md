@@ -68,6 +68,7 @@ the child.
 | `kernel` | extension registration and dispatch |
 | `audit` | structured local activity records |
 | `run` | CLI orchestration for `run` and `exec` |
+| `host` | strict XDG configuration, machine setup, diagnostics, and local project enrollment |
 | `reflect` | compile-time extension metadata experiments |
 
 Public headers live under `include/glove/`. Implementations mirror that layout in
@@ -97,6 +98,11 @@ filesystem/environment exposure.
 public control methods provide capability discovery, canonical plan validation,
 durable create/status operations, bounded receipt pages, and exact
 acknowledgement.
+
+`glove setup` creates owner-only XDG configuration, runtime/state directories,
+key material, and an optional protected-root policy. `glove init` then creates
+a generation-bound exposure through the authenticated local control socket.
+Project files are never configuration input, and raw paths never cross P2P.
 
 When Sage configures `glove_activation_mode = "user_service"`, `saged` first
 asks the platform user service manager to start the fixed local Glove unit. It

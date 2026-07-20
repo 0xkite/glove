@@ -2,6 +2,7 @@ build/
 build-*/
 .cache/
 compile_commands.json
+infer-out/
 .DS_Store
 *.swp
 *.swo

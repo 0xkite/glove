@@ -7,24 +7,8 @@
     <key>ProgramArguments</key>
     <array>
         <string>@GLOVED_BINARY@</string>
-        <string>--runtime-dir</string>
-        <string>@GLOVE_RUNTIME_DIR@</string>
-        <string>--audit-key</string>
-        <string>@GLOVE_AUDIT_KEY@</string>
-        <string>--journal</string>
-        <string>@GLOVE_RECEIPT_JOURNAL@</string>
-        <string>--session-policy</string>
-        <string>@GLOVE_SESSION_POLICY@</string>
-        <string>--session-store</string>
-        <string>@GLOVE_SESSION_STORE@</string>
-        <string>--materialization-root</string>
-        <string>@GLOVE_MATERIALIZATION_ROOT@</string>
-        <string>--library-bundle-root</string>
-        <string>@GLOVE_LIBRARY_BUNDLE_ROOT@</string>
-        <string>--path-exposure-policy</string>
-        <string>@GLOVE_PATH_EXPOSURE_POLICY@</string>
-        <string>--path-exposure-journal</string>
-        <string>@GLOVE_PATH_EXPOSURE_JOURNAL@</string>
+        <string>--config</string>
+        <string>@GLOVE_CONFIG@</string>
     </array>
     <key>RunAtLoad</key>
     <false/>

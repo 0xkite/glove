@@ -86,17 +86,15 @@ Live host writes are unsupported. Dynamic path exposure is owner-local;
 write-capable sessions use isolated, quota-backed materializations.
 
 ```sh
-./build/dev/src/gloved \
-  --runtime-dir /absolute/owner-only/runtime \
-  --audit-key /absolute/owner-only/audit.key \
-  --journal /absolute/owner-only/receipts.journal \
-  --session-policy /absolute/owner-only/session-policy.json \
-  --session-store /absolute/owner-only/sessions.journal \
-  --materialization-root /absolute/owner-only/materializations \
-  --library-bundle-root /absolute/owner-only/sage-library-bundles \
-  --path-exposure-policy /absolute/owner-only/path-exposure-policy.json \
-  --path-exposure-journal /absolute/owner-only/path-exposures.journal
+./build/dev/src/glove setup --path-root "$HOME/work" --dry-run
+./build/dev/src/glove setup --path-root "$HOME/work" --yes
+./build/dev/src/gloved --config "$(./build/dev/src/glove config path)"
 ```
+
+Add `--session-policy /absolute/owner-only/session-policy.json` during setup to
+enable managed-session configuration. Enroll individual projects only while
+the local service is running: `glove init /absolute/project`. See
+[host setup](docs/host-setup.md).
 
 ## Documentation
 
@@ -104,6 +102,7 @@ write-capable sessions use isolated, quota-backed materializations.
 - [Session policy](docs/session-policy.md): canonical plan and local policy contract
 - [Threat model](docs/threat-model.md): guarantees, assumptions, and residual risk
 - [Quickstart](docs/quickstart.md): build and invocation examples
+- [Host setup](docs/host-setup.md): XDG state, service registration, and project enrollment
 - [Future work](docs/future-work.md): prioritized launch and hardening gates
 - [Credits](CREDITS.md): dependencies and research references
 

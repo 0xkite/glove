@@ -4,7 +4,7 @@ Documentation=https://github.com/sage-protocol/sage-protocol
 
 [Service]
 Type=simple
-ExecStart=@GLOVED_BINARY@ --runtime-dir @GLOVE_RUNTIME_DIR@ --audit-key @GLOVE_AUDIT_KEY@ --journal @GLOVE_RECEIPT_JOURNAL@ --session-policy @GLOVE_SESSION_POLICY@ --session-store @GLOVE_SESSION_STORE@ --materialization-root @GLOVE_MATERIALIZATION_ROOT@ --library-bundle-root @GLOVE_LIBRARY_BUNDLE_ROOT@ --path-exposure-policy @GLOVE_PATH_EXPOSURE_POLICY@ --path-exposure-journal @GLOVE_PATH_EXPOSURE_JOURNAL@
+ExecStart="@GLOVED_BINARY@" --config "@GLOVE_CONFIG@"
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=15s

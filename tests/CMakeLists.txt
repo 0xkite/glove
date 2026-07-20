@@ -2,6 +2,10 @@ add_executable(smoke_test smoke_test.cpp)
 target_link_libraries(smoke_test PRIVATE glove_kernel)
 add_test(NAME smoke COMMAND smoke_test)
 
+add_executable(host_config_test host/config_test.cpp)
+target_link_libraries(host_config_test PRIVATE glove_host glove_supervisor)
+add_test(NAME host_config COMMAND host_config_test)
+
 add_executable(thread_smoke_test thread_smoke_test.cpp)
 target_link_libraries(thread_smoke_test PRIVATE glove_kernel)
 add_test(NAME thread_smoke COMMAND thread_smoke_test)
@@ -119,7 +123,7 @@ if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(control_receipt_audit_server_fixture PRIVATE glove_control)
 
     add_executable(gloved_lifecycle_test control/gloved_lifecycle_test.cpp)
-    target_link_libraries(gloved_lifecycle_test PRIVATE glove_control glaze::glaze)
+    target_link_libraries(gloved_lifecycle_test PRIVATE glove_control glove_host glaze::glaze)
     target_include_directories(gloved_lifecycle_test PRIVATE
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
     )

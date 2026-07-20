@@ -6,6 +6,8 @@ project(glove
     LANGUAGES CXX
 )
 
+include(GNUInstallDirs)
+
 # --- Global toolchain defaults ----------------------------------------------
 
 set(CMAKE_CXX_STANDARD 23)
@@ -50,6 +52,20 @@ if(GLOVE_REFLECTION)
 endif()
 
 add_subdirectory(src)
+
+install(TARGETS glove RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(TARGET gloved)
+    install(TARGETS gloved RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(
+    FILES packaging/systemd/sage-gloved.service.in
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/glove/packaging/systemd
+)
+install(
+    FILES packaging/launchd/org.sage-protocol.gloved.plist.in
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/glove/packaging/launchd
+)
 
 # --- Tests ------------------------------------------------------------------
 

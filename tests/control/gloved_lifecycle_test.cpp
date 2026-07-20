@@ -1,5 +1,7 @@
 #include "glove/container/receipt_chain.hpp"
 #include "glove/control/receipt_audit_protocol.hpp"
+#include "glove/host/config.hpp"
+#include "glove/host/control_client.hpp"
 
 #include "receipt_audit_wire.hpp"
 
@@ -365,6 +367,16 @@ auto start_gloved(
     _exit(127);
 }
 
+auto start_gloved_config(const std::filesystem::path& config_path) -> child_process {
+    const auto process = ::fork();
+    if (process != 0) {
+        return child_process{process};
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+    ::execl(GLOVED_BIN, GLOVED_BIN, "--config", config_path.c_str(), static_cast<char*>(nullptr));
+    _exit(127);
+}
+
 auto wait_until_ready(
     child_process& process,
     const std::filesystem::path& socket_path,
@@ -405,6 +417,16 @@ auto wait_until_secret_changes(
         }
         if (!process.running()) {
             return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    return false;
+}
+
+auto wait_until_authenticated(const glove::host::config& configured) -> bool {
+    for (int attempt = 0; attempt < 300; ++attempt) {
+        if (glove::host::supervisor_health(configured)) {
+            return true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     }
@@ -566,6 +588,12 @@ auto policy_json(const std::filesystem::path& source) -> std::string {
            R"(","target_path":"/workspace","max_ttl_secs":120,"access":[{"access":"ephemeral_write","materialization":"copy","create_policy":"empty_directory","cleanup_policy":"remove","max_bytes":2097152}]}],"library_projection_destinations":[{"alias":"libraries","target_path":"/opt/sage/library-bundles"}],"resource_profiles":[{"profile_id":"small","cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576}],"egress_policy_ids":["no-network"],"tool_policy_ids":["sage-readonly"],"secret_handles":["codex-token"]})";
 }
 
+auto exposure_policy_json(const std::filesystem::path& root) -> std::string {
+    return R"({"schema_version":1,"roots":[{"root_id":"projects","host_root":")" +
+           std::filesystem::canonical(root).string() +
+           R"(","allowed_modes":[{"access":"read","materialization":"bind","max_bytes":0,"cleanup_policy":"retain"}],"max_ttl_secs":3600,"allowed_runtime_template_ids":["codex-safe"]}]})";
+}
+
 auto plan_json(std::uint64_t expires_at_ms) -> std::string {
     return R"({"schema_version":1,"runtime_id":"codex","runtime_template_id":"codex-safe","adapter_command_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandbox_backend":"linux_production","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"alias":"workspace","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","destination_alias":"libraries"}],"secret_handles":["codex-token"],"limits":{"cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576},"policy_revision":7,"expires_at_ms":)" +
            std::to_string(expires_at_ms) + "}";
@@ -702,6 +730,45 @@ auto run() -> int {
     REQUIRE(*third_secret != *second_secret);
     REQUIRE(page_and_acknowledge(socket_path, *third_secret, **genesis));
     REQUIRE(third.stop());
+    REQUIRE(!std::filesystem::exists(socket_path));
+
+    const auto config_path = temp.root() / "gloved.json";
+    const auto exposure_root = temp.root() / "projects";
+    const auto exposure_project = exposure_root / "sage-protocol";
+    REQUIRE(std::filesystem::create_directories(exposure_project));
+    const auto exposure_policy_path = temp.root() / "path-exposure-policy.json";
+    const auto exposure_journal_path = temp.root() / "path-exposures.journal";
+    REQUIRE(write_owner_only(exposure_policy_path, exposure_policy_json(exposure_root)));
+    const glove::host::config host_config{
+        .runtime_directory = temp.root(),
+        .audit_key = key_path,
+        .receipt_journal = journal_path,
+        .path_exposure_policy = exposure_policy_path,
+        .path_exposure_journal = exposure_journal_path,
+    };
+    const auto encoded_config = glove::host::encode_config(host_config);
+    REQUIRE(encoded_config.has_value());
+    REQUIRE(write_owner_only(config_path, *encoded_config));
+    auto configured = start_gloved_config(config_path);
+    REQUIRE(wait_until_secret_changes(configured, socket_path, secret_path, *third_secret));
+    REQUIRE(wait_until_authenticated(host_config));
+    auto exposure = glove::host::enroll_project(
+        host_config,
+        glove::host::project_enrollment{
+            .project = exposure_project,
+            .exposure_id = "sage-protocol",
+            .root_id = "projects",
+            .display_label = "Sage protocol",
+            .access = glove::host::project_access::read,
+            .max_bytes = 0,
+            .ttl_secs = 3'600,
+            .runtime_template_ids = {"codex-safe"},
+            .idempotency_key = "lifecycle-enrollment",
+        }
+    );
+    REQUIRE(exposure.has_value());
+    REQUIRE(exposure->generation == 1);
+    REQUIRE(configured.stop());
     REQUIRE(!std::filesystem::exists(socket_path));
 
     const auto plan_source = temp.root() / "plan-source";

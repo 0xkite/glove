@@ -11,6 +11,7 @@ FetchContent_Declare(
     GIT_TAG        v7.5.0
     GIT_SHALLOW    TRUE
     SYSTEM
+    EXCLUDE_FROM_ALL
 )
 
 FetchContent_MakeAvailable(glaze)

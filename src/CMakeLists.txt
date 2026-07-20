@@ -3,6 +3,7 @@ add_subdirectory(mcp)
 add_subdirectory(policy)
 add_subdirectory(audit)
 add_subdirectory(net)
+add_subdirectory(host)
 
 # Dependency-free content commitments are shared by supervisor planning and
 # container receipts without joining their higher-level dependency graph.
@@ -37,6 +38,7 @@ target_link_libraries(glove_kernel
         glove::policy
         glove::audit
         glove::net
+        glove::host
         glove::supervisor
         glove::container
         glove::control
@@ -49,7 +51,7 @@ target_link_libraries(glove PRIVATE glove_kernel)
 
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(gloved gloved_main.cpp)
-    target_link_libraries(gloved PRIVATE glove_control)
+    target_link_libraries(gloved PRIVATE glove_control glove_host)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_include_directories(gloved PRIVATE
             $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>

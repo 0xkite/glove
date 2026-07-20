@@ -3,6 +3,8 @@
 #include "glove/term/terminal.hpp"
 #include "glove/version.hpp"
 
+#include "host/cli.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
@@ -397,6 +399,26 @@ auto main(int argc, char** argv) -> int {
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }
+    if (sub == "setup") {
+        return glove::host::setup_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
+    if (sub == "doctor") {
+        return glove::host::doctor_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
+    if (sub == "config") {
+        return glove::host::config_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
+    if (sub == "init") {
+        return glove::host::init_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
     if (sub == "-h" || sub == "--help") {
         print_banner();
         std::fprintf(
@@ -404,6 +426,10 @@ auto main(int argc, char** argv) -> int {
             "\nsubcommands:\n"
             "  run     spawn an MCP-client agent inside the container\n"
             "  exec    contain a real self-driving agent (e.g. pi); stdio + egress\n"
+            "  setup   create trusted machine-local configuration and state\n"
+            "  doctor  verify configuration and local service readiness\n"
+            "  config  inspect trusted machine-local configuration\n"
+            "  init    enroll a project beneath a setup-approved protected root\n"
         );
         return 0;
     }

@@ -18,6 +18,7 @@ host security boundary.
 | Agent-supplied JSON-RPC and terminal input | Untrusted |
 | Glove control, policy, and sandbox code | Trusted |
 | Local policy, launch templates, and approval records | Trusted operator input |
+| Project files, repository configuration, and agent instructions | Untrusted; never machine-setup authority |
 | MCP upstream servers | Trusted host processes; not sandboxed by Glove |
 | Sage controller | Authenticated peer, but not authority for raw paths, exposure administration, or host mutation |
 | Operating-system kernel and platform sandbox | Trusted and patched |
@@ -64,6 +65,8 @@ The security claims require:
   the Glove executable;
 - the host kernel and platform sandbox behave as documented;
 - no agent-visible path contains control secrets, journals, or audit output;
+- machine setup and project enrollment are performed by the local operator,
+  outside any remote request or project-provided configuration;
 - allowed tools and upstream servers are appropriate for the deployment;
 - Linux cgroup v2, namespace, mount, seccomp, and quota prerequisites are
   available when managed-session capabilities are advertised;

@@ -101,59 +101,48 @@ authenticated against a same-user host process.
 
 ## Gloved control service
 
-`gloved` requires an existing owner-only runtime directory and protected key,
-journal, policy, and session-store paths:
+Use the host setup workflow instead of assembling daemon flags manually:
 
 ```sh
-./build/dev/src/gloved \
-  --runtime-dir /absolute/owner-only/runtime \
-  --audit-key /absolute/owner-only/audit.key \
-  --journal /absolute/owner-only/receipts.journal \
-  --session-policy /absolute/owner-only/session-policy.json \
-  --session-store /absolute/owner-only/sessions.journal \
-  --path-exposure-policy /absolute/owner-only/path-exposure-policy.json \
-  --path-exposure-journal /absolute/owner-only/path-exposures.journal
+./build/dev/src/glove setup --path-root "$HOME/work" --dry-run
+./build/dev/src/glove setup --path-root "$HOME/work" --yes
+./build/dev/src/gloved --config "$(./build/dev/src/glove config path)"
 ```
 
-Linux managed-session configuration may also provide
-`--materialization-root` and `--library-bundle-root`. This enables the local
-session lifecycle, but does not by itself make Sage remote launch production
-ready. Retained-write preparation additionally requires `mkfs.ext4`,
-`/dev/loop-control`, loop devices, and mount capability. See
-[session-policy.md](session-policy.md).
+Pass `--session-policy /absolute/owner-only/session-policy.json` to both setup
+commands when testing managed sessions. Retained-write preparation on Linux
+also requires `mkfs.ext4`, loop devices, and mount capability. See
+[host-setup.md](host-setup.md) and [session-policy.md](session-policy.md).
 
 ### Sage-triggered user service
 
-Sage can start `gloved` through the current user's service manager before it
-negotiates capabilities. Substitute absolute paths in the platform template,
-install it under the standard per-user service directory, and load or enable
-it without starting it:
+Substitute `@GLOVED_BINARY@` and `@GLOVE_CONFIG@` in the platform template,
+then install and register it as a user service:
 
 - systemd: `packaging/systemd/sage-gloved.service.in`
 - launchd: `packaging/launchd/org.sage-protocol.gloved.plist.in`
 
-Then configure `saged`:
+Then configure and verify Sage:
 
-```toml
-[daemon]
-fleet_execution_host_enabled = true
-glove_activation_mode = "user_service"
-glove_service_name = "org.sage-protocol.gloved" # macOS
-# glove_service_name = "sage-gloved.service"    # Linux
-glove_runtime_dir = "/absolute/owner-only/runtime"
-glove_session_policy_path = "/absolute/owner-only/session-policy.json"
+```sh
+sage config set daemon.glove_activation_mode user_service
+sage config set daemon.glove_service_name sage-gloved.service
+sage config set daemon.glove_runtime_dir /value/from/glove-config-show
+sage config set daemon.glove_session_policy_path /value/from/glove-config-show
+sage config set daemon.glove_audit_key_path /value/from/glove-config-show
+sage config set daemon.fleet_execution_host_enabled true
+sage daemon restart
+sage doctor --scope glove --include-details
 ```
 
-Activation invokes only `/bin/launchctl` or `/usr/bin/systemctl` with a bounded
-service label. Neither a Glove binary path nor a service label is accepted from
-P2P. The service manager owns restart and shutdown policy; Sage waits for the
-socket and per-start credential, then performs its normal health and capability
-checks.
+Use `org.sage-protocol.gloved` as the service name on macOS. Enable
+`fleet_execution_host_enabled` only after reviewing the local Sage daemon
+policy.
 
-This user-service profile retains the existing same-UID control contract and
-cannot activate host apply. A future system-service profile must use a distinct
-Glove identity, peer-credential policy, and group-readable control socket while
-keeping the apply-signing key unavailable to Sage.
+Sage invokes only the platform service manager with a bounded local service
+label. P2P cannot select the binary, service, arguments, environment, or path
+policy. Authentication or capability failure leaves Sage available while
+remote launch remains disabled.
 
 ## Troubleshooting
 

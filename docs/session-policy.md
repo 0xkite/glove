@@ -61,6 +61,11 @@ entry exposes only its ID, generation, scope digest, label, allowed modes,
 expiry, runtimes, and state. Paths, root IDs, and source identities remain
 local. Replacing a live generation requires revocation or expiry.
 
+`glove init <project>` is the owner-local enrollment client. It canonicalizes
+the project path and requests one exposure beneath a root created by
+`glove setup --path-root`; remote session requests cannot invoke enrollment or
+supply a host path.
+
 ## Policy schema
 
 The decoder rejects unknown fields. This example defines one runtime, one
