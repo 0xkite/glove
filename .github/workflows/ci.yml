@@ -36,7 +36,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes clang clang-tidy libseccomp-dev ninja-build python3-venv
+          sudo apt-get install --yes clang clang-tidy libc++-dev libc++abi-dev libseccomp-dev ninja-build python3-venv
+          echo "CXXFLAGS=-stdlib=libc++" >> "$GITHUB_ENV"
 
       - name: Install macOS toolchain
         if: runner.os == 'macOS'
