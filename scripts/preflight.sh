@@ -28,18 +28,19 @@ bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 
-run_ctest() {
-    if [[ "${GLOVE_PRIVILEGED_TESTS:-0}" == "1" ]]; then
+prepare_linux_userns_tests() {
+    if [[ "${GLOVE_PREPARE_LINUX_USERNS:-0}" == "1" ]]; then
         if [[ "$(uname -s)" != "Linux" ]]; then
-            fail "GLOVE_PRIVILEGED_TESTS is supported only on Linux"
+            fail "GLOVE_PREPARE_LINUX_USERNS is supported only on Linux"
         fi
         if ! command -v sudo >/dev/null; then
-            fail "GLOVE_PRIVILEGED_TESTS requires sudo"
+            fail "GLOVE_PREPARE_LINUX_USERNS requires sudo"
         fi
-        sudo --preserve-env=ASAN_OPTIONS,UBSAN_OPTIONS,TSAN_OPTIONS ctest "$@"
-        return
+        if [[ ! -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            fail "AppArmor unprivileged-userns control is unavailable"
+        fi
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
     fi
-    ctest "$@"
 }
 
 # 1. GitHub Actions ---------------------------------------------------------
@@ -147,6 +148,7 @@ fi
 
 # 4. asan -------------------------------------------------------------------
 bold "[4/5] asan preset"
+prepare_linux_userns_tests
 cmake --preset asan
 cmake --build --preset asan
 asan_opts="halt_on_error=1:abort_on_error=1"
@@ -156,7 +158,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    run_ctest --preset asan
+    ctest --preset asan
 ok "asan ok"
 
 # 5. tsan -------------------------------------------------------------------
@@ -164,7 +166,7 @@ bold "[5/5] tsan preset"
 cmake --preset tsan
 cmake --build --preset tsan
 TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
-    run_ctest --preset tsan
+    ctest --preset tsan
 ok "tsan ok"
 
 bold "all gates passed"

@@ -70,5 +70,5 @@ jobs:
 
       - name: Run preflight
         env:
-          GLOVE_PRIVILEGED_TESTS: ${{ runner.os == 'Linux' && '1' || '0' }}
+          GLOVE_PREPARE_LINUX_USERNS: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: scripts/preflight.sh
