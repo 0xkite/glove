@@ -111,6 +111,7 @@ the local service is running: `glove init /absolute/project`. See
 - [Quickstart](docs/quickstart.md): build and invocation examples
 - [Host setup](docs/host-setup.md): XDG state, service registration, and project enrollment
 - [Future work](docs/future-work.md): prioritized launch and hardening gates
+- [Validation surface](docs/validation-surface.md): style findings and research evidence map
 - [Credits](CREDITS.md): dependencies and research references
 
 ## License
