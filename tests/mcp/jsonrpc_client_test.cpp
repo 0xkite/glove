@@ -7,11 +7,14 @@
 
 #include "src/mcp/codec.hpp"
 
+#include <array>
 #include <cstdio>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -44,6 +47,37 @@ auto fake_server(std::string_view request_frame) -> std::optional<std::string> {
         }
     }
     return R"({"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"unhandled by fake server"}})";
+}
+
+auto mismatched_id_server(std::string_view request_frame) -> std::optional<std::string> {
+    if (request_frame.find("\"method\":\"tools/list\"") != std::string_view::npos) {
+        return R"({"jsonrpc":"2.0","id":99,"result":{"tools":[]}})";
+    }
+    return std::nullopt;
+}
+
+auto duplicate_id_server(std::string_view request_frame) -> std::optional<std::string> {
+    if (request_frame.find("\"method\":\"tools/list\"") != std::string_view::npos) {
+        return R"({"jsonrpc":"2.0","id":1,"result":{"tools":[]}})";
+    }
+    if (request_frame.find("\"method\":\"tools/call\"") != std::string_view::npos) {
+        return R"({"jsonrpc":"2.0","id":1,"result":{"content":[],"isError":false}})";
+    }
+    return std::nullopt;
+}
+
+auto correlated_server(std::string_view request_frame) -> std::optional<std::string> {
+    auto request = glove::mcp::codec::decode_request(request_frame);
+    if (!request || !request->id) {
+        return R"({"jsonrpc":"2.0","id":0,"error":{"code":-32600,"message":"invalid request"}})";
+    }
+    auto response = glove::mcp::codec::encode_response_with_result(
+        *request->id, R"({"content":[{"type":"text","text":"ok"}],"isError":false})"
+    );
+    if (!response) {
+        return R"({"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"encoding failed"}})";
+    }
+    return std::move(*response);
 }
 
 auto run() -> int {
@@ -79,6 +113,42 @@ auto run() -> int {
         REQUIRE(result.has_value());
         REQUIRE(result->status == glove::mcp::tool_call_status::execution_error);
         REQUIRE(result->error_message.find("tool not found") != std::string::npos);
+    }
+
+    {
+        auto mismatched =
+            glove::mcp::make_client(glove::mcp::make_in_memory_transport(mismatched_id_server));
+        auto tools = mismatched->list_tools();
+        REQUIRE(!tools.has_value());
+        REQUIRE(tools.error().find("response id") != std::string::npos);
+    }
+
+    {
+        auto duplicate =
+            glove::mcp::make_client(glove::mcp::make_in_memory_transport(duplicate_id_server));
+        REQUIRE(duplicate->list_tools().has_value());
+        auto result = duplicate->call_tool({.name = "echo", .arguments_json = "{}"});
+        REQUIRE(!result.has_value());
+        REQUIRE(result.error().find("response id") != std::string::npos);
+    }
+
+    {
+        auto concurrent =
+            glove::mcp::make_client(glove::mcp::make_in_memory_transport(correlated_server));
+        std::array<bool, 8> succeeded{};
+        {
+            std::vector<std::jthread> workers;
+            workers.reserve(succeeded.size());
+            for (std::size_t index = 0; index < succeeded.size(); ++index) {
+                workers.emplace_back([&concurrent, &succeeded, index] {
+                    auto result = concurrent->call_tool({.name = "echo", .arguments_json = "{}"});
+                    succeeded[index] = result.has_value() && result->content == "ok";
+                });
+            }
+        }
+        for (const bool result : succeeded) {
+            REQUIRE(result);
+        }
     }
 
     return 0;

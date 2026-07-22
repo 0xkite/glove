@@ -33,7 +33,8 @@ target_link_libraries(mcp_initialize_test PRIVATE glove_kernel)
 add_test(NAME mcp_initialize COMMAND mcp_initialize_test)
 
 add_executable(mcp_lazy_init_test mcp/lazy_init_test.cpp)
-target_link_libraries(mcp_lazy_init_test PRIVATE glove_kernel)
+target_link_libraries(mcp_lazy_init_test PRIVATE glove_kernel glaze::glaze)
+target_include_directories(mcp_lazy_init_test PRIVATE $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>)
 add_test(NAME mcp_lazy_init COMMAND mcp_lazy_init_test)
 
 add_executable(mcp_protocol_version_test mcp/protocol_version_test.cpp)

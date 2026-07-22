@@ -7,6 +7,8 @@
 #include "glove/mcp/messages.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include "src/mcp/codec.hpp"
+
 #include <atomic>
 #include <cstdio>
 #include <memory>
@@ -30,24 +32,33 @@ std::atomic<int> tools_list_calls{0};
 std::atomic<int> tools_call_calls{0};
 
 auto fake_server(std::string_view req) -> std::optional<std::string> {
-    if (req.find("\"method\":\"initialize\"") != std::string_view::npos) {
-        initialize_calls.fetch_add(1, std::memory_order_relaxed);
-        return std::string{R"({"jsonrpc":"2.0","id":1,"result":{)"
-                           R"("protocolVersion":"2024-11-05",)"
-                           R"("serverInfo":{"name":"f","version":"0"},)"
-                           R"("capabilities":{}}})"};
-    }
     if (req.find("notifications/initialized") != std::string_view::npos) {
         return std::nullopt;
     }
-    if (req.find("\"method\":\"tools/list\"") != std::string_view::npos) {
-        tools_list_calls.fetch_add(1, std::memory_order_relaxed);
-        return std::string{R"({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})"};
+    auto request = glove::mcp::codec::decode_request(req);
+    if (!request || !request->id) {
+        return R"({"jsonrpc":"2.0","id":0,"error":{"code":-32600,"message":"invalid request"}})";
     }
-    if (req.find("\"method\":\"tools/call\"") != std::string_view::npos) {
+    if (request->method == "initialize") {
+        initialize_calls.fetch_add(1, std::memory_order_relaxed);
+        auto response = glove::mcp::codec::encode_response_with_result(
+            *request->id,
+            R"({"protocolVersion":"2024-11-05","serverInfo":{"name":"f","version":"0"},"capabilities":{}})"
+        );
+        return response ? std::optional<std::string>{std::move(*response)} : std::nullopt;
+    }
+    if (request->method == "tools/list") {
+        tools_list_calls.fetch_add(1, std::memory_order_relaxed);
+        auto response =
+            glove::mcp::codec::encode_response_with_result(*request->id, R"({"tools":[]})");
+        return response ? std::optional<std::string>{std::move(*response)} : std::nullopt;
+    }
+    if (request->method == "tools/call") {
         tools_call_calls.fetch_add(1, std::memory_order_relaxed);
-        return std::string{R"({"jsonrpc":"2.0","id":3,"result":{)"
-                           R"("content":[{"type":"text","text":"ok"}],"isError":false}})"};
+        auto response = glove::mcp::codec::encode_response_with_result(
+            *request->id, R"({"content":[{"type":"text","text":"ok"}],"isError":false})"
+        );
+        return response ? std::optional<std::string>{std::move(*response)} : std::nullopt;
     }
     return std::string{R"({"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"x"}})"};
 }

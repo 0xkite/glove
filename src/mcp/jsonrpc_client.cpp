@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,18 +24,11 @@ public:
 
     auto initialize(std::string_view client_name, std::string_view client_version)
         -> std::expected<server_info, std::string> override {
-        auto frame = codec::build_initialize_request(next_id(), client_name, client_version);
-        if (!frame) {
-            return std::unexpected(frame.error());
-        }
-        if (auto sent = transport_->send(*frame); !sent) {
-            return std::unexpected(sent.error());
-        }
-        auto reply = transport_->recv();
-        if (!reply) {
-            return std::unexpected(reply.error());
-        }
-        auto env = codec::decode_response(*reply);
+        const std::scoped_lock lock{transaction_mutex_};
+        const auto request_id = next_id();
+        auto env = transact(
+            request_id, codec::build_initialize_request(request_id, client_name, client_version)
+        );
         if (!env) {
             return std::unexpected(env.error());
         }
@@ -56,19 +50,9 @@ public:
     }
 
     auto list_tools() -> std::expected<std::vector<tool_descriptor>, std::string> override {
-        auto frame = codec::build_tools_list_request(next_id());
-        if (!frame) {
-            return std::unexpected(frame.error());
-        }
-        auto sent = transport_->send(*frame);
-        if (!sent) {
-            return std::unexpected(sent.error());
-        }
-        auto reply = transport_->recv();
-        if (!reply) {
-            return std::unexpected(reply.error());
-        }
-        auto env = codec::decode_response(*reply);
+        const std::scoped_lock lock{transaction_mutex_};
+        const auto request_id = next_id();
+        auto env = transact(request_id, codec::build_tools_list_request(request_id));
         if (!env) {
             return std::unexpected(env.error());
         }
@@ -77,19 +61,9 @@ public:
 
     auto call_tool(const tool_call_request& req)
         -> std::expected<tool_call_result, std::string> override {
-        auto frame = codec::build_tools_call_request(next_id(), req);
-        if (!frame) {
-            return std::unexpected(frame.error());
-        }
-        auto sent = transport_->send(*frame);
-        if (!sent) {
-            return std::unexpected(sent.error());
-        }
-        auto reply = transport_->recv();
-        if (!reply) {
-            return std::unexpected(reply.error());
-        }
-        auto env = codec::decode_response(*reply);
+        const std::scoped_lock lock{transaction_mutex_};
+        const auto request_id = next_id();
+        auto env = transact(request_id, codec::build_tools_call_request(request_id, req));
         if (!env) {
             return std::unexpected(env.error());
         }
@@ -99,7 +73,32 @@ public:
 private:
     auto next_id() -> std::int64_t { return ++last_id_; }
 
+    auto transact(std::int64_t request_id, std::expected<std::string, std::string> frame)
+        -> std::expected<jsonrpc_response_envelope, std::string> {
+        if (!frame) {
+            return std::unexpected(frame.error());
+        }
+        if (auto sent = transport_->send(*frame); !sent) {
+            return std::unexpected(sent.error());
+        }
+        auto reply = transport_->recv();
+        if (!reply) {
+            return std::unexpected(reply.error());
+        }
+        auto envelope = codec::decode_response(*reply);
+        if (!envelope) {
+            return std::unexpected(envelope.error());
+        }
+        if (envelope->id != request_id) {
+            return std::unexpected(
+                std::string{"JSON-RPC response id does not match the pending request"}
+            );
+        }
+        return envelope;
+    }
+
     std::unique_ptr<transport> transport_;
+    std::mutex transaction_mutex_;
     std::int64_t last_id_ = 0;
 };
 
