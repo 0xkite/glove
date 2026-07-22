@@ -132,6 +132,18 @@ auto run() -> int {
     REQUIRE(::close(corrupt) == 0);
     REQUIRE(!path_exposure_journal::open(corrupt_path).has_value());
 
+    const auto truncated_path = temporary.root() / "truncated.journal";
+    {
+        auto journal = path_exposure_journal::open(truncated_path);
+        REQUIRE(journal.has_value());
+        REQUIRE(journal->append(create).has_value());
+    }
+    struct stat truncated_metadata{};
+    REQUIRE(::stat(truncated_path.c_str(), &truncated_metadata) == 0);
+    REQUIRE(truncated_metadata.st_size > 0);
+    REQUIRE(::truncate(truncated_path.c_str(), truncated_metadata.st_size - 1) == 0);
+    REQUIRE(!path_exposure_journal::open(truncated_path).has_value());
+
     const auto weak_path = temporary.root() / "weak.journal";
     const int weak = ::open(weak_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     REQUIRE(weak >= 0);

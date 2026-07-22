@@ -2,6 +2,7 @@
 
 #include "glove/supervisor/path_alias.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -55,6 +56,23 @@ struct change_apply_grant_status {
     std::optional<change_apply_terminal_record> terminal;
 };
 
+// Local I/O boundary for the journal's durable append protocol. Production
+// callers use the default POSIX implementation; an injected instance permits
+// deterministic short-write and sync-failure recovery tests.
+class change_apply_journal_io {
+public:
+    virtual ~change_apply_journal_io() = default;
+
+    [[nodiscard]] virtual auto
+    write_at(int descriptor, std::string_view bytes, std::uint64_t offset) const
+        -> result<std::size_t> = 0;
+
+    [[nodiscard]] virtual auto truncate(int descriptor, std::uint64_t size) const
+        -> result<void> = 0;
+
+    [[nodiscard]] virtual auto sync(int descriptor) const -> result<void> = 0;
+};
+
 // Owner-only, bounded, append-only consumption ledger. reserve() is synced
 // before a future apply engine may mutate the host. A reservation without a
 // terminal record remains consumed after recovery and must never be retried.
@@ -77,7 +95,8 @@ public:
 
     [[nodiscard]] static auto open(
         const std::filesystem::path& path,
-        std::uint64_t max_bytes = default_change_apply_journal_bytes
+        std::uint64_t max_bytes = default_change_apply_journal_bytes,
+        std::shared_ptr<const change_apply_journal_io> io = {}
     ) -> result<change_apply_journal>;
 
     [[nodiscard]] auto records() const -> std::vector<change_apply_grant_status>;

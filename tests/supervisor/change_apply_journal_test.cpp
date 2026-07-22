@@ -4,8 +4,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <string>
 #include <system_error>
 
@@ -40,6 +44,60 @@ public:
 
 private:
     std::filesystem::path root_;
+};
+
+class fault_injecting_journal_io final : public glove::supervisor::change_apply_journal_io {
+public:
+    void fail_next_append_after_partial_write() { fail_write_ = true; }
+
+    void fail_next_sync() { fail_sync_ = true; }
+
+    auto write_at(int descriptor, std::string_view bytes, std::uint64_t offset) const
+        -> glove::supervisor::result<std::size_t> override {
+        if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+            return std::unexpected(std::string{"test write offset is invalid"});
+        }
+        std::size_t count = bytes.size();
+        if (fail_write_) {
+            if (partial_write_complete_) {
+                fail_write_ = false;
+                partial_write_complete_ = false;
+                return std::unexpected(std::string{"injected disk full"});
+            }
+            count = std::max(std::size_t{1}, bytes.size() / 2U);
+            partial_write_complete_ = true;
+        }
+        const auto written = ::pwrite(descriptor, bytes.data(), count, static_cast<off_t>(offset));
+        if (written <= 0) {
+            return std::unexpected(std::string{"test write failed"});
+        }
+        return static_cast<std::size_t>(written);
+    }
+
+    auto truncate(int descriptor, std::uint64_t size) const
+        -> glove::supervisor::result<void> override {
+        if (size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+            ::ftruncate(descriptor, static_cast<off_t>(size)) != 0) {
+            return std::unexpected(std::string{"test truncate failed"});
+        }
+        return {};
+    }
+
+    auto sync(int descriptor) const -> glove::supervisor::result<void> override {
+        if (fail_sync_) {
+            fail_sync_ = false;
+            return std::unexpected(std::string{"injected sync failure"});
+        }
+        if (::fsync(descriptor) != 0) {
+            return std::unexpected(std::string{"test sync failed"});
+        }
+        return {};
+    }
+
+private:
+    mutable bool fail_write_ = false;
+    mutable bool partial_write_complete_ = false;
+    mutable bool fail_sync_ = false;
 };
 
 auto reservation(
@@ -174,6 +232,55 @@ auto run() -> int {
     REQUIRE(weak >= 0);
     REQUIRE(::close(weak) == 0);
     REQUIRE(!change_apply_journal::open(weak_path).has_value());
+
+    const auto malformed_path = temporary.root() / "malformed.journal";
+    const int malformed =
+        ::open(malformed_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    REQUIRE(malformed >= 0);
+    constexpr std::string_view journal_magic = "GLOVE-CHANGE-APPLY1\n";
+    constexpr std::array malformed_record{'{', '\0', '}', '\n'};
+    REQUIRE(
+        ::write(malformed, journal_magic.data(), journal_magic.size()) ==
+        static_cast<ssize_t>(journal_magic.size())
+    );
+    REQUIRE(
+        ::write(malformed, malformed_record.data(), malformed_record.size()) ==
+        static_cast<ssize_t>(malformed_record.size())
+    );
+    REQUIRE(::close(malformed) == 0);
+    REQUIRE(!change_apply_journal::open(malformed_path).has_value());
+
+    const auto fault_path = temporary.root() / "fault.journal";
+    const auto fault_io = std::make_shared<fault_injecting_journal_io>();
+    {
+        auto journal =
+            change_apply_journal::open(fault_path, default_change_apply_journal_bytes, fault_io);
+        REQUIRE(journal.has_value());
+        struct stat before{};
+        REQUIRE(::stat(fault_path.c_str(), &before) == 0);
+
+        fault_io->fail_next_append_after_partial_write();
+        REQUIRE(!journal->reserve(reservation("grant-write-failure", 'e', 'f')).has_value());
+        struct stat after_write_failure{};
+        REQUIRE(::stat(fault_path.c_str(), &after_write_failure) == 0);
+        REQUIRE(after_write_failure.st_size == before.st_size);
+        REQUIRE(journal->records().empty());
+
+        fault_io->fail_next_sync();
+        REQUIRE(!journal->reserve(reservation("grant-sync-failure", 'e', 'f')).has_value());
+        struct stat after_sync_failure{};
+        REQUIRE(::stat(fault_path.c_str(), &after_sync_failure) == 0);
+        REQUIRE(after_sync_failure.st_size == before.st_size);
+        REQUIRE(journal->records().empty());
+
+        REQUIRE(journal->reserve(reservation("grant-retry", 'e', 'f')).has_value());
+    }
+    {
+        auto replayed = change_apply_journal::open(fault_path);
+        REQUIRE(replayed.has_value());
+        REQUIRE(replayed->records().size() == 1U);
+        REQUIRE(replayed->find("grant-retry").has_value());
+    }
     return 0;
 }
 

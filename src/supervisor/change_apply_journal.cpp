@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -134,6 +135,53 @@ struct opened_journal {
 auto error_message(std::string_view operation, int error_number = errno) -> std::string {
     return std::string{operation} + ": " +
            std::error_code{error_number, std::generic_category()}.message();
+}
+
+class posix_change_apply_journal_io final : public change_apply_journal_io {
+public:
+    auto write_at(int descriptor, std::string_view bytes, std::uint64_t offset) const
+        -> result<std::size_t> override {
+        if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+            return std::unexpected(std::string{"change apply journal offset is too large"});
+        }
+        while (true) {
+            const auto written =
+                ::pwrite(descriptor, bytes.data(), bytes.size(), static_cast<off_t>(offset));
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            if (written <= 0) {
+                return std::unexpected(error_message("write change apply journal"));
+            }
+            return static_cast<std::size_t>(written);
+        }
+    }
+
+    auto truncate(int descriptor, std::uint64_t size) const -> result<void> override {
+        if (size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+            return std::unexpected(std::string{"change apply journal offset is too large"});
+        }
+        while (::ftruncate(descriptor, static_cast<off_t>(size)) != 0) {
+            if (errno != EINTR) {
+                return std::unexpected(error_message("truncate change apply journal"));
+            }
+        }
+        return {};
+    }
+
+    auto sync(int descriptor) const -> result<void> override {
+        while (::fsync(descriptor) != 0) {
+            if (errno != EINTR) {
+                return std::unexpected(error_message("sync change apply journal"));
+            }
+        }
+        return {};
+    }
+};
+
+auto default_journal_io() -> std::shared_ptr<const change_apply_journal_io> {
+    static const auto instance = std::make_shared<posix_change_apply_journal_io>();
+    return instance;
 }
 
 auto valid_identifier(std::string_view value) -> bool {
@@ -327,25 +375,22 @@ auto decode(const wire_record& record) -> result<decoded_record> {
     };
 }
 
-auto write_all_at(int descriptor, std::string_view bytes, std::uint64_t offset) -> result<void> {
+auto write_all_at(
+    const change_apply_journal_io& io, int descriptor, std::string_view bytes, std::uint64_t offset
+) -> result<void> {
     std::size_t written = 0;
     while (written < bytes.size()) {
         if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) - written) {
             return std::unexpected(std::string{"change apply journal offset is too large"});
         }
-        const auto result = ::pwrite(
-            descriptor,
-            bytes.data() + written,
-            bytes.size() - written,
-            static_cast<off_t>(offset + written)
-        );
-        if (result < 0 && errno == EINTR) {
-            continue;
+        const auto result = io.write_at(descriptor, bytes.substr(written), offset + written);
+        if (!result) {
+            return std::unexpected(result.error());
         }
-        if (result <= 0) {
-            return std::unexpected(error_message("write change apply journal"));
+        if (*result == 0 || *result > bytes.size() - written) {
+            return std::unexpected(std::string{"change apply journal write count is invalid"});
         }
-        written += static_cast<std::size_t>(result);
+        written += *result;
     }
     return {};
 }
@@ -377,15 +422,6 @@ auto read_all(int descriptor, std::uint64_t size) -> result<std::string> {
     return bytes;
 }
 
-auto sync_descriptor(int descriptor) -> result<void> {
-    while (::fsync(descriptor) != 0) {
-        if (errno != EINTR) {
-            return std::unexpected(error_message("sync change apply journal"));
-        }
-    }
-    return {};
-}
-
 auto validate_file(int descriptor, std::uint64_t max_bytes) -> result<std::uint64_t> {
     struct stat metadata{};
     if (::fstat(descriptor, &metadata) != 0) {
@@ -402,8 +438,9 @@ auto validate_file(int descriptor, std::uint64_t max_bytes) -> result<std::uint6
     return static_cast<std::uint64_t>(metadata.st_size);
 }
 
-auto open_file(const std::filesystem::path& path, std::uint64_t max_bytes)
-    -> result<opened_journal> {
+auto open_file(
+    const std::filesystem::path& path, std::uint64_t max_bytes, const change_apply_journal_io& io
+) -> result<opened_journal> {
     if (!path.is_absolute() || path.filename().empty()) {
         return std::unexpected(std::string{"change apply journal path must be absolute"});
     }
@@ -444,21 +481,21 @@ auto open_file(const std::filesystem::path& path, std::uint64_t max_bytes)
     if (created) {
         const auto discard = [&] {
             (void)::unlinkat(parent.get(), filename.c_str(), 0);
-            (void)sync_descriptor(parent.get());
+            (void)io.sync(parent.get());
         };
         if (max_bytes < journal_magic.size()) {
             discard();
             return std::unexpected(std::string{"change apply journal capacity is too small"});
         }
-        if (auto written = write_all_at(file.get(), journal_magic, 0); !written) {
+        if (auto written = write_all_at(io, file.get(), journal_magic, 0); !written) {
             discard();
             return std::unexpected(written.error());
         }
-        if (auto synced = sync_descriptor(file.get()); !synced) {
+        if (auto synced = io.sync(file.get()); !synced) {
             discard();
             return std::unexpected(synced.error());
         }
-        if (auto synced = sync_descriptor(parent.get()); !synced) {
+        if (auto synced = io.sync(parent.get()); !synced) {
             discard();
             return std::unexpected(synced.error());
         }
@@ -476,6 +513,7 @@ auto open_file(const std::filesystem::path& path, std::uint64_t max_bytes)
 
 struct change_apply_journal::implementation {
     opened_journal opened;
+    std::shared_ptr<const change_apply_journal_io> io;
     std::uint64_t max_bytes = 0;
     std::uint64_t sequence = 0;
     std::string head_hash = std::string(64, '0');
@@ -506,13 +544,14 @@ auto append_record(change_apply_journal::implementation& state, wire_record reco
         return std::unexpected(std::string{"change apply journal byte capacity is exhausted"});
     }
     const auto original_size = state.opened.size;
-    if (auto written = write_all_at(state.opened.file.get(), *json, original_size); !written) {
-        (void)::ftruncate(state.opened.file.get(), static_cast<off_t>(original_size));
+    if (auto written = write_all_at(*state.io, state.opened.file.get(), *json, original_size);
+        !written) {
+        (void)state.io->truncate(state.opened.file.get(), original_size);
         return std::unexpected(written.error());
     }
-    if (auto synced = sync_descriptor(state.opened.file.get()); !synced) {
-        (void)::ftruncate(state.opened.file.get(), static_cast<off_t>(original_size));
-        (void)sync_descriptor(state.opened.file.get());
+    if (auto synced = state.io->sync(state.opened.file.get()); !synced) {
+        (void)state.io->truncate(state.opened.file.get(), original_size);
+        (void)state.io->sync(state.opened.file.get());
         return std::unexpected(synced.error());
     }
     state.opened.size += json->size();
@@ -537,12 +576,18 @@ auto change_apply_journal::operator=(change_apply_journal&&) noexcept
 
 change_apply_journal::~change_apply_journal() = default;
 
-auto change_apply_journal::open(const std::filesystem::path& path, std::uint64_t max_bytes)
-    -> result<change_apply_journal> {
+auto change_apply_journal::open(
+    const std::filesystem::path& path,
+    std::uint64_t max_bytes,
+    std::shared_ptr<const change_apply_journal_io> io
+) -> result<change_apply_journal> {
     if (max_bytes < journal_magic.size() + 2U) {
         return std::unexpected(std::string{"change apply journal capacity is invalid"});
     }
-    auto opened = open_file(path, max_bytes);
+    if (!io) {
+        io = default_journal_io();
+    }
+    auto opened = open_file(path, max_bytes, *io);
     if (!opened) {
         return std::unexpected(opened.error());
     }
@@ -552,6 +597,7 @@ auto change_apply_journal::open(const std::filesystem::path& path, std::uint64_t
     }
     auto state = std::make_unique<implementation>();
     state->opened = std::move(*opened);
+    state->io = std::move(io);
     state->max_bytes = max_bytes;
     std::size_t offset = journal_magic.size();
     while (offset < bytes->size()) {
@@ -562,7 +608,10 @@ auto change_apply_journal::open(const std::filesystem::path& path, std::uint64_t
         }
         const std::string_view json{bytes->data() + offset, newline - offset};
         wire_record record;
-        if (const auto error = glz::read<strict_read_options>(record, json);
+        // Glaze's padded fast path requires mutable, resizable storage. Journal
+        // bytes are framed untrusted input, so give the parser an owned buffer.
+        std::string parse_buffer{json};
+        if (const auto error = glz::read<strict_read_options>(record, parse_buffer);
             error || record.schema_version != 1 || record.sequence != state->sequence + 1U ||
             record.previous_hash != state->head_hash || !valid_digest(record.record_hash)) {
             return std::unexpected(std::string{"change apply journal chain metadata is invalid"});
