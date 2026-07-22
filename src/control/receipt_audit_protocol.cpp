@@ -293,6 +293,11 @@ struct supervisor_capabilities {
     std::vector<backend_capabilities> backends;
 };
 
+struct supervisor_health {
+    std::uint8_t schema_version = 1;
+    std::string status = "ready";
+};
+
 } // namespace wire
 
 namespace {
@@ -701,6 +706,20 @@ auto handle_capabilities(
             },
         }
     );
+    if (!result) {
+        return std::unexpected(result.error());
+    }
+    return success_response(request_id, std::move(*result));
+}
+
+auto handle_health(std::string_view request_id, const rpc_params& params)
+    -> std::expected<std::string, std::string> {
+    if (params.idempotency_key.has_value() || params.payload.str != "null") {
+        return error_response(
+            request_id, "invalid_request", "health requires a null read-only payload"
+        );
+    }
+    auto result = encode_json(wire::supervisor_health{});
     if (!result) {
         return std::unexpected(result.error());
     }
@@ -1815,6 +1834,10 @@ auto receipt_audit_protocol::handle_frame(std::string_view frame, std::uint64_t 
     }
     if (params->deadline_ms == 0 || params->deadline_ms < now_ms) {
         return error_response(request->id, "deadline_exceeded", "request deadline elapsed");
+    }
+
+    if (request->method == "health") {
+        return handle_health(request->id, *params);
     }
 
     if (request->method == "capabilities") {

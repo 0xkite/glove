@@ -189,6 +189,11 @@ struct supervisor_capabilities {
     std::vector<backend_capabilities> backends;
 };
 
+struct supervisor_health {
+    std::uint8_t schema_version = 0;
+    std::string status;
+};
+
 struct path_exposure_mode {
     std::string access;
     std::string materialization;
@@ -244,6 +249,7 @@ using wire_test::page_result;
 using wire_test::rpc_error;
 using wire_test::rpc_response;
 using wire_test::supervisor_capabilities;
+using wire_test::supervisor_health;
 
 auto valid_plan() -> std::string {
     return R"({"schema_version":1,"runtime_id":"codex","runtime_template_id":"codex-safe","adapter_command_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sandbox_backend":"linux_production","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"alias":"workspace","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","destination_alias":"libraries"}],"secret_handles":["codex-token"],"limits":{"cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576},"policy_revision":7,"expires_at_ms":61000})";
@@ -374,6 +380,42 @@ auto run() -> int {
     REQUIRE(!(*recovered)->bootstrap_reconciled());
     auto protocol = glove::control::receipt_audit_protocol::create(bootstrap_secret, *recovered);
     REQUIRE(protocol.has_value());
+
+    auto health_frame = (*protocol)->handle_frame(
+        make_request("health-1", "health", bootstrap_secret, "null"), 1'000
+    );
+    REQUIRE(health_frame.has_value());
+    auto health_response = decode_response(*health_frame);
+    REQUIRE(health_response.has_value());
+    REQUIRE(health_response->result.has_value());
+    REQUIRE(!health_response->error.has_value());
+    supervisor_health health;
+    REQUIRE(
+        !glz::read<glz::opts{.error_on_unknown_keys = true}>(health, health_response->result->str)
+    );
+    REQUIRE(health.schema_version == 1);
+    REQUIRE(health.status == "ready");
+
+    auto invalid_health = (*protocol)->handle_frame(
+        make_request("invalid-health", "health", bootstrap_secret, "{}"), 1'000
+    );
+    REQUIRE(invalid_health.has_value());
+    auto invalid_health_response = decode_response(*invalid_health);
+    REQUIRE(invalid_health_response.has_value());
+    REQUIRE(invalid_health_response->error.has_value());
+    REQUIRE(invalid_health_response->error->code == "invalid_request");
+
+    auto keyed_health = (*protocol)->handle_frame(
+        make_request(
+            "keyed-health", "health", bootstrap_secret, "null", "health-must-be-read-only"
+        ),
+        1'000
+    );
+    REQUIRE(keyed_health.has_value());
+    auto keyed_health_response = decode_response(*keyed_health);
+    REQUIRE(keyed_health_response.has_value());
+    REQUIRE(keyed_health_response->error.has_value());
+    REQUIRE(keyed_health_response->error->code == "invalid_request");
 
     auto capabilities_frame = (*protocol)->handle_frame(
         make_request("capabilities-1", "capabilities", bootstrap_secret, "null"), 1'000
