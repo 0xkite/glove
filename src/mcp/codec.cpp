@@ -24,10 +24,14 @@ namespace {
 constexpr glz::opts lenient_read_opts{.error_on_unknown_keys = false};
 
 template<class T> auto read_lenient(std::string_view buffer) -> std::expected<T, std::string> {
+    // The public codec boundary accepts any byte span. Glaze enables its padded
+    // fast path only for a mutable, resizable buffer; parsing an arbitrary
+    // string_view directly would leave that boundary to the caller.
+    std::string parse_buffer{buffer};
     T value{};
-    auto ec = glz::read<lenient_read_opts>(value, buffer);
+    auto ec = glz::read<lenient_read_opts>(value, parse_buffer);
     if (ec) {
-        return std::unexpected(glz::format_error(ec, buffer));
+        return std::unexpected(glz::format_error(ec, parse_buffer));
     }
     return value;
 }

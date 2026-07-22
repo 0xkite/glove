@@ -3,7 +3,7 @@
 #
 # Runs:
 #   1. actionlint across GitHub Actions workflows
-#   2. clang-format --dry-run -Werror across src/ include/ tests/
+#   2. clang-format --dry-run -Werror across src/ include/ tests/ benchmarks/ fuzz/
 #   3. clang-tidy on the dev compile_commands.json (if available)
 #   4. asan preset: configure, build, ctest
 #   5. tsan preset: configure, build, ctest
@@ -17,6 +17,8 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 skip_tidy=0
+required_actionlint_version="1.7.12"
+required_clang_format_version="22.1.8"
 for arg in "$@"; do
     case "${arg}" in
         --skip-tidy) skip_tidy=1 ;;
@@ -43,10 +45,32 @@ prepare_linux_userns_tests() {
     fi
 }
 
+find_fuzzer_compiler() {
+    local candidate=""
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null; then
+        candidate="$(brew --prefix llvm 2>/dev/null)/bin/clang++"
+        if [[ -x "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return
+        fi
+    fi
+    for candidate in clang++-22 clang++-21 clang++-20 clang++-19 clang++-18 clang++; do
+        if command -v "${candidate}" >/dev/null; then
+            command -v "${candidate}"
+            return
+        fi
+    done
+    fail "a Clang compiler with libFuzzer support is required"
+}
+
 # 1. GitHub Actions ---------------------------------------------------------
 bold "[1/5] actionlint"
 if ! command -v actionlint >/dev/null; then
     fail "actionlint not on PATH"
+fi
+actionlint_version="$(actionlint -version | sed -n '1p')"
+if [[ "${actionlint_version}" != "${required_actionlint_version}" ]]; then
+    fail "actionlint ${required_actionlint_version} required; found ${actionlint_version}"
 fi
 actionlint
 sh -n setup.sh
@@ -57,10 +81,17 @@ bold "[2/5] clang-format --dry-run"
 if ! command -v clang-format >/dev/null; then
     fail "clang-format not on PATH"
 fi
+clang_format_version="$(clang-format --version)"
+if [[ "${clang_format_version}" != *"version ${required_clang_format_version}"* ]]; then
+    fail "clang-format ${required_clang_format_version} required; found ${clang_format_version}"
+fi
 fmt_files=()
 while IFS= read -r -d '' f; do
     fmt_files+=("${f}")
-done < <(find src include tests -type f \( -name '*.cpp' -o -name '*.hpp' \) -print0 2>/dev/null)
+done < <(
+    find src include tests benchmarks fuzz -type f \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
+        2>/dev/null
+)
 if [[ ${#fmt_files[@]} -eq 0 ]]; then
     ok "no source files yet"
 else
@@ -83,9 +114,9 @@ else
     if [[ -z "${tidy_bin}" ]]; then
         echo "  clang-tidy not installed; skipping (install via 'brew install llvm' for the gate)"
     else
-        if [[ ! -f build/dev/compile_commands.json ]]; then
-            cmake --preset dev >/dev/null
-        fi
+        # Benchmarks are opt-in for ordinary builds, but their source remains
+        # part of the style gate and must appear in the compilation database.
+        cmake --preset dev -DGLOVE_BUILD_BENCHMARKS=ON -DGLOVE_BUILD_FUZZERS=OFF >/dev/null
         # Ninja's C++ dependency scanner writes module-map response files that
         # appear in compile_commands.json. A fresh checkout must build once
         # before clang-tidy can consume those generated arguments.
@@ -149,7 +180,7 @@ fi
 # 4. asan -------------------------------------------------------------------
 bold "[4/5] asan preset"
 prepare_linux_userns_tests
-cmake --preset asan
+cmake --preset asan -DGLOVE_BUILD_FUZZERS=OFF
 cmake --build --preset asan
 asan_opts="halt_on_error=1:abort_on_error=1"
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -159,11 +190,70 @@ fi
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     ctest --preset asan
+fuzzer_cxx="$(find_fuzzer_compiler)"
+fuzzer_symbolizer="$(dirname "${fuzzer_cxx}")/llvm-symbolizer"
+if [[ -x "${fuzzer_symbolizer}" ]]; then
+    export ASAN_SYMBOLIZER_PATH="${fuzzer_symbolizer}"
+fi
+cmake --preset fuzz \
+    -DCMAKE_CXX_COMPILER="${fuzzer_cxx}" \
+    -DFETCHCONTENT_SOURCE_DIR_GLAZE="${ROOT}/build/dev/_deps/glaze-src"
+cmake --build --preset fuzz
+fuzz_workspace="$(mktemp -d "${TMPDIR:-/tmp}/glove-fuzz-corpora.XXXXXX")"
+trap 'rm -rf -- "${fuzz_workspace}"' EXIT
+mcp_fuzz_corpus="${fuzz_workspace}/mcp_codec"
+policy_fuzz_corpus="${fuzz_workspace}/policy_jsonpath"
+manifest_fuzz_corpus="${fuzz_workspace}/change_manifest"
+session_plan_fuzz_corpus="${fuzz_workspace}/session_plan"
+journal_fuzz_corpus="${fuzz_workspace}/change_apply_journal"
+bundle_fuzz_corpus="${fuzz_workspace}/library_bundle"
+cp -R fuzz/corpus/mcp_codec "${mcp_fuzz_corpus}"
+cp -R fuzz/corpus/policy_jsonpath "${policy_fuzz_corpus}"
+cp -R fuzz/corpus/change_manifest "${manifest_fuzz_corpus}"
+cp -R fuzz/corpus/session_plan "${session_plan_fuzz_corpus}"
+cp -R fuzz/corpus/change_apply_journal "${journal_fuzz_corpus}"
+cp -R fuzz/corpus/library_bundle "${bundle_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    build/fuzz/fuzz/glove_mcp_codec_fuzzer \
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${mcp_fuzz_corpus}/" \
+        "${mcp_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    build/fuzz/fuzz/glove_policy_jsonpath_fuzzer \
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${policy_fuzz_corpus}/" \
+        "${policy_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    build/fuzz/fuzz/glove_change_manifest_fuzzer \
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${manifest_fuzz_corpus}/" \
+        "${manifest_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    build/fuzz/fuzz/glove_session_plan_fuzzer \
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${session_plan_fuzz_corpus}/" \
+        "${session_plan_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    build/fuzz/fuzz/glove_change_apply_journal_fuzzer \
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${journal_fuzz_corpus}/" \
+        "${journal_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    build/fuzz/fuzz/glove_library_bundle_fuzzer \
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${bundle_fuzz_corpus}/" \
+        "${bundle_fuzz_corpus}"
 ok "asan ok"
 
 # 5. tsan -------------------------------------------------------------------
 bold "[5/5] tsan preset"
-cmake --preset tsan
+cmake --preset tsan -DGLOVE_BUILD_FUZZERS=OFF
 cmake --build --preset tsan
 TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
     ctest --preset tsan

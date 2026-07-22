@@ -171,6 +171,17 @@ auto run() -> int {
         std::fprintf(stderr, "validator build failed: %s\n", validator.error().c_str());
     }
     REQUIRE(validator.has_value());
+
+    // Fixed-size storage exercises the public parser boundary without a
+    // trailing std::string sentinel. Malformed plans must fail closed.
+    constexpr std::string_view malformed_plan =
+        "{\"schema_version\":1,\"runtime_id\":\"codex\",\"runtime_template_id\":\"codex-safe\"";
+    std::array<char, malformed_plan.size()> unterminated{};
+    std::ranges::copy(malformed_plan, unterminated.begin());
+    REQUIRE(!validator
+                 ->validate_json(std::string_view{unterminated.data(), unterminated.size()}, 1'000)
+                 .has_value());
+
     REQUIRE(launch_digest().size() == 64U);
     REQUIRE(launch_digest() == "05a49649e7973f6f8d6b119c9d525472517e6021fb38f8b191e0b40c8c4741d0");
     auto changed_launch = launch_template();

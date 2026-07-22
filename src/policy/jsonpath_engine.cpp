@@ -64,8 +64,11 @@ public:
 
         // Parse arguments. Empty / non-object args fail any prefix rule
         // since there's nothing to read the field from.
+        // `arguments_json` is an untrusted byte span. Give Glaze a mutable,
+        // resizable buffer so its padded parsing path owns the boundary.
+        std::string parse_buffer{arguments_json};
         glz::generic parsed;
-        if (auto ec = glz::read<lenient_read_opts>(parsed, arguments_json); ec) {
+        if (auto ec = glz::read<lenient_read_opts>(parsed, parse_buffer); ec) {
             return outcome{
                 .verdict = decision::deny,
                 .reason = std::string{"argument JSON unparseable"},

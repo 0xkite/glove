@@ -74,6 +74,18 @@ if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
 
+# --- Benchmarks -------------------------------------------------------------
+
+if(GLOVE_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+
+# --- Fuzzers ----------------------------------------------------------------
+
+if(GLOVE_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif()
+
 # --- Status ------------------------------------------------------------------
 
 message(STATUS "glove ${PROJECT_VERSION}")
@@ -82,5 +94,7 @@ message(STATUS "  C++ standard         : ${CMAKE_CXX_STANDARD}")
 message(STATUS "  GLOVE_REFLECTION     : ${GLOVE_REFLECTION}")
 message(STATUS "  GLOVE_WITH_GHOSTTY   : ${GLOVE_WITH_GHOSTTY}")
 message(STATUS "  GLOVE_ENABLE_SAGE_INTEROP_TEST : ${GLOVE_ENABLE_SAGE_INTEROP_TEST}")
+message(STATUS "  GLOVE_BUILD_BENCHMARKS : ${GLOVE_BUILD_BENCHMARKS}")
+message(STATUS "  GLOVE_BUILD_FUZZERS  : ${GLOVE_BUILD_FUZZERS}")
 message(STATUS "  GLOVE_SANITIZER      : ${GLOVE_SANITIZER}")
 message(STATUS "  GLOVE_WARNINGS_AS_ERRORS : ${GLOVE_WARNINGS_AS_ERRORS}")

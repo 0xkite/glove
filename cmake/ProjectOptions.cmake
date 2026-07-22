@@ -7,6 +7,14 @@ option(GLOVE_ENABLE_SAGE_INTEROP_TEST
     "Run the Sage Rust client against the real Glove receipt server fixture"
     OFF
 )
+option(GLOVE_BUILD_BENCHMARKS
+    "Build reproducible research-facing benchmark executables"
+    OFF
+)
+option(GLOVE_BUILD_FUZZERS
+    "Build sanitizer-backed libFuzzer targets"
+    OFF
+)
 
 set(GLOVE_SANITIZER "none" CACHE STRING
     "Sanitizer to enable: none|address|address+undefined|thread|memory")

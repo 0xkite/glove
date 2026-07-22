@@ -5,8 +5,12 @@
 #include "src/mcp/codec.hpp"
 #include "src/mcp/jsonrpc.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -85,6 +89,24 @@ auto test_decode_rejects_malformed_json() -> int {
     std::string frame = "{not json";
     auto env = glove::mcp::codec::decode_response(frame);
     REQUIRE(!env.has_value());
+    return 0;
+}
+
+auto test_decode_request_handles_unterminated_malformed_input() -> int {
+    // A libFuzzer finding. Copy into a fixed-size array so this deliberately
+    // lacks the sentinel byte that std::string storage normally provides.
+    constexpr std::string_view malformed_request =
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{},\"error\":{\"code\":-32603,"
+        "\"message\":\"conflicting {\"json"
+        "\x9A"
+        "pc\"env"
+        "\x9B\x93\x90\x98"
+        "e\":\"2.0\",\"id\":{\"jsonr3,pc\"\"r\":\"2.0}\",\"sid}";
+    std::array<char, malformed_request.size()> frame{};
+    std::ranges::copy(malformed_request, frame.begin());
+
+    auto request = glove::mcp::codec::decode_request(std::string_view{frame.data(), frame.size()});
+    REQUIRE(!request.has_value());
     return 0;
 }
 
@@ -201,6 +223,9 @@ auto main() -> int {
         return 1;
     }
     if (test_decode_rejects_malformed_json() != 0) {
+        return 1;
+    }
+    if (test_decode_request_handles_unterminated_malformed_input() != 0) {
         return 1;
     }
     if (test_call_request_round_trip() != 0) {

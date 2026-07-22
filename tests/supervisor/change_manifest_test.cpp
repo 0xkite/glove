@@ -4,10 +4,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace {
@@ -59,6 +62,18 @@ private:
 
 auto run() -> int {
     using namespace glove::supervisor;
+
+    // Fixed-size storage exercises the public string_view boundary without a
+    // trailing std::string sentinel. Malformed input must fail closed.
+    constexpr std::string_view malformed_manifest =
+        "{\"schema_version\":1,\"session_id\":\"session-1\",\"manifest_digest\":\""
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+    std::array<char, malformed_manifest.size()> unterminated{};
+    std::ranges::copy(malformed_manifest, unterminated.begin());
+    REQUIRE(!decode_retained_change_manifest_json(
+                 std::string_view{unterminated.data(), unterminated.size()}
+    )
+                 .has_value());
 
     temporary_directory base;
     temporary_directory staged;

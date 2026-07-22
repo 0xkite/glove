@@ -5,9 +5,12 @@
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -111,6 +114,31 @@ auto test_unparseable_args_denies() -> int {
     return 0;
 }
 
+auto test_unterminated_malformed_args_deny_without_overread() -> int {
+    glove::policy::jsonpath_options opts;
+    opts.allow = {"fs.read_file"};
+    opts.prefix_rules = {
+        {.tool_name = "fs.read_file", .field = "path", .required_prefix = "/workspace/"},
+    };
+    auto eng = glove::policy::make_jsonpath_engine(std::move(opts));
+
+    // A libFuzzer finding against the analogous codec path. This fixed-size
+    // storage deliberately has no std::string sentinel beyond the view.
+    constexpr std::string_view malformed_args =
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{},\"error\":{\"code\":-32603,"
+        "\"message\":\"conflicting {\"json"
+        "\x9A"
+        "pc\"env"
+        "\x9B\x93\x90\x98"
+        "e\":\"2.0\",\"id\":{\"jsonr3,pc\"\"r\":\"2.0}\",\"sid}";
+    std::array<char, malformed_args.size()> frame{};
+    std::ranges::copy(malformed_args, frame.begin());
+
+    auto out = eng->check("fs.read_file", std::string_view{frame.data(), frame.size()});
+    REQUIRE(out.verdict == glove::policy::decision::deny);
+    return 0;
+}
+
 auto test_deny_takes_precedence() -> int {
     glove::policy::jsonpath_options opts;
     opts.allow = {"fs.read_file"};
@@ -175,6 +203,8 @@ auto main() -> int {
     if (test_wrong_type_denies() != 0)
         return 1;
     if (test_unparseable_args_denies() != 0)
+        return 1;
+    if (test_unterminated_malformed_args_deny_without_overread() != 0)
         return 1;
     if (test_deny_takes_precedence() != 0)
         return 1;

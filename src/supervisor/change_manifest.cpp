@@ -723,8 +723,11 @@ auto decode_retained_change_manifest_json(std::string_view canonical_json)
     if (canonical_json.empty() || canonical_json.size() > max_manifest_bytes) {
         return std::unexpected(std::string{"retained change manifest exceeds its bound"});
     }
+    // This public boundary accepts arbitrary byte spans. Give Glaze a mutable,
+    // resizable buffer so padded parsing cannot read outside caller storage.
+    std::string parse_buffer{canonical_json};
     wire_manifest_envelope envelope;
-    if (const auto error = glz::read<strict_read_options>(envelope, canonical_json);
+    if (const auto error = glz::read<strict_read_options>(envelope, parse_buffer);
         error || envelope.schema_version != 1 || !valid_identifier(envelope.session_id) ||
         !valid_identifier(envelope.exposure_id) || envelope.generation == 0 ||
         !valid_digest(envelope.scope_digest) || !valid_digest(envelope.source_identity_digest) ||

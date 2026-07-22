@@ -172,6 +172,14 @@ constexpr std::size_t max_launch_fields = 256U;
 constexpr std::size_t max_launch_string_bytes = std::size_t{64} * 1024U;
 constexpr std::size_t max_launch_path_bytes = 4'096U;
 
+template<auto Options, typename Value>
+auto read_untrusted_json(Value& value, std::string_view json) -> glz::error_ctx {
+    // Public plan methods accept arbitrary byte spans. Glaze's padded parser
+    // requires mutable, resizable storage, which this local copy provides.
+    std::string parse_buffer{json};
+    return glz::read<Options>(value, parse_buffer);
+}
+
 class unique_fd {
 public:
     explicit unique_fd(int descriptor = -1) noexcept : descriptor_{descriptor} {}
@@ -638,7 +646,7 @@ auto validate_path_projection(
 
 auto plan_schema_version(std::string_view plan_json) -> result<std::uint8_t> {
     wire::session_plan_header header;
-    if (const auto error = glz::read<header_read_options>(header, plan_json);
+    if (const auto error = read_untrusted_json<header_read_options>(header, plan_json);
         error || header.schema_version == 0) {
         return std::unexpected(std::string{"invalid session plan schema"});
     }
@@ -894,7 +902,7 @@ auto session_plan_validator::validate_json(std::string_view plan_json, std::uint
     }
     if (*schema == 2) {
         wire::session_plan_v2 plan;
-        if (const auto error = glz::read<strict_read_options>(plan, plan_json);
+        if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json);
             error || plan.schema_version != 2 || plan.path_grants.size() > max_path_grants) {
             return std::unexpected(std::string{"invalid session plan v2 schema"});
         }
@@ -925,7 +933,7 @@ auto session_plan_validator::validate_json(std::string_view plan_json, std::uint
         return std::unexpected(std::string{"unsupported session plan schema"});
     }
     wire::session_plan plan;
-    if (const auto error = glz::read<strict_read_options>(plan, plan_json); error) {
+    if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error) {
         return std::unexpected(std::string{"invalid session plan schema"});
     }
     if (plan.schema_version != 1 || plan.policy_revision != policy_.revision ||
@@ -986,7 +994,7 @@ auto session_plan_validator::canonicalize_json(
     }
     if (validation->schema_version == 2) {
         wire::session_plan_v2 plan;
-        if (const auto error = glz::read<strict_read_options>(plan, plan_json); error) {
+        if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error) {
             return std::unexpected(std::string{"invalid session plan v2 schema"});
         }
         auto canonical_json = glz::write_json(plan);
@@ -1000,7 +1008,7 @@ auto session_plan_validator::canonicalize_json(
         };
     }
     wire::session_plan plan;
-    if (const auto error = glz::read<strict_read_options>(plan, plan_json); error) {
+    if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error) {
         return std::unexpected(std::string{"invalid session plan schema"});
     }
     auto canonical_json = glz::write_json(plan);
@@ -1024,11 +1032,13 @@ auto session_plan_validator::resolve_runtime_launch_json(
     wire::session_plan plan;
     if (validation->schema_version == 2) {
         wire::session_plan_v2 v2;
-        if (const auto error = glz::read<strict_read_options>(v2, plan_json); error) {
+        if (const auto error = read_untrusted_json<strict_read_options>(v2, plan_json); error) {
             return std::unexpected(std::string{"invalid session plan v2 schema"});
         }
         plan = common_v1_plan(v2);
-    } else if (const auto error = glz::read<strict_read_options>(plan, plan_json); error) {
+    } else if (
+        const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error
+    ) {
         return std::unexpected(std::string{"invalid session plan schema"});
     }
     const auto runtime =
@@ -1070,7 +1080,7 @@ auto session_plan_validator::resolve_path_grants_json(
     }
     if (validation->schema_version == 2) {
         wire::session_plan_v2 plan;
-        if (const auto error = glz::read<strict_read_options>(plan, plan_json);
+        if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json);
             error || !exposures_) {
             return std::unexpected(std::string{"invalid session plan v2 path grants"});
         }
@@ -1105,7 +1115,7 @@ auto session_plan_validator::resolve_path_grants_json(
         return resolved;
     }
     wire::session_plan plan;
-    if (const auto error = glz::read<strict_read_options>(plan, plan_json); error) {
+    if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error) {
         return std::unexpected(std::string{"invalid session plan schema"});
     }
     std::vector<resolved_path_grant> resolved;
@@ -1142,13 +1152,13 @@ auto session_plan_validator::resolve_library_projections_json(
     std::vector<wire::library_projection> encoded;
     if (validation->schema_version == 2) {
         wire::session_plan_v2 plan;
-        if (const auto error = glz::read<strict_read_options>(plan, plan_json); error) {
+        if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error) {
             return std::unexpected(std::string{"invalid session plan v2 schema"});
         }
         encoded = std::move(plan.library_projections);
     } else {
         wire::session_plan plan;
-        if (const auto error = glz::read<strict_read_options>(plan, plan_json); error) {
+        if (const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error) {
             return std::unexpected(std::string{"invalid session plan schema"});
         }
         encoded = std::move(plan.library_projections);

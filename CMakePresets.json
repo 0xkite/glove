@@ -42,6 +42,19 @@
       }
     },
     {
+      "name": "fuzz",
+      "displayName": "RelWithDebInfo + ASan/UBSan + libFuzzer",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BUILD_TESTING": "OFF",
+        "GLOVE_BUILD_BENCHMARKS": "OFF",
+        "GLOVE_BUILD_FUZZERS": "ON",
+        "GLOVE_SANITIZER": "address+undefined",
+        "GLOVE_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
       "name": "relwithdebinfo",
       "displayName": "RelWithDebInfo (perf testing)",
       "inherits": "_base",
@@ -65,6 +78,7 @@
     { "name": "dev",            "configurePreset": "dev" },
     { "name": "asan",           "configurePreset": "asan" },
     { "name": "tsan",           "configurePreset": "tsan" },
+    { "name": "fuzz",           "configurePreset": "fuzz" },
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
     { "name": "release",        "configurePreset": "release" }
   ],
