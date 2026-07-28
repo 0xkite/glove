@@ -7,6 +7,8 @@ add_library(glove_supervisor STATIC
     change_apply_recovery.cpp
     change_apply_trust_policy.cpp
     change_manifest.cpp
+    codex_runtime_adapter.cpp
+    native_skill_runtime_adapter.cpp
     library_bundle.cpp
     path_alias.cpp
     path_exposure.cpp

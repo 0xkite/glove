@@ -1,14 +1,18 @@
 #include "glove/container/digest.hpp"
+#include "glove/supervisor/codex_runtime_adapter.hpp"
 #include "glove/supervisor/library_bundle.hpp"
+#include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <span>
 #include <string>
 #include <system_error>
@@ -112,6 +116,101 @@ auto run() -> int {
     REQUIRE(projections->front().target_path == "/opt/sage/library-bundles/" + digest + ".json");
     REQUIRE(projections->front().bundle.content_digest() == digest);
     REQUIRE(projections->front().bundle.verify_identity().has_value());
+
+    constexpr std::string_view codex_canonical =
+        R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"}]})";
+    const auto codex_digest = digest_for(codex_canonical);
+    write_bundle(root, codex_canonical);
+    std::vector<glove::supervisor::resolved_library_projection_target> codex_targets;
+    codex_targets.push_back({
+        .projection =
+            {
+                .projection_id = "sage-codex",
+                .content_digest = codex_digest,
+                .destination_alias = "libraries",
+            },
+        .target_path = "/opt/sage/library-bundles",
+    });
+    auto codex_projections = store->resolve_projections(codex_targets);
+    REQUIRE(codex_projections.has_value());
+    auto codex = glove::supervisor::resolve_codex_runtime_projection(*codex_projections);
+    REQUIRE(codex.has_value());
+    REQUIRE(codex->skills.size() == 1U);
+    REQUIRE(codex->skills.front().projection_id == "sage-codex");
+    REQUIRE(codex->skills.front().key == "sage-core");
+    REQUIRE(codex->skills.front().content == "# Sage core\n");
+    auto codex_projection_digest = glove::supervisor::codex_runtime_projection_digest(*codex);
+    REQUIRE(codex_projection_digest.has_value());
+    REQUIRE(codex_projection_digest->size() == 64U);
+    auto reordered_codex = *codex;
+    std::ranges::reverse(reordered_codex.skills);
+    REQUIRE(glove::supervisor::codex_runtime_projection_digest(reordered_codex) ==
+            codex_projection_digest);
+    reordered_codex.skills.front().content = "# changed\n";
+    REQUIRE(!glove::supervisor::codex_runtime_projection_digest(reordered_codex).has_value());
+
+    constexpr std::string_view unsupported_codex_canonical =
+        R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"selected-prompt","kind":"prompt","content_digest":"3514cf816e5407a39cb7a1c1e1243f176dda121e06398a8934edb1dc426b0b34","content":"ignored"}]})";
+    const auto unsupported_codex_digest = digest_for(unsupported_codex_canonical);
+    write_bundle(root, unsupported_codex_canonical);
+    std::vector<glove::supervisor::resolved_library_projection_target> unsupported_codex_targets;
+    unsupported_codex_targets.push_back({
+        .projection =
+            {
+                .projection_id = "sage-prompt",
+                .content_digest = unsupported_codex_digest,
+                .destination_alias = "libraries",
+            },
+        .target_path = "/opt/sage/library-bundles",
+    });
+    auto unsupported_codex_projections = store->resolve_projections(unsupported_codex_targets);
+    REQUIRE(unsupported_codex_projections.has_value());
+    REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*unsupported_codex_projections));
+
+    // Every built-in harness consumes the same verified Agent Skills bundle,
+    // but receives it in an adapter-owned private-home layout. This proves the
+    // generic adapter is not a Codex-only projection with renamed metadata.
+    const auto native_homes = temporary.root() / "native-homes";
+    REQUIRE(std::filesystem::create_directory(native_homes));
+    REQUIRE(::chmod(native_homes.c_str(), 0700) == 0);
+    for (const std::string_view runtime_id : {
+             "codex", "claude-code", "pi", "copilot", "opencode",
+         }) {
+        const auto adapter = glove::supervisor::native_skill_runtime_adapter_for(runtime_id);
+        REQUIRE(adapter.has_value());
+        auto native = glove::supervisor::resolve_native_skill_runtime_projection(
+            *adapter, *codex_projections
+        );
+        REQUIRE(native.has_value());
+        auto native_digest =
+            glove::supervisor::native_skill_runtime_projection_digest(*adapter, *native);
+        REQUIRE(native_digest.has_value());
+        REQUIRE(native_digest->size() == 64U);
+
+        const auto home = native_homes / std::string{runtime_id};
+        REQUIRE(std::filesystem::create_directory(home));
+        const int home_fd = ::open(home.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        REQUIRE(home_fd >= 0);
+        const auto materialized = glove::supervisor::materialize_native_skill_runtime_projection(
+            home_fd, *adapter, *native
+        );
+        ::close(home_fd);
+        REQUIRE(materialized.has_value());
+        auto skill_path = home;
+        for (const auto& component : adapter->skill_root_components) {
+            skill_path /= component;
+        }
+        skill_path /= "sage-codex-sage-core";
+        skill_path /= "SKILL.md";
+        REQUIRE(std::filesystem::is_regular_file(skill_path));
+        std::ifstream materialized_skill{skill_path, std::ios::binary};
+        REQUIRE(static_cast<bool>(materialized_skill));
+        std::string materialized_contents{
+            std::istreambuf_iterator<char>{materialized_skill}, std::istreambuf_iterator<char>{}
+        };
+        REQUIRE(materialized_contents == "# Sage core\n");
+    }
+    REQUIRE(!glove::supervisor::native_skill_runtime_adapter_for("untrusted-runtime"));
 
     auto duplicate_targets = targets;
     duplicate_targets.push_back({

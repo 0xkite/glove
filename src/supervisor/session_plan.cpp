@@ -1,6 +1,7 @@
 #include "glove/supervisor/session_plan.hpp"
 
 #include "glove/container/digest.hpp"
+#include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
@@ -12,6 +13,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <expected>
 #include <filesystem>
 #include <limits>
@@ -211,6 +213,13 @@ auto valid_launch_string(std::string_view value) -> bool {
            value.find('\0') == std::string_view::npos;
 }
 
+auto valid_launch_path(std::string_view raw) -> bool {
+    const std::filesystem::path path{raw};
+    return !raw.empty() && raw.size() <= max_launch_path_bytes &&
+           raw.find('\0') == std::string_view::npos && path.is_absolute() &&
+           path != path.root_path() && path.lexically_normal() == path;
+}
+
 auto valid_environment_name(std::string_view name) -> bool {
     if (name.empty()) {
         return false;
@@ -227,14 +236,20 @@ auto valid_environment_name(std::string_view name) -> bool {
     });
 }
 
+auto path_within(const std::filesystem::path& candidate, const std::filesystem::path& root) -> bool;
+
 auto validate_launch_template(const runtime_launch_template& launch)
     -> std::expected<void, std::string> {
     const std::filesystem::path executable{launch.executable_path};
-    if (launch.executable_path.empty() || launch.executable_path.size() > max_launch_path_bytes ||
-        launch.executable_path.find('\0') != std::string::npos || !executable.is_absolute() ||
-        executable == executable.root_path() || executable.lexically_normal() != executable ||
+    const auto discovered_adapter = native_skill_runtime_adapter_for(launch.runtime_discovery);
+    if ((launch.runtime_discovery.empty()
+             ? !valid_launch_path(launch.executable_path)
+             : !discovered_adapter || !launch.executable_path.empty() ||
+                   launch.executable_search_paths.empty()) ||
         launch.arguments.size() > max_launch_fields ||
         launch.environment.size() > max_launch_fields ||
+        launch.read_only_paths.size() > max_launch_fields ||
+        launch.executable_search_paths.size() > max_launch_fields ||
         std::ranges::any_of(launch.arguments, [](const auto& value) {
             return !valid_launch_string(value);
         })) {
@@ -257,6 +272,32 @@ auto validate_launch_template(const runtime_launch_template& launch)
             return std::unexpected(std::string{"runtime launch environment is not canonical"});
         }
         previous = entry;
+    }
+    std::vector<std::filesystem::path> paths;
+    paths.reserve(launch.read_only_paths.size());
+    for (const auto& raw : launch.read_only_paths) {
+        const std::filesystem::path path{raw};
+        if (!valid_launch_path(raw) ||
+            (!discovered_adapter &&
+             (path_within(path, executable) || path_within(executable, path))) ||
+            std::ranges::any_of(paths, [&](const auto& existing) {
+                return path_within(path, existing) || path_within(existing, path);
+            })) {
+            return std::unexpected(std::string{"runtime launch runtime paths are invalid"});
+        }
+        paths.push_back(path);
+    }
+    std::vector<std::filesystem::path> search_paths;
+    search_paths.reserve(launch.executable_search_paths.size());
+    for (const auto& raw : launch.executable_search_paths) {
+        const std::filesystem::path path{raw};
+        if (!discovered_adapter || !valid_launch_path(raw) ||
+            std::ranges::any_of(search_paths, [&](const auto& existing) {
+                return path_within(path, existing) || path_within(existing, path);
+            })) {
+            return std::unexpected(std::string{"runtime discovery search paths are invalid"});
+        }
+        search_paths.push_back(path);
     }
     return {};
 }
@@ -510,6 +551,10 @@ auto valid_projection_destination_path(std::string_view raw) -> bool {
     });
 }
 
+auto remaining_whole_seconds(std::uint64_t expires_at_ms, std::uint64_t now_ms) -> std::uint64_t {
+    return (expires_at_ms - now_ms) / 1'000U;
+}
+
 auto valid_projection_destinations(
     const std::vector<library_projection_destination_policy>& destinations
 ) -> bool {
@@ -544,6 +589,10 @@ auto validate_runtime_policy(const runtime_template_policy& runtime) -> bool {
                              unique_identifiers(runtime.allowed_projection_destinations);
     if (!identifiers || !runtime.launch) {
         return identifiers;
+    }
+    if (!runtime.launch->runtime_discovery.empty() &&
+        runtime.launch->runtime_discovery != runtime.runtime_id) {
+        return false;
     }
     auto digest = runtime_launch_template_digest(*runtime.launch);
     return digest && *digest == runtime.adapter_command_digest;
@@ -613,9 +662,7 @@ auto validate_path_projection(
         })) {
         return std::unexpected(std::string{"session exposure grants are not canonical"});
     }
-    const auto remaining_ttl_ms = plan.expires_at_ms - now_ms;
-    const auto remaining_ttl_secs =
-        remaining_ttl_ms / 1'000U + static_cast<std::uint64_t>(remaining_ttl_ms % 1'000U != 0);
+    const auto remaining_ttl_secs = remaining_whole_seconds(plan.expires_at_ms, now_ms);
     for (const auto& grant : plan.path_grants) {
         auto access = parse_access(grant.access);
         auto materialization = parse_materialization(grant.materialization);
@@ -710,7 +757,16 @@ auto runtime_launch_template_digest(const runtime_launch_template& launch) -> re
     }
     launch_template_encoder encoder;
     encoder.append_string("glove.runtime-launch-template");
-    encoder.append_u8(std::uint8_t{1});
+    // Preserve v1 commitments for existing pinned policies. Discovery has a
+    // separate version so its search surface is committed explicitly.
+    encoder.append_u8(launch.runtime_discovery.empty() ? std::uint8_t{1} : std::uint8_t{2});
+    if (!launch.runtime_discovery.empty()) {
+        encoder.append_string(launch.runtime_discovery);
+        encoder.append_u32(static_cast<std::uint32_t>(launch.executable_search_paths.size()));
+        for (const auto& path : launch.executable_search_paths) {
+            encoder.append_string(path);
+        }
+    }
     encoder.append_string(launch.executable_path);
     encoder.append_u32(static_cast<std::uint32_t>(launch.arguments.size()));
     for (const auto& argument : launch.arguments) {
@@ -720,7 +776,81 @@ auto runtime_launch_template_digest(const runtime_launch_template& launch) -> re
     for (const auto& environment : launch.environment) {
         encoder.append_string(environment);
     }
+    encoder.append_u32(static_cast<std::uint32_t>(launch.read_only_paths.size()));
+    for (const auto& path : launch.read_only_paths) {
+        encoder.append_string(path);
+    }
     return container::sha256_hex(encoder.bytes());
+}
+
+auto resolve_runtime_executable(const runtime_launch_template& launch) -> result<std::string> {
+    if (launch.runtime_discovery.empty()) {
+        return launch.executable_path;
+    }
+    // This name is adapter-owned. It is not supplied by the Sage plan or
+    // arbitrary policy data, and the final resolved file is identity-pinned by
+    // managed launch binding before it is executed.
+    const auto adapter = native_skill_runtime_adapter_for(launch.runtime_discovery);
+    if (!adapter) {
+        return std::unexpected(std::string{"runtime discovery adapter is unavailable"});
+    }
+    // Discovery is intentionally never delegated to the inherited PATH. Every
+    // directory is an explicit, digest-bound operator policy value.
+    for (const auto& configured_root : launch.executable_search_paths) {
+        if (!valid_launch_path(configured_root)) {
+            continue;
+        }
+        std::error_code error;
+        const auto root = std::filesystem::canonical(configured_root, error);
+        if (error || !std::filesystem::is_directory(root, error) || error) {
+            continue;
+        }
+        // All path components must be controlled by the service account (or
+        // root) and may not be writable by another principal. A root-owned
+        // sticky directory such as /tmp is safe as an ancestor: an unprivileged
+        // user cannot rename this service-owned child from it.
+        bool trusted = true;
+        for (auto current = root;; current = current.parent_path()) {
+            struct stat directory_status{};
+            if (::stat(current.c_str(), &directory_status) != 0 ||
+                !S_ISDIR(directory_status.st_mode) ||
+                (directory_status.st_uid != 0 && directory_status.st_uid != ::geteuid())) {
+                trusted = false;
+                break;
+            }
+            const bool writable_by_other = (directory_status.st_mode & (S_IWGRP | S_IWOTH)) != 0;
+            const bool root_owned_sticky =
+                directory_status.st_uid == 0 && (directory_status.st_mode & S_ISVTX) != 0;
+            if (writable_by_other && !root_owned_sticky) {
+                trusted = false;
+                break;
+            }
+            if (current == current.root_path()) {
+                break;
+            }
+        }
+        if (!trusted) {
+            continue;
+        }
+        const std::filesystem::path candidate = root / adapter->executable_name;
+        const auto status = std::filesystem::status(candidate, error);
+        if (error || !std::filesystem::is_regular_file(status)) {
+            continue;
+        }
+        const auto permissions = status.permissions();
+        if ((permissions &
+             (std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
+              std::filesystem::perms::others_exec)) == std::filesystem::perms::none) {
+            continue;
+        }
+        const auto resolved = std::filesystem::canonical(candidate, error);
+        if (!error && valid_launch_path(resolved.string())) {
+            return resolved.string();
+        }
+    }
+    return std::unexpected(
+        std::string{"operator-installed "} + adapter->runtime_id + " executable is unavailable"
+    );
 }
 
 auto session_plan_validator::load(
@@ -1049,9 +1179,13 @@ auto session_plan_validator::resolve_runtime_launch_json(
         return std::unexpected(std::string{"runtime launch template is unavailable"});
     }
     const runtime_launch_template launch = runtime->launch.value_or(runtime_launch_template{});
+    auto executable = resolve_runtime_executable(launch);
+    if (!executable) {
+        return std::unexpected(executable.error());
+    }
     std::vector<std::string> argv;
     argv.reserve(launch.arguments.size() + 1U);
-    argv.push_back(launch.executable_path);
+    argv.push_back(std::move(*executable));
     argv.insert(argv.end(), launch.arguments.begin(), launch.arguments.end());
     return runtime_launch_projection{
         .validation = *validation,
@@ -1061,6 +1195,7 @@ auto session_plan_validator::resolve_runtime_launch_json(
         .backend = runtime->backend,
         .argv = std::move(argv),
         .environment = launch.environment,
+        .read_only_paths = launch.read_only_paths,
         .limits = plan.limits,
         .expires_at_ms = plan.expires_at_ms,
         .requires_direct_write_approval =

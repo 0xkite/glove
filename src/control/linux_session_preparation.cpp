@@ -1,6 +1,7 @@
 #include "linux_session_preparation.hpp"
 
 #include "glove/supervisor/linux_session_filesystem.hpp"
+#include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include "linux_session_recovery.hpp"
 
@@ -146,7 +147,35 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
 
     const auto limits = convert_limits(owned_inputs.launch.limits);
     container::profile requested_profile;
+    requested_profile.runtime_filesystem.reserve(owned_inputs.launch.read_only_paths.size());
+    for (const auto& path : owned_inputs.launch.read_only_paths) {
+        requested_profile.runtime_filesystem.push_back({.path = path, .writable = false});
+    }
     requested_profile.environment = owned_inputs.launch.environment;
+    if (const auto adapter = supervisor::native_skill_runtime_adapter_for(
+            owned_inputs.launch.runtime_id
+        )) {
+        const bool overrides_managed_environment = std::ranges::any_of(
+            adapter->managed_environment, [&](const auto& managed) {
+                const auto separator = managed.find('=');
+                const std::string_view name{managed.data(), separator};
+                return std::ranges::any_of(requested_profile.environment, [&](const auto& entry) {
+                    return entry.starts_with(std::string{name} + "=");
+                });
+            }
+        );
+        if (overrides_managed_environment) {
+            return std::unexpected(
+                std::string{"native skill runtime state is managed by Glove, not launch policy"}
+            );
+        }
+        requested_profile.managed_home_dir = "/home/agent";
+        requested_profile.environment.insert(
+            requested_profile.environment.end(),
+            adapter->managed_environment.begin(),
+            adapter->managed_environment.end()
+        );
+    }
     requested_profile.required_limits = limits;
     auto profile = container::validate(requested_profile);
     if (!profile) {
@@ -164,7 +193,8 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         owned_inputs.session.session_id,
         limits.disk_bytes,
         std::move(owned_inputs.path_grants),
-        std::move(owned_inputs.library_projections)
+        std::move(owned_inputs.library_projections),
+        owned_inputs.launch.runtime_id
     );
     if (!filesystem) {
         return std::unexpected(filesystem.error());

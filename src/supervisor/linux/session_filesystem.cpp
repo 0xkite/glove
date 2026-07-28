@@ -1,5 +1,7 @@
 #include "glove/supervisor/linux_session_filesystem.hpp"
 
+#include "glove/supervisor/native_skill_runtime_adapter.hpp"
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/mount.h>
@@ -409,6 +411,8 @@ auto scratch_mount(int source_fd, std::string target, std::string alias, std::ui
         .source_content_digest = std::nullopt,
         .projection_id = std::nullopt,
         .projection_destination_alias = std::nullopt,
+        .runtime_adapter_id = std::nullopt,
+        .runtime_context_digest = std::nullopt,
         .writable = true,
         .directory = true,
     };
@@ -433,6 +437,52 @@ auto create_scratch_mounts(
     return mounts;
 }
 
+auto append_native_skill_runtime_home(
+    const native_skill_runtime_adapter& adapter,
+    int scratch_fd,
+    std::uint64_t scratch_quota,
+    const std::vector<resolved_library_projection>& library_projections,
+    std::vector<session_mount>& mounts
+) -> result<void> {
+    auto projection = resolve_native_skill_runtime_projection(adapter, library_projections);
+    if (!projection) {
+        return std::unexpected(projection.error());
+    }
+    auto context_digest = native_skill_runtime_projection_digest(adapter, *projection);
+    if (!context_digest) {
+        return std::unexpected(context_digest.error());
+    }
+    if (::mkdirat(scratch_fd, "agent-home", 0700) != 0) {
+        return std::unexpected(
+            std::string{"create native skill private home: "} + errno_message(errno)
+        );
+    }
+    unique_fd home_fd{::openat(
+        scratch_fd, "agent-home", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+    )};
+    if (home_fd.get() < 0) {
+        return std::unexpected(
+            std::string{"open native skill private home: "} + errno_message(errno)
+        );
+    }
+    if (auto materialized = materialize_native_skill_runtime_projection(
+            home_fd.get(), adapter, *projection
+        );
+        !materialized) {
+        return std::unexpected(materialized.error());
+    }
+    auto mount = scratch_mount(
+        home_fd.get(), "/home/agent", adapter.home_mount_alias, scratch_quota
+    );
+    if (!mount) {
+        return std::unexpected(mount.error());
+    }
+    mount->runtime_adapter_id = adapter.runtime_id;
+    mount->runtime_context_digest = std::move(*context_digest);
+    mounts.push_back(std::move(*mount));
+    return {};
+}
+
 auto append_read_mount(const resolved_path_grant& grant, std::vector<session_mount>& mounts)
     -> result<void> {
     if (auto verified = grant.verify_identity(); !verified) {
@@ -449,6 +499,8 @@ auto append_read_mount(const resolved_path_grant& grant, std::vector<session_mou
         .source_content_digest = std::nullopt,
         .projection_id = std::nullopt,
         .projection_destination_alias = std::nullopt,
+        .runtime_adapter_id = std::nullopt,
+        .runtime_context_digest = std::nullopt,
         .writable = false,
         .directory = static_cast<bool>(S_ISDIR(mode)),
     };
@@ -486,6 +538,8 @@ auto append_ephemeral_mount(
         .source_content_digest = std::nullopt,
         .projection_id = std::nullopt,
         .projection_destination_alias = std::nullopt,
+        .runtime_adapter_id = std::nullopt,
+        .runtime_context_digest = std::nullopt,
         .writable = true,
         .directory = materialized->is_directory(),
     };
@@ -521,6 +575,8 @@ auto append_library_mounts(
             .source_content_digest = std::string{projection.bundle.content_digest()},
             .projection_id = projection.projection_id,
             .projection_destination_alias = projection.destination_alias,
+            .runtime_adapter_id = std::nullopt,
+            .runtime_context_digest = std::nullopt,
             .writable = false,
             .directory = false,
         };
@@ -594,7 +650,8 @@ result<linux_session_filesystem> linux_session_filesystem::create(
     std::string_view session_id,
     std::uint64_t disk_limit_bytes,
     std::vector<resolved_path_grant>&& grants,
-    std::vector<resolved_library_projection>&& library_projections
+    std::vector<resolved_library_projection>&& library_projections,
+    std::string_view runtime_id
 ) {
     auto owned_grants = std::move(grants);
     auto owned_library_projections = std::move(library_projections);
@@ -645,10 +702,23 @@ result<linux_session_filesystem> linux_session_filesystem::create(
         tmp_fd.get(),
         var_tmp_fd.get(),
         scratch_quota,
-        owned_grants.size() + owned_library_projections.size() + 2U
+        owned_grants.size() + owned_library_projections.size() + 3U
     );
     if (!mounts) {
         return std::unexpected(mounts.error());
+    }
+    if (const auto adapter = native_skill_runtime_adapter_for(runtime_id)) {
+        if (auto appended = append_native_skill_runtime_home(
+                *adapter,
+                scratch->content_fd(),
+                scratch_quota,
+                owned_library_projections,
+                *mounts
+            );
+            !appended) {
+            close_mount_records(*mounts);
+            return std::unexpected(appended.error());
+        }
     }
     if (auto appended = append_grant_mounts(
             materialization_root, session_id, owned_grants, materializations, *mounts

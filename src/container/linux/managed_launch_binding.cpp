@@ -1,6 +1,8 @@
 #include "../sha256.hpp"
 #include "linux_managed_session.hpp"
 
+#include "glove/supervisor/native_skill_runtime_adapter.hpp"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -140,6 +142,10 @@ struct mount_projection_state {
     std::vector<std::filesystem::path> target_paths;
     std::map<std::string, std::uint64_t> quota_partitions;
     std::size_t scratch_mounts = 0;
+    std::size_t runtime_home_mounts = 0;
+    std::optional<std::string> runtime_home_path;
+    std::optional<std::string> runtime_adapter_id;
+    std::optional<std::string> runtime_context_digest;
 };
 
 auto valid_mount_source_identity(const supervisor::linux_detail::session_mount& mount) -> bool {
@@ -173,7 +179,8 @@ auto reserve_mount_projection(
 auto validate_read_only_mount(const supervisor::linux_detail::session_mount& mount)
     -> std::expected<void, std::string> {
     if (!mount.quota_partition.empty() || mount.quota_bytes != 0 ||
-        !valid_mount_source_identity(mount)) {
+        !valid_mount_source_identity(mount) || mount.runtime_adapter_id ||
+        mount.runtime_context_digest) {
         return std::unexpected(std::string{"invalid managed launch read-only projection"});
     }
     const bool has_projection_evidence = mount.source_content_digest.has_value() ||
@@ -205,6 +212,30 @@ auto validate_writable_mount(
             std::string{"writable managed launch projection has content digest"}
         );
     }
+    const bool has_runtime_context = mount.runtime_adapter_id.has_value() ||
+                                     mount.runtime_context_digest.has_value();
+    if (has_runtime_context) {
+        const auto adapter = mount.runtime_adapter_id
+                                 ? supervisor::native_skill_runtime_adapter_for(*mount.runtime_adapter_id)
+                                 : std::nullopt;
+        if (!mount.runtime_adapter_id || !mount.runtime_context_digest || !adapter ||
+            !valid_digest(*mount.runtime_context_digest) ||
+            mount.quota_partition != "__scratch" || mount.alias != adapter->home_mount_alias ||
+            mount.target_path != "/home/agent" || mount.source_identity || !mount.directory ||
+            state.runtime_home_mounts != 0U) {
+            return std::unexpected(std::string{"invalid managed runtime home projection"});
+        }
+        ++state.runtime_home_mounts;
+        state.runtime_home_path = mount.target_path;
+        state.runtime_adapter_id = *mount.runtime_adapter_id;
+        state.runtime_context_digest = *mount.runtime_context_digest;
+        const auto [partition, inserted] =
+            state.quota_partitions.emplace(mount.quota_partition, mount.quota_bytes);
+        if (!inserted && partition->second != mount.quota_bytes) {
+            return std::unexpected(std::string{"managed launch quota partition is inconsistent"});
+        }
+        return {};
+    }
     const auto [partition, inserted] =
         state.quota_partitions.emplace(mount.quota_partition, mount.quota_bytes);
     if (!inserted && partition->second != mount.quota_bytes) {
@@ -235,9 +266,11 @@ auto validate_mount_projection_entry(
 }
 
 auto validate_mount_projection(
-    std::span<const supervisor::linux_detail::session_mount> mounts, const resource_limits& limits
+    std::span<const supervisor::linux_detail::session_mount> mounts,
+    const resource_limits& limits,
+    const std::optional<std::string>& managed_home_dir
 ) -> std::expected<void, std::string> {
-    if (mounts.size() < 2U || mounts.size() > max_launch_fields + 2U) {
+    if (mounts.size() < 2U || mounts.size() > max_launch_fields + 3U) {
         return std::unexpected(std::string{"managed launch has an invalid mount count"});
     }
     mount_projection_state state;
@@ -246,7 +279,10 @@ auto validate_mount_projection(
             return valid;
         }
     }
-    if (state.scratch_mounts != 2U) {
+    if (state.scratch_mounts != 2U ||
+        (managed_home_dir.has_value() != (state.runtime_home_mounts == 1U)) ||
+        (managed_home_dir && (*managed_home_dir != "/home/agent" ||
+                              state.runtime_home_path != managed_home_dir))) {
         return std::unexpected(std::string{"managed launch requires exact scratch projections"});
     }
     std::uint64_t quota_total = 0;
@@ -333,7 +369,10 @@ auto bind_managed_launch_projection_from_fd(
         return std::unexpected(std::string{"managed launch requires resource limits"});
     }
     if (!checked->filesystem.empty() || checked->home_dir || checked->temp_dir ||
-        checked->work_dir) {
+        checked->work_dir ||
+        std::ranges::any_of(checked->runtime_filesystem, [](const auto& rule) {
+            return rule.writable;
+        })) {
         return std::unexpected(
             std::string{"managed session paths must come from the lifecycle mount set"}
         );
@@ -364,7 +403,7 @@ auto bind_managed_launch_projection_from_fd(
         return std::unexpected(std::string{"managed launch environment exceeds its bound"});
     }
     const resource_limits limits = checked->required_limits.value_or(resource_limits{});
-    if (auto valid = validate_mount_projection(mounts, limits); !valid) {
+    if (auto valid = validate_mount_projection(mounts, limits, checked->managed_home_dir); !valid) {
         return std::unexpected(valid.error());
     }
 
@@ -395,6 +434,15 @@ auto bind_managed_launch_projection_from_fd(
     for (const auto& entry : environment) {
         encoder.append_string(entry);
     }
+    encoder.append_u32(static_cast<std::uint32_t>(checked->runtime_filesystem.size()));
+    for (const auto& rule : checked->runtime_filesystem) {
+        encoder.append_string(rule.path);
+        encoder.append_bool(rule.writable);
+    }
+    encoder.append_bool(checked->managed_home_dir.has_value());
+    if (checked->managed_home_dir) {
+        encoder.append_string(*checked->managed_home_dir);
+    }
     encoder.append_u32(static_cast<std::uint32_t>(resolved_argv.size()));
     for (const auto& argument : resolved_argv) {
         encoder.append_string(argument);
@@ -418,6 +466,11 @@ auto bind_managed_launch_projection_from_fd(
             encoder.append_string(*mount.source_content_digest);
             encoder.append_string(*mount.projection_id);
             encoder.append_string(*mount.projection_destination_alias);
+        }
+        encoder.append_bool(mount.runtime_adapter_id.has_value());
+        if (mount.runtime_adapter_id) {
+            encoder.append_string(*mount.runtime_adapter_id);
+            encoder.append_string(*mount.runtime_context_digest);
         }
     }
     auto digest = detail::sha256_hex(encoder.bytes());

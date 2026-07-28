@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -62,9 +63,12 @@ auto replace_once(std::string input, std::string_view before, std::string_view a
 
 auto launch_template() -> glove::supervisor::runtime_launch_template {
     return {
+        .runtime_discovery = "",
         .executable_path = "/usr/bin/true",
+        .executable_search_paths = {},
         .arguments = {"--version"},
         .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+        .read_only_paths = {},
     };
 }
 
@@ -183,15 +187,29 @@ auto run() -> int {
                  .has_value());
 
     REQUIRE(launch_digest().size() == 64U);
-    REQUIRE(launch_digest() == "05a49649e7973f6f8d6b119c9d525472517e6021fb38f8b191e0b40c8c4741d0");
+    REQUIRE(launch_digest() == "0129a3a97cacbef9bd8a2df44ea3b1e01ae8dad706cbe0c27c2237881b5107e7");
     auto changed_launch = launch_template();
     changed_launch.arguments.push_back("changed");
     auto changed_launch_digest = glove::supervisor::runtime_launch_template_digest(changed_launch);
     REQUIRE(changed_launch_digest.has_value());
     REQUIRE(*changed_launch_digest != launch_digest());
+    auto runtime_paths_launch = launch_template();
+    runtime_paths_launch.read_only_paths = {"/opt/glove/codex-runtime"};
+    auto runtime_paths_digest =
+        glove::supervisor::runtime_launch_template_digest(runtime_paths_launch);
+    REQUIRE(runtime_paths_digest.has_value());
+    REQUIRE(*runtime_paths_digest != launch_digest());
     auto relative_launch = launch_template();
     relative_launch.executable_path = "usr/bin/true";
     REQUIRE(!glove::supervisor::runtime_launch_template_digest(relative_launch).has_value());
+    auto relative_runtime_path = launch_template();
+    relative_runtime_path.read_only_paths = {"opt/glove/codex-runtime"};
+    REQUIRE(!glove::supervisor::runtime_launch_template_digest(relative_runtime_path).has_value());
+    auto overlapping_runtime_path = launch_template();
+    overlapping_runtime_path.read_only_paths = {"/usr/bin"};
+    REQUIRE(
+        !glove::supervisor::runtime_launch_template_digest(overlapping_runtime_path).has_value()
+    );
     auto unsorted_environment = launch_template();
     std::ranges::reverse(unsorted_environment.environment);
     REQUIRE(!glove::supervisor::runtime_launch_template_digest(unsorted_environment).has_value());
@@ -199,6 +217,122 @@ auto run() -> int {
     duplicate_environment.environment = {"PATH=first", "PATH=second"};
     REQUIRE(!glove::supervisor::runtime_launch_template_digest(duplicate_environment).has_value());
 
+    const auto harness_bin = temp.root() / "operator-harnesses";
+    REQUIRE(std::filesystem::create_directory(harness_bin));
+    const auto codex = harness_bin / "codex";
+    std::ofstream{codex} << "#!/bin/sh\nexit 0\n";
+    REQUIRE(::chmod(codex.c_str(), 0700) == 0);
+    const runtime_launch_template inherited_path_discovery{
+        .runtime_discovery = "codex",
+        .executable_path = "",
+        .executable_search_paths = {},
+        .arguments = {"--version"},
+        .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+        .read_only_paths = {},
+    };
+    // A service PATH must never become launch authority. Discovery is bounded
+    // by explicit, digest-bound directories only.
+    REQUIRE(!runtime_launch_template_digest(inherited_path_discovery).has_value());
+    auto discovered_codex = inherited_path_discovery;
+    discovered_codex.executable_search_paths = {harness_bin.string()};
+    const auto discovered_digest = runtime_launch_template_digest(discovered_codex);
+    REQUIRE(discovered_digest.has_value());
+    REQUIRE(*discovered_digest != launch_digest());
+    for (const std::string_view runtime_id : {"claude-code", "pi", "copilot", "opencode"}) {
+        auto native_discovery = discovered_codex;
+        native_discovery.runtime_discovery = std::string{runtime_id};
+        REQUIRE(runtime_launch_template_digest(native_discovery).has_value());
+    }
+    const auto alternate_harness_bin = temp.root() / "operator-harnesses-alternate";
+    REQUIRE(std::filesystem::create_directory(alternate_harness_bin));
+    auto alternate_search_path = discovered_codex;
+    alternate_search_path.executable_search_paths = {alternate_harness_bin.string()};
+    const auto alternate_search_digest = runtime_launch_template_digest(alternate_search_path);
+    REQUIRE(alternate_search_digest.has_value());
+    REQUIRE(*alternate_search_digest != *discovered_digest);
+    auto unknown_discovery = discovered_codex;
+    unknown_discovery.runtime_discovery = "shell";
+    REQUIRE(!runtime_launch_template_digest(unknown_discovery).has_value());
+    auto discovery_paths = path_alias_registry::build({path_alias_policy{
+        .alias = "workspace",
+        .host_path = std::filesystem::canonical(source).string(),
+        .target_path = "/workspace",
+        .max_ttl_secs = 120,
+        .access = {path_access_policy{
+            .access = path_access::ephemeral_write,
+            .materialization = path_materialization::copy,
+            .create_policy = path_create_policy::empty_directory,
+            .cleanup_policy = path_cleanup_policy::remove,
+            .max_bytes = 2'097'152,
+        }},
+    }});
+    REQUIRE(discovery_paths.has_value());
+    auto discovery_validator = session_plan_validator::build(
+        session_plan_policy{
+            .revision = 7,
+            .max_plan_ttl_ms = 120'000,
+            .runtime_templates = {runtime_template_policy{
+                .runtime_template_id = "codex-safe",
+                .runtime_id = "codex",
+                .adapter_command_digest = *discovered_digest,
+                .backend = sandbox_backend::linux_production,
+                .allowed_path_aliases = {"workspace"},
+                .allowed_projection_destinations = {"libraries"},
+                .launch = discovered_codex,
+            }},
+            .library_projection_destinations = {library_projection_destination_policy{
+                .alias = "libraries",
+                .target_path = "/opt/sage/library-bundles",
+            }},
+            .resource_profiles = {resource_limits{
+                .cpu_time_ms = 1'000,
+                .memory_bytes = 67'108'864,
+                .pids = 16,
+                .wall_time_ms = 2'000,
+                .disk_bytes = 2'097'152,
+                .terminal_output_bytes = 1'048'576,
+            }},
+            .egress_policy_ids = {"no-network"},
+            .tool_policy_ids = {"sage-readonly"},
+            .secret_handles = {"codex-token"},
+        },
+        std::move(*discovery_paths)
+    );
+    REQUIRE(discovery_validator.has_value());
+    const auto discovery_plan = replace_once(valid_plan(), launch_digest(), *discovered_digest);
+    auto discovered_launch =
+        discovery_validator->resolve_runtime_launch_json(discovery_plan, 1'000);
+    REQUIRE(discovered_launch.has_value());
+    REQUIRE(
+        discovered_launch->argv ==
+        std::vector<std::string>({std::filesystem::canonical(codex).string(), "--version"})
+    );
+    REQUIRE(::chmod(harness_bin.c_str(), 0777) == 0);
+    REQUIRE(!discovery_validator->resolve_runtime_launch_json(discovery_plan, 1'000).has_value());
+    REQUIRE(::chmod(harness_bin.c_str(), 0700) == 0);
+    REQUIRE(discovery_validator->resolve_runtime_launch_json(discovery_plan, 1'000).has_value());
+    const auto discovery_policy_path = temp.root() / "discovery-session-policy.json";
+    {
+        std::ofstream output{discovery_policy_path};
+        auto encoded = replace_once(policy_json(source), launch_digest(), *discovered_digest);
+        encoded = replace_once(
+            std::move(encoded),
+            R"("launch":{"executable_path":"/usr/bin/true","arguments":["--version"],"environment":["PATH=/usr/bin:/bin","TERM=xterm-256color"]})",
+            "\"launch\":{\"runtime_discovery\":\"codex\",\"executable_path\":\"\",\"executable_"
+            "search_paths\":[\"" +
+                harness_bin.string() +
+                "\"],\"arguments\":[\"--version\"],\"environment\":[\"PATH=/usr/bin:/"
+                "bin\",\"TERM=xterm-256color\"]}"
+        );
+        output << encoded;
+    }
+    REQUIRE(::chmod(discovery_policy_path.c_str(), 0600) == 0);
+    auto loaded_discovery = session_plan_validator::load(discovery_policy_path);
+    REQUIRE(loaded_discovery.has_value());
+    auto loaded_discovery_launch =
+        loaded_discovery->resolve_runtime_launch_json(discovery_plan, 1'000);
+    REQUIRE(loaded_discovery_launch.has_value());
+    REQUIRE(loaded_discovery_launch->argv == discovered_launch->argv);
     auto accepted = validator->validate_json(valid_plan(), 1'000);
     REQUIRE(accepted.has_value());
     REQUIRE(accepted->schema_version == 1);
@@ -286,6 +420,50 @@ auto run() -> int {
     REQUIRE(resolved_v2->size() == 1U);
     REQUIRE(resolved_v2->front().alias() == "worktree");
     REQUIRE(resolved_v2->front().target_path() == "/workspace/exposures/worktree");
+
+    auto short_exposure = shared_exposures->create(
+        path_exposure_create_request{
+            .request_id = "create-short-window",
+            .exposure_id = "short-window",
+            .root_id = "projects",
+            .host_path = std::filesystem::canonical(source).string(),
+            .display_label = "Short Window",
+            .allowed_modes =
+                {
+                    path_exposure_mode{
+                        .access = path_access::ephemeral_write,
+                        .materialization = path_materialization::copy,
+                        .max_bytes = 2'097'152,
+                        .cleanup_policy = path_cleanup_policy::remove,
+                    },
+                },
+            .ttl_secs = 60,
+            .allowed_runtime_template_ids = {"codex-safe"},
+        },
+        1'000
+    );
+    REQUIRE(short_exposure.has_value());
+    const auto v2_subsecond_boundary_rejected =
+        R"({"schema_version":2,"runtime_id":"codex","runtime_template_id":"codex-safe","adapter_command_digest":")" +
+        launch_digest() +
+        R"(","sandbox_backend":"linux_production","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"exposure_id":"short-window","generation":1,"scope_digest":")" +
+        short_exposure->scope_digest +
+        R"(","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","destination_alias":"libraries"}],"secret_handles":["codex-token"],"limits":{"cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576},"policy_revision":7,"expires_at_ms":60999})";
+    REQUIRE(!v2_validator->validate_json(v2_subsecond_boundary_rejected, 1'000).has_value());
+    REQUIRE(
+        !v2_validator->resolve_path_grants_json(v2_subsecond_boundary_rejected, 1'000).has_value()
+    );
+
+    const auto v2_subsecond_boundary_accepted =
+        replace_once(v2_subsecond_boundary_rejected, "\"ttl_secs\":60", "\"ttl_secs\":59");
+    REQUIRE(v2_validator->validate_json(v2_subsecond_boundary_accepted, 1'000).has_value());
+    auto resolved_v2_subsecond =
+        v2_validator->resolve_path_grants_json(v2_subsecond_boundary_accepted, 1'000);
+    REQUIRE(resolved_v2_subsecond.has_value());
+    REQUIRE(resolved_v2_subsecond->size() == 1U);
+    REQUIRE(resolved_v2_subsecond->front().alias() == "short-window");
+    REQUIRE(resolved_v2_subsecond->front().target_path() == "/workspace/exposures/short-window");
+
     REQUIRE(shared_exposures->revoke("revoke-worktree", "worktree", exposure->generation, 2'000)
                 .has_value());
     REQUIRE(!v2_validator->validate_json(v2_plan, 2'000).has_value());

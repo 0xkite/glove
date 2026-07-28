@@ -19,10 +19,51 @@ Capabilities are derived from successfully constructed components. macOS does
 not advertise managed-session resource enforcement.
 
 `agent_runtime_adapter_schema_version` is independent of the raw process/PTY
-lifecycle. It remains `0` until Glove creates a private agent home, expands an
-exact Sage bundle into Codex/Pi-native locations, and commits the derived
-context to the launch profile and receipt. Sage requires version `1` before
-remote launch.
+lifecycle. It is `1` only for an active Linux managed-session runtime: Glove
+creates a fresh private harness home, expands verified Sage `skill` bundles
+into that adapter's native Agent Skills directory, and commits the derived
+projection digest, home mount, and managed environment to the launch profile.
+The authenticated terminal receipt is bound to that profile digest. Sage
+requires version `1` before remote launch.
+
+Glove images do not bundle agent harnesses or their credentials. A runtime
+template may instead name bounded `launch.read_only_paths` for immutable files
+belonging to an operator-installed harness (such as its package directory).
+Glove mounts those paths read-only; Sage selects only the template ID and its
+digest, never an executable or a host path. Runtime paths cannot be `/`,
+relative, duplicate, or overlap a pinned executable.
+
+For a supported native-skill runtime on Linux, an operator can replace a
+pinned `executable_path` with a matching `runtime_discovery` value and an empty
+executable path. Supported values and their Glove-owned private locations are:
+
+| Runtime | Executable | Skill directory | Managed environment |
+|---|---|---|---|
+| `codex` | `codex` | `/home/agent/.codex/skills` | `CODEX_HOME=/home/agent/.codex` |
+| `claude-code` | `claude` | `/home/agent/.claude/skills` | — |
+| `pi` | `pi` | `/home/agent/.pi/agent/skills` | — |
+| `copilot` | `copilot` | `/home/agent/.copilot/skills` | `COPILOT_HOME=/home/agent/.copilot` |
+| `opencode` | `opencode` | `/home/agent/.config/opencode/skills` | `XDG_CONFIG_HOME=/home/agent/.config` |
+
+Discovery requires a non-empty ordered `executable_search_paths` list. Each
+directory is an explicit, digest-bound local policy value; Glove rejects any
+directory or ancestor that is not owned by the service account or root, or is
+writable by another principal. Glove never searches its inherited `PATH`. It
+canonicalizes and identity-pins the selected file before execution. The adapter
+ID, explicit search paths, arguments, environment, and read-only dependencies
+are all covered by the local adapter digest. A Sage plan cannot select a
+directory, binary, arguments, adapter, private-home path, or managed
+environment. Discovery is rejected when it does not match the template's
+runtime ID and fails closed when no executable is installed. Linux-production
+templates may enter the authenticated managed-session lifecycle. macOS
+templates use the same local discovery boundary only for SBPL-contained local
+execution and remain experimental: Glove does not advertise resource
+enforcement or remote managed-session capability there.
+
+Package-manager bin directories are often group-writable. Point the policy at
+a dedicated service-owned runtime directory instead; an operator may place a
+runtime-named symlink there to the package-managed executable. The directory—not
+the Sage plan—remains the authority for the selected harness.
 
 `direct_write` remains a legacy parse-only value and is rejected at launch.
 New write-capable plans use isolated `retained_write` materializations; applying
@@ -88,7 +129,8 @@ profile:
       "launch": {
         "executable_path": "/usr/bin/true",
         "arguments": ["--version"],
-        "environment": ["PATH=/usr/bin:/bin", "TERM=xterm-256color"]
+        "environment": ["PATH=/usr/bin:/bin", "TERM=xterm-256color"],
+        "read_only_paths": ["/opt/operator-harness/codex-runtime"]
       }
     }
   ],
@@ -207,10 +249,28 @@ it read-only at the configured target. The launch binding and authenticated
 terminal receipt commit each projection's identifier, destination, target, and
 digest.
 
-Runtime templates bind an absolute executable, ordered arguments, and canonical
-environment to `adapter_command_digest`. Sage and Glove derive that digest
-independently. Linux preparation then binds the launch to cgroup identity,
+Runtime templates bind either an absolute executable or the constrained Codex
+discovery surface, plus ordered arguments and canonical environment, to
+`adapter_command_digest`. Sage and Glove derive that digest independently.
+Linux preparation then binds the resolved launch to cgroup identity,
 quota-backed filesystems, the six limits, and resolved projections.
+
+For `runtime_id: "codex"`, Glove never uses an image-bundled client or an
+operator's existing Codex home. It creates `/home/agent`, injects
+`HOME=/home/agent` and `CODEX_HOME=/home/agent/.codex`, and materializes only
+the exact verified `skill` entries requested by the Sage plan. The operator
+must still locally configure either the executable or Codex discovery paths,
+plus any immutable dependencies, through the launch template. Network
+credentials and egress remain separate policy features and are not exposed by
+this adapter.
+
+On macOS, `container_macos_codex_discovery` is a local live probe. When Codex
+is present on the `gloved` service PATH, it resolves the canonical executable
+through the policy and runs `codex --version` under `sandbox-exec`; otherwise
+CTest marks the probe skipped. `scripts/testing/glove_local_harness.sh` runs
+that lane alongside the filesystem and environment SBPL probes. Linux keeps
+the privileged Docker workflow lane for namespace, cgroup, receipt, cleanup,
+and no-network assertions.
 
 ## Receipts and recovery
 
@@ -244,8 +304,8 @@ codes. Ambiguous transactions are never retried or terminalized automatically.
 
 ## Remaining boundary
 
-Glove projects exact bundle files but does not expand their contents into
-agent-specific prompt-library directories or generate initial prompt context.
-`prompt_ref` remains rejected. Live direct host writes are outside v2. Applying
-a retained stage remains unavailable until Glove verifies an independently
-signed, single-use local authorization.
+Glove's Codex adapter expands only exact `skill` bundle entries; unsupported
+bundle entry kinds fail closed. Other harnesses do not inherit Codex's layout,
+and `prompt_ref` remains rejected. Live direct host writes are outside v2.
+Applying a retained stage remains unavailable until Glove verifies an
+independently signed, single-use local authorization.

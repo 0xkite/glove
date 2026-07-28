@@ -1,6 +1,8 @@
 #include "glove/container/profile.hpp"
 #include "glove/container/receipt_chain.hpp"
 #include "glove/container/receipt_producer.hpp"
+#include "glove/container/digest.hpp"
+#include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/linux_session_filesystem.hpp"
 #include "glove/supervisor/path_alias.hpp"
 
@@ -113,7 +115,9 @@ auto make_lifecycle(
     const std::filesystem::path& materialization_root,
     std::span<const requested_alias> requested_aliases,
     std::string_view session_id,
-    const resource_limits& limits
+    const resource_limits& limits,
+    std::vector<glove::supervisor::resolved_library_projection>&& library_projections = {},
+    std::string_view runtime_id = {}
 ) -> std::expected<std::unique_ptr<linux_resource_lifecycle>, std::string> {
     std::vector<glove::supervisor::resolved_path_grant> grants;
     if (!requested_aliases.empty()) {
@@ -143,7 +147,12 @@ auto make_lifecycle(
         }
     }
     auto filesystem = linux_session_filesystem::create(
-        materialization_root.string(), session_id, limits.disk_bytes, std::move(grants)
+        materialization_root.string(),
+        session_id,
+        limits.disk_bytes,
+        std::move(grants),
+        std::move(library_projections),
+        runtime_id
     );
     if (!filesystem) {
         return std::unexpected(filesystem.error());
@@ -173,6 +182,11 @@ auto launch_profile(const resource_limits& limits) -> profile {
     value.environment = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin"};
     value.required_limits = limits;
     return value;
+}
+
+auto digest_for(std::string_view value) -> std::string {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(value.data());
+    return glove::container::sha256_hex(std::span{bytes, value.size()}).value_or("");
 }
 
 auto execute_managed(
@@ -363,6 +377,31 @@ auto managed_policy_rejection_test(
     REQUIRE(raw_path.error().find("lifecycle mount set") != std::string::npos);
     REQUIRE(std::filesystem::is_empty(materialization_root));
 
+    auto runtime_path_lifecycle =
+        make_lifecycle(root, materialization_root, {}, "managed-runtime-path", limits);
+    REQUIRE(runtime_path_lifecycle.has_value());
+    auto runtime_path_profile = launch_profile(limits);
+    runtime_path_profile.runtime_filesystem.push_back({.path = source.string(), .writable = false});
+    auto runtime_path = execute_managed(
+        runtime_path_profile,
+        {"/bin/sh", "-c", "test -f " + (source / "input.txt").string()},
+        std::move(*runtime_path_lifecycle)
+    );
+    REQUIRE(runtime_path.has_value());
+    REQUIRE(std::filesystem::is_empty(materialization_root));
+
+    auto unmanaged_home_lifecycle =
+        make_lifecycle(root, materialization_root, {}, "managed-unbound-home", limits);
+    REQUIRE(unmanaged_home_lifecycle.has_value());
+    auto unmanaged_home_profile = launch_profile(limits);
+    unmanaged_home_profile.managed_home_dir = "/home/agent";
+    auto unmanaged_home = execute_managed(
+        unmanaged_home_profile, {"/usr/bin/true"}, std::move(*unmanaged_home_lifecycle)
+    );
+    REQUIRE(!unmanaged_home.has_value());
+    REQUIRE(unmanaged_home.error().find("exact scratch projections") != std::string::npos);
+    REQUIRE(std::filesystem::is_empty(materialization_root));
+
     auto mismatched_lifecycle =
         make_lifecycle(root, materialization_root, {}, "managed-limit-mismatch", limits);
     REQUIRE(mismatched_lifecycle.has_value());
@@ -391,6 +430,134 @@ auto managed_policy_rejection_test(
     REQUIRE(!tampered.has_value());
     REQUIRE(tampered.error().find("launch binding mismatch") != std::string::npos);
     REQUIRE(std::filesystem::is_empty(materialization_root));
+    return 0;
+}
+
+auto codex_runtime_context_test(
+    cgroup_v2_root& root,
+    const std::filesystem::path& materialization_root,
+    const std::filesystem::path& library_root,
+    std::uint64_t page
+) -> int {
+    constexpr std::string_view bundle =
+        R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"}]})";
+    const auto bundle_digest = digest_for(bundle);
+    REQUIRE(bundle_digest.size() == 64U);
+    const auto bundle_path = library_root / (bundle_digest + ".json");
+    {
+        std::ofstream output{bundle_path, std::ios::binary | std::ios::trunc};
+        output << bundle;
+    }
+    REQUIRE(::chmod(bundle_path.c_str(), 0600) == 0);
+    auto store = glove::supervisor::library_bundle_store::open(library_root);
+    REQUIRE(store.has_value());
+    auto projections = store->resolve_projections({{
+        .projection = {
+            .projection_id = "sage-codex",
+            .content_digest = bundle_digest,
+            .destination_alias = "libraries",
+        },
+        .target_path = "/opt/sage/library-bundles",
+    }});
+    REQUIRE(projections.has_value());
+    const auto limits = limits_for(page * 32U);
+    auto lifecycle = make_lifecycle(
+        root,
+        materialization_root,
+        {},
+        "managed-codex-context",
+        limits,
+        std::move(*projections),
+        "codex"
+    );
+    REQUIRE(lifecycle.has_value());
+    auto prof = launch_profile(limits);
+    prof.environment.push_back("CODEX_HOME=/home/agent/.codex");
+    prof.managed_home_dir = "/home/agent";
+    const std::vector argv = {
+        std::string{"/usr/bin/sh"},
+        std::string{"-c"},
+        std::string{
+            "test \"$HOME\" = /home/agent; test \"$CODEX_HOME\" = /home/agent/.codex; "
+            "test -f /home/agent/.codex/skills/sage-codex-sage-core/SKILL.md; "
+            "test \"$(cat /home/agent/.codex/skills/sage-codex-sage-core/SKILL.md)\" = '# Sage core'"
+        },
+    };
+    auto binding = glove::container::linux_detail::bind_managed_session(
+        prof, argv, **lifecycle, controller_plan_digest
+    );
+    REQUIRE(binding.has_value());
+    auto terminal = glove::container::linux_detail::exec_managed_session(
+        prof, argv, *binding, std::move(*lifecycle)
+    );
+    REQUIRE(terminal.has_value());
+    REQUIRE(terminal->exit_code == 0);
+    REQUIRE(terminal->profile_digest == binding->profile_digest);
+    REQUIRE(terminal->library_projections.size() == 1U);
+    REQUIRE(terminal->library_projections.front().content_digest == bundle_digest);
+    REQUIRE(std::filesystem::is_empty(materialization_root));
+
+    struct native_runtime_case {
+        std::string_view runtime_id;
+        std::string_view skill_directory;
+        std::string_view managed_environment;
+    };
+    for (const native_runtime_case runtime : {
+             native_runtime_case{"claude-code", ".claude/skills", ""},
+             native_runtime_case{"pi", ".pi/agent/skills", ""},
+             native_runtime_case{"copilot", ".copilot/skills", "COPILOT_HOME=/home/agent/.copilot"},
+             native_runtime_case{
+                 "opencode", ".config/opencode/skills", "XDG_CONFIG_HOME=/home/agent/.config"
+             },
+         }) {
+        auto native_projections = store->resolve_projections({{
+            .projection = {
+                .projection_id = "sage-codex",
+                .content_digest = bundle_digest,
+                .destination_alias = "libraries",
+            },
+            .target_path = "/opt/sage/library-bundles",
+        }});
+        REQUIRE(native_projections.has_value());
+        auto native_lifecycle = make_lifecycle(
+            root,
+            materialization_root,
+            {},
+            std::string{"managed-"} + std::string{runtime.runtime_id} + "-context",
+            limits,
+            std::move(*native_projections),
+            runtime.runtime_id
+        );
+        REQUIRE(native_lifecycle.has_value());
+        auto native_profile = launch_profile(limits);
+        native_profile.managed_home_dir = "/home/agent";
+        if (!runtime.managed_environment.empty()) {
+            native_profile.environment.push_back(std::string{runtime.managed_environment});
+        }
+        std::string command = "test \"$HOME\" = /home/agent; test -f /home/agent/" +
+                              std::string{runtime.skill_directory} +
+                              "/sage-codex-sage-core/SKILL.md";
+        if (!runtime.managed_environment.empty()) {
+            const auto separator = runtime.managed_environment.find('=');
+            command += "; test \"$" + std::string{runtime.managed_environment.substr(0, separator)} +
+                       "\" = \"" + std::string{runtime.managed_environment.substr(separator + 1)} + "\"";
+        }
+        const std::vector native_argv = {
+            std::string{"/usr/bin/sh"},
+            std::string{"-c"},
+            std::move(command),
+        };
+        auto native_binding = glove::container::linux_detail::bind_managed_session(
+            native_profile, native_argv, **native_lifecycle, controller_plan_digest
+        );
+        REQUIRE(native_binding.has_value());
+        auto native_terminal = glove::container::linux_detail::exec_managed_session(
+            native_profile, native_argv, *native_binding, std::move(*native_lifecycle)
+        );
+        REQUIRE(native_terminal.has_value());
+        REQUIRE(native_terminal->exit_code == 0);
+        REQUIRE(std::filesystem::is_empty(materialization_root));
+    }
     return 0;
 }
 
@@ -602,10 +769,13 @@ auto run() -> int {
     const auto source = tree.root() / "source";
     const auto file_source = tree.root() / "single-source.txt";
     const auto reference_source = tree.root() / "reference";
+    const auto library_root = tree.root() / "library";
     REQUIRE(std::filesystem::create_directory(materialization_root));
     REQUIRE(::chmod(materialization_root.c_str(), 0700) == 0);
     REQUIRE(std::filesystem::create_directory(source));
     REQUIRE(std::filesystem::create_directory(reference_source));
+    REQUIRE(std::filesystem::create_directory(library_root));
+    REQUIRE(::chmod(library_root.c_str(), 0700) == 0);
     {
         std::ofstream input{source / "input.txt"};
         input << "seed\n";
@@ -629,6 +799,7 @@ auto run() -> int {
         ) == 0
     );
     REQUIRE(managed_policy_rejection_test(*root, materialization_root, source, page) == 0);
+    REQUIRE(codex_runtime_context_test(*root, materialization_root, library_root, page) == 0);
     REQUIRE(
         child_release_is_gated_by_durable_callback_test(*root, materialization_root, page) == 0
     );
