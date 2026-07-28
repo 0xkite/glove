@@ -34,9 +34,19 @@ struct resource_limits {
 // template identifier and independently derived digest; they never carry these
 // launch fields.
 struct runtime_launch_template {
+    // Empty for an explicitly pinned executable. `codex` delegates executable
+    // discovery to the local Glove supervisor using only the policy-owned
+    // search paths below; it is never selected or influenced by a session
+    // request.
+    std::string runtime_discovery;
     std::string executable_path;
+    std::vector<std::string> executable_search_paths;
     std::vector<std::string> arguments;
     std::vector<std::string> environment;
+    // Immutable operator-installed harness files required in addition to the
+    // selected executable. These remain local policy, are mounted read-only,
+    // and are never accepted from a Sage session request.
+    std::vector<std::string> read_only_paths;
 
     auto operator==(const runtime_launch_template&) const -> bool = default;
 };
@@ -98,6 +108,7 @@ struct runtime_launch_projection {
     sandbox_backend backend = sandbox_backend::macos_experimental;
     std::vector<std::string> argv;
     std::vector<std::string> environment;
+    std::vector<std::string> read_only_paths;
     resource_limits limits;
     std::uint64_t expires_at_ms = 0;
     bool requires_direct_write_approval = false;

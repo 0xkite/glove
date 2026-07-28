@@ -1,5 +1,4 @@
 #include "glove/supervisor/linux_session_filesystem.hpp"
-
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include <dirent.h>
@@ -15,7 +14,6 @@
 #include <charconv>
 #include <cstring>
 #include <filesystem>
-#include <limits>
 #include <set>
 #include <system_error>
 #include <utility>
@@ -61,10 +59,11 @@ auto valid_digest(std::string_view value) -> bool {
 }
 
 auto checked_add(std::uint64_t& total, std::uint64_t value) -> bool {
-    if (value > std::numeric_limits<std::uint64_t>::max() - total) {
+    std::uint64_t next = 0;
+    if (__builtin_add_overflow(total, value, &next)) {
         return false;
     }
-    total += value;
+    total = next;
     return true;
 }
 
@@ -457,23 +456,21 @@ auto append_native_skill_runtime_home(
             std::string{"create native skill private home: "} + errno_message(errno)
         );
     }
-    unique_fd home_fd{::openat(
-        scratch_fd, "agent-home", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
-    )};
+    unique_fd home_fd{
+        ::openat(scratch_fd, "agent-home", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+    };
     if (home_fd.get() < 0) {
         return std::unexpected(
             std::string{"open native skill private home: "} + errno_message(errno)
         );
     }
-    if (auto materialized = materialize_native_skill_runtime_projection(
-            home_fd.get(), adapter, *projection
-        );
+    if (auto materialized =
+            materialize_native_skill_runtime_projection(home_fd.get(), adapter, *projection);
         !materialized) {
         return std::unexpected(materialized.error());
     }
-    auto mount = scratch_mount(
-        home_fd.get(), "/home/agent", adapter.home_mount_alias, scratch_quota
-    );
+    auto mount =
+        scratch_mount(home_fd.get(), "/home/agent", adapter.home_mount_alias, scratch_quota);
     if (!mount) {
         return std::unexpected(mount.error());
     }
@@ -709,11 +706,7 @@ result<linux_session_filesystem> linux_session_filesystem::create(
     }
     if (const auto adapter = native_skill_runtime_adapter_for(runtime_id)) {
         if (auto appended = append_native_skill_runtime_home(
-                *adapter,
-                scratch->content_fd(),
-                scratch_quota,
-                owned_library_projections,
-                *mounts
+                *adapter, scratch->content_fd(), scratch_quota, owned_library_projections, *mounts
             );
             !appended) {
             close_mount_records(*mounts);

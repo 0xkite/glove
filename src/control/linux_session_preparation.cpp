@@ -152,18 +152,16 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         requested_profile.runtime_filesystem.push_back({.path = path, .writable = false});
     }
     requested_profile.environment = owned_inputs.launch.environment;
-    if (const auto adapter = supervisor::native_skill_runtime_adapter_for(
-            owned_inputs.launch.runtime_id
-        )) {
-        const bool overrides_managed_environment = std::ranges::any_of(
-            adapter->managed_environment, [&](const auto& managed) {
+    if (const auto adapter =
+            supervisor::native_skill_runtime_adapter_for(owned_inputs.launch.runtime_id)) {
+        const bool overrides_managed_environment =
+            std::ranges::any_of(adapter->managed_environment, [&](const auto& managed) {
                 const auto separator = managed.find('=');
                 const std::string_view name{managed.data(), separator};
                 return std::ranges::any_of(requested_profile.environment, [&](const auto& entry) {
                     return entry.starts_with(std::string{name} + "=");
                 });
-            }
-        );
+            });
         if (overrides_managed_environment) {
             return std::unexpected(
                 std::string{"native skill runtime state is managed by Glove, not launch policy"}

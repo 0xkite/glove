@@ -2,22 +2,23 @@
 
 #include "glove/container/digest.hpp"
 
+#include <fcntl.h>
 #include <glaze/glaze.hpp>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstdint>
 #include <cerrno>
-#include <fcntl.h>
+#include <cstdint>
+#include <limits>
 #include <set>
 #include <span>
-#include <sys/stat.h>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <tuple>
-#include <unistd.h>
 #include <utility>
 
 namespace glove::supervisor {
@@ -46,6 +47,7 @@ constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 constexpr std::size_t max_bundle_entries = 4'096U;
 constexpr std::size_t max_entry_bytes = 1024U * 1024U;
 constexpr std::size_t max_projection_bytes = 16U * 1024U * 1024U;
+constexpr std::size_t max_skill_directory_bytes = 255U;
 
 auto valid_digest(std::string_view value) -> bool {
     return value.size() == 64U && std::ranges::all_of(value, [](char character) {
@@ -67,6 +69,12 @@ auto valid_projection_id(std::string_view value) -> bool {
         return std::isalnum(byte) != 0 || character == '-' || character == '_' ||
                character == ':' || character == '.';
     });
+}
+
+auto valid_skill_directory_name(std::string_view projection_id, std::string_view key) -> bool {
+    return projection_id.size() <= max_skill_directory_bytes &&
+           key.size() < max_skill_directory_bytes &&
+           projection_id.size() <= max_skill_directory_bytes - key.size() - 1U;
 }
 
 auto read_bundle(const resolved_library_bundle& bundle) -> std::expected<std::string, std::string> {
@@ -104,7 +112,8 @@ auto decode_bundle(const resolved_library_bundle& bundle)
         return std::unexpected(std::string{"Codex bundle JSON is invalid"});
     }
     if (document.schema_version != 1 || document.source_library_ref.empty() ||
-        document.source_library_ref.size() > 512U || !valid_digest(document.source_manifest_digest) ||
+        document.source_library_ref.size() > 512U ||
+        !valid_digest(document.source_manifest_digest) ||
         document.entries.size() > max_bundle_entries) {
         return std::unexpected(std::string{"Codex bundle schema is invalid"});
     }
@@ -143,15 +152,22 @@ auto make_directory_at(int parent_fd, const char* name) -> std::expected<void, s
 
 class canonical_encoder {
 public:
-    void append_u32(std::uint32_t value) {
-        for (const unsigned int shift : {24U, 16U, 8U, 0U}) {
-            bytes_.push_back(static_cast<unsigned char>(value >> shift));
+    auto append_size(std::size_t value) -> std::expected<void, std::string> {
+        if (value > std::numeric_limits<std::uint32_t>::max()) {
+            return std::unexpected(std::string{"canonical value exceeds u32 encoding"});
         }
+        for (const unsigned int shift : {24U, 16U, 8U, 0U}) {
+            bytes_.push_back(static_cast<unsigned char>((value >> shift) & 0xffU));
+        }
+        return {};
     }
 
-    void append_string(std::string_view value) {
-        append_u32(static_cast<std::uint32_t>(value.size()));
+    auto append_string(std::string_view value) -> std::expected<void, std::string> {
+        if (auto appended = append_size(value.size()); !appended) {
+            return std::unexpected(appended.error());
+        }
         bytes_.insert(bytes_.end(), value.begin(), value.end());
+        return {};
     }
 
     [[nodiscard]] auto bytes() const noexcept -> std::span<const unsigned char> { return bytes_; }
@@ -168,7 +184,8 @@ auto resolve_codex_runtime_projection(const std::vector<resolved_library_project
     std::set<std::pair<std::string, std::string>> identities;
     std::size_t total_bytes = 0;
     for (const auto& bundle_projection : bundles) {
-        if (bundle_projection.projection_id.empty() || !valid_digest(bundle_projection.bundle.content_digest())) {
+        if (!valid_projection_id(bundle_projection.projection_id) ||
+            !valid_digest(bundle_projection.bundle.content_digest())) {
             return std::unexpected(std::string{"Codex library projection identity is invalid"});
         }
         auto document = decode_bundle(bundle_projection.bundle);
@@ -176,14 +193,18 @@ auto resolve_codex_runtime_projection(const std::vector<resolved_library_project
             return std::unexpected(document.error());
         }
         for (const auto& entry : document->entries) {
-            if (entry.kind != "skill" || !valid_skill_key(entry.key) || !valid_digest(entry.content_digest) ||
-                entry.content.empty() || entry.content.size() > max_entry_bytes || entry.content.find('\0') != std::string::npos ||
+            if (entry.kind != "skill" || !valid_skill_key(entry.key) ||
+                !valid_skill_directory_name(bundle_projection.projection_id, entry.key) ||
+                !valid_digest(entry.content_digest) || entry.content.empty() ||
+                entry.content.size() > max_entry_bytes ||
+                entry.content.find('\0') != std::string::npos ||
                 !identities.insert({bundle_projection.projection_id, entry.key}).second) {
                 return std::unexpected(std::string{"Codex bundle entry is unsafe or unsupported"});
             }
             const auto* raw = reinterpret_cast<const unsigned char*>(entry.content.data());
             const auto digest = glove::container::sha256_hex(std::span{raw, entry.content.size()});
-            if (!digest || *digest != entry.content_digest || entry.content.size() > max_projection_bytes - total_bytes) {
+            if (!digest || *digest != entry.content_digest ||
+                entry.content.size() > max_projection_bytes - total_bytes) {
                 return std::unexpected(std::string{"Codex bundle entry digest or size is invalid"});
             }
             total_bytes += entry.content.size();
@@ -208,14 +229,20 @@ auto codex_runtime_projection_digest(const codex_runtime_projection& projection)
         return std::unexpected(std::string{"Codex projection exceeds its skill bound"});
     }
     canonical_encoder encoder;
-    encoder.append_string("glove.codex-runtime-projection");
-    encoder.append_u32(static_cast<std::uint32_t>(projection.skills.size()));
+    if (auto appended = encoder.append_string("glove.codex-runtime-projection"); !appended) {
+        return std::unexpected(appended.error());
+    }
+    if (auto appended = encoder.append_size(projection.skills.size()); !appended) {
+        return std::unexpected(appended.error());
+    }
     std::pair<std::string, std::string> previous;
     bool have_previous = false;
     for (const auto& skill : projection.skills) {
-        if (!valid_projection_id(skill.projection_id) || !valid_digest(skill.bundle_content_digest) ||
-            !valid_skill_key(skill.key) || !valid_digest(skill.content_digest) ||
-            skill.content.empty() || skill.content.size() > max_entry_bytes) {
+        if (!valid_projection_id(skill.projection_id) ||
+            !valid_digest(skill.bundle_content_digest) || !valid_skill_key(skill.key) ||
+            !valid_digest(skill.content_digest) || skill.content.empty() ||
+            !valid_skill_directory_name(skill.projection_id, skill.key) ||
+            skill.content.size() > max_entry_bytes) {
             return std::unexpected(std::string{"Codex projection is invalid"});
         }
         const auto identity = std::pair{skill.projection_id, skill.key};
@@ -223,14 +250,21 @@ auto codex_runtime_projection_digest(const codex_runtime_projection& projection)
             return std::unexpected(std::string{"Codex projection is not canonically ordered"});
         }
         const auto* raw = reinterpret_cast<const unsigned char*>(skill.content.data());
-        const auto content_digest = glove::container::sha256_hex(std::span{raw, skill.content.size()});
+        const auto content_digest =
+            glove::container::sha256_hex(std::span{raw, skill.content.size()});
         if (!content_digest || *content_digest != skill.content_digest) {
             return std::unexpected(std::string{"Codex projection content digest is invalid"});
         }
-        encoder.append_string(skill.projection_id);
-        encoder.append_string(skill.bundle_content_digest);
-        encoder.append_string(skill.key);
-        encoder.append_string(skill.content_digest);
+        for (const std::string_view value : {
+                 std::string_view{skill.projection_id},
+                 std::string_view{skill.bundle_content_digest},
+                 std::string_view{skill.key},
+                 std::string_view{skill.content_digest},
+             }) {
+            if (auto appended = encoder.append_string(value); !appended) {
+                return std::unexpected(appended.error());
+            }
+        }
         previous = identity;
         have_previous = true;
     }
@@ -243,12 +277,14 @@ auto materialize_codex_runtime_projection(
     if (private_home_fd < 0) {
         return std::unexpected(std::string{"Codex private home descriptor is unavailable"});
     }
+    if (auto valid = codex_runtime_projection_digest(projection); !valid) {
+        return std::unexpected(valid.error());
+    }
     if (auto created = make_directory_at(private_home_fd, ".codex"); !created) {
         return std::unexpected(created.error());
     }
-    const int codex_fd = ::openat(
-        private_home_fd, ".codex", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
-    );
+    const int codex_fd =
+        ::openat(private_home_fd, ".codex", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (codex_fd < 0) {
         return std::unexpected(errno_message("open private CODEX_HOME"));
     }
@@ -257,7 +293,8 @@ auto materialize_codex_runtime_projection(
         close_codex();
         return std::unexpected(errno_message("create Codex skills directory"));
     }
-    const int skills_fd = ::openat(codex_fd, "skills", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    const int skills_fd =
+        ::openat(codex_fd, "skills", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     close_codex();
     if (skills_fd < 0) {
         return std::unexpected(errno_message("open Codex skills directory"));
@@ -269,9 +306,8 @@ auto materialize_codex_runtime_projection(
             ::close(skills_fd);
             return std::unexpected(std::string{"create Codex skill directory"});
         }
-        const int skill_fd = ::openat(
-            skills_fd, directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
-        );
+        const int skill_fd =
+            ::openat(skills_fd, directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (skill_fd < 0) {
             ::close(skills_fd);
             return std::unexpected(errno_message("open Codex skill directory"));

@@ -178,6 +178,46 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         }
     }
 
+    std::set<std::string> runtime_paths;
+    for (auto& rule : copy.runtime_filesystem) {
+        if (rule.writable) {
+            return std::unexpected(std::string{"runtime filesystem rule must be read-only"});
+        }
+        auto path = canonical_path(rule.path, "runtime filesystem rule");
+        if (!path) {
+            return std::unexpected(path.error());
+        }
+        rule.path = std::move(*path);
+        if (!runtime_paths.insert(rule.path).second) {
+            return std::unexpected(
+                std::string{"duplicate runtime filesystem rule: '"} + rule.path + "'"
+            );
+        }
+        const std::filesystem::path runtime_path{rule.path};
+        if (std::ranges::any_of(copy.filesystem, [&](const auto& filesystem_rule) {
+                const std::filesystem::path filesystem_path{filesystem_rule.path};
+                return path_within(runtime_path, filesystem_path) ||
+                       path_within(filesystem_path, runtime_path);
+            })) {
+            return std::unexpected(
+                std::string{"runtime and ordinary filesystem rules overlap: '"} + rule.path + "'"
+            );
+        }
+    }
+    for (auto outer = copy.runtime_filesystem.begin(); outer != copy.runtime_filesystem.end();
+         ++outer) {
+        for (auto inner = std::next(outer); inner != copy.runtime_filesystem.end(); ++inner) {
+            const std::filesystem::path first{outer->path};
+            const std::filesystem::path second{inner->path};
+            if (path_within(first, second) || path_within(second, first)) {
+                return std::unexpected(
+                    std::string{"overlapping runtime filesystem rules are ambiguous: '"} +
+                    outer->path + "' and '" + inner->path + "'"
+                );
+            }
+        }
+    }
+
     auto normalise_optional = [&](std::optional<std::string>& value,
                                   std::string_view label,
                                   bool needs_write) -> std::expected<void, std::string> {
@@ -199,6 +239,13 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
     };
     if (auto out = normalise_optional(copy.home_dir, "home_dir", true); !out) {
         return std::unexpected(out.error());
+    }
+    if (copy.managed_home_dir) {
+        auto path = canonical_path(*copy.managed_home_dir, "managed_home_dir");
+        if (!path) {
+            return std::unexpected(path.error());
+        }
+        copy.managed_home_dir = std::move(*path);
     }
     if (auto out = normalise_optional(copy.temp_dir, "temp_dir", true); !out) {
         return std::unexpected(out.error());
@@ -265,42 +312,42 @@ auto require_resource_enforcement(
         return {};
     }
 
-    std::vector<std::string_view> missing;
+    std::string message{"mandatory resource enforcement unavailable: "};
+    bool has_missing = false;
+    const auto append_missing = [&message, &has_missing](std::string_view capability) {
+        if (has_missing) {
+            message.append(", ");
+        }
+        message.append(capability);
+        has_missing = true;
+    };
     const auto cpu_supported = capabilities.cpu_time == enforcement_mechanism::rlimit ||
                                capabilities.cpu_time == enforcement_mechanism::cgroup_v2;
     const auto memory_supported = capabilities.memory == enforcement_mechanism::rlimit ||
                                   capabilities.memory == enforcement_mechanism::cgroup_v2;
     if (!cpu_supported) {
-        missing.emplace_back("cpu_time");
+        append_missing("cpu_time");
     }
     if (!memory_supported) {
-        missing.emplace_back("memory");
+        append_missing("memory");
     }
     if (capabilities.pids != enforcement_mechanism::cgroup_v2) {
-        missing.emplace_back("pids");
+        append_missing("pids");
     }
     if (capabilities.wall_time != enforcement_mechanism::watchdog) {
-        missing.emplace_back("wall_time");
+        append_missing("wall_time");
     }
     if (capabilities.disk != enforcement_mechanism::filesystem_quota) {
-        missing.emplace_back("disk");
+        append_missing("disk");
     }
     if (capabilities.terminal_output != enforcement_mechanism::byte_counter) {
-        missing.emplace_back("terminal_output");
+        append_missing("terminal_output");
     }
     if (capabilities.receipt_schema_version != 1) {
-        missing.emplace_back("observable_receipts");
+        append_missing("observable_receipts");
     }
-    if (missing.empty()) {
+    if (!has_missing) {
         return {};
-    }
-
-    std::string message{"mandatory resource enforcement unavailable: "};
-    for (std::size_t index = 0; index < missing.size(); ++index) {
-        if (index != 0) {
-            message.append(", ");
-        }
-        message.append(missing[index]);
     }
     return std::unexpected(std::move(message));
 }

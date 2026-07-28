@@ -7,8 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -144,10 +144,31 @@ auto run() -> int {
     REQUIRE(codex_projection_digest->size() == 64U);
     auto reordered_codex = *codex;
     std::ranges::reverse(reordered_codex.skills);
-    REQUIRE(glove::supervisor::codex_runtime_projection_digest(reordered_codex) ==
-            codex_projection_digest);
+    REQUIRE(
+        glove::supervisor::codex_runtime_projection_digest(reordered_codex) ==
+        codex_projection_digest
+    );
     reordered_codex.skills.front().content = "# changed\n";
     REQUIRE(!glove::supervisor::codex_runtime_projection_digest(reordered_codex).has_value());
+
+    // A skill directory is a single filesystem component. Reject an otherwise
+    // syntactically valid projection before materialization rather than letting
+    // a host filesystem limit decide the launch result.
+    auto oversized_directory = *codex;
+    oversized_directory.skills.front().projection_id = std::string(128U, 'p');
+    oversized_directory.skills.front().key = std::string(128U, 'k');
+    REQUIRE(!glove::supervisor::codex_runtime_projection_digest(oversized_directory).has_value());
+    const auto oversized_home = temporary.root() / "oversized-codex-home";
+    REQUIRE(std::filesystem::create_directory(oversized_home));
+    const int oversized_home_fd =
+        ::open(oversized_home.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    REQUIRE(oversized_home_fd >= 0);
+    REQUIRE(!glove::supervisor::materialize_codex_runtime_projection(
+                 oversized_home_fd, oversized_directory
+    )
+                 .has_value());
+    ::close(oversized_home_fd);
+    REQUIRE(std::filesystem::is_empty(oversized_home));
 
     constexpr std::string_view unsupported_codex_canonical =
         R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"selected-prompt","kind":"prompt","content_digest":"3514cf816e5407a39cb7a1c1e1243f176dda121e06398a8934edb1dc426b0b34","content":"ignored"}]})";
@@ -174,7 +195,11 @@ auto run() -> int {
     REQUIRE(std::filesystem::create_directory(native_homes));
     REQUIRE(::chmod(native_homes.c_str(), 0700) == 0);
     for (const std::string_view runtime_id : {
-             "codex", "claude-code", "pi", "copilot", "opencode",
+             "codex",
+             "claude-code",
+             "pi",
+             "copilot",
+             "opencode",
          }) {
         const auto adapter = glove::supervisor::native_skill_runtime_adapter_for(runtime_id);
         REQUIRE(adapter.has_value());

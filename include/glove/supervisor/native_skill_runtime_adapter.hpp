@@ -54,8 +54,7 @@ struct native_skill_runtime_projection {
 // Commitment includes the adapter ID as well as every projected skill, so a
 // valid context for one harness cannot be rebound as another harness's home.
 [[nodiscard]] auto native_skill_runtime_projection_digest(
-    const native_skill_runtime_adapter& adapter,
-    const native_skill_runtime_projection& projection
+    const native_skill_runtime_adapter& adapter, const native_skill_runtime_projection& projection
 ) -> std::expected<std::string, std::string>;
 
 // Materialize under a descriptor-owned empty /home/agent. `skill_root_components`

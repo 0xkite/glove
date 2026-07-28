@@ -66,6 +66,7 @@ auto run() -> int {
               "' >/dev/null 2>&1 && echo outside=BAD || echo outside=denied; ";
     script += "touch /etc/glove_evil 2>/dev/null && echo writeetc=BAD || echo writeetc=denied; ";
     script += "touch ./wok 2>/dev/null && echo writews=ok || echo writews=no; ";
+    script += "test -s /proc/net/route && echo network=BAD || echo network=denied; ";
     script +=
         "env | grep '^GLOVE_TEST_HOST_SECRET=' >/dev/null && echo env=BAD || echo env=scrubbed; ";
     script += "} > '" + (ws / "result").string() + "'";
@@ -87,6 +88,7 @@ auto run() -> int {
     REQUIRE(contains(out, "outside=denied"));        // unrelated host file is absent
     REQUIRE(contains(out, "writeetc=denied"));       // write-narrow: /etc not writable
     REQUIRE(contains(out, "writews=ok"));            // workspace writable
+    REQUIRE(contains(out, "network=denied"));        // no route leaves the network namespace
     REQUIRE(contains(out, "env=scrubbed"));          // host credentials are not inherited
 
     REQUIRE(std::filesystem::remove_all(ws, filesystem_error) > 0);

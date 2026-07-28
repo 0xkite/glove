@@ -157,11 +157,20 @@ struct resource_enforcement_receipt {
 struct profile {
     std::vector<fs_rule> filesystem;
 
+    // Immutable harness runtime files derived only from an executor-owned
+    // runtime template. Managed-session binding rejects ordinary filesystem
+    // grants and accepts this read-only surface separately.
+    std::vector<fs_rule> runtime_filesystem;
+
     // Complete environment inherited by the agent, expressed as NAME=VALUE.
     // The host environment is never copied implicitly.
     std::vector<std::string> environment;
 
     std::optional<std::string> home_dir;
+    // A private home derived by a managed runtime adapter, never a general
+    // filesystem grant. Linux managed binding admits it only when the exact
+    // lifecycle mount proves a supported adapter context.
+    std::optional<std::string> managed_home_dir;
     std::optional<std::string> temp_dir;
     std::optional<std::string> work_dir;
 

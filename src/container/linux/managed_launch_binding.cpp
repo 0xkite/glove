@@ -1,7 +1,7 @@
+#include "glove/supervisor/native_skill_runtime_adapter.hpp"
+
 #include "../sha256.hpp"
 #include "linux_managed_session.hpp"
-
-#include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -212,17 +212,17 @@ auto validate_writable_mount(
             std::string{"writable managed launch projection has content digest"}
         );
     }
-    const bool has_runtime_context = mount.runtime_adapter_id.has_value() ||
-                                     mount.runtime_context_digest.has_value();
+    const bool has_runtime_context =
+        mount.runtime_adapter_id.has_value() || mount.runtime_context_digest.has_value();
     if (has_runtime_context) {
-        const auto adapter = mount.runtime_adapter_id
-                                 ? supervisor::native_skill_runtime_adapter_for(*mount.runtime_adapter_id)
-                                 : std::nullopt;
+        const auto adapter =
+            mount.runtime_adapter_id
+                ? supervisor::native_skill_runtime_adapter_for(*mount.runtime_adapter_id)
+                : std::nullopt;
         if (!mount.runtime_adapter_id || !mount.runtime_context_digest || !adapter ||
-            !valid_digest(*mount.runtime_context_digest) ||
-            mount.quota_partition != "__scratch" || mount.alias != adapter->home_mount_alias ||
-            mount.target_path != "/home/agent" || mount.source_identity || !mount.directory ||
-            state.runtime_home_mounts != 0U) {
+            !valid_digest(*mount.runtime_context_digest) || mount.quota_partition != "__scratch" ||
+            mount.alias != adapter->home_mount_alias || mount.target_path != "/home/agent" ||
+            mount.source_identity || !mount.directory || state.runtime_home_mounts != 0U) {
             return std::unexpected(std::string{"invalid managed runtime home projection"});
         }
         ++state.runtime_home_mounts;
@@ -281,8 +281,8 @@ auto validate_mount_projection(
     }
     if (state.scratch_mounts != 2U ||
         (managed_home_dir.has_value() != (state.runtime_home_mounts == 1U)) ||
-        (managed_home_dir && (*managed_home_dir != "/home/agent" ||
-                              state.runtime_home_path != managed_home_dir))) {
+        (managed_home_dir &&
+         (*managed_home_dir != "/home/agent" || state.runtime_home_path != managed_home_dir))) {
         return std::unexpected(std::string{"managed launch requires exact scratch projections"});
     }
     std::uint64_t quota_total = 0;
@@ -318,14 +318,22 @@ public:
     void append_bool(bool value) { append_u8(static_cast<std::uint8_t>(value ? 1U : 0U)); }
 
     void append_string(std::string_view value) {
-        append_u32(static_cast<std::uint32_t>(value.size()));
+        if (value.size() > std::numeric_limits<std::uint32_t>::max()) {
+            valid_ = false;
+            return;
+        }
+        for (const unsigned int shift : {24U, 16U, 8U, 0U}) {
+            bytes_.push_back(static_cast<unsigned char>(value.size() >> shift));
+        }
         bytes_.insert(bytes_.end(), value.begin(), value.end());
     }
 
     [[nodiscard]] auto bytes() const noexcept -> std::span<const unsigned char> { return bytes_; }
+    [[nodiscard]] auto valid() const noexcept -> bool { return valid_; }
 
 private:
     std::vector<unsigned char> bytes_;
+    bool valid_ = true;
 };
 
 void append_limits(canonical_encoder& encoder, const resource_limits& limits) {
@@ -369,8 +377,7 @@ auto bind_managed_launch_projection_from_fd(
         return std::unexpected(std::string{"managed launch requires resource limits"});
     }
     if (!checked->filesystem.empty() || checked->home_dir || checked->temp_dir ||
-        checked->work_dir ||
-        std::ranges::any_of(checked->runtime_filesystem, [](const auto& rule) {
+        checked->work_dir || std::ranges::any_of(checked->runtime_filesystem, [](const auto& rule) {
             return rule.writable;
         })) {
         return std::unexpected(
@@ -472,6 +479,9 @@ auto bind_managed_launch_projection_from_fd(
             encoder.append_string(*mount.runtime_adapter_id);
             encoder.append_string(*mount.runtime_context_digest);
         }
+    }
+    if (!encoder.valid()) {
+        return std::unexpected(std::string{"managed launch field exceeds canonical encoding limit"});
     }
     auto digest = detail::sha256_hex(encoder.bytes());
     if (!digest) {

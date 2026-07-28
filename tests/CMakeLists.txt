@@ -463,6 +463,14 @@ if(APPLE)
     add_test(NAME container_macos_exec COMMAND container_macos_exec_test)
     set_tests_properties(container_macos_exec PROPERTIES TIMEOUT 30)
 
+    # Policy-owned Codex discovery is tested against the locally installed
+    # harness when present. This is SBPL-only and intentionally not a claim of
+    # production resource enforcement on macOS.
+    add_executable(container_macos_codex_discovery_test container/macos_codex_discovery_test.cpp)
+    target_link_libraries(container_macos_codex_discovery_test PRIVATE glove_kernel glove_supervisor)
+    add_test(NAME container_macos_codex_discovery COMMAND container_macos_codex_discovery_test)
+    set_tests_properties(container_macos_codex_discovery PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+
     add_executable(glove_exec_audit_test run/glove_exec_audit_test.cpp)
     target_link_libraries(glove_exec_audit_test PRIVATE glove_kernel)
     target_compile_definitions(glove_exec_audit_test PRIVATE

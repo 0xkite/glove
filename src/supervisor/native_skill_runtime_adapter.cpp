@@ -10,6 +10,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -52,15 +53,22 @@ auto make_directory_at(int parent_fd, std::string_view name) -> std::expected<in
 
 class canonical_encoder {
 public:
-    void append_u32(std::uint32_t value) {
-        for (const unsigned int shift : {24U, 16U, 8U, 0U}) {
-            bytes_.push_back(static_cast<unsigned char>(value >> shift));
+    auto append_size(std::size_t value) -> std::expected<void, std::string> {
+        if (value > std::numeric_limits<std::uint32_t>::max()) {
+            return std::unexpected(std::string{"canonical value exceeds u32 encoding"});
         }
+        for (const unsigned int shift : {24U, 16U, 8U, 0U}) {
+            bytes_.push_back(static_cast<unsigned char>((value >> shift) & 0xffU));
+        }
+        return {};
     }
 
-    void append_string(std::string_view value) {
-        append_u32(static_cast<std::uint32_t>(value.size()));
+    auto append_string(std::string_view value) -> std::expected<void, std::string> {
+        if (auto appended = append_size(value.size()); !appended) {
+            return std::unexpected(appended.error());
+        }
         bytes_.insert(bytes_.end(), value.begin(), value.end());
+        return {};
     }
 
     [[nodiscard]] auto bytes() const noexcept -> std::span<const unsigned char> { return bytes_; }
@@ -152,8 +160,7 @@ auto resolve_native_skill_runtime_projection(
 }
 
 auto native_skill_runtime_projection_digest(
-    const native_skill_runtime_adapter& adapter,
-    const native_skill_runtime_projection& projection
+    const native_skill_runtime_adapter& adapter, const native_skill_runtime_projection& projection
 ) -> std::expected<std::string, std::string> {
     if (!is_builtin_adapter(adapter)) {
         return std::unexpected(std::string{"native skill runtime adapter is unsupported"});
@@ -174,9 +181,15 @@ auto native_skill_runtime_projection_digest(
         return std::unexpected(skill_digest.error());
     }
     canonical_encoder encoder;
-    encoder.append_string("glove.native-skill-runtime-projection");
-    encoder.append_string(adapter.runtime_id);
-    encoder.append_string(*skill_digest);
+    for (const std::string_view value : {
+             std::string_view{"glove.native-skill-runtime-projection"},
+             std::string_view{adapter.runtime_id},
+             std::string_view{*skill_digest},
+         }) {
+        if (auto appended = encoder.append_string(value); !appended) {
+            return std::unexpected(appended.error());
+        }
+    }
     auto digest = container::sha256_hex(encoder.bytes());
     if (!digest) {
         return std::unexpected(digest.error());
@@ -191,6 +204,9 @@ auto materialize_native_skill_runtime_projection(
 ) -> std::expected<void, std::string> {
     if (private_home_fd < 0 || !is_builtin_adapter(adapter)) {
         return std::unexpected(std::string{"native skill runtime home is unavailable"});
+    }
+    if (auto valid = native_skill_runtime_projection_digest(adapter, projection); !valid) {
+        return std::unexpected(valid.error());
     }
     int parent_fd = private_home_fd;
     std::vector<int> opened_directories;

@@ -1,9 +1,10 @@
+#include "glove/container/digest.hpp"
 #include "glove/container/profile.hpp"
 #include "glove/container/receipt_chain.hpp"
 #include "glove/container/receipt_producer.hpp"
-#include "glove/container/digest.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/linux_session_filesystem.hpp"
+#include "glove/supervisor/native_skill_runtime_adapter.hpp"
 #include "glove/supervisor/path_alias.hpp"
 
 #include "cgroup_v2.hpp"
@@ -13,9 +14,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <expected>
 #include <filesystem>
 #include <fstream>
@@ -452,11 +455,12 @@ auto codex_runtime_context_test(
     auto store = glove::supervisor::library_bundle_store::open(library_root);
     REQUIRE(store.has_value());
     auto projections = store->resolve_projections({{
-        .projection = {
-            .projection_id = "sage-codex",
-            .content_digest = bundle_digest,
-            .destination_alias = "libraries",
-        },
+        .projection =
+            {
+                .projection_id = "sage-codex",
+                .content_digest = bundle_digest,
+                .destination_alias = "libraries",
+            },
         .target_path = "/opt/sage/library-bundles",
     }});
     REQUIRE(projections.has_value());
@@ -477,11 +481,10 @@ auto codex_runtime_context_test(
     const std::vector argv = {
         std::string{"/usr/bin/sh"},
         std::string{"-c"},
-        std::string{
-            "test \"$HOME\" = /home/agent; test \"$CODEX_HOME\" = /home/agent/.codex; "
-            "test -f /home/agent/.codex/skills/sage-codex-sage-core/SKILL.md; "
-            "test \"$(cat /home/agent/.codex/skills/sage-codex-sage-core/SKILL.md)\" = '# Sage core'"
-        },
+        std::string{"test \"$HOME\" = /home/agent; test \"$CODEX_HOME\" = /home/agent/.codex; "
+                    "test -f /home/agent/.codex/skills/sage-codex-sage-core/SKILL.md; "
+                    "test \"$(cat /home/agent/.codex/skills/sage-codex-sage-core/SKILL.md)\" = '# "
+                    "Sage core'"},
     };
     auto binding = glove::container::linux_detail::bind_managed_session(
         prof, argv, **lifecycle, controller_plan_digest
@@ -502,6 +505,7 @@ auto codex_runtime_context_test(
         std::string_view skill_directory;
         std::string_view managed_environment;
     };
+
     for (const native_runtime_case runtime : {
              native_runtime_case{"claude-code", ".claude/skills", ""},
              native_runtime_case{"pi", ".pi/agent/skills", ""},
@@ -511,11 +515,12 @@ auto codex_runtime_context_test(
              },
          }) {
         auto native_projections = store->resolve_projections({{
-            .projection = {
-                .projection_id = "sage-codex",
-                .content_digest = bundle_digest,
-                .destination_alias = "libraries",
-            },
+            .projection =
+                {
+                    .projection_id = "sage-codex",
+                    .content_digest = bundle_digest,
+                    .destination_alias = "libraries",
+                },
             .target_path = "/opt/sage/library-bundles",
         }});
         REQUIRE(native_projections.has_value());
@@ -539,8 +544,9 @@ auto codex_runtime_context_test(
                               "/sage-codex-sage-core/SKILL.md";
         if (!runtime.managed_environment.empty()) {
             const auto separator = runtime.managed_environment.find('=');
-            command += "; test \"$" + std::string{runtime.managed_environment.substr(0, separator)} +
-                       "\" = \"" + std::string{runtime.managed_environment.substr(separator + 1)} + "\"";
+            command += "; test \"$" +
+                       std::string{runtime.managed_environment.substr(0, separator)} + "\" = \"" +
+                       std::string{runtime.managed_environment.substr(separator + 1)} + "\"";
         }
         const std::vector native_argv = {
             std::string{"/usr/bin/sh"},
@@ -557,6 +563,157 @@ auto codex_runtime_context_test(
         REQUIRE(native_terminal.has_value());
         REQUIRE(native_terminal->exit_code == 0);
         REQUIRE(std::filesystem::is_empty(materialization_root));
+    }
+    return 0;
+}
+
+// A test-only image supplies pinned, operator-like harness installations under
+// this one read-only runtime root. The regular containment image intentionally
+// has no vendor client, so ordinary unit and workflow lanes retain that guard.
+auto real_native_harness_test(
+    cgroup_v2_root& root,
+    const std::filesystem::path& materialization_root,
+    const std::filesystem::path& library_root,
+    std::uint64_t page
+) -> int {
+    const char* configured_root = ::getenv("GLOVE_TEST_NATIVE_HARNESS_ROOT");
+    if (configured_root == nullptr || *configured_root == '\0') {
+        return 0;
+    }
+    std::error_code error;
+    const auto harness_root = std::filesystem::canonical(configured_root, error);
+    REQUIRE(!error);
+    REQUIRE(std::filesystem::is_directory(harness_root));
+
+    constexpr std::string_view bundle =
+        R"({"schema_version":1,"source_library_ref":"bafy-native","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"}]})";
+    const auto bundle_digest = digest_for(bundle);
+    REQUIRE(bundle_digest.size() == 64U);
+    const auto bundle_path = library_root / (bundle_digest + ".json");
+    {
+        std::ofstream output{bundle_path, std::ios::binary | std::ios::trunc};
+        output << bundle;
+    }
+    REQUIRE(::chmod(bundle_path.c_str(), 0600) == 0);
+    auto store = glove::supervisor::library_bundle_store::open(library_root);
+    REQUIRE(store.has_value());
+
+    struct harness_case {
+        std::string_view runtime_id;
+        std::string_view executable;
+    };
+
+    constexpr std::array<harness_case, 4> harnesses{{
+        {"claude-code", "claude"},
+        {"pi", "pi"},
+        {"copilot", "copilot"},
+        {"opencode", "opencode"},
+    }};
+    auto limits = limits_for(page * 256U);
+    // Vendor startup shapes differ; this is a conformance ceiling, not the
+    // low-limit enforcement probe elsewhere in this test suite.
+    limits.memory_bytes = std::uint64_t{1} * 1024U * 1024U * 1024U;
+    limits.pids = 64;
+    limits.wall_time_ms = 20'000;
+    limits.disk_bytes = std::uint64_t{512} * 1024U * 1024U;
+    const auto bin_directory = harness_root / "node_modules" / ".bin";
+    const auto node_directory = harness_root / "node-runtime" / "bin";
+    for (const auto& harness : harnesses) {
+        const auto adapter =
+            glove::supervisor::native_skill_runtime_adapter_for(harness.runtime_id);
+        REQUIRE(adapter.has_value());
+        const auto executable = bin_directory / harness.executable;
+        REQUIRE(std::filesystem::is_regular_file(executable));
+        REQUIRE(::access(executable.c_str(), X_OK) == 0);
+
+        auto projections = store->resolve_projections({{
+            .projection =
+                {
+                    .projection_id = "sage-native",
+                    .content_digest = bundle_digest,
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        }});
+        REQUIRE(projections.has_value());
+        auto lifecycle = make_lifecycle(
+            root,
+            materialization_root,
+            {},
+            std::string{"managed-real-"} + std::string{harness.runtime_id},
+            limits,
+            std::move(*projections),
+            harness.runtime_id
+        );
+        REQUIRE(lifecycle.has_value());
+        auto prof = launch_profile(limits);
+        prof.environment = {
+            "PATH=" + bin_directory.string() + ":" + node_directory.string() + ":/usr/bin:/bin",
+            "TERM=xterm-256color",
+        };
+        for (const auto& variable : adapter->managed_environment) {
+            prof.environment.push_back(variable);
+        }
+        prof.runtime_filesystem.push_back({.path = harness_root.string(), .writable = false});
+        prof.managed_home_dir = "/home/agent";
+        const std::vector argv = {executable.string(), std::string{"--version"}};
+        auto binding = glove::container::linux_detail::bind_managed_session(
+            prof, argv, **lifecycle, controller_plan_digest
+        );
+        REQUIRE(binding.has_value());
+        auto session = glove::container::linux_detail::start_managed_pty_session(
+            prof,
+            argv,
+            *binding,
+            std::move(*lifecycle),
+            {
+                .transcript_bytes = 64U * 1024U,
+                .max_read_bytes = 64U * 1024U,
+                .max_input_frame_bytes = 64U * 1024U,
+                .input_timeout_ms = 1'000,
+                .initial_rows = 24,
+                .initial_columns = 80,
+            },
+            [](::pid_t) -> std::expected<void, std::string> { return {}; }
+        );
+        REQUIRE(session.has_value());
+        auto output = (*session)->wait_read(0, 64U * 1024U, 5'000);
+        REQUIRE(output.has_value());
+        auto terminal = (*session)->wait();
+        REQUIRE(terminal.has_value());
+        if (terminal->exit_code != 0) {
+            std::fprintf(
+                stderr,
+                "Glove Linux real native harness probe (%.*s) exited %d: %.*s\n",
+                static_cast<int>(harness.runtime_id.size()),
+                harness.runtime_id.data(),
+                terminal->exit_code.value_or(-1),
+                static_cast<int>(output->bytes.size()),
+                output->bytes.data()
+            );
+            std::fprintf(
+                stderr,
+                "  termination=%u peak_memory=%llu peak_pids=%u wall=%llu\n",
+                static_cast<unsigned int>(terminal->termination_cause),
+                static_cast<unsigned long long>(terminal->observed.peak_memory_bytes),
+                terminal->observed.peak_pids,
+                static_cast<unsigned long long>(terminal->observed.wall_time_ms)
+            );
+            return 1;
+        }
+        REQUIRE(terminal->termination_cause == resource_termination_cause::exited);
+        REQUIRE(!output->bytes.empty());
+        REQUIRE(!output->truncated);
+        REQUIRE(terminal->profile_digest == binding->profile_digest);
+        REQUIRE(terminal->library_projections.size() == 1U);
+        REQUIRE(terminal->library_projections.front().content_digest == bundle_digest);
+        REQUIRE(std::filesystem::is_empty(materialization_root));
+        std::fprintf(
+            stderr,
+            "Glove Linux real native harness probe (%.*s) passed\n",
+            static_cast<int>(harness.runtime_id.size()),
+            harness.runtime_id.data()
+        );
     }
     return 0;
 }
@@ -800,6 +957,7 @@ auto run() -> int {
     );
     REQUIRE(managed_policy_rejection_test(*root, materialization_root, source, page) == 0);
     REQUIRE(codex_runtime_context_test(*root, materialization_root, library_root, page) == 0);
+    REQUIRE(real_native_harness_test(*root, materialization_root, library_root, page) == 0);
     REQUIRE(
         child_release_is_gated_by_durable_callback_test(*root, materialization_root, page) == 0
     );

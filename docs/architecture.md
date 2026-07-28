@@ -43,7 +43,7 @@ does not sandbox the upstream processes themselves.
 |---|---|---|
 | Process visibility | PID namespace | SBPL process policy |
 | Filesystem | mount namespace, `pivot_root`, read-only binds, private writable mounts | deny-default SBPL path rules |
-| Network | network namespace plus seccomp socket denial | deny-default SBPL network rules |
+| Network | network namespace plus seccomp Internet-socket denial; private AF_UNIX socketpairs are allowed for runtime IPC | deny-default SBPL network rules |
 | Identity | user namespace and UID/GID mapping | invoking user |
 | IPC and hostname | IPC and UTS namespaces | SBPL policy |
 | Resource limits | private cgroup/quota/watchdog implementation | incomplete for the Sage six-limit contract |

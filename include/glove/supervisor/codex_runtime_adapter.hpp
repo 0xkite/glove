@@ -32,9 +32,9 @@ struct codex_runtime_projection {
 // Strictly decodes each verified Sage session-library bundle. Only `skill`
 // entries have an unambiguous Codex-native location. Other entry kinds are
 // rejected rather than silently dropping controller-selected context.
-[[nodiscard]] auto resolve_codex_runtime_projection(
-    const std::vector<resolved_library_projection>& bundles
-) -> std::expected<codex_runtime_projection, std::string>;
+[[nodiscard]] auto
+resolve_codex_runtime_projection(const std::vector<resolved_library_projection>& bundles)
+    -> std::expected<codex_runtime_projection, std::string>;
 
 // Canonical commitment for the exact native projection. This deliberately
 // commits every source bundle identity and skill byte digest without exposing

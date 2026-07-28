@@ -24,6 +24,10 @@ struct session_mount {
     std::optional<std::string> source_content_digest;
     std::optional<std::string> projection_id;
     std::optional<std::string> projection_destination_alias;
+    // Present only for an executor-derived private harness home. These values
+    // are not controller input and are committed by managed_launch_binding.
+    std::optional<std::string> runtime_adapter_id;
+    std::optional<std::string> runtime_context_digest;
     bool writable = false;
     bool directory = false;
 };
@@ -67,7 +71,8 @@ public:
         std::string_view session_id,
         std::uint64_t disk_limit_bytes,
         std::vector<resolved_path_grant>&& grants,
-        std::vector<resolved_library_projection>&& library_projections = {}
+        std::vector<resolved_library_projection>&& library_projections = {},
+        std::string_view runtime_id = {}
     );
 
     // Removes only the deterministic tmpfs partitions whose complete quota

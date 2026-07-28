@@ -29,7 +29,7 @@ host security boundary.
 | Area | Enforcement |
 |---|---|
 | Filesystem | Deny-default sandbox; explicit read/write grants; descriptor-based path resolution; link, ownership, identity, and overlap checks |
-| Network | Linux network namespace and seccomp denial; exact macOS egress rules |
+| Network | Linux network namespace plus seccomp denial of Internet-capable socket creation; private AF_UNIX socketpairs remain available only for in-sandbox runtime IPC; exact macOS egress rules |
 | Process surface | Linux PID/user/IPC/UTS namespaces; macOS deny-default SBPL |
 | Environment | Minimal environment plus named grants |
 | Tool access | Qualified allow-list and configured argument rules before upstream dispatch |

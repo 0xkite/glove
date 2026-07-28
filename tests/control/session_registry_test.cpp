@@ -32,8 +32,6 @@ namespace {
 
 constexpr std::string_view controller_digest =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-constexpr std::string_view runtime_digest =
-    "05a49649e7973f6f8d6b119c9d525472517e6021fb38f8b191e0b40c8c4741d0";
 constexpr std::string_view audit_key =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 constexpr std::string_view library_bundle =
@@ -67,8 +65,22 @@ auto library_bundle_digest() -> std::string {
     return glove::container::sha256_hex(std::span{bytes, library_bundle.size()}).value_or("");
 }
 
+auto launch_template() -> glove::supervisor::runtime_launch_template {
+    return {
+        .executable_path = "/usr/bin/true",
+        .arguments = {"--version"},
+        .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+    };
+}
+
+auto runtime_digest() -> std::string {
+    return glove::supervisor::runtime_launch_template_digest(launch_template()).value_or("");
+}
+
 auto valid_plan() -> std::string {
-    return R"({"schema_version":1,"runtime_id":"codex","runtime_template_id":"codex-safe","adapter_command_digest":"05a49649e7973f6f8d6b119c9d525472517e6021fb38f8b191e0b40c8c4741d0","sandbox_backend":"linux_production","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"alias":"workspace","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":")" +
+    return R"({"schema_version":1,"runtime_id":"codex","runtime_template_id":"codex-safe","adapter_command_digest":")" +
+           runtime_digest() +
+           R"(","sandbox_backend":"linux_production","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"alias":"workspace","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":")" +
            library_bundle_digest() +
            R"(","destination_alias":"libraries"}],"secret_handles":["codex-token"],"limits":{"cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576},"policy_revision":7,"expires_at_ms":61000})";
 }
@@ -209,16 +221,11 @@ auto validator_for(const std::filesystem::path& source)
                     runtime_template_policy{
                         .runtime_template_id = "codex-safe",
                         .runtime_id = "codex",
-                        .adapter_command_digest = std::string{runtime_digest},
+                        .adapter_command_digest = runtime_digest(),
                         .backend = sandbox_backend::linux_production,
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {"libraries"},
-                        .launch =
-                            runtime_launch_template{
-                                .executable_path = "/usr/bin/true",
-                                .arguments = {"--version"},
-                                .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
-                            },
+                        .launch = launch_template(),
                     },
                 },
             .library_projection_destinations =

@@ -142,6 +142,7 @@ auto make_inputs(
                 .backend = backend,
                 .argv = {"/usr/bin/true", "--version"},
                 .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+                .read_only_paths = {},
                 .limits = limits,
                 .expires_at_ms = now_ms + 60'000,
                 .requires_direct_write_approval = false,
@@ -233,9 +234,13 @@ auto run() -> int {
         REQUIRE(prepared->profile.required_limits.has_value());
         REQUIRE(prepared->profile.required_limits->disk_bytes == page * 16U);
         REQUIRE(
-            prepared->profile.environment ==
-            std::vector<std::string>({"PATH=/usr/bin:/bin", "TERM=xterm-256color"})
+            prepared->profile.environment == std::vector<std::string>({
+                                                 "PATH=/usr/bin:/bin",
+                                                 "TERM=xterm-256color",
+                                                 "CODEX_HOME=/home/agent/.codex",
+                                             })
         );
+        REQUIRE(prepared->profile.managed_home_dir == "/home/agent");
         REQUIRE(prepared->argv == std::vector<std::string>({"/usr/bin/true", "--version"}));
         REQUIRE(prepared->binding.controller_plan_digest == controller_digest);
         REQUIRE(prepared->binding.profile_digest.size() == 64);
@@ -260,7 +265,7 @@ auto run() -> int {
         REQUIRE(prepared->lifecycle != nullptr);
         REQUIRE(prepared->lifecycle->cgroup_fd() >= 0);
         const auto prepared_mounts = prepared->lifecycle->mounts();
-        REQUIRE(prepared_mounts.size() == 4);
+        REQUIRE(prepared_mounts.size() == 5);
         const auto library_mount = std::ranges::find(
             prepared_mounts,
             "/opt/sage/library-bundles/" + library_digest() + ".json",
@@ -268,6 +273,14 @@ auto run() -> int {
         );
         REQUIRE(library_mount != prepared_mounts.end());
         REQUIRE(library_mount->source_content_digest == library_digest());
+        const auto runtime_home_mount = std::ranges::find(
+            prepared_mounts,
+            "/home/agent",
+            &glove::supervisor::linux_detail::session_mount::target_path
+        );
+        REQUIRE(runtime_home_mount != prepared_mounts.end());
+        REQUIRE(runtime_home_mount->runtime_adapter_id == "codex");
+        REQUIRE(runtime_home_mount->runtime_context_digest.has_value());
         REQUIRE(!std::filesystem::is_empty(materializations));
     }
     REQUIRE(std::filesystem::is_empty(materializations));

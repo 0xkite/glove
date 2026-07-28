@@ -686,7 +686,14 @@ auto handle_capabilities(
                     .stop_session = state.session_runtime != nullptr,
                     .cleanup_session = state.session_runtime != nullptr,
                 },
-            .agent_runtime_adapter_schema_version = 0,
+            // Linux managed sessions own a fresh private Codex home and
+            // derive its native skills from verified Sage library bundles.
+            .agent_runtime_adapter_schema_version =
+#if defined(__linux__)
+                state.session_runtime ? std::uint8_t{1} : std::uint8_t{0},
+#else
+                std::uint8_t{0},
+#endif
             .path_exposure_admin_schema_version =
                 state.path_exposures ? std::uint8_t{1} : std::uint8_t{0},
             .path_exposure_catalog_schema_version =
@@ -1135,11 +1142,7 @@ auto handle_write_stdin(
         return error_response(request_id, "invalid_request", "invalid session input request");
     }
 #if defined(__linux__)
-    std::string bytes;
-    bytes.reserve(payload->bytes.size());
-    for (const auto byte : payload->bytes) {
-        bytes.push_back(static_cast<char>(byte));
-    }
+    const std::string bytes{payload->bytes.begin(), payload->bytes.end()};
     const auto session_id = payload->session_id;
     return handle_idempotent_session_mutation(
         state,
@@ -1537,7 +1540,6 @@ auto handle_inspect_retained_changes(
     const auto end =
         std::min(manifest->changes.size(), begin + static_cast<std::size_t>(payload->limit));
     std::vector<retained_change_entry> changes;
-    changes.reserve(end - begin);
     for (auto index = begin; index < end; ++index) {
         const auto& change = manifest->changes[index];
         changes.push_back({

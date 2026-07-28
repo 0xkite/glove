@@ -28,6 +28,7 @@
 #include <seccomp.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -657,6 +658,11 @@ auto build_rootfs(
     if (!program_bound) {
         return program_bound;
     }
+    for (const auto& rule : prof.runtime_filesystem) {
+        if (auto bound = bind_path(new_root, rule.path, false); !bound) {
+            return bound;
+        }
+    }
     for (const auto& rule : prof.filesystem) {
         if (auto bound = bind_path(new_root, rule.path, rule.writable); !bound) {
             return bound;
@@ -725,7 +731,8 @@ auto install_environment(const profile& prof) -> std::expected<void, std::string
             return std::unexpected(std::string{"setenv "} + name + ": " + std::strerror(errno));
         }
     }
-    if (prof.home_dir && ::setenv("HOME", prof.home_dir->c_str(), 1) != 0) {
+    const auto& home_dir = prof.managed_home_dir ? prof.managed_home_dir : prof.home_dir;
+    if (home_dir && ::setenv("HOME", home_dir->c_str(), 1) != 0) {
         return std::unexpected(std::string{"setenv HOME: "} + std::strerror(errno));
     }
     if (prof.temp_dir && ::setenv("TMPDIR", prof.temp_dir->c_str(), 1) != 0) {
@@ -757,12 +764,13 @@ auto setup_seccomp() -> std::expected<void, std::string> {
         return ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), syscall_nr, 0);
     };
 
-    // Network: deny new socket creation. The kernel-mediated MCP pipe is
-    // already open (file descriptors survive seccomp_load), so the agent
-    // can still read/write its existing channel; it just cannot phone home.
+    // Network: deny all Internet-capable socket creation. A local AF_UNIX
+    // socketpair is safe inside the private IPC namespace and lets runtimes use
+    // their signal helpers; it cannot connect to a host or network endpoint.
+    // The kernel-mediated MCP pipe is already open (file descriptors survive
+    // seccomp_load), so the agent can still read/write its existing channel.
     const int net_syscalls[] = {
         SCMP_SYS(socket),
-        SCMP_SYS(socketpair),
         SCMP_SYS(bind),
         SCMP_SYS(connect),
         SCMP_SYS(listen),
@@ -778,6 +786,19 @@ auto setup_seccomp() -> std::expected<void, std::string> {
             ::seccomp_release(ctx);
             return std::unexpected(std::string{"deny network syscall: "} + std::strerror(-rc));
         }
+    }
+    const scmp_arg_cmp socketpair_domain{
+        .arg = 0,
+        .op = SCMP_CMP_NE,
+        .datum_a = AF_UNIX,
+        .datum_b = 0,
+    };
+    if (int rc = ::seccomp_rule_add(
+            ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socketpair), 1, socketpair_domain
+        );
+        rc != 0) {
+        ::seccomp_release(ctx);
+        return std::unexpected(std::string{"deny non-Unix socketpair: "} + std::strerror(-rc));
     }
 
     // Namespace + mount manipulation: an already-contained agent has no
