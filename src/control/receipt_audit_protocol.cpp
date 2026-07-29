@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <memory>
 #include <mutex>
@@ -966,6 +967,15 @@ auto handle_start_session(
     auto started =
         state.session_runtime->start(**producer, payload->authorization, idempotency_key, now_ms);
     if (!started) {
+        // The authenticated caller receives a stable, non-sensitive denial,
+        // while the owner-local service journal retains the actionable host
+        // failure needed to repair namespace, mount, or cgroup setup.
+        std::fprintf(
+            stderr,
+            "gloved: managed session %s start failed: %s\n",
+            payload->authorization.session_id.c_str(),
+            started.error().c_str()
+        );
         return error_response(request_id, "session_start_failed", "session start was rejected");
     }
     auto response = session_result(*state.sessions, *started);

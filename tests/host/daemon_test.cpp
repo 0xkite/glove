@@ -79,7 +79,14 @@ auto run() -> int {
     REQUIRE(plan->manager == daemon_service_manager::systemd_user);
     REQUIRE(plan->service_name == "sage-gloved.service");
     REQUIRE(plan->service_path == temporary.root() / ".config/systemd/user/sage-gloved.service");
-    REQUIRE(plan->service_definition.find("ExecStart=\"") != std::string::npos);
+    REQUIRE(
+        plan->service_definition.find(
+            "ExecStart=\"/usr/bin/unshare\" --user --map-root-user --mount "
+            "--propagation private -- \""
+        ) != std::string::npos
+    );
+    REQUIRE(plan->service_definition.find(gloved.string()) != std::string::npos);
+    REQUIRE(plan->service_definition.find("Delegate=cpu memory pids\n") != std::string::npos);
 #elif defined(__APPLE__)
     REQUIRE(plan->manager == daemon_service_manager::launchd_user);
     REQUIRE(plan->service_name == "org.sage-protocol.gloved");

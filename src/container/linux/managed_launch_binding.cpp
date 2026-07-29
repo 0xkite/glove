@@ -329,6 +329,7 @@ public:
     }
 
     [[nodiscard]] auto bytes() const noexcept -> std::span<const unsigned char> { return bytes_; }
+
     [[nodiscard]] auto valid() const noexcept -> bool { return valid_; }
 
 private:
@@ -481,7 +482,9 @@ auto bind_managed_launch_projection_from_fd(
         }
     }
     if (!encoder.valid()) {
-        return std::unexpected(std::string{"managed launch field exceeds canonical encoding limit"});
+        return std::unexpected(
+            std::string{"managed launch field exceeds canonical encoding limit"}
+        );
     }
     auto digest = detail::sha256_hex(encoder.bytes());
     if (!digest) {

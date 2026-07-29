@@ -1564,7 +1564,7 @@ auto start_reservation_from_record(
     if (!launch) {
         return std::unexpected(failure(
             session_registry_error_code::invalid_plan,
-            "stored session plan no longer resolves to a runtime launch"
+            "stored session plan no longer resolves to a runtime launch: " + launch.error()
         ));
     }
     if (launch->requires_direct_write_approval) {
@@ -2228,7 +2228,7 @@ auto session_registry::reserve_start(
     if (!launch) {
         return std::unexpected(failure(
             session_registry_error_code::invalid_plan,
-            "stored session plan no longer resolves to a runtime launch"
+            "stored session plan no longer resolves to a runtime launch: " + launch.error()
         ));
     }
     if (launch->requires_direct_write_approval) {
@@ -2368,7 +2368,7 @@ auto session_registry::resolve_start_inputs(
     if (!launch) {
         return std::unexpected(failure(
             session_registry_error_code::invalid_plan,
-            "stored session plan no longer resolves to a runtime launch"
+            "stored session plan no longer resolves to a runtime launch: " + launch.error()
         ));
     }
     if (launch->requires_direct_write_approval) {

@@ -35,6 +35,7 @@ namespace {
 
 #if defined(__linux__)
 constexpr std::string_view systemd_service_name = "sage-gloved.service";
+constexpr std::string_view unshare_executable = "/usr/bin/unshare";
 #elif defined(__APPLE__)
 constexpr std::string_view launchd_service_name = "org.sage-protocol.gloved";
 #endif
@@ -175,7 +176,8 @@ auto systemd_definition(
 ) -> result<std::string> {
     const auto executable = gloved.string();
     const auto config = config_path.string();
-    if (!safe_systemd_path(executable) || !safe_systemd_path(config)) {
+    if (!safe_systemd_path(unshare_executable) || !safe_systemd_path(executable) ||
+        !safe_systemd_path(config)) {
         return std::unexpected(
             std::string{"systemd service paths contain unsupported control or expansion bytes"}
         );
@@ -185,8 +187,11 @@ auto systemd_definition(
            "[Service]\n"
            "Type=simple\n"
            "ExecStart=\"" +
-           executable + "\" --config \"" + config +
-           "\"\nRestart=on-failure\nRestartSec=2s\nTimeoutStopSec=15s\nUMask=0077\n\n"
+           std::string{unshare_executable} +
+           "\" --user --map-root-user --mount --propagation private -- \"" + executable +
+           "\" --config \"" + config +
+           "\"\nDelegate=cpu memory pids\nRestart=on-failure\nRestartSec=2s\nTimeoutStopSec=15s\n"
+           "UMask=0077\n\n"
            "[Install]\nWantedBy=default.target\n";
 }
 #endif

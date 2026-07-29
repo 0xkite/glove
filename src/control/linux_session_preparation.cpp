@@ -61,7 +61,8 @@ auto validate_inputs(const session_start_inputs& inputs, std::uint64_t started_a
     if (inputs.session.state != session_state::preparing) {
         return std::unexpected(std::string{"session is not durably reserved for preparation"});
     }
-    if (inputs.session.schema_version != 1 || inputs.launch.validation.schema_version != 1) {
+    if (inputs.session.schema_version != 1 || (inputs.launch.validation.schema_version != 1 &&
+                                               inputs.launch.validation.schema_version != 2)) {
         return std::unexpected(std::string{"Linux preparation schema is unsupported"});
     }
     if (!valid_identifier(inputs.session.session_id) ||

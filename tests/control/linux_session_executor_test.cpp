@@ -38,8 +38,6 @@ namespace glove_test {
 
 constexpr std::string_view controller_digest =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-constexpr std::string_view runtime_digest =
-    "05a49649e7973f6f8d6b119c9d525472517e6021fb38f8b191e0b40c8c4741d0";
 constexpr std::string_view audit_key =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 constexpr std::string_view bootstrap_secret =
@@ -161,9 +159,24 @@ auto make_request(
 
 auto interactive_runtime_digest() -> std::string {
     auto digest = glove::supervisor::runtime_launch_template_digest({
+        .runtime_discovery = {},
         .executable_path = "/usr/bin/cat",
+        .executable_search_paths = {},
         .arguments = {},
         .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+        .read_only_paths = {},
+    });
+    return digest.value_or(std::string{});
+}
+
+auto safe_runtime_digest() -> std::string {
+    auto digest = glove::supervisor::runtime_launch_template_digest({
+        .runtime_discovery = {},
+        .executable_path = "/usr/bin/true",
+        .executable_search_paths = {},
+        .arguments = {"--version"},
+        .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+        .read_only_paths = {},
     });
     return digest.value_or(std::string{});
 }
@@ -221,9 +234,10 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
     if (!paths) {
         return std::unexpected(paths.error());
     }
+    const auto safe_digest = safe_runtime_digest();
     const auto interactive_digest = interactive_runtime_digest();
-    if (interactive_digest.empty()) {
-        return std::unexpected(std::string{"derive interactive runtime digest"});
+    if (safe_digest.empty() || interactive_digest.empty()) {
+        return std::unexpected(std::string{"derive runtime digest"});
     }
     return session_plan_validator::build(
         session_plan_policy{
@@ -234,15 +248,18 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
                     runtime_template_policy{
                         .runtime_template_id = "codex-safe",
                         .runtime_id = "codex",
-                        .adapter_command_digest = std::string{runtime_digest},
+                        .adapter_command_digest = safe_digest,
                         .backend = sandbox_backend::linux_production,
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {"libraries"},
                         .launch =
                             runtime_launch_template{
+                                .runtime_discovery = {},
                                 .executable_path = "/usr/bin/true",
+                                .executable_search_paths = {},
                                 .arguments = {"--version"},
                                 .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+                                .read_only_paths = {},
                             },
                     },
                     runtime_template_policy{
@@ -254,9 +271,12 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
                         .allowed_projection_destinations = {"libraries"},
                         .launch =
                             runtime_launch_template{
+                                .runtime_discovery = {},
                                 .executable_path = "/usr/bin/cat",
+                                .executable_search_paths = {},
                                 .arguments = {},
                                 .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+                                .read_only_paths = {},
                             },
                     },
                 },
@@ -291,7 +311,7 @@ auto plan(
 ) -> std::string {
     const auto adapter_digest = runtime_template_id == "codex-interactive"
                                     ? interactive_runtime_digest()
-                                    : std::string{runtime_digest};
+                                    : safe_runtime_digest();
     return std::string{"{\"schema_version\":1,\"runtime_id\":\"codex\","} +
            "\"runtime_template_id\":\"" + std::string{runtime_template_id} +
            "\",\"adapter_command_digest\":\"" + adapter_digest +

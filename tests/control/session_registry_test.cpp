@@ -67,9 +67,12 @@ auto library_bundle_digest() -> std::string {
 
 auto launch_template() -> glove::supervisor::runtime_launch_template {
     return {
+        .runtime_discovery = {},
         .executable_path = "/usr/bin/true",
+        .executable_search_paths = {},
         .arguments = {"--version"},
         .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+        .read_only_paths = {},
     };
 }
 

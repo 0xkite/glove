@@ -412,6 +412,10 @@ auto run() -> int {
     auto accepted_v2 = v2_validator->validate_json(v2_plan, 1'000);
     REQUIRE(accepted_v2.has_value());
     REQUIRE(accepted_v2->schema_version == 2);
+    auto launch_v2 = v2_validator->resolve_runtime_launch_json(v2_plan, 1'000);
+    REQUIRE(launch_v2.has_value());
+    REQUIRE(launch_v2->validation.schema_version == 2);
+    REQUIRE(!launch_v2->requires_direct_write_approval);
     auto canonical_v2 = v2_validator->canonicalize_json(v2_plan, 1'000);
     REQUIRE(canonical_v2.has_value());
     REQUIRE(canonical_v2->canonical_json == v2_plan);

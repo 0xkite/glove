@@ -60,7 +60,10 @@ glove daemon status
 `sage-gloved.service` with the systemd user manager on Linux and
 `org.sage-protocol.gloved` with the launchd GUI domain on macOS. The service
 definition fixes the resolved local `gloved` binary and protected config path;
-no remote request can alter them.
+no remote request can alter them. On Linux the fixed service enters an
+unprivileged user and private mount namespace before starting `gloved`, while
+systemd delegates the `cpu`, `memory`, and `pids` cgroup controllers. Both are
+required for quota-backed session filesystems and managed resource limits.
 
 Use `--config <absolute-file>` for a non-default machine configuration and
 `--gloved <absolute-file>` only when the daemon binary is not installed beside

@@ -1199,7 +1199,6 @@ auto session_plan_validator::resolve_runtime_launch_json(
         .limits = plan.limits,
         .expires_at_ms = plan.expires_at_ms,
         .requires_direct_write_approval =
-            validation->schema_version == 1 &&
             std::ranges::any_of(plan.path_grants, [](const auto& grant) {
                 return grant.access == "direct_write";
             }),

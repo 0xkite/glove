@@ -137,13 +137,16 @@ auto run() -> int {
             glove::mcp::make_client(glove::mcp::make_in_memory_transport(correlated_server));
         std::array<bool, 8> succeeded{};
         {
-            std::vector<std::jthread> workers;
+            std::vector<std::thread> workers;
             workers.reserve(succeeded.size());
             for (std::size_t index = 0; index < succeeded.size(); ++index) {
                 workers.emplace_back([&concurrent, &succeeded, index] {
                     auto result = concurrent->call_tool({.name = "echo", .arguments_json = "{}"});
                     succeeded[index] = result.has_value() && result->content == "ok";
                 });
+            }
+            for (auto& worker : workers) {
+                worker.join();
             }
         }
         for (const bool result : succeeded) {

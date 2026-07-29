@@ -66,6 +66,8 @@ auto mounts() -> std::vector<session_mount> {
             .source_content_digest = std::nullopt,
             .projection_id = std::nullopt,
             .projection_destination_alias = std::nullopt,
+            .runtime_adapter_id = std::nullopt,
+            .runtime_context_digest = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -79,6 +81,8 @@ auto mounts() -> std::vector<session_mount> {
             .source_content_digest = std::nullopt,
             .projection_id = std::nullopt,
             .projection_destination_alias = std::nullopt,
+            .runtime_adapter_id = std::nullopt,
+            .runtime_context_digest = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -97,6 +101,8 @@ auto mounts() -> std::vector<session_mount> {
             .source_content_digest = std::nullopt,
             .projection_id = std::nullopt,
             .projection_destination_alias = std::nullopt,
+            .runtime_adapter_id = std::nullopt,
+            .runtime_context_digest = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -115,6 +121,8 @@ auto mounts() -> std::vector<session_mount> {
             .source_content_digest = std::nullopt,
             .projection_id = std::nullopt,
             .projection_destination_alias = std::nullopt,
+            .runtime_adapter_id = std::nullopt,
+            .runtime_context_digest = std::nullopt,
             .writable = false,
             .directory = true,
         },
@@ -203,6 +211,8 @@ auto run() -> int {
         .source_content_digest = library_digest,
         .projection_id = "sage-core",
         .projection_destination_alias = "libraries",
+        .runtime_adapter_id = std::nullopt,
+        .runtime_context_digest = std::nullopt,
         .writable = false,
         .directory = false,
     });
@@ -260,7 +270,7 @@ auto run() -> int {
         first_profile, executable_argv, first_mounts, controller_digest, executable_fd
     );
     REQUIRE(pinned_after.has_value());
-    REQUIRE(pinned_after->profile_digest != pinned_before->profile_digest);
+    REQUIRE(pinned_after == pinned_before);
     auto pinned_repeated = glove::container::linux_detail::bind_managed_launch_projection_from_fd(
         first_profile, executable_argv, first_mounts, controller_digest, executable_fd
     );

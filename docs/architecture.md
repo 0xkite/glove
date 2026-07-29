@@ -109,6 +109,11 @@ on Linux or launchd on macOS. The CLI resolves the local `gloved` executable,
 binds it to the protected config, writes the service definition atomically, and
 invokes the service manager without a shell. It never accepts service labels,
 extra arguments, environment, or lifecycle requests from P2P.
+The Linux unit enters an unprivileged user namespace and a private mount
+namespace before executing `gloved`; that gives the current user namespace only
+the mount authority needed for quota-backed private session filesystems.
+Systemd separately delegates the `cpu`, `memory`, and `pids` controllers to the
+unit. Neither mechanism grants host-root authority.
 
 When Sage configures `glove_activation_mode = "user_service"`, `saged` first
 asks the platform user service manager to start the fixed local Glove unit. It
