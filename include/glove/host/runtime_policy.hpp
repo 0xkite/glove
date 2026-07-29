@@ -51,6 +51,13 @@ struct staged_runtime_harness {
     std::string executable_name;
     std::filesystem::path source_executable;
     std::filesystem::path protected_entry_point;
+    // Canonical launch closure derived locally from the staged entry point.
+    // Script harnesses launch their pinned interpreter with source_executable
+    // as the first argument; native harnesses launch source_executable
+    // directly. These paths never include an operator credential/config home.
+    std::filesystem::path launch_executable;
+    std::vector<std::string> launch_arguments;
+    std::vector<std::filesystem::path> read_only_paths;
     bool changed = false;
 };
 

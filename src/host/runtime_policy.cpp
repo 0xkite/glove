@@ -4,16 +4,25 @@
 
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
+#include <spawn.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cerrno>
+#include <fstream>
+#include <limits>
 #include <ranges>
 #include <set>
+#include <sstream>
 #include <string_view>
 #include <system_error>
 #include <utility>
+
+extern char** environ;
 
 namespace glove::host {
 namespace runtime_policy_wire {
@@ -126,6 +135,290 @@ auto ensure_protected_directory(const std::filesystem::path& path) -> result<voi
     return {};
 }
 
+auto path_within(const std::filesystem::path& candidate, const std::filesystem::path& root) noexcept
+    -> bool {
+    const auto mismatch =
+        std::mismatch(root.begin(), root.end(), candidate.begin(), candidate.end());
+    return mismatch.first == root.end();
+}
+
+auto capture_command(
+    const std::filesystem::path& executable, const std::vector<std::string>& arguments
+) -> result<std::string> {
+    constexpr std::size_t max_output_bytes = 1024U * 1024U;
+    std::array<int, 2> output_pipe{-1, -1};
+    if (::pipe(output_pipe.data()) != 0) {
+        return std::unexpected(system_error("create dependency command pipe"));
+    }
+    if (::fcntl(output_pipe[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        ::fcntl(output_pipe[1], F_SETFD, FD_CLOEXEC) < 0) {
+        const auto error = system_error("protect dependency command pipe");
+        (void)::close(output_pipe[0]);
+        (void)::close(output_pipe[1]);
+        return std::unexpected(error);
+    }
+
+    ::posix_spawn_file_actions_t actions{};
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+        (void)::close(output_pipe[0]);
+        (void)::close(output_pipe[1]);
+        return std::unexpected(std::string{"initialize dependency command"});
+    }
+    const std::array action_results = {
+        ::posix_spawn_file_actions_adddup2(&actions, output_pipe[1], STDOUT_FILENO),
+        ::posix_spawn_file_actions_addclose(&actions, output_pipe[0]),
+        ::posix_spawn_file_actions_addclose(&actions, output_pipe[1]),
+        ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0),
+    };
+    if (const auto failed =
+            std::ranges::find_if(action_results, [](int result) { return result != 0; });
+        failed != action_results.end()) {
+        (void)::posix_spawn_file_actions_destroy(&actions);
+        (void)::close(output_pipe[0]);
+        (void)::close(output_pipe[1]);
+        return std::unexpected(
+            std::string{"configure dependency command: "} +
+            std::error_code{*failed, std::generic_category()}.message()
+        );
+    }
+
+    std::vector<std::string> owned_argv;
+    owned_argv.reserve(arguments.size() + 1U);
+    owned_argv.push_back(executable.string());
+    owned_argv.insert(owned_argv.end(), arguments.begin(), arguments.end());
+    std::vector<char*> argv;
+    argv.reserve(owned_argv.size() + 1U);
+    for (auto& argument : owned_argv) {
+        argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
+
+    ::pid_t child = -1;
+    const int spawned =
+        ::posix_spawn(&child, executable.c_str(), &actions, nullptr, argv.data(), environ);
+    (void)::posix_spawn_file_actions_destroy(&actions);
+    (void)::close(output_pipe[1]);
+    if (spawned != 0) {
+        (void)::close(output_pipe[0]);
+        return std::unexpected(
+            std::string{"launch dependency command: "} +
+            std::error_code{spawned, std::generic_category()}.message()
+        );
+    }
+
+    std::string output;
+    std::array<char, 4096> buffer{};
+    while (output.size() <= max_output_bytes) {
+        const auto count = ::read(output_pipe[0], buffer.data(), buffer.size());
+        if (count > 0) {
+            output.append(buffer.data(), static_cast<std::size_t>(count));
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    (void)::close(output_pipe[0]);
+    int child_status = 0;
+    ::pid_t waited = -1;
+    do {
+        waited = ::waitpid(child, &child_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited < 0) {
+        return std::unexpected(std::string{"wait for dependency command: "} + std::strerror(errno));
+    }
+    if (output.size() > max_output_bytes || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0) {
+        return std::unexpected(std::string{"dependency command failed"});
+    }
+    return output;
+}
+
+auto valid_formula_name(std::string_view value) noexcept -> bool {
+    return !value.empty() && value.size() <= 128U &&
+           std::ranges::all_of(value, [](unsigned char byte) {
+               return std::isalnum(byte) != 0 || byte == '@' || byte == '+' || byte == '-' ||
+                      byte == '_' || byte == '.';
+           });
+}
+
+struct homebrew_keg {
+    std::filesystem::path prefix;
+    std::string formula;
+    std::filesystem::path root;
+};
+
+auto homebrew_keg_for(const std::filesystem::path& path) -> std::optional<homebrew_keg> {
+    std::filesystem::path prefix;
+    auto component = path.begin();
+    for (; component != path.end() && *component != "Cellar"; ++component) {
+        prefix /= *component;
+    }
+    if (component == path.end()) {
+        return std::nullopt;
+    }
+    ++component;
+    if (component == path.end()) {
+        return std::nullopt;
+    }
+    const std::string formula = component->string();
+    ++component;
+    if (!valid_formula_name(formula) || component == path.end()) {
+        return std::nullopt;
+    }
+    return homebrew_keg{
+        .prefix = prefix,
+        .formula = formula,
+        .root = prefix / "Cellar" / formula / *component,
+    };
+}
+
+auto append_homebrew_runtime_closure(
+    const homebrew_keg& interpreter, std::vector<std::filesystem::path>& paths
+) -> result<void> {
+    const auto brew = interpreter.prefix / "bin" / "brew";
+    std::error_code error;
+    const auto canonical_brew = std::filesystem::canonical(brew, error);
+    if (error) {
+        return std::unexpected("resolve Homebrew dependency tool: " + error.message());
+    }
+    auto dependencies =
+        capture_command(canonical_brew, {"deps", "--installed", "--formula", interpreter.formula});
+    if (!dependencies) {
+        return std::unexpected(dependencies.error());
+    }
+    paths.push_back(interpreter.root);
+    std::istringstream lines{*dependencies};
+    for (std::string formula; std::getline(lines, formula);) {
+        if (!valid_formula_name(formula)) {
+            return std::unexpected(std::string{"Homebrew returned an invalid dependency name"});
+        }
+        const auto dependency_link = interpreter.prefix / "opt" / formula;
+        const auto dependency = std::filesystem::canonical(dependency_link, error);
+        if (error) {
+            return std::unexpected(
+                "resolve Homebrew dependency " + formula + ": " + error.message()
+            );
+        }
+        const auto keg = homebrew_keg_for(dependency);
+        if (!keg) {
+            return std::unexpected(
+                "Homebrew dependency does not resolve to one immutable keg: " + formula
+            );
+        }
+        paths.push_back(keg->root);
+    }
+    return {};
+}
+
+auto minimise_roots(std::vector<std::filesystem::path> paths)
+    -> std::vector<std::filesystem::path> {
+    std::ranges::sort(paths);
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+    std::vector<std::filesystem::path> roots;
+    for (const auto& candidate : paths) {
+        if (std::ranges::any_of(roots, [&](const auto& root) {
+                return path_within(candidate, root);
+            })) {
+            continue;
+        }
+        std::erase_if(roots, [&](const auto& root) { return path_within(root, candidate); });
+        roots.push_back(candidate);
+    }
+    std::ranges::sort(roots);
+    return roots;
+}
+
+struct runtime_dependency_closure {
+    std::filesystem::path executable;
+    std::vector<std::string> arguments;
+    std::vector<std::filesystem::path> read_only_paths;
+};
+
+auto package_root_for(const std::filesystem::path& source) -> std::filesystem::path {
+    std::error_code error;
+    for (auto current = source.parent_path(); current != current.root_path();
+         current = current.parent_path()) {
+        const auto manifest = current / "package.json";
+        if (std::filesystem::is_regular_file(manifest, error) && !error) {
+            return current;
+        }
+        error.clear();
+    }
+    return source;
+}
+
+auto derive_runtime_dependency_closure(
+    const std::filesystem::path& source_entry, const std::filesystem::path& source
+) -> result<runtime_dependency_closure> {
+    std::ifstream input{source, std::ios::binary};
+    std::string first_line;
+    std::getline(input, first_line);
+    if (!first_line.starts_with("#!")) {
+        return runtime_dependency_closure{
+            .executable = source,
+            .arguments = {},
+            .read_only_paths = {source},
+        };
+    }
+    first_line.erase(0, 2);
+    std::istringstream shebang{first_line};
+    std::vector<std::string> fields;
+    for (std::string field; shebang >> field;) {
+        fields.push_back(std::move(field));
+    }
+    if (fields.empty() || fields.size() > 2U) {
+        return std::unexpected(std::string{"unsupported harness interpreter directive"});
+    }
+
+    std::filesystem::path interpreter;
+    std::error_code error;
+    if (fields.front() == "/usr/bin/env") {
+        if (fields.size() != 2U || fields[1].find('/') != std::string::npos) {
+            return std::unexpected(std::string{"unsupported env-based harness interpreter"});
+        }
+        interpreter = std::filesystem::canonical(source_entry.parent_path() / fields[1], error);
+        if (error) {
+            return std::unexpected(
+                "resolve adjacent harness interpreter " + fields[1] + ": " + error.message()
+            );
+        }
+    } else {
+        if (fields.size() != 1U || !std::filesystem::path{fields.front()}.is_absolute()) {
+            return std::unexpected(std::string{"harness interpreter must be absolute"});
+        }
+        interpreter = std::filesystem::canonical(fields.front(), error);
+        if (error) {
+            return std::unexpected("resolve harness interpreter: " + error.message());
+        }
+    }
+    const auto status = std::filesystem::status(interpreter, error);
+    if (error || !std::filesystem::is_regular_file(status)) {
+        return std::unexpected(std::string{"harness interpreter is not a regular file"});
+    }
+
+    std::vector<std::filesystem::path> roots{package_root_for(source)};
+    if (const auto keg = homebrew_keg_for(interpreter)) {
+        if (auto appended = append_homebrew_runtime_closure(*keg, roots); !appended) {
+            return std::unexpected(appended.error());
+        }
+    } else if (fields.front() == "/usr/bin/env") {
+        const auto installation_root = interpreter.parent_path().parent_path();
+        if (installation_root == installation_root.root_path()) {
+            return std::unexpected(
+                std::string{"refusing root-wide interpreter dependency closure"}
+            );
+        }
+        roots.push_back(installation_root);
+    }
+    return runtime_dependency_closure{
+        .executable = std::move(interpreter),
+        .arguments = {source.string()},
+        .read_only_paths = minimise_roots(std::move(roots)),
+    };
+}
+
 } // namespace
 
 auto detect_runtime_harnesses(const std::vector<std::filesystem::path>& executable_search_paths)
@@ -190,6 +483,10 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
         return std::unexpected("canonicalize protected harness directory: " + error.message());
     }
     const auto entry_point = directory / adapter->executable_name;
+    auto dependency_closure = derive_runtime_dependency_closure(options.source_executable, source);
+    if (!dependency_closure) {
+        return std::unexpected(dependency_closure.error());
+    }
     bool changed = false;
     if (!options.dry_run) {
         if (auto prepared = ensure_protected_directory(directory); !prepared) {
@@ -236,6 +533,9 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
         .executable_name = adapter->executable_name,
         .source_executable = source,
         .protected_entry_point = entry_point,
+        .launch_executable = std::move(dependency_closure->executable),
+        .launch_arguments = std::move(dependency_closure->arguments),
+        .read_only_paths = std::move(dependency_closure->read_only_paths),
         .changed = changed,
     };
 }

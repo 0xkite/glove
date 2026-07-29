@@ -51,6 +51,18 @@ struct detection_report {
     std::vector<harness> harnesses;
 };
 
+struct stage_report {
+    std::uint8_t schema_version = 1;
+    std::string runtime_id;
+    std::string protected_entry_point;
+    std::string source_executable;
+    std::string launch_executable;
+    std::vector<std::string> launch_arguments;
+    std::vector<std::string> read_only_paths;
+    bool changed = false;
+    bool dry_run = false;
+};
+
 struct validation_report {
     std::uint8_t schema_version = 1;
     bool valid = false;
@@ -188,7 +200,7 @@ void print_policy_usage() {
         "usage:\n"
         "  glove policy detect --search-path <absolute-directory>... [--json]\n"
         "  glove policy stage --runtime <id> --source <absolute-file>\n"
-        "      --directory <absolute-directory> [--dry-run | --yes]\n"
+        "      --directory <absolute-directory> [--dry-run | --yes] [--json]\n"
         "  glove policy generate --runtime <id>\n"
         "      (--executable <absolute-file> | --search-path <absolute-directory>...)\n"
         "      [--template-id <id>] [--backend <linux_production|macos_experimental>]\n"
@@ -580,6 +592,7 @@ auto policy_command(std::span<char* const> arguments) -> int {
     if (action == "stage") {
         runtime_harness_stage_options options;
         bool yes = false;
+        bool json = false;
         for (std::size_t index = 1; index < arguments.size();) {
             const std::string_view argument{arguments[index]};
             if (argument == "--yes") {
@@ -587,6 +600,9 @@ auto policy_command(std::span<char* const> arguments) -> int {
                 ++index;
             } else if (argument == "--dry-run") {
                 options.dry_run = true;
+                ++index;
+            } else if (argument == "--json") {
+                json = true;
                 ++index;
             } else if (
                 index + 1 < arguments.size() &&
@@ -632,22 +648,53 @@ auto policy_command(std::span<char* const> arguments) -> int {
         if (!staged) {
             return print_error("policy_stage_failed", staged.error(), "glove policy stage --help");
         }
+        policy_wire::stage_report report{
+            .runtime_id = staged->runtime_id,
+            .protected_entry_point = staged->protected_entry_point.string(),
+            .source_executable = staged->source_executable.string(),
+            .launch_executable = staged->launch_executable.string(),
+            .launch_arguments = staged->launch_arguments,
+            .read_only_paths = {},
+            .changed = staged->changed,
+            .dry_run = options.dry_run,
+        };
+        report.read_only_paths.reserve(staged->read_only_paths.size());
+        for (const auto& path : staged->read_only_paths) {
+            report.read_only_paths.push_back(path.string());
+        }
+        if (json) {
+            auto encoded = glz::write_json(report);
+            if (!encoded) {
+                return print_error(
+                    "policy_encode_failed",
+                    "Could not encode harness staging output.",
+                    "glove policy stage --help"
+                );
+            }
+            std::printf("%s\n", encoded->c_str());
+            return 0;
+        }
         std::printf(
             "%s harness entry point: %s\n",
             options.dry_run ? "Planned" : (staged->changed ? "Created" : "Verified"),
             staged->protected_entry_point.c_str()
         );
         std::printf(
-            "Source executable:          %s\nNext:\n"
-            "  glove policy detect --search-path %s --json\n"
-            "  glove policy generate --runtime %s --executable %s\n"
-            "Or, when the service sees the same UID ownership mapping:\n"
-            "  glove policy generate --runtime %s --search-path %s\n",
+            "Source executable:          %s\n"
+            "Launch executable:          %s\n",
             staged->source_executable.c_str(),
-            staged->protected_entry_point.parent_path().c_str(),
-            staged->runtime_id.c_str(),
-            staged->source_executable.c_str(),
-            staged->runtime_id.c_str(),
+            staged->launch_executable.c_str()
+        );
+        for (const auto& argument : staged->launch_arguments) {
+            std::printf("Launch argument:            %s\n", argument.c_str());
+        }
+        for (const auto& path : staged->read_only_paths) {
+            std::printf("Read-only dependency root:  %s\n", path.c_str());
+        }
+        std::printf(
+            "Next:\n"
+            "  Use --json to pass this exact launch closure to policy generation.\n"
+            "  glove policy detect --search-path %s --json\n",
             staged->protected_entry_point.parent_path().c_str()
         );
         return 0;

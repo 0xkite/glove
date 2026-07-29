@@ -34,8 +34,12 @@ glove policy stage \
 ```
 
 Staging creates only a protected symlink to the canonical executable. It does
-not copy or expose the operator's credential/config home. Harness package and
-interpreter dependencies remain explicit operator-owned read-only paths.
+not copy or expose the operator's credential/config home. The stage report
+automatically resolves native binaries or safe shebang interpreters and emits
+the exact launch executable, script argument, and minimal immutable read-only
+dependency roots. Homebrew clients are closed over installed formula kegs;
+adjacent version-manager interpreters are closed over that one version root.
+Unsupported shebangs and root-wide dependency grants fail closed.
 
 Generate a strict `runtime_templates[]` entry through the same resolver and
 digest algorithm used by managed launch:
@@ -57,8 +61,9 @@ Linux services running in an unprivileged user namespace see unmapped
 host-root ancestors such as `/home` as UID `65534`; discovery deliberately
 rejects that ambiguity. A pinned executable remains adapter-generic and is
 identity-pinned again at launch. Interpreter-based clients can instead pin the
-interpreter and pass the detected script as a digest-bound `--argument`, with
-its immutable package root supplied by `--read-only-path`.
+interpreter and pass the stage report's detected script as a digest-bound
+`--argument`, with its emitted dependency roots supplied by
+`--read-only-path`.
 
 The JSON template is written to stdout; the resolved executable and canonical
 `adapter_command_digest` are reported separately on stderr. Add the template to

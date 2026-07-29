@@ -109,6 +109,40 @@ auto run() -> int {
     REQUIRE(staged_detection.front().available);
     REQUIRE(staged_detection.front().resolved_executable == std::filesystem::canonical(codex));
 
+    const auto managed_runtime = temporary.root() / "managed-node";
+    const auto managed_bin = managed_runtime / "bin";
+    const auto managed_package = managed_runtime / "lib" / "node_modules" / "vendor" / "bin";
+    REQUIRE(std::filesystem::create_directories(managed_bin));
+    REQUIRE(std::filesystem::create_directories(managed_package));
+    const auto managed_node = managed_bin / "node";
+    const auto managed_script = managed_package / "codex.js";
+    REQUIRE(write_owner_file(managed_node, "#!/bin/sh\nexit 0\n", 0700));
+    REQUIRE(write_owner_file(managed_script, "#!/usr/bin/env node\n", 0700));
+    const auto managed_entry = managed_bin / "codex";
+    REQUIRE(
+        ::symlink("../lib/node_modules/vendor/bin/codex.js", managed_entry.c_str()) == 0
+    );
+    auto managed_stage_options = stage_options;
+    managed_stage_options.source_executable = managed_entry;
+    managed_stage_options.protected_directory = temporary.root() / "protected" / "managed-codex";
+    managed_stage_options.dry_run = true;
+    auto managed_stage = stage_runtime_harness(managed_stage_options);
+    REQUIRE(managed_stage.has_value());
+    REQUIRE(managed_stage->launch_executable == std::filesystem::canonical(managed_node));
+    REQUIRE(
+        managed_stage->launch_arguments ==
+        std::vector<std::string>{std::filesystem::canonical(managed_script).string()}
+    );
+    REQUIRE(
+        managed_stage->read_only_paths ==
+        std::vector<std::filesystem::path>{std::filesystem::canonical(managed_runtime)}
+    );
+
+    const auto missing_interpreter = managed_package / "missing.js";
+    REQUIRE(write_owner_file(missing_interpreter, "#!/usr/bin/env missing-runtime\n", 0700));
+    managed_stage_options.source_executable = missing_interpreter;
+    REQUIRE(!stage_runtime_harness(managed_stage_options).has_value());
+
     runtime_policy_generation_options options{
         .runtime_id = "codex",
         .runtime_template_id = "codex-safe",
