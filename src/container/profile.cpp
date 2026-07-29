@@ -311,15 +311,18 @@ auto require_resource_enforcement(
     if (!p.required_limits) {
         return {};
     }
+    if (capabilities.complete()) {
+        return {};
+    }
 
     std::string message{"mandatory resource enforcement unavailable: "};
-    bool has_missing = false;
-    const auto append_missing = [&message, &has_missing](std::string_view capability) {
-        if (has_missing) {
+    bool first = true;
+    const auto append_missing = [&message, &first](std::string_view capability) {
+        if (!first) {
             message.append(", ");
         }
         message.append(capability);
-        has_missing = true;
+        first = false;
     };
     const auto cpu_supported = capabilities.cpu_time == enforcement_mechanism::rlimit ||
                                capabilities.cpu_time == enforcement_mechanism::cgroup_v2;
@@ -345,9 +348,6 @@ auto require_resource_enforcement(
     }
     if (capabilities.receipt_schema_version != 1) {
         append_missing("observable_receipts");
-    }
-    if (!has_missing) {
-        return {};
     }
     return std::unexpected(std::move(message));
 }
