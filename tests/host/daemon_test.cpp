@@ -75,6 +75,25 @@ auto run() -> int {
     REQUIRE(plan->service_definition.find(gloved.string()) != std::string::npos);
     REQUIRE(plan->service_definition.find(setup->config_path.string()) != std::string::npos);
 
+    std::error_code remove_error;
+    std::filesystem::remove_all(setup->service.runtime_directory, remove_error);
+    REQUIRE(!remove_error);
+    REQUIRE(!std::filesystem::exists(setup->service.runtime_directory));
+    REQUIRE(prepare_daemon_runtime(*plan).has_value());
+    struct stat runtime_metadata{};
+    REQUIRE(::lstat(setup->service.runtime_directory.c_str(), &runtime_metadata) == 0);
+    REQUIRE(S_ISDIR(runtime_metadata.st_mode));
+    REQUIRE((static_cast<unsigned int>(runtime_metadata.st_mode) & 0777U) == 0700U);
+
+    REQUIRE(::chmod(setup->service.runtime_directory.c_str(), 0755) == 0);
+    REQUIRE(prepare_daemon_runtime(*plan).has_value());
+    REQUIRE(::lstat(setup->service.runtime_directory.c_str(), &runtime_metadata) == 0);
+    REQUIRE((static_cast<unsigned int>(runtime_metadata.st_mode) & 0777U) == 0700U);
+
+    REQUIRE(::chmod(setup->service.runtime_directory.c_str(), 0777) == 0);
+    REQUIRE(!prepare_daemon_runtime(*plan).has_value());
+    REQUIRE(::chmod(setup->service.runtime_directory.c_str(), 0700) == 0);
+
 #if defined(__linux__)
     REQUIRE(plan->manager == daemon_service_manager::systemd_user);
     REQUIRE(plan->service_name == "sage-gloved.service");

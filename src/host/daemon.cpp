@@ -253,6 +253,30 @@ auto create_owner_directory(const std::filesystem::path& path) -> result<void> {
     return {};
 }
 
+auto create_owner_runtime_directory(const std::filesystem::path& path) -> result<void> {
+    if (auto created = create_owner_directory(path); !created) {
+        return created;
+    }
+    const unique_fd directory{
+        ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW)
+    };
+    struct stat metadata{};
+    if (directory.get() < 0 || ::fstat(directory.get(), &metadata) != 0) {
+        return std::unexpected(system_error("open configured runtime directory"));
+    }
+    if (!S_ISDIR(metadata.st_mode) || metadata.st_uid != ::geteuid() ||
+        (static_cast<unsigned int>(metadata.st_mode) & 0022U) != 0U) {
+        return std::unexpected(
+            std::string{"configured runtime directory is not protected for the current user"}
+        );
+    }
+    if ((static_cast<unsigned int>(metadata.st_mode) & 0077U) != 0U &&
+        ::fchmod(directory.get(), 0700) != 0) {
+        return std::unexpected(system_error("protect configured runtime directory"));
+    }
+    return {};
+}
+
 auto write_exact(int descriptor, std::string_view contents) -> result<void> {
     std::size_t written = 0;
     while (written < contents.size()) {
@@ -522,6 +546,14 @@ auto plan_daemon_service(const daemon_options& options, const environment& value
 #endif
 }
 
+auto prepare_daemon_runtime(const daemon_service_plan& plan) -> result<void> {
+    auto configured = load_config(plan.config_path);
+    if (!configured) {
+        return std::unexpected("load daemon configuration: " + configured.error());
+    }
+    return create_owner_runtime_directory(configured->runtime_directory);
+}
+
 auto install_daemon_service(const daemon_service_plan& plan) -> result<void> {
     auto installed = install_definition(plan);
     if (!installed) {
@@ -565,6 +597,9 @@ auto daemon_service_is_active(const daemon_service_plan& plan) -> result<bool> {
 }
 
 auto start_daemon_service(const daemon_service_plan& plan) -> result<void> {
+    if (auto prepared = prepare_daemon_runtime(plan); !prepared) {
+        return prepared;
+    }
     if (auto installed = install_daemon_service(plan); !installed) {
         return installed;
     }
@@ -598,6 +633,9 @@ auto stop_daemon_service(const daemon_service_plan& plan) -> result<void> {
 
 auto restart_daemon_service(const daemon_service_plan& plan) -> result<void> {
     if (plan.manager == daemon_service_manager::systemd_user) {
+        if (auto prepared = prepare_daemon_runtime(plan); !prepared) {
+            return prepared;
+        }
         if (auto installed = install_daemon_service(plan); !installed) {
             return installed;
         }

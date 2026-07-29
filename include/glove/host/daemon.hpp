@@ -30,6 +30,7 @@ struct daemon_service_plan {
 
 [[nodiscard]] auto plan_daemon_service(const daemon_options& options, const environment& values)
     -> result<daemon_service_plan>;
+[[nodiscard]] auto prepare_daemon_runtime(const daemon_service_plan& plan) -> result<void>;
 [[nodiscard]] auto install_daemon_service(const daemon_service_plan& plan) -> result<void>;
 [[nodiscard]] auto start_daemon_service(const daemon_service_plan& plan) -> result<void>;
 [[nodiscard]] auto stop_daemon_service(const daemon_service_plan& plan) -> result<void>;
