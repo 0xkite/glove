@@ -64,6 +64,59 @@ for compiler in "$CC" "$CXX"; do
     fi
 done
 
+probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/glove-cxx-probe.XXXXXX")
+trap 'rm -rf "$probe_dir"' 0 HUP INT TERM
+probe_source=$probe_dir/required_features.cpp
+probe_binary=$probe_dir/required_features
+cat >"$probe_source" <<'EOF'
+#include <expected>
+
+int main() {
+    std::expected<int, int> value{1};
+    return *value - 1;
+}
+EOF
+
+supports_required_cxx_features() {
+    # CXXFLAGS is an operator-owned compiler flag list and intentionally uses
+    # shell field splitting here, matching conventional build-tool behavior.
+    # shellcheck disable=SC2086
+    "$CXX" ${CXXFLAGS:-} "$@" -std=c++23 "$probe_source" -o "$probe_binary" \
+        >/dev/null 2>&1
+}
+
+if ! supports_required_cxx_features; then
+    case "$(uname -s):${CXXFLAGS:-}" in
+        Linux:*"-stdlib="*)
+            printf '%s\n' \
+                "selected C++ compiler/library lacks required C++23 features" >&2
+            exit 1
+            ;;
+        Linux:*)
+            if supports_required_cxx_features -stdlib=libc++; then
+                CXXFLAGS="${CXXFLAGS:+${CXXFLAGS} }-stdlib=libc++"
+                export CXXFLAGS
+                printf '%s\n' \
+                    "Default C++ library lacks required C++23 support; using libc++." \
+                    "Set CXXFLAGS explicitly to select another compatible library."
+            else
+                printf '%s\n' \
+                    "selected C++ compiler/library lacks required C++23 features" \
+                    "Install a compatible standard library or set CC, CXX, and CXXFLAGS explicitly." \
+                    >&2
+                exit 1
+            fi
+            ;;
+        *)
+            printf '%s\n' \
+                "selected C++ compiler/library lacks required C++23 features" \
+                "Select a compatible compiler and standard library with CC, CXX, and CXXFLAGS." \
+                >&2
+            exit 1
+            ;;
+    esac
+fi
+
 if [ -z "${GLOVE_INSTALL_PREFIX:-}" ] && [ -z "${HOME:-}" ]; then
     printf '%s\n' "HOME or GLOVE_INSTALL_PREFIX is required" >&2
     exit 1
