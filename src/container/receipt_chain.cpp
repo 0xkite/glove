@@ -26,21 +26,21 @@ public:
     void append_u8(std::uint8_t value) { bytes_.push_back(value); }
 
     void append_u32(std::uint32_t value) {
-        bytes_.push_back(static_cast<unsigned char>(value >> 24U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 16U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 8U));
-        bytes_.push_back(static_cast<unsigned char>(value));
+        bytes_.push_back(static_cast<unsigned char>((value >> 24U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 16U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 8U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>(value & 0xffU));
     }
 
     void append_u64(std::uint64_t value) {
-        bytes_.push_back(static_cast<unsigned char>(value >> 56U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 48U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 40U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 32U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 24U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 16U));
-        bytes_.push_back(static_cast<unsigned char>(value >> 8U));
-        bytes_.push_back(static_cast<unsigned char>(value));
+        bytes_.push_back(static_cast<unsigned char>((value >> 56U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 48U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 40U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 32U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 24U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 16U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>((value >> 8U) & 0xffU));
+        bytes_.push_back(static_cast<unsigned char>(value & 0xffU));
     }
 
     void append_string(std::string_view value) {

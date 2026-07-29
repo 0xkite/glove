@@ -92,10 +92,10 @@ auto system_error(std::string_view operation) -> std::string {
 }
 
 auto append_u32(std::vector<unsigned char>& output, std::uint32_t value) -> void {
-    output.push_back(static_cast<unsigned char>(value >> 24U));
-    output.push_back(static_cast<unsigned char>(value >> 16U));
-    output.push_back(static_cast<unsigned char>(value >> 8U));
-    output.push_back(static_cast<unsigned char>(value));
+    output.push_back(static_cast<unsigned char>((value >> 24U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 16U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 8U) & 0xffU));
+    output.push_back(static_cast<unsigned char>(value & 0xffU));
 }
 
 auto decode_u32(std::span<const unsigned char, 4> input) noexcept -> std::uint32_t {

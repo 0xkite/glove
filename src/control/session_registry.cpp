@@ -269,21 +269,21 @@ auto same_process_identity(
 }
 
 auto append_u32(std::vector<unsigned char>& output, std::uint32_t value) -> void {
-    output.push_back(static_cast<unsigned char>(value >> 24U));
-    output.push_back(static_cast<unsigned char>(value >> 16U));
-    output.push_back(static_cast<unsigned char>(value >> 8U));
-    output.push_back(static_cast<unsigned char>(value));
+    output.push_back(static_cast<unsigned char>((value >> 24U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 16U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 8U) & 0xffU));
+    output.push_back(static_cast<unsigned char>(value & 0xffU));
 }
 
 auto append_u64(std::vector<unsigned char>& output, std::uint64_t value) -> void {
-    output.push_back(static_cast<unsigned char>(value >> 56U));
-    output.push_back(static_cast<unsigned char>(value >> 48U));
-    output.push_back(static_cast<unsigned char>(value >> 40U));
-    output.push_back(static_cast<unsigned char>(value >> 32U));
-    output.push_back(static_cast<unsigned char>(value >> 24U));
-    output.push_back(static_cast<unsigned char>(value >> 16U));
-    output.push_back(static_cast<unsigned char>(value >> 8U));
-    output.push_back(static_cast<unsigned char>(value));
+    output.push_back(static_cast<unsigned char>((value >> 56U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 48U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 40U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 32U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 24U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 16U) & 0xffU));
+    output.push_back(static_cast<unsigned char>((value >> 8U) & 0xffU));
+    output.push_back(static_cast<unsigned char>(value & 0xffU));
 }
 
 auto append_string(std::vector<unsigned char>& output, std::string_view value) -> bool {
