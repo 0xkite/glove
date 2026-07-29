@@ -43,7 +43,7 @@ does not sandbox the upstream processes themselves.
 |---|---|---|
 | Process visibility | PID namespace | SBPL process policy |
 | Filesystem | mount namespace, `pivot_root`, read-only binds, private writable mounts | deny-default SBPL path rules |
-| Network | network namespace plus seccomp Internet-socket denial; private AF_UNIX socketpairs are allowed for runtime IPC | deny-default SBPL network rules |
+| Network | route-less network namespace; offline socket denial or private-loopback access to the authenticated audited proxy through an inherited Unix descriptor channel | deny-default SBPL network rules |
 | Identity | user namespace and UID/GID mapping | invoking user |
 | IPC and hostname | IPC and UTS namespaces | SBPL policy |
 | Resource limits | private cgroup/quota/watchdog implementation | incomplete for the Sage six-limit contract |
@@ -53,6 +53,11 @@ perimeter, applies seccomp, then releases the child to execute. Writable
 materializations are quota-backed; retained copies use persistent hard-sized
 ext4 loop images while ephemeral copies use tmpfs. Read-only inputs are
 descriptor-pinned.
+For approved egress, a namespace-local helper passes accepted loopback sockets
+to a host relay with `SCM_RIGHTS`. The relay can connect only to the per-run
+authenticated proxy; it never exposes a host-network socket or DNS service to
+the agent. The namespace-local helper consumes one PID within the configured
+session PID limit.
 macOS constructs a deny-default sandbox profile and applies it before executing
 the child.
 

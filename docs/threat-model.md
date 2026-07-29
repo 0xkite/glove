@@ -29,7 +29,7 @@ host security boundary.
 | Area | Enforcement |
 |---|---|
 | Filesystem | Deny-default sandbox; explicit read/write grants; descriptor-based path resolution; link, ownership, identity, and overlap checks |
-| Network | Linux network namespace plus seccomp denial of Internet-capable socket creation; private AF_UNIX socketpairs remain available only for in-sandbox runtime IPC; exact macOS egress rules |
+| Network | Linux private network namespace with no external route; offline agents cannot create Internet sockets, while online agents reach only an authenticated audited host proxy through a private-loopback listener and inherited Unix descriptor channel; exact macOS egress rules |
 | Process surface | Linux PID/user/IPC/UTS namespaces; macOS deny-default SBPL |
 | Environment | Minimal environment plus named grants |
 | Tool access | Qualified allow-list and configured argument rules before upstream dispatch |
@@ -52,7 +52,7 @@ the operation rather than silently reducing enforcement.
 | Same-user host tampering | A peer process can rewrite the general JSONL log or unkeyed session state and may read shared local secrets. | Isolate the service identity; use asymmetric signing or protected key storage; authenticate general logs. |
 | Linux kernel escape | A kernel vulnerability can cross namespace or seccomp boundaries. | Patch hosts and add an outer VM/container boundary where required. |
 | macOS resource exhaustion | The Sage six-limit resource contract is not implemented on macOS. | Add enforceable CPU, memory, PID, wall-time, disk, and output controls with receipts. |
-| Linux egress unavailable | Contained direct agents cannot use approved network destinations on Linux. | Implement an authenticated proxy transport into the network namespace. |
+| Host egress broker compromise | A defect in the host relay or authenticated proxy could mishandle an approved connection. | Keep the relay target fixed to the per-run proxy, use exact host/port grants, cap concurrent relays, and retain proxy audit evidence. |
 | Retained-change apply disabled | The local atomic/recovery primitive is not a production authorization boundary by itself. | Keep capability `0` until the independent Ed25519 helper/verifier, local RPC/audit path, startup sweep, host-space policy, and Sage-to-parent isolation are configured and tested. |
 | Bundle expansion absent | A verified bundle file is not yet converted into harness-native prompt context. | Add bounded, format-aware extraction and receipt-bound launch inputs. |
 | Dependency or compiler compromise | Build-time code or toolchain compromise can alter enforcement. | Pin dependencies by immutable digest, verify releases, and use reproducible builds. |

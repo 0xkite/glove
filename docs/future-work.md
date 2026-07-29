@@ -24,7 +24,6 @@ version control, tests, and architecture documentation.
 | Durable-state authentication | Session state and general activity logs are keyed or asymmetrically signed, with explicit recovery and key-rotation rules. |
 | Immutable dependency pinning | Glaze and CI actions are pinned to immutable revisions with recorded provenance and verification. |
 | Upstream containment | MCP upstream processes receive a separate sandbox profile or a documented isolated service boundary. |
-| Linux egress | An authenticated proxy crosses the isolated namespace without exposing a general host socket or DNS bypass. |
 
 ## P2: validation evidence
 

@@ -302,14 +302,6 @@ auto start_egress(
     if (opts.egress.empty()) {
         return std::unique_ptr<glove::net::egress_proxy>{};
     }
-#if defined(__linux__)
-    (void)profile;
-    (void)sink;
-    return std::unexpected(
-        std::string{"egress is not supported by the Linux network namespace; refusing to "
-                    "advertise an unreachable proxy"}
-    );
-#else
     glove::net::egress_options proxy_options;
     proxy_options.allow = opts.egress;
     proxy_options.on_event =
@@ -341,7 +333,6 @@ auto start_egress(
         .url = (*proxy)->proxy_url(),
     };
     return std::move(*proxy);
-#endif
 }
 
 } // namespace

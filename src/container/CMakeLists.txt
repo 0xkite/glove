@@ -52,6 +52,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(glove_container PRIVATE
         linux/cgroup_v2.cpp
         linux/clone_spawner.cpp
+        linux/linux_egress_bridge.cpp
         linux/linux_resource_lifecycle.cpp
         linux/managed_launch_binding.cpp
         linux/pty_session_channel.cpp

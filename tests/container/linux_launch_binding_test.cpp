@@ -243,6 +243,19 @@ auto run() -> int {
     REQUIRE(changed_plan.has_value());
     REQUIRE(changed_plan->profile_digest != first->profile_digest);
 
+    auto online_profile = first_profile;
+    online_profile.proxy = glove::container::proxy_settings{
+        .port = 43117,
+        .url = "http://glove:ephemeral-a@127.0.0.1:43117",
+    };
+    auto online_binding = make_binding(online_profile, argv, first_mounts);
+    REQUIRE(online_binding.has_value());
+    REQUIRE(online_binding->profile_digest != first->profile_digest);
+    online_profile.proxy->url = "http://glove:ephemeral-b@127.0.0.1:43117";
+    auto changed_egress_capability = make_binding(online_profile, argv, first_mounts);
+    REQUIRE(changed_egress_capability.has_value());
+    REQUIRE(changed_egress_capability->profile_digest != online_binding->profile_digest);
+
     std::string executable_pattern = "/tmp/glove-launch-binding-exec-XXXXXX";
     const int executable_fd = ::mkstemp(executable_pattern.data());
     REQUIRE(executable_fd >= 0);

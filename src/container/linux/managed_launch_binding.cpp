@@ -385,11 +385,6 @@ auto bind_managed_launch_projection_from_fd(
             std::string{"managed session paths must come from the lifecycle mount set"}
         );
     }
-    if (checked->proxy) {
-        return std::unexpected(
-            std::string{"Linux egress proxy transport is not implemented; refusing network grant"}
-        );
-    }
     if (resolved_argv.empty() || resolved_argv.size() > max_launch_fields ||
         std::ranges::any_of(resolved_argv, [](const auto& value) {
             return !valid_string(value);
@@ -480,6 +475,15 @@ auto bind_managed_launch_projection_from_fd(
             encoder.append_string(*mount.runtime_adapter_id);
             encoder.append_string(*mount.runtime_context_digest);
         }
+    }
+    // Preserve the version-1 digest for offline launches while binding the
+    // exact ephemeral proxy capability whenever egress is present. This
+    // prevents a controller-approved offline projection from being replayed
+    // with an uncommitted network grant.
+    if (checked->proxy) {
+        encoder.append_string("glove.managed-launch-egress");
+        encoder.append_u32(checked->proxy->port);
+        encoder.append_string(checked->proxy->url);
     }
     if (!encoder.valid()) {
         return std::unexpected(

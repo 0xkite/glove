@@ -19,6 +19,7 @@
 #include "glove/container/spawner.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include "linux_egress_bridge.hpp"
 #include "linux_managed_session.hpp"
 #include "output_pump.hpp"
 
@@ -119,11 +120,13 @@ struct child_stdio_capture {
 struct launched_sandbox_child {
     ::pid_t pid = -1;
     std::unique_ptr<detail::output_pump> output;
+    std::unique_ptr<linux_detail::host_egress_bridge> egress;
 };
 
 struct launched_pty_child {
     ::pid_t pid = -1;
     std::unique_ptr<linux_detail::pty_session_channel> terminal;
+    std::unique_ptr<linux_detail::host_egress_bridge> egress;
 };
 
 class owned_fd {
@@ -274,8 +277,12 @@ private:
 
 class linux_agent_handle final : public agent_handle {
 public:
-    linux_agent_handle(::pid_t pid, std::unique_ptr<pipe_transport> t)
-        : pid_{pid}, transport_{std::move(t)} {}
+    linux_agent_handle(
+        ::pid_t pid,
+        std::unique_ptr<pipe_transport> t,
+        std::unique_ptr<linux_detail::host_egress_bridge> egress
+    )
+        : pid_{pid}, transport_{std::move(t)}, egress_{std::move(egress)} {}
 
     ~linux_agent_handle() override {
         transport_.reset();
@@ -339,6 +346,7 @@ public:
 private:
     ::pid_t pid_;
     std::unique_ptr<pipe_transport> transport_;
+    std::unique_ptr<linux_detail::host_egress_bridge> egress_;
     bool waited_ = false;
     int cached_code_ = -1;
 };
@@ -741,6 +749,14 @@ auto install_environment(const profile& prof) -> std::expected<void, std::string
     if (::setenv("GLOVE_SANDBOXED", "1", 1) != 0) {
         return std::unexpected(std::string{"setenv GLOVE_SANDBOXED: "} + std::strerror(errno));
     }
+    if (prof.proxy) {
+        for (const char* name :
+             {"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY"}) {
+            if (::setenv(name, prof.proxy->url.c_str(), 1) != 0) {
+                return std::unexpected(std::string{"setenv "} + name + ": " + std::strerror(errno));
+            }
+        }
+    }
     return {};
 }
 
@@ -754,7 +770,7 @@ auto install_environment(const profile& prof) -> std::expected<void, std::string
 // real agents need. Production-grade seccomp profiles must be data-driven;
 // premature minimisation breaks debuggers, sanitizers, and language
 // runtimes that grow new syscall use across releases.
-auto setup_seccomp() -> std::expected<void, std::string> {
+auto setup_seccomp(bool proxy_enabled) -> std::expected<void, std::string> {
     ::scmp_filter_ctx ctx = ::seccomp_init(SCMP_ACT_ALLOW);
     if (ctx == nullptr) {
         return std::unexpected(std::string{"seccomp_init failed"});
@@ -769,22 +785,68 @@ auto setup_seccomp() -> std::expected<void, std::string> {
     // their signal helpers; it cannot connect to a host or network endpoint.
     // The kernel-mediated MCP pipe is already open (file descriptors survive
     // seccomp_load), so the agent can still read/write its existing channel.
-    const int net_syscalls[] = {
-        SCMP_SYS(socket),
+    const int always_denied_net_syscalls[] = {
         SCMP_SYS(bind),
-        SCMP_SYS(connect),
         SCMP_SYS(listen),
         SCMP_SYS(accept),
         SCMP_SYS(accept4),
-        SCMP_SYS(getsockname),
-        SCMP_SYS(getpeername),
-        SCMP_SYS(setsockopt),
-        SCMP_SYS(getsockopt),
     };
-    for (int sc : net_syscalls) {
+    for (int sc : always_denied_net_syscalls) {
         if (int rc = deny(sc); rc != 0) {
             ::seccomp_release(ctx);
             return std::unexpected(std::string{"deny network syscall: "} + std::strerror(-rc));
+        }
+    }
+    if (!proxy_enabled) {
+        const int offline_net_syscalls[] = {
+            SCMP_SYS(socket),
+            SCMP_SYS(connect),
+            SCMP_SYS(getsockname),
+            SCMP_SYS(getpeername),
+            SCMP_SYS(setsockopt),
+            SCMP_SYS(getsockopt),
+        };
+        for (int sc : offline_net_syscalls) {
+            if (int rc = deny(sc); rc != 0) {
+                ::seccomp_release(ctx);
+                return std::unexpected(
+                    std::string{"deny offline network syscall: "} + std::strerror(-rc)
+                );
+            }
+        }
+    } else {
+        // The agent may create AF_INET stream sockets only inside its private
+        // network namespace. That namespace has no external route and exposes
+        // one private-loopback listener backed by the descriptor bridge.
+        const scmp_arg_cmp unspecified_domain{
+            .arg = 0,
+            .op = SCMP_CMP_EQ,
+            .datum_a = AF_UNSPEC,
+            .datum_b = 0,
+        };
+        if (int rc = ::seccomp_rule_add(
+                ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1, unspecified_domain
+            );
+            rc != 0) {
+            ::seccomp_release(ctx);
+            return std::unexpected(
+                std::string{"restrict proxy socket domain: "} + std::strerror(-rc)
+            );
+        }
+        const scmp_arg_cmp unsupported_domain{
+            .arg = 0,
+            .op = SCMP_CMP_GT,
+            .datum_a = AF_INET,
+            .datum_b = 0,
+        };
+        if (int rc = ::seccomp_rule_add(
+                ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1, unsupported_domain
+            );
+            rc != 0) {
+            ::seccomp_release(ctx);
+            return std::unexpected(
+                std::string{"restrict proxy socket family: "} + std::strerror(-rc)
+            );
         }
     }
     const scmp_arg_cmp socketpair_domain{
@@ -885,6 +947,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     int pipe_out_write,
     int pipe_error_read_close,
     int pipe_error_write,
+    int egress_channel_fd,
     const profile& prof,
     std::vector<std::string> argv,
     std::span<const supervisor::linux_detail::session_mount> session_mounts
@@ -936,11 +999,21 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         std::fprintf(stderr, "glove child: pivot: %s\n", r.error().c_str());
         std::_Exit(124);
     }
+    if (prof.proxy) {
+        if (auto installed =
+                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, prof.proxy->port);
+            !installed) {
+            std::fprintf(stderr, "glove child: egress bridge: %s\n", installed.error().c_str());
+            std::_Exit(125);
+        }
+    } else {
+        close_fd(egress_channel_fd);
+    }
 
     // Seccomp filter goes after the rootfs pivot (so we don't accidentally
     // deny syscalls our setup needs) but before the agent's exec, so the
     // agent inherits the filter as its starting policy.
-    if (auto r = setup_seccomp(); !r) {
+    if (auto r = setup_seccomp(prof.proxy.has_value()); !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }
@@ -1003,6 +1076,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     std::vector<std::string> argv,
     std::span<const supervisor::linux_detail::session_mount> session_mounts,
     int agent_program_fd,
+    int egress_channel_fd,
     child_stdio_capture capture
 ) {
     char ack = 0;
@@ -1057,7 +1131,18 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         std::_Exit(126);
     }
 
-    if (auto r = setup_seccomp(); !r) {
+    if (prof.proxy) {
+        if (auto installed =
+                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, prof.proxy->port);
+            !installed) {
+            std::fprintf(stderr, "glove child: egress bridge: %s\n", installed.error().c_str());
+            std::_Exit(125);
+        }
+    } else {
+        close_fd(egress_channel_fd);
+    }
+
+    if (auto r = setup_seccomp(prof.proxy.has_value()); !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }
@@ -1120,13 +1205,6 @@ public:
             !limits) {
             return std::unexpected(limits.error());
         }
-        if (checked->proxy) {
-            return std::unexpected(
-                std::string{
-                    "Linux egress proxy transport is not implemented; refusing network grant"
-                }
-            );
-        }
         std::vector<std::string> launch_argv = argv;
         auto program = resolve_program(*checked, launch_argv.front());
         if (!program) {
@@ -1138,6 +1216,8 @@ public:
         int pipe_out[2] = {-1, -1};   // child stdout -> parent reads pipe_out[0]
         int pipe_error[2] = {-1, -1}; // child stderr -> parent drain worker
         int sync_pipe[2] = {-1, -1};  // parent → child uid-map ack
+        int egress_host_fd = -1;
+        int egress_sandbox_fd = -1;
 
         if (::pipe2(pipe_in, O_CLOEXEC) != 0) {
             return std::unexpected(std::string{"pipe2(in): "} + std::strerror(errno));
@@ -1160,6 +1240,18 @@ public:
             close_pipe_pair(pipe_error);
             return std::unexpected(std::string{"pipe2(sync): "} + std::strerror(saved));
         }
+        if (checked->proxy) {
+            auto channel = linux_detail::create_egress_channel();
+            if (!channel) {
+                close_pipe_pair(pipe_in);
+                close_pipe_pair(pipe_out);
+                close_pipe_pair(pipe_error);
+                close_pipe_pair(sync_pipe);
+                return std::unexpected(channel.error());
+            }
+            egress_host_fd = channel->host_fd;
+            egress_sandbox_fd = channel->sandbox_fd;
+        }
 
         clone_args_v3 ca{};
         ca.flags = static_cast<std::uint64_t>(CLONE_NEWUSER) | CLONE_NEWNS | CLONE_NEWPID |
@@ -1173,6 +1265,8 @@ public:
             close_pipe_pair(pipe_out);
             close_pipe_pair(pipe_error);
             close_pipe_pair(sync_pipe);
+            close_fd(egress_host_fd);
+            close_fd(egress_sandbox_fd);
             return std::unexpected(std::string{"clone3: "} + std::strerror(saved));
         }
 
@@ -1184,6 +1278,7 @@ public:
             ::fcntl(pipe_in[0], F_SETFD, 0);
             ::fcntl(pipe_out[1], F_SETFD, 0);
             ::fcntl(pipe_error[1], F_SETFD, 0);
+            close_fd(egress_host_fd);
             child_setup_and_exec(
                 sync_pipe[0],
                 pipe_in[0],
@@ -1192,6 +1287,7 @@ public:
                 pipe_out[1],
                 pipe_error[0],
                 pipe_error[1],
+                egress_sandbox_fd,
                 *checked,
                 launch_argv,
                 {}
@@ -1204,16 +1300,36 @@ public:
         ::close(pipe_out[1]);
         ::close(pipe_error[1]);
         ::close(sync_pipe[0]);
+        close_fd(egress_sandbox_fd);
 
         if (auto uid_ok = setup_uid_map(child); !uid_ok) {
             ::close(pipe_in[1]);
             ::close(pipe_out[0]);
             ::close(pipe_error[0]);
             ::close(sync_pipe[1]);
+            close_fd(egress_host_fd);
             ::kill(child, SIGKILL);
             int status = 0;
             ::waitpid(child, &status, 0);
             return std::unexpected(uid_ok.error());
+        }
+
+        std::unique_ptr<linux_detail::host_egress_bridge> egress;
+        if (checked->proxy) {
+            auto started =
+                linux_detail::start_host_egress_bridge(egress_host_fd, checked->proxy->port);
+            egress_host_fd = -1;
+            if (!started) {
+                ::close(pipe_in[1]);
+                ::close(pipe_out[0]);
+                ::close(pipe_error[0]);
+                ::close(sync_pipe[1]);
+                ::kill(child, SIGKILL);
+                int status = 0;
+                ::waitpid(child, &status, 0);
+                return std::unexpected(started.error());
+            }
+            egress = std::move(*started);
         }
 
         // Tell the child it can proceed with exec.
@@ -1224,6 +1340,7 @@ public:
             ::close(pipe_out[0]);
             ::close(pipe_error[0]);
             ::close(sync_pipe[1]);
+            egress.reset();
             ::kill(child, SIGKILL);
             int status = 0;
             ::waitpid(child, &status, 0);
@@ -1242,13 +1359,14 @@ public:
             ::close(pipe_in[1]);
             ::close(pipe_out[0]);
             ::close(pipe_error[0]);
+            egress.reset();
             ::kill(child, SIGKILL);
             int status = 0;
             ::waitpid(child, &status, 0);
             return std::unexpected(output.error());
         }
         auto t = std::make_unique<pipe_transport>(pipe_in[1], std::move(*output));
-        return std::make_unique<linux_agent_handle>(child, std::move(t));
+        return std::make_unique<linux_agent_handle>(child, std::move(t), std::move(egress));
     }
 };
 
@@ -1387,6 +1505,8 @@ auto launch_passthrough_child(
     }
     int pipe_out[2] = {-1, -1};
     int pipe_error[2] = {-1, -1};
+    int egress_host_fd = -1;
+    int egress_sandbox_fd = -1;
     if (capture_output && ::pipe2(pipe_out, O_CLOEXEC) != 0) {
         const int saved = errno;
         close_pipe_pair(sync_pipe);
@@ -1397,6 +1517,17 @@ auto launch_passthrough_child(
         close_pipe_pair(sync_pipe);
         close_pipe_pair(pipe_out);
         return std::unexpected(std::string{"pipe2(managed stderr): "} + errno_message(saved));
+    }
+    if (prof.proxy) {
+        auto channel = linux_detail::create_egress_channel();
+        if (!channel) {
+            close_pipe_pair(sync_pipe);
+            close_pipe_pair(pipe_out);
+            close_pipe_pair(pipe_error);
+            return std::unexpected(channel.error());
+        }
+        egress_host_fd = channel->host_fd;
+        egress_sandbox_fd = channel->sandbox_fd;
     }
 
     clone_args_v3 arguments{};
@@ -1420,16 +1551,20 @@ auto launch_passthrough_child(
         close_pipe_pair(sync_pipe);
         close_pipe_pair(pipe_out);
         close_pipe_pair(pipe_error);
+        close_fd(egress_host_fd);
+        close_fd(egress_sandbox_fd);
         return std::unexpected(std::string{"clone3: "} + errno_message(saved));
     }
     if (pid == 0) {
         ::close(sync_pipe[1]);
+        close_fd(egress_host_fd);
         child_setup_and_exec_passthrough(
             sync_pipe[0],
             prof,
             launch_argv,
             mounts,
             agent_program_fd,
+            egress_sandbox_fd,
             {
                 .stdout_read_close = pipe_out[0],
                 .stdout_write = pipe_out[1],
@@ -1445,10 +1580,14 @@ auto launch_passthrough_child(
     pipe_out[1] = -1;
     ::close(pipe_error[1]);
     pipe_error[1] = -1;
+    close_fd(egress_sandbox_fd);
+    std::unique_ptr<linux_detail::host_egress_bridge> egress;
     auto fail = [&](std::string message) -> std::expected<launched_sandbox_child, std::string> {
         ::close(sync_pipe[1]);
         close_pipe_pair(pipe_out);
         close_pipe_pair(pipe_error);
+        close_fd(egress_host_fd);
+        egress.reset();
         static_cast<void>(::kill(child, SIGKILL));
         int status = 0;
         while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
@@ -1461,6 +1600,14 @@ auto launch_passthrough_child(
         if (auto attached = lifecycle->attach(child); !attached) {
             return fail(attached.error());
         }
+    }
+    if (prof.proxy) {
+        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, prof.proxy->port);
+        egress_host_fd = -1;
+        if (!started) {
+            return fail(started.error());
+        }
+        egress = std::move(*started);
     }
     std::unique_ptr<detail::output_pump> output;
     if (capture_output) {
@@ -1493,7 +1640,9 @@ auto launch_passthrough_child(
         return fail(std::string{"sync write: "} + errno_message(errno));
     }
     ::close(sync_pipe[1]);
-    return launched_sandbox_child{.pid = child, .output = std::move(output)};
+    return launched_sandbox_child{
+        .pid = child, .output = std::move(output), .egress = std::move(egress)
+    };
 }
 
 auto launch_pty_child(
@@ -1516,6 +1665,17 @@ auto launch_pty_child(
     if (::pipe2(sync_pipe, O_CLOEXEC) != 0) {
         return std::unexpected(std::string{"pipe2(PTY sync): "} + errno_message(errno));
     }
+    int egress_host_fd = -1;
+    int egress_sandbox_fd = -1;
+    if (prof.proxy) {
+        auto channel = linux_detail::create_egress_channel();
+        if (!channel) {
+            close_pipe_pair(sync_pipe);
+            return std::unexpected(channel.error());
+        }
+        egress_host_fd = channel->host_fd;
+        egress_sandbox_fd = channel->sandbox_fd;
+    }
 
     clone_args_v3 arguments{};
     arguments.flags = static_cast<std::uint64_t>(CLONE_NEWUSER) | CLONE_NEWNS | CLONE_NEWPID |
@@ -1526,16 +1686,20 @@ auto launch_pty_child(
     if (pid < 0) {
         const int saved = errno;
         close_pipe_pair(sync_pipe);
+        close_fd(egress_host_fd);
+        close_fd(egress_sandbox_fd);
         return std::unexpected(std::string{"clone3 PTY child: "} + errno_message(saved));
     }
     if (pid == 0) {
         ::close(sync_pipe[1]);
+        close_fd(egress_host_fd);
         child_setup_and_exec_passthrough(
             sync_pipe[0],
             prof,
             launch_argv,
             mounts,
             agent_program_fd,
+            egress_sandbox_fd,
             {
                 .terminal_master_close = terminal_pair->master_fd(),
                 .terminal_slave = terminal_pair->slave_fd(),
@@ -1547,9 +1711,13 @@ auto launch_pty_child(
     ::close(sync_pipe[0]);
     sync_pipe[0] = -1;
     terminal_pair->close_slave();
+    close_fd(egress_sandbox_fd);
+    std::unique_ptr<linux_detail::host_egress_bridge> egress;
     std::unique_ptr<linux_detail::pty_session_channel> terminal;
     auto fail = [&](std::string message) -> std::expected<launched_pty_child, std::string> {
         close_pipe_pair(sync_pipe);
+        close_fd(egress_host_fd);
+        egress.reset();
         terminal.reset();
         static_cast<void>(::kill(child, SIGKILL));
         int status = 0;
@@ -1561,6 +1729,14 @@ auto launch_pty_child(
     }
     if (auto attached = lifecycle.attach(child); !attached) {
         return fail(attached.error());
+    }
+    if (prof.proxy) {
+        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, prof.proxy->port);
+        egress_host_fd = -1;
+        if (!started) {
+            return fail(started.error());
+        }
+        egress = std::move(*started);
     }
     auto channel = linux_detail::pty_session_channel::create({
         .master_fd = terminal_pair->release_master(),
@@ -1594,7 +1770,9 @@ auto launch_pty_child(
     }
     ::close(sync_pipe[1]);
     sync_pipe[1] = -1;
-    return launched_pty_child{.pid = child, .terminal = std::move(terminal)};
+    return launched_pty_child{
+        .pid = child, .terminal = std::move(terminal), .egress = std::move(egress)
+    };
 }
 
 auto wait_for_child(::pid_t child) -> std::expected<int, std::string> {
@@ -1756,6 +1934,7 @@ struct linux_detail::managed_pty_session::implementation {
     resource_limits limits;
     std::unique_ptr<linux_resource_lifecycle> lifecycle;
     std::unique_ptr<pty_session_channel> terminal;
+    std::unique_ptr<host_egress_bridge> egress;
     std::mutex state_mutex;
     std::condition_variable state_changed;
     bool finished = false;
@@ -1922,6 +2101,7 @@ auto linux_detail::start_managed_pty_session(
     }
     session->state_->child = child->pid;
     session->state_->terminal = std::move(child->terminal);
+    session->state_->egress = std::move(child->egress);
     auto started = session->state_->start_waiter();
     if (!started) {
         static_cast<void>(session->state_->lifecycle->request_stop());
@@ -1948,11 +2128,6 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     if (auto limits = require_resource_enforcement(*checked, linux_resource_capabilities());
         !limits) {
         return std::unexpected(limits.error());
-    }
-    if (checked->proxy) {
-        return std::unexpected(
-            std::string{"Linux egress proxy transport is not implemented; refusing network grant"}
-        );
     }
     std::vector<std::string> launch_argv = argv;
     auto program = resolve_program(*checked, launch_argv.front());
