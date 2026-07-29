@@ -1,9 +1,9 @@
 # Linux build + test image for glove.
 #
-# Used to validate the Linux container spawner from a macOS host (Docker
-# Desktop / colima / Apple's `container` CLI). The image installs libseccomp
-# and a recent clang + libc++, builds glove with the `asan` preset, and runs
-# the test suite inside the container.
+# Used to validate Linux compilation and the portable test surface from a
+# macOS host (Docker Desktop / colima / Apple's `container` CLI). The image
+# installs libseccomp and a recent clang + libc++, builds glove with the `asan`
+# preset, and runs the test suite inside the container.
 #
 # Run from the repo root:
 #   docker build -f dockerfiles/Dockerfile.linux -t glove-linux .
@@ -16,6 +16,12 @@
 # bind-mounts a minimal rootfs into a fresh tmpfs. Production deployments
 # can run glove directly on the Linux host (no nested containerisation) and
 # need only the host kernel's standard rootless-userns surface.
+#
+# Apple's runtime places this image in a lightweight VM. Its default kernel
+# currently rejects procfs mounts from Glove's nested child user namespace, so
+# use scripts/apple-container-parity.sh there. That harness separates portable
+# Linux evidence from outer-VM perimeter evidence and does not claim the nested
+# Linux-production backend passed.
 
 FROM ubuntu:24.04
 

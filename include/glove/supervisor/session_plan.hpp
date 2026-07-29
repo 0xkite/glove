@@ -34,10 +34,10 @@ struct resource_limits {
 // template identifier and independently derived digest; they never carry these
 // launch fields.
 struct runtime_launch_template {
-    // Empty for an explicitly pinned executable. `codex` delegates executable
-    // discovery to the local Glove supervisor using only the policy-owned
-    // search paths below; it is never selected or influenced by a session
-    // request.
+    // Empty for an explicitly pinned executable. A supported native adapter
+    // delegates executable discovery to the local Glove supervisor using only
+    // the policy-owned search paths below; it is never selected or influenced
+    // by a session request.
     std::string runtime_discovery;
     std::string executable_path;
     std::vector<std::string> executable_search_paths;
@@ -51,8 +51,20 @@ struct runtime_launch_template {
     auto operator==(const runtime_launch_template&) const -> bool = default;
 };
 
+// Validate only the bounded, canonical launch-template fields. This is shared
+// by policy tooling and the session-policy loader so operator diagnostics use
+// the exact enforcement rules rather than a second approximation.
+[[nodiscard]] auto validate_runtime_launch_template(const runtime_launch_template& launch)
+    -> result<void>;
+
 // Canonical SHA-256 commitment for the complete host launch template.
 [[nodiscard]] auto runtime_launch_template_digest(const runtime_launch_template& launch)
+    -> result<std::string>;
+
+// Resolve an explicit executable or search the template's ordered,
+// digest-bound roots for its built-in adapter executable. Inherited PATH is
+// never consulted.
+[[nodiscard]] auto resolve_runtime_executable(const runtime_launch_template& launch)
     -> result<std::string>;
 
 struct runtime_template_policy {

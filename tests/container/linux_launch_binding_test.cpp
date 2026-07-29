@@ -261,6 +261,11 @@ auto run() -> int {
     REQUIRE(pinned_before.has_value());
     const std::string original_path = executable_pattern + "-original";
     REQUIRE(::rename(executable_pattern.c_str(), original_path.c_str()) == 0);
+    auto pinned_after_rename =
+        glove::container::linux_detail::bind_managed_launch_projection_from_fd(
+            first_profile, executable_argv, first_mounts, controller_digest, executable_fd
+        );
+    REQUIRE(pinned_after_rename.has_value());
     const int replacement_fd =
         ::open(executable_pattern.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0700);
     REQUIRE(replacement_fd >= 0);
@@ -270,7 +275,9 @@ auto run() -> int {
         first_profile, executable_argv, first_mounts, controller_digest, executable_fd
     );
     REQUIRE(pinned_after.has_value());
-    REQUIRE(pinned_after == pinned_before);
+    // Rename updates ctime, which is deliberately committed by the binding.
+    // Replacing the old path must not affect a descriptor pinned after rename.
+    REQUIRE(pinned_after == pinned_after_rename);
     auto pinned_repeated = glove::container::linux_detail::bind_managed_launch_projection_from_fd(
         first_profile, executable_argv, first_mounts, controller_digest, executable_fd
     );

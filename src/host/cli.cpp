@@ -4,6 +4,8 @@
 #include "glove/host/control_client.hpp"
 #include "glove/host/daemon.hpp"
 #include "glove/host/doctor.hpp"
+#include "glove/host/operator_experience.hpp"
+#include "glove/host/runtime_policy.hpp"
 #include "glove/host/setup.hpp"
 
 #include <glaze/glaze.hpp>
@@ -33,6 +35,31 @@ struct doctor_report_wire {
     std::vector<doctor_check_wire> checks;
 };
 } // namespace doctor_wire
+
+namespace policy_wire {
+struct harness {
+    std::string runtime_id;
+    std::string executable_name;
+    bool available = false;
+    std::string resolved_executable;
+    std::string diagnostic;
+};
+
+struct detection_report {
+    std::uint8_t schema_version = 1;
+    std::vector<std::string> search_paths;
+    std::vector<harness> harnesses;
+};
+
+struct validation_report {
+    std::uint8_t schema_version = 1;
+    bool valid = false;
+    std::string policy_path;
+    std::string code;
+    std::string message;
+    std::string recovery;
+};
+} // namespace policy_wire
 
 namespace {
 
@@ -99,10 +126,52 @@ auto default_project_identifier(std::string_view name) -> std::string {
 void print_setup_usage() {
     std::fprintf(
         stderr,
-        "usage: glove setup [--config <absolute-file>] [--path-root <absolute-directory>] "
+        "usage:\n"
+        "  glove setup guide [--json]\n"
+        "  glove setup [--config <absolute-file>] [--path-root <absolute-directory>] "
         "[--session-policy <absolute-file>] "
         "[--root-id <id>] [--runtime <template-id>]... [--dry-run | --yes]\n"
     );
+}
+
+auto print_setup_guidance(bool json) -> int {
+    const auto guidance = operator_setup_guidance();
+    if (json) {
+        auto encoded = glz::write_json(guidance);
+        if (!encoded) {
+            return print_error(
+                "setup_guide_encode_failed", "Could not encode setup guidance.", "glove setup guide"
+            );
+        }
+        std::printf("%s\n", encoded->c_str());
+        return 0;
+    }
+    std::printf(
+        "Detected platform: %s\nRecommended path: %s\n",
+        guidance.platform.c_str(),
+        guidance.recommended_path.empty() ? "none" : guidance.recommended_path.c_str()
+    );
+    for (const auto& path : guidance.paths) {
+        std::printf(
+            "\n%s%s%s\n"
+            "  Goal:       %s\n"
+            "  Isolation:  %s\n"
+            "  Cost:       %s\n"
+            "  Receipts:   %s\n"
+            "  Limitation: %s\n"
+            "  Next:       %s\n",
+            path.id.c_str(),
+            path.recommended ? " (recommended)" : "",
+            path.eligible ? "" : " (not eligible on this host)",
+            path.goal.c_str(),
+            path.isolation.c_str(),
+            path.cost.c_str(),
+            path.receipts.c_str(),
+            path.limitation.c_str(),
+            path.next_command.c_str()
+        );
+    }
+    return 0;
 }
 
 void print_daemon_usage() {
@@ -113,9 +182,37 @@ void print_daemon_usage() {
     );
 }
 
+void print_policy_usage() {
+    std::fprintf(
+        stderr,
+        "usage:\n"
+        "  glove policy detect --search-path <absolute-directory>... [--json]\n"
+        "  glove policy stage --runtime <id> --source <absolute-file>\n"
+        "      --directory <absolute-directory> [--dry-run | --yes]\n"
+        "  glove policy generate --runtime <id>\n"
+        "      (--executable <absolute-file> | --search-path <absolute-directory>...)\n"
+        "      [--template-id <id>] [--backend <linux_production|macos_experimental>]\n"
+        "      [--argument <value>]... [--environment <NAME=VALUE>]...\n"
+        "      [--read-only-path <absolute-path>]... [--path-alias <id>]...\n"
+        "      [--projection-destination <id>]...\n"
+        "  glove policy validate --file <absolute-file>\n"
+        "  glove policy explain --file <absolute-file> [--json]\n"
+    );
+}
+
 } // namespace
 
 auto setup_command(std::span<char* const> arguments) -> int {
+    if (!arguments.empty() && std::string_view{arguments.front()} == "guide") {
+        if (arguments.size() == 1U) {
+            return print_setup_guidance(false);
+        }
+        if (arguments.size() == 2U && std::string_view{arguments[1]} == "--json") {
+            return print_setup_guidance(true);
+        }
+        print_setup_usage();
+        return 2;
+    }
     setup_options options;
     bool yes = false;
     bool runtime_overridden = false;
@@ -167,11 +264,27 @@ auto setup_command(std::span<char* const> arguments) -> int {
             "glove setup --help"
         );
     }
+    if (options.session_policy) {
+        auto valid = validate_session_policy_file(*options.session_policy);
+        if (!valid) {
+            return print_error(
+                "setup_session_policy_invalid",
+                valid.error(),
+                "glove policy explain --file <absolute-file>\n"
+                "  glove policy validate --file <absolute-file>"
+            );
+        }
+    }
     auto plan = plan_setup(options, current_environment());
     if (!plan) {
         return print_error("setup_invalid", plan.error(), "glove setup --help");
     }
     std::printf("Configuration: %s\n", plan->config_path.c_str());
+    const auto guidance = operator_setup_guidance();
+    std::printf(
+        "Platform shipping lane: %s (run `glove setup guide` for tradeoffs)\n",
+        guidance.recommended_path.empty() ? "unsupported" : guidance.recommended_path.c_str()
+    );
     std::printf("Runtime:       %s\n", plan->service.runtime_directory.c_str());
     std::printf("State:         %s\n", plan->service.audit_key.parent_path().c_str());
     if (plan->canonical_protected_root) {
@@ -198,6 +311,9 @@ auto setup_command(std::span<char* const> arguments) -> int {
         return print_error("setup_failed", executed.error(), "glove doctor");
     }
     std::printf("Glove machine setup completed.\nNext:\n  glove daemon start\n  glove doctor\n");
+    if (plan->service.session_policy) {
+        std::printf("  glove policy validate --file %s\n", plan->service.session_policy->c_str());
+    }
     if (plan->canonical_protected_root) {
         std::printf("  glove init <project-path> --root %s\n", plan->root_id.c_str());
     }
@@ -384,13 +500,309 @@ auto config_command(std::span<char* const> arguments) -> int {
     return print_error("config_action_invalid", "Unknown config action.", "glove config --help");
 }
 
+auto policy_command(std::span<char* const> arguments) -> int {
+    if (arguments.empty() || std::string_view{arguments.front()} == "-h" ||
+        std::string_view{arguments.front()} == "--help") {
+        print_policy_usage();
+        return arguments.empty() ? 2 : 0;
+    }
+    const std::string_view action{arguments.front()};
+    if (arguments.size() == 2U &&
+        (std::string_view{arguments[1]} == "-h" || std::string_view{arguments[1]} == "--help")) {
+        print_policy_usage();
+        return 0;
+    }
+    if (action == "detect") {
+        std::vector<std::filesystem::path> search_paths;
+        bool json = false;
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (argument == "--json") {
+                json = true;
+                ++index;
+            } else if (argument == "--search-path" && index + 1 < arguments.size()) {
+                search_paths.emplace_back(arguments[index + 1]);
+                index += 2;
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+        }
+        if (search_paths.empty()) {
+            return print_error(
+                "policy_search_path_required",
+                "Harness detection requires an explicit search directory; inherited PATH is not "
+                "trusted.",
+                "glove policy detect --search-path <absolute-directory> --json"
+            );
+        }
+        const auto detected = detect_runtime_harnesses(search_paths);
+        if (json) {
+            policy_wire::detection_report report;
+            for (const auto& path : search_paths) {
+                report.search_paths.push_back(path.string());
+            }
+            for (const auto& harness : detected) {
+                report.harnesses.push_back({
+                    .runtime_id = harness.runtime_id,
+                    .executable_name = harness.executable_name,
+                    .available = harness.available,
+                    .resolved_executable = harness.resolved_executable.string(),
+                    .diagnostic = harness.diagnostic,
+                });
+            }
+            auto encoded = glz::write_json(report);
+            if (!encoded) {
+                return print_error(
+                    "policy_encode_failed",
+                    "Could not encode harness detection output.",
+                    "glove policy detect --help"
+                );
+            }
+            std::printf("%s\n", encoded->c_str());
+        } else {
+            for (const auto& harness : detected) {
+                if (harness.available) {
+                    std::printf(
+                        "+ %-12s %s\n",
+                        harness.runtime_id.c_str(),
+                        harness.resolved_executable.c_str()
+                    );
+                } else {
+                    std::printf(
+                        "- %-12s %s\n", harness.runtime_id.c_str(), harness.diagnostic.c_str()
+                    );
+                }
+            }
+        }
+        return 0;
+    }
+    if (action == "stage") {
+        runtime_harness_stage_options options;
+        bool yes = false;
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (argument == "--yes") {
+                yes = true;
+                ++index;
+            } else if (argument == "--dry-run") {
+                options.dry_run = true;
+                ++index;
+            } else if (
+                index + 1 < arguments.size() &&
+                (argument == "--runtime" || argument == "--source" || argument == "--directory")
+            ) {
+                const std::string value{arguments[index + 1]};
+                if (argument == "--runtime") {
+                    options.runtime_id = value;
+                } else if (argument == "--source") {
+                    options.source_executable = value;
+                } else {
+                    options.protected_directory = value;
+                }
+                index += 2;
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+        }
+        if (yes && options.dry_run) {
+            return print_error(
+                "policy_conflicting_flags",
+                "--dry-run and --yes cannot be combined.",
+                "glove policy stage --help"
+            );
+        }
+        if (options.runtime_id.empty() || options.source_executable.empty() ||
+            options.protected_directory.empty()) {
+            print_policy_usage();
+            return 2;
+        }
+        if (!yes && !options.dry_run) {
+            return print_error(
+                "policy_confirmation_required",
+                "Staging creates a protected adapter-named entry point on this machine.",
+                "glove policy stage --runtime <id> --source <absolute-file> --directory "
+                "<absolute-directory> --dry-run\n"
+                "  glove policy stage --runtime <id> --source <absolute-file> --directory "
+                "<absolute-directory> --yes"
+            );
+        }
+        auto staged = stage_runtime_harness(options);
+        if (!staged) {
+            return print_error("policy_stage_failed", staged.error(), "glove policy stage --help");
+        }
+        std::printf(
+            "%s harness entry point: %s\n",
+            options.dry_run ? "Planned" : (staged->changed ? "Created" : "Verified"),
+            staged->protected_entry_point.c_str()
+        );
+        std::printf(
+            "Source executable:          %s\nNext:\n"
+            "  glove policy detect --search-path %s --json\n"
+            "  glove policy generate --runtime %s --executable %s\n"
+            "Or, when the service sees the same UID ownership mapping:\n"
+            "  glove policy generate --runtime %s --search-path %s\n",
+            staged->source_executable.c_str(),
+            staged->protected_entry_point.parent_path().c_str(),
+            staged->runtime_id.c_str(),
+            staged->source_executable.c_str(),
+            staged->runtime_id.c_str(),
+            staged->protected_entry_point.parent_path().c_str()
+        );
+        return 0;
+    }
+    if (action == "generate") {
+        runtime_policy_generation_options options;
+#if defined(__linux__)
+        options.backend = supervisor::sandbox_backend::linux_production;
+#else
+        options.backend = supervisor::sandbox_backend::macos_experimental;
+#endif
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (index + 1 >= arguments.size()) {
+                print_policy_usage();
+                return 2;
+            }
+            const std::string value{arguments[index + 1]};
+            if (argument == "--runtime") {
+                options.runtime_id = value;
+            } else if (argument == "--template-id") {
+                options.runtime_template_id = value;
+            } else if (argument == "--backend") {
+                if (value == "linux_production") {
+                    options.backend = supervisor::sandbox_backend::linux_production;
+                } else if (value == "macos_experimental") {
+                    options.backend = supervisor::sandbox_backend::macos_experimental;
+                } else {
+                    return print_error(
+                        "policy_backend_invalid",
+                        "Unknown sandbox backend.",
+                        "glove policy generate --help"
+                    );
+                }
+            } else if (argument == "--executable") {
+                options.executable_path = value;
+            } else if (argument == "--search-path") {
+                options.executable_search_paths.emplace_back(value);
+            } else if (argument == "--argument") {
+                options.arguments.push_back(value);
+            } else if (argument == "--environment") {
+                options.environment.push_back(value);
+            } else if (argument == "--read-only-path") {
+                options.read_only_paths.emplace_back(value);
+            } else if (argument == "--path-alias") {
+                options.allowed_path_aliases.push_back(value);
+            } else if (argument == "--projection-destination") {
+                options.allowed_projection_destinations.push_back(value);
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+            index += 2;
+        }
+        if (options.runtime_id.empty()) {
+            return print_error(
+                "policy_runtime_required",
+                "Runtime adapter ID is required.",
+                "glove policy generate --runtime <id> --executable <absolute-file>\n"
+                "  glove policy generate --runtime <id> --search-path <absolute-directory>"
+            );
+        }
+        auto generated = generate_runtime_policy(options);
+        if (!generated) {
+            return print_error(
+                "policy_generate_failed", generated.error(), "glove policy detect --help"
+            );
+        }
+        std::fprintf(
+            stderr,
+            "Resolved executable: %s\nAdapter digest:     %s\n",
+            generated->resolved_executable.c_str(),
+            generated->adapter_command_digest.c_str()
+        );
+        std::printf("%s", generated->policy_template_json.c_str());
+        return 0;
+    }
+    if (action == "validate" || action == "explain") {
+        std::optional<std::filesystem::path> policy_path;
+        bool json = false;
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (argument == "--json" && action == "explain") {
+                json = true;
+                ++index;
+            } else if (argument == "--file" && index + 1 < arguments.size()) {
+                policy_path = arguments[index + 1];
+                index += 2;
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+        }
+        if (!policy_path) {
+            print_policy_usage();
+            return 2;
+        }
+        auto valid = validate_session_policy_file(*policy_path);
+        if (action == "validate") {
+            if (!valid) {
+                return print_error(
+                    "policy_invalid",
+                    valid.error(),
+                    "fix the reported field, chmod 600 <policy>, then rerun glove policy validate"
+                );
+            }
+            std::printf("Session policy is valid: %s\n", policy_path->c_str());
+            return 0;
+        }
+        policy_wire::validation_report report{
+            .valid = valid.has_value(),
+            .policy_path = policy_path->string(),
+            .code = valid ? "policy_valid" : "policy_invalid",
+            .message =
+                valid ? "Session policy schema and local invariants are valid." : valid.error(),
+            .recovery =
+                valid ? std::string{}
+                      : "Fix the reported field, protect the file with mode 0600, and validate "
+                        "again.",
+        };
+        if (json) {
+            auto encoded = glz::write_json(report);
+            if (!encoded) {
+                return print_error(
+                    "policy_encode_failed",
+                    "Could not encode policy diagnostic output.",
+                    "glove policy explain --help"
+                );
+            }
+            std::printf("%s\n", encoded->c_str());
+        } else {
+            std::printf(
+                "%c [%s] %s\n",
+                report.valid ? '+' : 'x',
+                report.code.c_str(),
+                report.message.c_str()
+            );
+            if (!report.recovery.empty()) {
+                std::printf("    %s\n", report.recovery.c_str());
+            }
+        }
+        return valid ? 0 : 1;
+    }
+    print_policy_usage();
+    return 2;
+}
+
 auto init_command(std::span<char* const> arguments) -> int {
     if (arguments.empty() || std::string_view{arguments.front()} == "-h" ||
         std::string_view{arguments.front()} == "--help") {
         std::fprintf(
             stderr,
             "usage: glove init <project> [--config <absolute-file>] [--id <id>] [--root <id>] "
-            "[--label <text>] [--access <read|ephemeral-write|retained-write>] "
+            "[--label <text>] [--purpose <inspect|experiment|retain>] "
+            "[--access <read|ephemeral-write|retained-write>] "
             "[--max-bytes <bytes>] [--ttl-secs <seconds>] [--runtime <template-id>]... "
             "[--request-id <id>]\n"
         );
@@ -407,14 +819,19 @@ auto init_command(std::span<char* const> arguments) -> int {
         .runtime_template_ids = {"codex-safe", "pi-safe"},
         .idempotency_key = {},
     };
+    project_purpose purpose = project_purpose::inspect;
+    std::optional<project_access> access_override;
+    std::optional<std::uint64_t> max_bytes_override;
+    std::optional<std::uint64_t> ttl_secs_override;
     std::optional<std::filesystem::path> config_path;
     bool runtime_overridden = false;
     for (std::size_t index = 1; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
         if (index + 1 >= arguments.size() ||
             (argument != "--config" && argument != "--id" && argument != "--root" &&
-             argument != "--label" && argument != "--access" && argument != "--max-bytes" &&
-             argument != "--ttl-secs" && argument != "--runtime" && argument != "--request-id")) {
+             argument != "--label" && argument != "--purpose" && argument != "--access" &&
+             argument != "--max-bytes" && argument != "--ttl-secs" && argument != "--runtime" &&
+             argument != "--request-id")) {
             return print_error(
                 "init_usage", "Project enrollment arguments are invalid.", "glove init --help"
             );
@@ -428,13 +845,20 @@ auto init_command(std::span<char* const> arguments) -> int {
             enrollment.root_id = value;
         } else if (argument == "--label") {
             enrollment.display_label = value;
+        } else if (argument == "--purpose") {
+            if (value != "inspect" && value != "experiment" && value != "retain") {
+                return print_error(
+                    "init_purpose_invalid", "Unknown project purpose.", "glove init --help"
+                );
+            }
+            purpose = parse_project_purpose(value);
         } else if (argument == "--access") {
             if (value == "read") {
-                enrollment.access = project_access::read;
+                access_override = project_access::read;
             } else if (value == "ephemeral-write") {
-                enrollment.access = project_access::ephemeral_write;
+                access_override = project_access::ephemeral_write;
             } else if (value == "retained-write") {
-                enrollment.access = project_access::retained_write;
+                access_override = project_access::retained_write;
             } else {
                 return print_error(
                     "init_access_invalid", "Unknown project access mode.", "glove init --help"
@@ -442,7 +866,7 @@ auto init_command(std::span<char* const> arguments) -> int {
             }
         } else if (argument == "--max-bytes") {
             try {
-                enrollment.max_bytes = std::stoull(value);
+                max_bytes_override = std::stoull(value);
             } catch (const std::exception&) {
                 return print_error(
                     "init_max_bytes_invalid", "--max-bytes must be an integer.", "glove init --help"
@@ -450,7 +874,7 @@ auto init_command(std::span<char* const> arguments) -> int {
             }
         } else if (argument == "--ttl-secs") {
             try {
-                enrollment.ttl_secs = std::stoull(value);
+                ttl_secs_override = std::stoull(value);
             } catch (const std::exception&) {
                 return print_error(
                     "init_ttl_invalid", "--ttl-secs must be an integer.", "glove init --help"
@@ -467,6 +891,15 @@ auto init_command(std::span<char* const> arguments) -> int {
         }
         index += 2;
     }
+    const auto purpose_defaults = defaults_for(purpose);
+    enrollment.access = access_override.value_or(purpose_defaults.access);
+    const auto default_write_bytes = std::uint64_t{1024} * 1024U * 1024U;
+    enrollment.max_bytes = max_bytes_override.value_or(
+        enrollment.access == project_access::read
+            ? 0
+            : std::max(purpose_defaults.max_bytes, default_write_bytes)
+    );
+    enrollment.ttl_secs = ttl_secs_override.value_or(purpose_defaults.ttl_secs);
     std::error_code canonical_error;
     enrollment.project = std::filesystem::canonical(enrollment.project, canonical_error);
     if (canonical_error) {
@@ -485,9 +918,6 @@ auto init_command(std::span<char* const> arguments) -> int {
     }
     if (enrollment.idempotency_key.empty()) {
         enrollment.idempotency_key = "init-" + enrollment.exposure_id;
-    }
-    if (enrollment.access != project_access::read && enrollment.max_bytes == 0) {
-        enrollment.max_bytes = std::uint64_t{1024} * 1024U * 1024U;
     }
     if (!config_path) {
         auto resolved = default_path();
@@ -508,6 +938,35 @@ auto init_command(std::span<char* const> arguments) -> int {
             "Project enrollment requires a setup-approved protected root.",
             "glove setup --path-root <absolute-directory> --dry-run"
         );
+    }
+    const auto access_name = enrollment.access == project_access::read ? "read-only"
+                             : enrollment.access == project_access::ephemeral_write
+                                 ? "ephemeral write"
+                                 : "retained write";
+    const auto writable_scope =
+        enrollment.access == project_access::read
+            ? std::string{"none"}
+            : "isolated copy, up to " + std::to_string(enrollment.max_bytes) + " bytes";
+    const auto cleanup =
+        enrollment.access == project_access::read
+            ? std::string{"No writable project copy is created."}
+        : enrollment.access == project_access::ephemeral_write
+            ? std::string{"The writable copy is removed after the session."}
+            : std::string{"The writable copy is retained for explicit review and apply."};
+    std::printf(
+        "Purpose:          %s\n"
+        "Access:           %s\n"
+        "Writable scope:   %s\n"
+        "Cleanup:          %s\n"
+        "Enrollment TTL:   %llu seconds\n",
+        project_purpose_name(purpose).data(),
+        access_name,
+        writable_scope.c_str(),
+        cleanup.c_str(),
+        static_cast<unsigned long long>(enrollment.ttl_secs)
+    );
+    if (access_override || max_bytes_override || ttl_secs_override) {
+        std::printf("Advanced overrides: active (review access, quota, and TTL above)\n");
     }
     auto exposure = enroll_project(*configured, enrollment);
     if (!exposure) {

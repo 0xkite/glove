@@ -50,10 +50,36 @@ docker run --rm --privileged --security-opt seccomp=unconfined glove-linux
 The elevated Docker flags permit nested namespace creation, `clone3`, and
 `pivot_root`. They are not required on a suitable bare-metal Linux host.
 
+On Apple Silicon with macOS 26 or newer, the Apple Containers shipping lane
+builds the same Linux image and verifies its portable tests plus an outer VM
+perimeter:
+
+```sh
+container system start
+./scripts/macos-shipping-lane.sh
+```
+
+Apple's default guest currently rejects mounting procfs from Glove's nested
+child user namespace. The script detects that condition and does not treat its
+portable Linux or outer-VM results as evidence that the nested
+`linux_production` backend passed. The CI workflow therefore targets a
+physical self-hosted Apple Silicon runner. Main-branch pushes run this shipping
+gate automatically; reviewed revisions may also be dispatched manually.
+
+The macOS shipping script and installed setup flow use the same operator model:
+
+```sh
+glove setup guide
+glove setup guide --json
+```
+
+The guide makes Apple Containers' VM/storage cost and the platform's nested
+kernel capability differences explicit. This is the default macOS shipping
+lane, just as the delegated-kernel lane is the default Linux shipping path.
+
 ## Contained MCP agent
 
-The synthetic agent verifies initialization, tool discovery, policy, dispatch,
-and response handling:
+`glove run` contains an MCP-client agent and exposes only allow-listed tools:
 
 ```sh
 ./build/dev/src/glove run \
@@ -62,21 +88,8 @@ and response handling:
   -- ./build/dev/src/container/glove_synthetic_agent --mode=client
 ```
 
-Multiple stdio MCP servers may be registered:
-
-```sh
-./build/dev/src/glove run \
-  --upstream yams=yams,serve,--quiet \
-  --upstream local=python3,-m,my_mcp_server \
-  --allow yams.mcp.echo \
-  --allow local.read \
-  --audit-log /tmp/glove-audit.jsonl \
-  --workspace /tmp/glove-work \
-  -- /absolute/path/to/agent
-```
-
-The agent sees qualified tool names such as `yams.mcp.echo`. An upstream server
-runs as a host process and is not contained by the agent sandbox.
+Upstream tool servers are separate host processes and require their own
+containment boundary.
 
 ## Direct agent
 
@@ -89,73 +102,22 @@ mkdir -p /tmp/glove-work
   -- /absolute/path/to/agent --version
 ```
 
-Exposure is opt-in:
-
-- `--workspace PATH` grants the working tree.
-- `--read PATH` grants a read-only file or directory.
-- `--write PATH` grants write access.
-- `--env NAME` copies one host environment variable.
-- `--egress-allow HOST:PORT` permits an exact macOS HTTPS destination.
-
 Without `--workspace`, Glove starts in a private empty directory. Linux direct
-execution is offline because proxy transport into the isolated network namespace
-is not implemented.
-
-## Audit output
-
-`--audit-log PATH` appends one JSON object per event:
-
-```sh
-tail -f /tmp/glove-audit.jsonl | jq .
-```
-
-The audit path must be outside every agent-visible path. Glove rejects unsafe
-placement. The general JSONL log prevents contained-agent access but is not
-authenticated against a same-user host process.
+execution is offline because proxy transport into the isolated network
+namespace is not implemented. Use `glove exec --help` for explicit filesystem,
+environment, egress, and audit grants.
 
 ## Gloved control service
 
-Use the host setup workflow instead of assembling daemon flags manually:
+Inspect the platform recommendation, then follow the dedicated host guide:
 
 ```sh
-./build/dev/src/glove setup --path-root "$HOME/work" --dry-run
-./build/dev/src/glove setup --path-root "$HOME/work" --yes
-./build/dev/src/glove daemon start
-./build/dev/src/glove daemon status
+./build/dev/src/glove setup guide
 ```
 
-Pass `--session-policy /absolute/owner-only/session-policy.json` to both setup
-commands when testing managed sessions. Retained-write preparation on Linux
-also requires `mkfs.ext4`, loop devices, and mount capability. See
-[host-setup.md](host-setup.md) and [session-policy.md](session-policy.md).
-
-### Sage-triggered user service
-
-`glove daemon start` installs the fixed user-service definition and starts it.
-The templates under `packaging/` document the equivalent systemd and launchd
-definitions.
-
-Then configure and verify Sage:
-
-```sh
-sage config set daemon.glove_activation_mode user_service
-sage config set daemon.glove_service_name sage-gloved.service
-sage config set daemon.glove_runtime_dir /value/from/glove-config-show
-sage config set daemon.glove_session_policy_path /value/from/glove-config-show
-sage config set daemon.glove_audit_key_path /value/from/glove-config-show
-sage config set daemon.fleet_execution_host_enabled true
-sage daemon restart
-sage doctor --scope glove --include-details
-```
-
-Use `org.sage-protocol.gloved` as the service name on macOS. Enable
-`fleet_execution_host_enabled` only after reviewing the local Sage daemon
-policy.
-
-Sage invokes only the platform service manager with a bounded local service
-label. P2P cannot select the binary, service, arguments, environment, or path
-policy. Authentication or capability failure leaves Sage available while
-remote launch remains disabled.
+[`host-setup.md`](host-setup.md) owns machine setup, service activation,
+purpose-based project enrollment, and Sage verification.
+[`session-policy.md`](session-policy.md) owns the managed-session contract.
 
 ## Troubleshooting
 

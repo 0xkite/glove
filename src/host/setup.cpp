@@ -1,5 +1,7 @@
 #include "glove/host/setup.hpp"
 
+#include "glove/host/runtime_policy.hpp"
+
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <sys/stat.h>
@@ -338,10 +340,8 @@ auto execute_setup(const setup_plan& plan) -> result<void> {
             }
         }
         if (plan.service.session_policy) {
-            if (auto policy = read_owner_file(*plan.service.session_policy, mebibyte); !policy) {
-                return std::unexpected(
-                    "session policy is not a protected owner-only file: " + policy.error()
-                );
+            if (auto valid = validate_session_policy_file(*plan.service.session_policy); !valid) {
+                return std::unexpected("session policy is invalid: " + valid.error());
             }
         }
         for (const auto& directory : {
@@ -377,10 +377,8 @@ auto execute_setup(const setup_plan& plan) -> result<void> {
         }
     }
     if (plan.service.session_policy) {
-        if (auto policy = read_owner_file(*plan.service.session_policy, mebibyte); !policy) {
-            return std::unexpected(
-                "session policy is not a protected owner-only file: " + policy.error()
-            );
+        if (auto valid = validate_session_policy_file(*plan.service.session_policy); !valid) {
+            return std::unexpected("session policy is invalid: " + valid.error());
         }
     }
     bool audit_key_created = false;

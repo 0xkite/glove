@@ -2,7 +2,7 @@
 
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir"
 
 usage() {
@@ -86,6 +86,7 @@ cmake --install "build/$preset" --prefix "$install_prefix"
 
 printf '\nInstalled Glove to %s\n' "$install_prefix"
 printf '%s\n' "Next:"
+printf '  %s/bin/glove setup guide\n' "$install_prefix"
 printf '  %s/bin/glove setup --dry-run\n' "$install_prefix"
 printf '  %s/bin/glove setup --yes\n' "$install_prefix"
 printf '  %s/bin/glove daemon start\n' "$install_prefix"

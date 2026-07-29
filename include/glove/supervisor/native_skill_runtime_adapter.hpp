@@ -27,6 +27,11 @@ struct native_skill_runtime_adapter {
 [[nodiscard]] auto native_skill_runtime_adapter_for(std::string_view runtime_id)
     -> std::optional<native_skill_runtime_adapter>;
 
+// Canonical built-in adapter catalog used by owner-local discovery and policy
+// tooling. Callers must still resolve executables through an explicit,
+// digest-bound search path.
+[[nodiscard]] auto native_skill_runtime_adapters() -> std::vector<native_skill_runtime_adapter>;
+
 struct native_skill_projection {
     std::string projection_id;
     std::string bundle_content_digest;

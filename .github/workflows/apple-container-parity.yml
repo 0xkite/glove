@@ -1,0 +1,31 @@
+name: macOS Apple Container Shipping Lane
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-apple-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-shipping-lane:
+    name: macOS shipping gate
+    # GitHub-hosted macOS runners do not support nested virtualization. This
+    # custom label intentionally targets a physical Apple Silicon runner.
+    runs-on: [self-hosted, macOS, ARM64, glove-apple-container]
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run native macOS preflight
+        run: scripts/preflight.sh
+
+      - name: Run macOS shipping lane
+        run: scripts/macos-shipping-lane.sh --start-system

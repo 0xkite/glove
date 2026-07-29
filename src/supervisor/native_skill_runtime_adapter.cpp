@@ -129,6 +129,20 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
     return std::nullopt;
 }
 
+auto native_skill_runtime_adapters() -> std::vector<native_skill_runtime_adapter> {
+    constexpr std::array<std::string_view, 5> runtime_ids = {
+        "codex", "claude-code", "pi", "copilot", "opencode"
+    };
+    std::vector<native_skill_runtime_adapter> adapters;
+    adapters.reserve(runtime_ids.size());
+    for (const auto runtime_id : runtime_ids) {
+        if (auto adapter = native_skill_runtime_adapter_for(runtime_id)) {
+            adapters.push_back(std::move(*adapter));
+        }
+    }
+    return adapters;
+}
+
 auto is_builtin_adapter(const native_skill_runtime_adapter& adapter) -> bool {
     const auto builtin = native_skill_runtime_adapter_for(adapter.runtime_id);
     return builtin && *builtin == adapter;

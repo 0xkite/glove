@@ -65,6 +65,31 @@ a dedicated service-owned runtime directory instead; an operator may place a
 runtime-named symlink there to the package-managed executable. The directory—not
 the Sage plan—remains the authority for the selected harness.
 
+The owner-local workflow is programmatic:
+
+```sh
+glove policy detect --search-path /absolute/directory --json
+glove policy stage --runtime codex --source /absolute/codex \
+  --directory /absolute/protected/codex --dry-run
+glove policy stage --runtime codex --source /absolute/codex \
+  --directory /absolute/protected/codex --yes
+glove policy generate --runtime codex \
+  --executable /absolute/canonical/codex --template-id codex-safe
+glove policy explain --file /absolute/session-policy.json --json
+glove policy validate --file /absolute/session-policy.json
+```
+
+`policy generate` emits one strict `runtime_templates[]` JSON entry after
+canonicalizing either a pinned `--executable` or explicit `--search-path`
+roots, resolving the adapter executable, and calculating its digest.
+Arguments, canonical environment, read-only dependency paths, allowed aliases,
+and projection destinations are repeatable explicit flags. `policy stage`
+never reads or copies a harness home and never overwrites an existing entry
+point. Pinned mode is the portable default for a Linux service in an
+unprivileged user namespace: unmapped host-root ancestors retain an ambiguous
+overflow UID and discovery continues to reject them rather than assuming they
+were root-owned.
+
 `direct_write` remains a legacy parse-only value and is rejected at launch.
 New write-capable plans use isolated `retained_write` materializations; applying
 their changes to the source is a separate, not-yet-enabled operation.
@@ -249,8 +274,8 @@ it read-only at the configured target. The launch binding and authenticated
 terminal receipt commit each projection's identifier, destination, target, and
 digest.
 
-Runtime templates bind either an absolute executable or the constrained Codex
-discovery surface, plus ordered arguments and canonical environment, to
+Runtime templates bind either an absolute executable or a constrained built-in
+native-adapter discovery surface, plus ordered arguments and canonical environment, to
 `adapter_command_digest`. Sage and Glove derive that digest independently.
 Linux preparation then binds the resolved launch to cgroup identity,
 quota-backed filesystems, the six limits, and resolved projections.

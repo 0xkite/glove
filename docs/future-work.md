@@ -9,10 +9,10 @@ version control, tests, and architecture documentation.
 |---|---|
 | Direct-write approval | A distinct authenticated local-consent record is persisted with approval class, actor identity, plan/session digests, scope, and expiry; start verifies it before any retained host write. |
 | Prompt-library expansion | A verified Sage bundle is parsed and projected into a bounded harness-native directory; launch binding and receipts commit every derived input. |
-| Runtime adapter integration | A private session home, harness-native Codex/Pi bundle projection, and exact initial context are committed to the launch profile and receipt; capability schema v1 is advertised only then. |
+| Runtime adapter integration | Harness-native bundle projection and exact initial context are committed to the launch profile and receipt for every supported adapter. |
 | Service ownership | Sage can activate the same-UID user-service templates. Production is complete when `gloved` uses a dedicated least-privilege identity, protected key rotation, and documented upgrade/recovery procedures. |
 | macOS resource contract | CPU, memory, PID, wall-time, disk, and terminal-output limits are enforced and represented in authenticated receipts, or managed remote launch remains unavailable on macOS. |
-| Exposure lifecycle hardening | Owner-local programmatic enrollment is implemented; production completion adds explicit renewal, revocation CLI/UX, and lifecycle receipts without accepting remote host paths. |
+| Exposure lifecycle hardening | Add explicit renewal and revocation CLI/UX plus lifecycle receipts without accepting remote host paths. |
 
 ## P1: protocol and integrity hardening
 
@@ -30,8 +30,8 @@ version control, tests, and architecture documentation.
 
 | Work | Completion condition |
 |---|---|
-| Parser fuzzing | JSON-RPC, policy, plan, journal, and bundle inputs have sanitizer-backed fuzz targets and a checked adversarial corpus. |
-| Fault injection | Tests cover short writes, disk-full behavior, journal truncation, process crashes at each lifecycle transition, and recovery idempotence. |
+| Bundle parser fuzzing | The derived prompt-library bundle decoder has a sanitizer-backed target and checked adversarial corpus. |
+| Remaining fault injection | Persisted journals share short-write/disk-full seams, and every lifecycle transition has crash/replay coverage. |
 | Multi-agent matrix | Supported Codex, Pi, Claude, and other adapters are tested against the same filesystem, environment, tool, terminal, and recovery invariants. |
 | Performance characterization | Startup cost, request latency, throughput, and memory overhead are measured with reproducible workloads and confidence intervals. |
 | Comparative evaluation | Claims are evaluated against comparable containment and gateway designs using the same threat model and workload. |

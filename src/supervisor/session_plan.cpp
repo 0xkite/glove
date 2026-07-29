@@ -238,64 +238,142 @@ auto valid_environment_name(std::string_view name) -> bool {
 
 auto path_within(const std::filesystem::path& candidate, const std::filesystem::path& root) -> bool;
 
-auto validate_launch_template(const runtime_launch_template& launch)
+auto validate_runtime_launch_template_impl(const runtime_launch_template& launch)
     -> std::expected<void, std::string> {
     const std::filesystem::path executable{launch.executable_path};
     const auto discovered_adapter = native_skill_runtime_adapter_for(launch.runtime_discovery);
-    if ((launch.runtime_discovery.empty()
-             ? !valid_launch_path(launch.executable_path)
-             : !discovered_adapter || !launch.executable_path.empty() ||
-                   launch.executable_search_paths.empty()) ||
-        launch.arguments.size() > max_launch_fields ||
-        launch.environment.size() > max_launch_fields ||
-        launch.read_only_paths.size() > max_launch_fields ||
-        launch.executable_search_paths.size() > max_launch_fields ||
-        std::ranges::any_of(launch.arguments, [](const auto& value) {
-            return !valid_launch_string(value);
-        })) {
-        return std::unexpected(std::string{"runtime launch template is invalid"});
+    if (launch.runtime_discovery.empty()) {
+        if (!valid_launch_path(launch.executable_path)) {
+            return std::unexpected(
+                std::string{"launch.executable_path must be a canonical absolute non-root path"}
+            );
+        }
+        if (!launch.executable_search_paths.empty()) {
+            return std::unexpected(
+                std::string{"launch.executable_search_paths requires launch.runtime_discovery"}
+            );
+        }
+    } else {
+        if (!discovered_adapter) {
+            return std::unexpected(
+                "launch.runtime_discovery is unsupported: " + launch.runtime_discovery
+            );
+        }
+        if (!launch.executable_path.empty()) {
+            return std::unexpected(
+                std::string{
+                    "launch.executable_path must be empty when launch.runtime_discovery is set"
+                }
+            );
+        }
+        if (launch.executable_search_paths.empty()) {
+            return std::unexpected(
+                std::string{
+                    "launch.executable_search_paths must contain at least one explicit directory"
+                }
+            );
+        }
+    }
+    if (launch.arguments.size() > max_launch_fields) {
+        return std::unexpected(std::string{"launch.arguments exceeds 256 entries"});
+    }
+    if (launch.environment.size() > max_launch_fields) {
+        return std::unexpected(std::string{"launch.environment exceeds 256 entries"});
+    }
+    if (launch.read_only_paths.size() > max_launch_fields) {
+        return std::unexpected(std::string{"launch.read_only_paths exceeds 256 entries"});
+    }
+    if (launch.executable_search_paths.size() > max_launch_fields) {
+        return std::unexpected(std::string{"launch.executable_search_paths exceeds 256 entries"});
+    }
+    for (std::size_t index = 0; index < launch.arguments.size(); ++index) {
+        if (!valid_launch_string(launch.arguments[index])) {
+            return std::unexpected(
+                "launch.arguments[" + std::to_string(index) + "] is empty or exceeds 64 KiB"
+            );
+        }
     }
 
     std::set<std::string> environment_names;
     std::string_view previous;
-    for (const auto& entry : launch.environment) {
+    for (std::size_t index = 0; index < launch.environment.size(); ++index) {
+        const auto& entry = launch.environment[index];
         if (!valid_launch_string(entry)) {
-            return std::unexpected(std::string{"runtime launch environment is not canonical"});
+            return std::unexpected(
+                "launch.environment[" + std::to_string(index) + "] is empty or exceeds 64 KiB"
+            );
         }
         const auto separator = entry.find('=');
         if (separator == std::string::npos) {
-            return std::unexpected(std::string{"runtime launch environment is not canonical"});
+            return std::unexpected(
+                "launch.environment[" + std::to_string(index) + "] must be NAME=VALUE"
+            );
         }
         const std::string_view name{entry.data(), separator};
-        if (!valid_environment_name(name) || !environment_names.emplace(name).second ||
-            (!previous.empty() && previous >= entry)) {
-            return std::unexpected(std::string{"runtime launch environment is not canonical"});
+        if (!valid_environment_name(name)) {
+            return std::unexpected(
+                "launch.environment[" + std::to_string(index) + "] has an invalid name"
+            );
+        }
+        if (!environment_names.emplace(name).second) {
+            return std::unexpected(
+                "launch.environment[" + std::to_string(index) + "] duplicates " + std::string{name}
+            );
+        }
+        if (!previous.empty() && previous >= entry) {
+            return std::unexpected(
+                "launch.environment[" + std::to_string(index) +
+                "] is not in strictly increasing byte order"
+            );
         }
         previous = entry;
     }
     std::vector<std::filesystem::path> paths;
     paths.reserve(launch.read_only_paths.size());
-    for (const auto& raw : launch.read_only_paths) {
+    for (std::size_t index = 0; index < launch.read_only_paths.size(); ++index) {
+        const auto& raw = launch.read_only_paths[index];
         const std::filesystem::path path{raw};
-        if (!valid_launch_path(raw) ||
-            (!discovered_adapter &&
-             (path_within(path, executable) || path_within(executable, path))) ||
-            std::ranges::any_of(paths, [&](const auto& existing) {
+        if (!valid_launch_path(raw)) {
+            return std::unexpected(
+                "launch.read_only_paths[" + std::to_string(index) +
+                "] must be a canonical absolute non-root path"
+            );
+        }
+        if (!discovered_adapter &&
+            (path_within(path, executable) || path_within(executable, path))) {
+            return std::unexpected(
+                "launch.read_only_paths[" + std::to_string(index) +
+                "] overlaps launch.executable_path"
+            );
+        }
+        if (std::ranges::any_of(paths, [&](const auto& existing) {
                 return path_within(path, existing) || path_within(existing, path);
             })) {
-            return std::unexpected(std::string{"runtime launch runtime paths are invalid"});
+            return std::unexpected(
+                "launch.read_only_paths[" + std::to_string(index) +
+                "] duplicates or overlaps an earlier entry"
+            );
         }
         paths.push_back(path);
     }
     std::vector<std::filesystem::path> search_paths;
     search_paths.reserve(launch.executable_search_paths.size());
-    for (const auto& raw : launch.executable_search_paths) {
+    for (std::size_t index = 0; index < launch.executable_search_paths.size(); ++index) {
+        const auto& raw = launch.executable_search_paths[index];
         const std::filesystem::path path{raw};
-        if (!discovered_adapter || !valid_launch_path(raw) ||
-            std::ranges::any_of(search_paths, [&](const auto& existing) {
+        if (!valid_launch_path(raw)) {
+            return std::unexpected(
+                "launch.executable_search_paths[" + std::to_string(index) +
+                "] must be a canonical absolute non-root path"
+            );
+        }
+        if (std::ranges::any_of(search_paths, [&](const auto& existing) {
                 return path_within(path, existing) || path_within(existing, path);
             })) {
-            return std::unexpected(std::string{"runtime discovery search paths are invalid"});
+            return std::unexpected(
+                "launch.executable_search_paths[" + std::to_string(index) +
+                "] duplicates or overlaps an earlier entry"
+            );
         }
         search_paths.push_back(path);
     }
@@ -581,21 +659,42 @@ auto valid_projection_destinations(
     return true;
 }
 
-auto validate_runtime_policy(const runtime_template_policy& runtime) -> bool {
-    const bool identifiers = valid_identifier(runtime.runtime_template_id) &&
-                             valid_identifier(runtime.runtime_id) &&
-                             valid_digest(runtime.adapter_command_digest) &&
-                             unique_identifiers(runtime.allowed_path_aliases) &&
-                             unique_identifiers(runtime.allowed_projection_destinations);
-    if (!identifiers || !runtime.launch) {
-        return identifiers;
+auto validate_runtime_policy(const runtime_template_policy& runtime)
+    -> std::expected<void, std::string> {
+    if (!valid_identifier(runtime.runtime_template_id)) {
+        return std::unexpected(std::string{"runtime_template_id is invalid"});
+    }
+    if (!valid_identifier(runtime.runtime_id)) {
+        return std::unexpected(std::string{"runtime_id is invalid"});
+    }
+    if (!valid_digest(runtime.adapter_command_digest)) {
+        return std::unexpected(std::string{"adapter_command_digest must be lowercase SHA-256"});
+    }
+    if (!unique_identifiers(runtime.allowed_path_aliases)) {
+        return std::unexpected(
+            std::string{"allowed_path_aliases must be canonical unique identifiers"}
+        );
+    }
+    if (!unique_identifiers(runtime.allowed_projection_destinations)) {
+        return std::unexpected(
+            std::string{"allowed_projection_destinations must be canonical unique identifiers"}
+        );
+    }
+    if (!runtime.launch) {
+        return {};
     }
     if (!runtime.launch->runtime_discovery.empty() &&
         runtime.launch->runtime_discovery != runtime.runtime_id) {
-        return false;
+        return std::unexpected(std::string{"launch.runtime_discovery must match runtime_id"});
     }
     auto digest = runtime_launch_template_digest(*runtime.launch);
-    return digest && *digest == runtime.adapter_command_digest;
+    if (!digest) {
+        return std::unexpected(digest.error());
+    }
+    if (*digest != runtime.adapter_command_digest) {
+        return std::unexpected("adapter_command_digest mismatch: expected " + *digest);
+    }
+    return {};
 }
 
 auto validate_path_projection(
@@ -751,8 +850,12 @@ auto validate_secret_projection(const wire::session_plan& plan, const session_pl
 
 } // namespace
 
+auto validate_runtime_launch_template(const runtime_launch_template& launch) -> result<void> {
+    return validate_runtime_launch_template_impl(launch);
+}
+
 auto runtime_launch_template_digest(const runtime_launch_template& launch) -> result<std::string> {
-    if (auto valid = validate_launch_template(launch); !valid) {
+    if (auto valid = validate_runtime_launch_template_impl(launch); !valid) {
         return std::unexpected(valid.error());
     }
     launch_template_encoder encoder;
@@ -784,6 +887,9 @@ auto runtime_launch_template_digest(const runtime_launch_template& launch) -> re
 }
 
 auto resolve_runtime_executable(const runtime_launch_template& launch) -> result<std::string> {
+    if (auto valid = validate_runtime_launch_template_impl(launch); !valid) {
+        return std::unexpected(valid.error());
+    }
     if (launch.runtime_discovery.empty()) {
         return launch.executable_path;
     }
@@ -796,13 +902,22 @@ auto resolve_runtime_executable(const runtime_launch_template& launch) -> result
     }
     // Discovery is intentionally never delegated to the inherited PATH. Every
     // directory is an explicit, digest-bound operator policy value.
+    std::vector<std::string> diagnostics;
+    diagnostics.reserve(launch.executable_search_paths.size());
     for (const auto& configured_root : launch.executable_search_paths) {
-        if (!valid_launch_path(configured_root)) {
-            continue;
-        }
+        const auto failure = [&](std::string reason) {
+            diagnostics.push_back(configured_root + ": " + std::move(reason));
+        };
         std::error_code error;
         const auto root = std::filesystem::canonical(configured_root, error);
-        if (error || !std::filesystem::is_directory(root, error) || error) {
+        if (error) {
+            failure("cannot canonicalize directory (" + error.message() + ")");
+            continue;
+        }
+        if (!std::filesystem::is_directory(root, error) || error) {
+            failure(
+                error ? "cannot inspect directory (" + error.message() + ")" : "is not a directory"
+            );
             continue;
         }
         // All path components must be controlled by the service account (or
@@ -813,8 +928,15 @@ auto resolve_runtime_executable(const runtime_launch_template& launch) -> result
         for (auto current = root;; current = current.parent_path()) {
             struct stat directory_status{};
             if (::stat(current.c_str(), &directory_status) != 0 ||
-                !S_ISDIR(directory_status.st_mode) ||
-                (directory_status.st_uid != 0 && directory_status.st_uid != ::geteuid())) {
+                !S_ISDIR(directory_status.st_mode)) {
+                failure("cannot inspect trusted ancestor " + current.string());
+                trusted = false;
+                break;
+            }
+            if (directory_status.st_uid != 0 && directory_status.st_uid != ::geteuid()) {
+                failure(
+                    "ancestor " + current.string() + " is not owned by root or the service user"
+                );
                 trusted = false;
                 break;
             }
@@ -822,6 +944,7 @@ auto resolve_runtime_executable(const runtime_launch_template& launch) -> result
             const bool root_owned_sticky =
                 directory_status.st_uid == 0 && (directory_status.st_mode & S_ISVTX) != 0;
             if (writable_by_other && !root_owned_sticky) {
+                failure("ancestor " + current.string() + " is writable by another principal");
                 trusted = false;
                 break;
             }
@@ -834,23 +957,45 @@ auto resolve_runtime_executable(const runtime_launch_template& launch) -> result
         }
         const std::filesystem::path candidate = root / adapter->executable_name;
         const auto status = std::filesystem::status(candidate, error);
-        if (error || !std::filesystem::is_regular_file(status)) {
+        if (error) {
+            failure(
+                "cannot inspect expected executable " + candidate.string() + " (" +
+                error.message() + ")"
+            );
+            continue;
+        }
+        if (!std::filesystem::is_regular_file(status)) {
+            failure("expected executable is not a regular file: " + candidate.string());
             continue;
         }
         const auto permissions = status.permissions();
         if ((permissions &
              (std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
               std::filesystem::perms::others_exec)) == std::filesystem::perms::none) {
+            failure("expected executable is not executable: " + candidate.string());
             continue;
         }
         const auto resolved = std::filesystem::canonical(candidate, error);
         if (!error && valid_launch_path(resolved.string())) {
             return resolved.string();
         }
+        failure(
+            error ? "cannot canonicalize executable (" + error.message() + ")"
+                  : "resolved executable path is invalid"
+        );
     }
-    return std::unexpected(
-        std::string{"operator-installed "} + adapter->runtime_id + " executable is unavailable"
-    );
+    std::string message =
+        std::string{"operator-installed "} + adapter->runtime_id + " executable is unavailable";
+    if (!diagnostics.empty()) {
+        message.append(": ");
+        for (std::size_t index = 0; index < diagnostics.size(); ++index) {
+            if (index != 0) {
+                message.append("; ");
+            }
+            message.append(diagnostics[index]);
+        }
+    }
+    return std::unexpected(std::move(message));
 }
 
 auto session_plan_validator::load(
@@ -862,9 +1007,15 @@ auto session_plan_validator::load(
         return std::unexpected(contents.error());
     }
     wire::session_plan_policy encoded;
-    if (const auto error = glz::read<strict_read_options>(encoded, *contents);
-        error || encoded.schema_version != 1) {
-        return std::unexpected(std::string{"invalid session policy schema"});
+    if (const auto error = glz::read<strict_read_options>(encoded, *contents); error) {
+        return std::unexpected(
+            std::string{"invalid session policy JSON: "} + glz::format_error(error, *contents)
+        );
+    }
+    if (encoded.schema_version != 1) {
+        return std::unexpected(
+            "schema_version must be 1, got " + std::to_string(encoded.schema_version)
+        );
     }
     if (encoded.runtime_templates.empty() ||
         encoded.runtime_templates.size() > max_runtime_templates || encoded.path_aliases.empty() ||
@@ -990,19 +1141,28 @@ auto session_plan_validator::build(
     }
 
     std::set<std::string> runtime_templates;
-    for (const auto& runtime : policy.runtime_templates) {
-        if (!validate_runtime_policy(runtime) ||
-            std::ranges::any_of(
-                runtime.allowed_projection_destinations,
-                [&](const auto& alias) {
-                    return std::ranges::none_of(
-                        policy.library_projection_destinations,
-                        [&](const auto& destination) { return destination.alias == alias; }
-                    );
-                }
-            ) ||
-            !runtime_templates.insert(runtime.runtime_template_id).second) {
-            return std::unexpected(std::string{"session plan runtime policy is invalid"});
+    for (std::size_t index = 0; index < policy.runtime_templates.size(); ++index) {
+        const auto& runtime = policy.runtime_templates[index];
+        if (auto valid = validate_runtime_policy(runtime); !valid) {
+            return std::unexpected(
+                "runtime_templates[" + std::to_string(index) + "]: " + valid.error()
+            );
+        }
+        if (std::ranges::any_of(runtime.allowed_projection_destinations, [&](const auto& alias) {
+                return std::ranges::none_of(
+                    policy.library_projection_destinations,
+                    [&](const auto& destination) { return destination.alias == alias; }
+                );
+            })) {
+            return std::unexpected(
+                "runtime_templates[" + std::to_string(index) +
+                "].allowed_projection_destinations contains an unknown alias"
+            );
+        }
+        if (!runtime_templates.insert(runtime.runtime_template_id).second) {
+            return std::unexpected(
+                "runtime_templates[" + std::to_string(index) + "].runtime_template_id is duplicated"
+            );
         }
     }
 

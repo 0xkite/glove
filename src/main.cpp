@@ -419,6 +419,11 @@ auto main(int argc, char** argv) -> int {
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }
+    if (sub == "policy") {
+        return glove::host::policy_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
     if (sub == "init") {
         return glove::host::init_command(
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
@@ -435,6 +440,7 @@ auto main(int argc, char** argv) -> int {
             "  daemon  install and manage the fixed gloved user service\n"
             "  doctor  verify configuration and local service readiness\n"
             "  config  inspect trusted machine-local configuration\n"
+            "  policy  detect harnesses and generate or validate runtime policy\n"
             "  init    enroll a project beneath a setup-approved protected root\n"
         );
         return 0;

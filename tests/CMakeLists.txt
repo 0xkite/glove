@@ -10,6 +10,14 @@ add_executable(host_daemon_test host/daemon_test.cpp)
 target_link_libraries(host_daemon_test PRIVATE glove_host)
 add_test(NAME host_daemon COMMAND host_daemon_test)
 
+add_executable(host_runtime_policy_test host/runtime_policy_test.cpp)
+target_link_libraries(host_runtime_policy_test PRIVATE glove_host glove_supervisor)
+add_test(NAME host_runtime_policy COMMAND host_runtime_policy_test)
+
+add_executable(host_operator_experience_test host/operator_experience_test.cpp)
+target_link_libraries(host_operator_experience_test PRIVATE glove_host)
+add_test(NAME host_operator_experience COMMAND host_operator_experience_test)
+
 add_executable(thread_smoke_test thread_smoke_test.cpp)
 target_link_libraries(thread_smoke_test PRIVATE glove_kernel)
 add_test(NAME thread_smoke COMMAND thread_smoke_test)
