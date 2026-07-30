@@ -10,6 +10,15 @@
 
 namespace glove::supervisor {
 
+struct native_skill_runtime_configuration {
+    // Materialized below the adapter's private configuration directory (the
+    // first skill-root component), never below a projected project.
+    std::string filename;
+    std::string contents;
+
+    auto operator==(const native_skill_runtime_configuration&) const -> bool = default;
+};
+
 // Built-in harness metadata for runtimes that consume the Agent Skills
 // standard. The table is intentionally closed: a root-owned policy can choose
 // a command and trusted discovery directory, but cannot define a new adapter
@@ -20,6 +29,11 @@ struct native_skill_runtime_adapter {
     std::string home_mount_alias;
     std::vector<std::string> skill_root_components;
     std::vector<std::string> managed_environment;
+    // Harness-owned arguments appended after the operator-pinned launch
+    // arguments. These encode how a client must run inside Glove's already
+    // enforced outer sandbox; policy cannot remove or replace them.
+    std::vector<std::string> managed_arguments;
+    std::optional<native_skill_runtime_configuration> managed_configuration;
 
     auto operator==(const native_skill_runtime_adapter&) const -> bool = default;
 };

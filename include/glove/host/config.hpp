@@ -28,8 +28,18 @@ struct directories {
     std::filesystem::path runtime;
 };
 
+struct apple_container_config {
+    std::filesystem::path cli;
+    std::string image;
+    std::string image_digest;
+    std::optional<std::string> harness_closure_digest;
+
+    auto operator==(const apple_container_config&) const -> bool = default;
+};
+
 struct config {
     std::uint8_t schema_version = 1;
+    bool persistent_service = false;
     std::filesystem::path runtime_directory;
     std::filesystem::path audit_key;
     std::filesystem::path receipt_journal;
@@ -39,6 +49,7 @@ struct config {
     std::optional<std::filesystem::path> library_bundle_root;
     std::optional<std::filesystem::path> path_exposure_policy;
     std::optional<std::filesystem::path> path_exposure_journal;
+    std::optional<apple_container_config> apple_container;
 
     auto operator==(const config&) const -> bool = default;
 };
@@ -49,5 +60,9 @@ struct config {
 [[nodiscard]] auto validate(const config& value) -> result<void>;
 [[nodiscard]] auto load_config(const std::filesystem::path& path) -> result<config>;
 [[nodiscard]] auto encode_config(const config& value) -> result<std::string>;
+// Write a validated config only into an existing owner-only directory. The
+// target must not exist; callers handle exact-match idempotence explicitly.
+[[nodiscard]] auto write_config_exclusive(const std::filesystem::path& path, const config& value)
+    -> result<void>;
 
 } // namespace glove::host

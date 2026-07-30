@@ -2,6 +2,7 @@
 
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/session_registry.hpp"
+#include "glove/control/session_runtime.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,21 +22,6 @@ enum class session_process_observation : std::uint8_t {
 
 using session_process_observer = std::function<
     std::expected<session_process_observation, std::string>(const session_recovery_record&)>;
-
-struct session_reconciliation_report {
-    std::size_t inspected = 0;
-    std::size_t recovered_exited = 0;
-    std::size_t recovered_failed = 0;
-    std::size_t recovered_terminated = 0;
-    std::size_t orphan_materializations_inspected = 0;
-    std::size_t orphan_materializations_removed = 0;
-    std::size_t orphan_retained_changes_recovered = 0;
-    std::vector<std::string> unresolved_running_session_ids;
-    std::vector<std::string> live_running_session_ids;
-    std::vector<std::string> identity_mismatch_session_ids;
-
-    auto operator==(const session_reconciliation_report&) const -> bool = default;
-};
 
 // Startup-only registry/journal repair. A starting child was never released,
 // so it can be closed as recovered_without_process. A running session is

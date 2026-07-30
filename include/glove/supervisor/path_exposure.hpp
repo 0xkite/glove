@@ -176,6 +176,16 @@ public:
         std::uint64_t max_journal_bytes
     ) -> result<path_exposure_registry>;
 
+    // Owner-local, read-only policy inspection. This opens and validates the
+    // protected roots but does not open or mutate the exposure journal.
+    [[nodiscard]] static auto inspect_policy(const std::filesystem::path& policy_path)
+        -> result<path_exposure_registry>;
+
+    // Explain protected-root policy mismatches before an owner-local control
+    // request. Remote protocol errors remain deliberately redacted.
+    [[nodiscard]] auto validate_create_policy(const path_exposure_create_request& request) const
+        -> std::expected<void, std::string>;
+
     [[nodiscard]] auto create(const path_exposure_create_request& request, std::uint64_t now_ms)
         -> result<path_exposure_descriptor>;
 

@@ -89,6 +89,7 @@ struct supervisor_capabilities {
     glz::raw_json receipt_audit;
     session_control_capabilities session_control;
     std::uint8_t agent_runtime_adapter_schema_version = 0;
+    std::vector<std::string> managed_runtime_ids;
     std::uint8_t path_exposure_admin_schema_version = 0;
     std::uint8_t path_exposure_catalog_schema_version = 0;
     std::uint8_t retained_write_schema_version = 0;
@@ -301,6 +302,8 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
             .egress_policy_ids = {"no-network"},
             .tool_policy_ids = {"sage-readonly"},
             .secret_handles = {},
+            .egress_policies = {},
+            .secret_mounts = {},
         },
         std::move(*paths)
     );
@@ -599,6 +602,7 @@ auto run() -> int {
     REQUIRE(capabilities.session_control.detach);
     REQUIRE(capabilities.session_control.cleanup_session);
     REQUIRE(capabilities.agent_runtime_adapter_schema_version == 0);
+    REQUIRE(capabilities.managed_runtime_ids.empty());
     REQUIRE(capabilities.path_exposure_admin_schema_version == 0);
     REQUIRE(capabilities.path_exposure_catalog_schema_version == 0);
     REQUIRE(capabilities.retained_write_schema_version == 0);
@@ -613,7 +617,7 @@ auto run() -> int {
     REQUIRE(capabilities.backends[0].resource_enforcement.disk == "filesystem_quota");
     REQUIRE(capabilities.backends[0].resource_enforcement.terminal_output == "byte_counter");
     REQUIRE(capabilities.backends[0].resource_enforcement.receipt_schema_version == 1);
-    REQUIRE(capabilities.backends[1].backend == "macos_experimental");
+    REQUIRE(capabilities.backends[1].backend == "apple_container");
     REQUIRE(capabilities.backends[1].resource_enforcement.cpu_time == "unavailable");
 
     auto authorization_json = glz::write_json(interactive_authorization);
@@ -910,7 +914,11 @@ auto run() -> int {
     REQUIRE(interactive_exited->stopping_at_ms == stopping_at_ms);
     auto durable_interactive = shared_registry->exited_status("session-interactive");
     REQUIRE(durable_interactive.has_value());
-    REQUIRE(*durable_interactive == *interactive_exited);
+    REQUIRE(durable_interactive->session == interactive_exited->session);
+    REQUIRE(durable_interactive->profile_digest == interactive_exited->profile_digest);
+    REQUIRE(durable_interactive->finished_at_ms == interactive_exited->finished_at_ms);
+    REQUIRE(durable_interactive->receipt_digest == interactive_exited->receipt_digest);
+    REQUIRE(durable_interactive->termination_cause == interactive_exited->termination_cause);
     const auto cleanup_payload = "{\"session_id\":\"" + interactive_created->session_id + "\"}";
     auto cleanup_frame = (*protocol)->handle_frame(
         make_request(

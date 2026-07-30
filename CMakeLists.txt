@@ -66,6 +66,21 @@ install(
     FILES packaging/launchd/org.sage-protocol.gloved.plist.in
     DESTINATION ${CMAKE_INSTALL_DATADIR}/glove/packaging/launchd
 )
+configure_file(
+    packaging/compatibility.json.in
+    ${CMAKE_CURRENT_BINARY_DIR}/compatibility.json
+    @ONLY
+)
+install(
+    FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/compatibility.json
+        docs/host-setup.md
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/glove
+)
+install(
+    PROGRAMS scripts/apple-container-session.sh
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/glove/scripts
+)
 
 # --- Tests ------------------------------------------------------------------
 

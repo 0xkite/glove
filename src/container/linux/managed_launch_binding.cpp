@@ -166,13 +166,44 @@ auto reserve_mount_projection(
         !state.targets.insert(mount.target_path).second) {
         return std::unexpected(std::string{"invalid managed launch mount projection"});
     }
-    const bool overlaps = std::ranges::any_of(state.target_paths, [&](const auto& existing) {
-        return path_within(target, existing) || path_within(existing, target);
-    });
-    if (overlaps) {
-        return std::unexpected(std::string{"overlapping managed launch mount projection"});
-    }
     state.target_paths.push_back(target);
+    return {};
+}
+
+auto allowed_secret_home_overlap(
+    const supervisor::linux_detail::session_mount& first,
+    const supervisor::linux_detail::session_mount& second
+) -> bool {
+    const auto* home = &first;
+    const auto* secret = &second;
+    if (second.runtime_adapter_id && first.secret_handle) {
+        home = &second;
+        secret = &first;
+    }
+    if (!home->runtime_adapter_id || !secret->secret_handle || !secret->secret_runtime_id ||
+        home->target_path != "/home/agent" ||
+        *home->runtime_adapter_id != *secret->secret_runtime_id) {
+        return false;
+    }
+    const std::filesystem::path home_path{home->target_path};
+    const std::filesystem::path secret_path{secret->target_path};
+    return secret_path != home_path && path_within(secret_path, home_path);
+}
+
+auto validate_secret_mount(const supervisor::linux_detail::session_mount& mount)
+    -> std::expected<void, std::string> {
+    const std::filesystem::path target{mount.target_path};
+    const std::filesystem::path managed_home{"/home/agent"};
+    if (!mount.secret_handle || !mount.secret_runtime_id ||
+        !valid_identifier(*mount.secret_handle) || !valid_identifier(*mount.secret_runtime_id) ||
+        mount.alias != "secret:" + *mount.secret_handle || target.lexically_normal() != target ||
+        target == managed_home || !path_within(target, managed_home) ||
+        !valid_mount_source_identity(mount) || mount.source_content_digest || mount.projection_id ||
+        mount.projection_destination_alias || mount.runtime_adapter_id ||
+        mount.runtime_context_digest || !mount.quota_partition.empty() || mount.quota_bytes != 0 ||
+        mount.directory) {
+        return std::unexpected(std::string{"invalid managed launch secret projection"});
+    }
     return {};
 }
 
@@ -182,6 +213,10 @@ auto validate_read_only_mount(const supervisor::linux_detail::session_mount& mou
         !valid_mount_source_identity(mount) || mount.runtime_adapter_id ||
         mount.runtime_context_digest) {
         return std::unexpected(std::string{"invalid managed launch read-only projection"});
+    }
+    const bool has_secret = mount.secret_handle.has_value() || mount.secret_runtime_id.has_value();
+    if (has_secret) {
+        return validate_secret_mount(mount);
     }
     const bool has_projection_evidence = mount.source_content_digest.has_value() ||
                                          mount.projection_id.has_value() ||
@@ -204,10 +239,15 @@ auto validate_read_only_mount(const supervisor::linux_detail::session_mount& mou
 auto validate_writable_mount(
     const supervisor::linux_detail::session_mount& mount, mount_projection_state& state
 ) -> std::expected<void, std::string> {
+    const bool has_secret = mount.secret_handle.has_value() || mount.secret_runtime_id.has_value();
+    if (has_secret) {
+        return validate_secret_mount(mount);
+    }
     if (!valid_identifier(mount.quota_partition) || mount.quota_bytes == 0) {
         return std::unexpected(std::string{"invalid managed launch writable projection"});
     }
-    if (mount.source_content_digest || mount.projection_id || mount.projection_destination_alias) {
+    if (mount.source_content_digest || mount.projection_id || mount.projection_destination_alias ||
+        mount.secret_handle || mount.secret_runtime_id) {
         return std::unexpected(
             std::string{"writable managed launch projection has content digest"}
         );
@@ -270,13 +310,23 @@ auto validate_mount_projection(
     const resource_limits& limits,
     const std::optional<std::string>& managed_home_dir
 ) -> std::expected<void, std::string> {
-    if (mounts.size() < 2U || mounts.size() > max_launch_fields + 3U) {
+    if (mounts.size() < 2U || mounts.size() > max_launch_fields + 35U) {
         return std::unexpected(std::string{"managed launch has an invalid mount count"});
     }
     mount_projection_state state;
     for (const auto& mount : mounts) {
         if (auto valid = validate_mount_projection_entry(mount, state); !valid) {
             return valid;
+        }
+    }
+    for (std::size_t index = 0; index < mounts.size(); ++index) {
+        const std::filesystem::path target{mounts[index].target_path};
+        for (std::size_t other = index + 1U; other < mounts.size(); ++other) {
+            const std::filesystem::path other_target{mounts[other].target_path};
+            if ((path_within(target, other_target) || path_within(other_target, target)) &&
+                !allowed_secret_home_overlap(mounts[index], mounts[other])) {
+                return std::unexpected(std::string{"overlapping managed launch mount projection"});
+            }
         }
     }
     if (state.scratch_mounts != 2U ||
@@ -370,15 +420,26 @@ auto bind_managed_launch_projection_from_fd(
     if (!valid_digest(controller_plan_digest)) {
         return std::unexpected(std::string{"invalid controller plan digest"});
     }
-    auto checked = validate(prof);
+    auto profile_without_managed_work_dir = prof;
+    const auto managed_work_dir = profile_without_managed_work_dir.work_dir;
+    profile_without_managed_work_dir.work_dir.reset();
+    auto checked = validate(profile_without_managed_work_dir);
     if (!checked) {
         return std::unexpected(std::string{"profile: "} + checked.error());
     }
+    if (managed_work_dir && *managed_work_dir != "/workspace" &&
+        (*managed_work_dir != "/home/agent" ||
+         checked->managed_home_dir != std::optional<std::string>{"/home/agent"})) {
+        return std::unexpected(
+            std::string{"managed session work directory must be /workspace or its private home"}
+        );
+    }
+    checked->work_dir = managed_work_dir;
     if (!checked->required_limits) {
         return std::unexpected(std::string{"managed launch requires resource limits"});
     }
     if (!checked->filesystem.empty() || checked->home_dir || checked->temp_dir ||
-        checked->work_dir || std::ranges::any_of(checked->runtime_filesystem, [](const auto& rule) {
+        std::ranges::any_of(checked->runtime_filesystem, [](const auto& rule) {
             return rule.writable;
         })) {
         return std::unexpected(
@@ -408,6 +469,15 @@ auto bind_managed_launch_projection_from_fd(
     const resource_limits limits = checked->required_limits.value_or(resource_limits{});
     if (auto valid = validate_mount_projection(mounts, limits, checked->managed_home_dir); !valid) {
         return std::unexpected(valid.error());
+    }
+    if (checked->work_dir && std::ranges::none_of(mounts, [&](const auto& mount) {
+            return path_within(
+                std::filesystem::path{mount.target_path}, std::filesystem::path{*checked->work_dir}
+            );
+        })) {
+        return std::unexpected(
+            std::string{"managed session work directory is not backed by a lifecycle mount"}
+        );
     }
 
     auto environment = checked->environment;
@@ -446,6 +516,10 @@ auto bind_managed_launch_projection_from_fd(
     if (checked->managed_home_dir) {
         encoder.append_string(*checked->managed_home_dir);
     }
+    if (checked->work_dir) {
+        encoder.append_string("glove.managed-launch-work-dir");
+        encoder.append_string(*checked->work_dir);
+    }
     encoder.append_u32(static_cast<std::uint32_t>(resolved_argv.size()));
     for (const auto& argument : resolved_argv) {
         encoder.append_string(argument);
@@ -474,6 +548,11 @@ auto bind_managed_launch_projection_from_fd(
         if (mount.runtime_adapter_id) {
             encoder.append_string(*mount.runtime_adapter_id);
             encoder.append_string(*mount.runtime_context_digest);
+        }
+        if (mount.secret_handle) {
+            encoder.append_string("glove.managed-launch-secret");
+            encoder.append_string(*mount.secret_handle);
+            encoder.append_string(*mount.secret_runtime_id);
         }
     }
     // Preserve the version-1 digest for offline launches while binding the

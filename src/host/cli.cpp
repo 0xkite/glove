@@ -11,6 +11,7 @@
 #include <glaze/glaze.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <filesystem>
 #include <optional>
@@ -59,6 +60,9 @@ struct stage_report {
     std::string launch_executable;
     std::vector<std::string> launch_arguments;
     std::vector<std::string> read_only_paths;
+    std::string snapshot_digest;
+    std::uint64_t snapshot_logical_bytes = 0;
+    std::uint64_t snapshot_entries = 0;
     bool changed = false;
     bool dry_run = false;
 };
@@ -70,6 +74,16 @@ struct validation_report {
     std::string code;
     std::string message;
     std::string recovery;
+};
+
+struct prepared_policy_report {
+    std::uint8_t schema_version = 1;
+    std::string policy_path;
+    std::vector<harness> detections;
+    std::vector<stage_report> runtimes;
+    std::string session_policy_json;
+    bool changed = false;
+    bool dry_run = false;
 };
 } // namespace policy_wire
 
@@ -140,9 +154,20 @@ void print_setup_usage() {
         stderr,
         "usage:\n"
         "  glove setup guide [--json]\n"
+        "  glove setup adopt [--config <absolute-file>] [--dry-run | --yes]\n"
+        "  glove setup cleanup [--config <absolute-file>]\n"
+        "      [--dry-run | --yes --confirm-ledger <sha256>]\n"
+        "  glove setup policy --search-path <absolute-directory>...\n"
+        "      --harness-root <absolute-directory> --path-root <absolute-directory>\n"
+        "      --output <absolute-file> [--backend <linux_production|apple_container>]\n"
+        "      [--runtime <adapter-id>]...\n"
+        "      [--egress <policy-id> <host> <port>]...\n"
+        "      [--secret <runtime-id> <handle> <absolute-source> <sandbox-target>]...\n"
+        "      [--dry-run | --yes] [--json]\n"
         "  glove setup [--config <absolute-file>] [--path-root <absolute-directory>] "
         "[--session-policy <absolute-file>] "
-        "[--root-id <id>] [--runtime <template-id>]... [--dry-run | --yes]\n"
+        "[--root-id <id>] [--runtime <template-id>]... [--persistent] "
+        "[--dry-run | --yes]\n"
     );
 }
 
@@ -203,13 +228,398 @@ void print_policy_usage() {
         "      --directory <absolute-directory> [--dry-run | --yes] [--json]\n"
         "  glove policy generate --runtime <id>\n"
         "      (--executable <absolute-file> | --search-path <absolute-directory>...)\n"
-        "      [--template-id <id>] [--backend <linux_production|macos_experimental>]\n"
+        "      [--template-id <id>] [--backend <linux_production|apple_container>]\n"
         "      [--argument <value>]... [--environment <NAME=VALUE>]...\n"
         "      [--read-only-path <absolute-path>]... [--path-alias <id>]...\n"
         "      [--projection-destination <id>]...\n"
         "  glove policy validate --file <absolute-file>\n"
         "  glove policy explain --file <absolute-file> [--json]\n"
     );
+}
+
+auto setup_policy_command(std::span<char* const> arguments) -> int {
+    if (arguments.size() == 1U && (std::string_view{arguments.front()} == "-h" ||
+                                   std::string_view{arguments.front()} == "--help")) {
+        print_setup_usage();
+        return 0;
+    }
+    session_policy_prepare_options options;
+#if defined(__linux__)
+    options.backend = supervisor::sandbox_backend::linux_production;
+#endif
+    bool yes = false;
+    bool json = false;
+    for (std::size_t index = 0; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--dry-run") {
+            options.dry_run = true;
+            ++index;
+        } else if (argument == "--yes") {
+            yes = true;
+            ++index;
+        } else if (argument == "--json") {
+            json = true;
+            ++index;
+        } else if (argument == "--egress" && index + 3U < arguments.size()) {
+            const std::string policy_id{arguments[index + 1U]};
+            const std::string host{arguments[index + 2U]};
+            const std::string_view raw_port{arguments[index + 3U]};
+            std::uint16_t port = 0;
+            const auto parsed =
+                std::from_chars(raw_port.data(), raw_port.data() + raw_port.size(), port);
+            if (parsed.ec != std::errc{} || parsed.ptr != raw_port.data() + raw_port.size() ||
+                port == 0) {
+                return print_error(
+                    "setup_policy_egress_invalid",
+                    "Egress port must be an integer from 1 through 65535.",
+                    "glove setup policy --help"
+                );
+            }
+            const auto existing = std::ranges::find(
+                options.egress_policies, policy_id, &supervisor::egress_policy::policy_id
+            );
+            if (existing == options.egress_policies.end()) {
+                options.egress_policies.push_back({
+                    .policy_id = policy_id,
+                    .targets = {{.host = host, .port = port, .allow_private = false}},
+                });
+            } else {
+                existing->targets.push_back({
+                    .host = host,
+                    .port = port,
+                    .allow_private = false,
+                });
+            }
+            index += 4U;
+        } else if (argument == "--secret" && index + 4U < arguments.size()) {
+            options.secret_mounts.push_back({
+                .handle = arguments[index + 2U],
+                .runtime_id = arguments[index + 1U],
+                .source_path = arguments[index + 3U],
+                .target_path = arguments[index + 4U],
+            });
+            index += 5U;
+        } else if (index + 1 < arguments.size()) {
+            const std::string value{arguments[index + 1]};
+            if (argument == "--search-path") {
+                options.executable_search_paths.emplace_back(value);
+            } else if (argument == "--runtime") {
+                options.selected_runtime_ids.push_back(value);
+            } else if (argument == "--harness-root") {
+                options.protected_harness_root = value;
+            } else if (argument == "--path-root") {
+                options.workspace_root = value;
+            } else if (argument == "--output") {
+                options.policy_path = value;
+            } else if (argument == "--backend") {
+                if (value == "linux_production") {
+                    options.backend = supervisor::sandbox_backend::linux_production;
+                } else if (value == "apple_container") {
+                    options.backend = supervisor::sandbox_backend::apple_container;
+                } else {
+                    return print_error(
+                        "setup_policy_backend_invalid",
+                        "Unknown sandbox backend.",
+                        "glove setup policy --help"
+                    );
+                }
+            } else {
+                print_setup_usage();
+                return 2;
+            }
+            index += 2;
+        } else {
+            print_setup_usage();
+            return 2;
+        }
+    }
+    if (options.dry_run && yes) {
+        return print_error(
+            "setup_policy_conflicting_flags",
+            "--dry-run and --yes cannot be combined.",
+            "glove setup policy --help"
+        );
+    }
+    if (!options.dry_run && !yes) {
+        return print_error(
+            "setup_policy_confirmation_required",
+            "Harness staging and policy creation require explicit confirmation.",
+            "glove setup policy ... --dry-run\n  glove setup policy ... --yes"
+        );
+    }
+    auto prepared = prepare_session_policy(options);
+    if (!prepared) {
+        return print_error("setup_policy_failed", prepared.error(), "glove setup policy --help");
+    }
+    policy_wire::prepared_policy_report report{
+        .policy_path = prepared->policy_path.string(),
+        .detections = {},
+        .runtimes = {},
+        .session_policy_json = prepared->policy_json,
+        .changed = prepared->changed,
+        .dry_run = prepared->dry_run,
+    };
+    for (const auto& detection : prepared->detections) {
+        report.detections.push_back({
+            .runtime_id = detection.runtime_id,
+            .executable_name = detection.executable_name,
+            .available = detection.available,
+            .resolved_executable = detection.resolved_executable.string(),
+            .diagnostic = detection.diagnostic,
+        });
+    }
+    for (const auto& runtime : prepared->runtimes) {
+        policy_wire::stage_report staged{
+            .runtime_id = runtime.runtime_id,
+            .protected_entry_point = runtime.protected_entry_point.string(),
+            .source_executable = runtime.source_executable.string(),
+            .launch_executable = runtime.launch_executable.string(),
+            .launch_arguments = runtime.launch_arguments,
+            .read_only_paths = {},
+            .snapshot_digest = runtime.snapshot_digest,
+            .snapshot_logical_bytes = runtime.snapshot_logical_bytes,
+            .snapshot_entries = runtime.snapshot_entries,
+            .changed = runtime.changed,
+            .dry_run = prepared->dry_run,
+        };
+        for (const auto& path : runtime.read_only_paths) {
+            staged.read_only_paths.push_back(path.string());
+        }
+        report.runtimes.push_back(std::move(staged));
+    }
+    if (json) {
+        auto encoded = glz::write_json(report);
+        if (!encoded) {
+            return print_error(
+                "setup_policy_encode_failed",
+                "Could not encode prepared policy report.",
+                "glove setup policy --help"
+            );
+        }
+        std::printf("%s\n", encoded->c_str());
+        return 0;
+    }
+    for (const auto& detection : prepared->detections) {
+        std::printf(
+            "%c %-12s %s\n",
+            detection.available ? '+' : '-',
+            detection.runtime_id.c_str(),
+            detection.available ? detection.resolved_executable.c_str()
+                                : detection.diagnostic.c_str()
+        );
+    }
+    std::printf(
+        "%s session policy: %s\n",
+        prepared->dry_run   ? "Would create"
+        : prepared->changed ? "Prepared"
+                            : "Verified",
+        prepared->policy_path.c_str()
+    );
+    if (prepared->dry_run) {
+        std::printf("%s", prepared->policy_json.c_str());
+    } else {
+        std::printf(
+            "Next:\n  glove policy validate --file %s\n"
+            "  glove setup --session-policy %s --dry-run\n",
+            prepared->policy_path.c_str(),
+            prepared->policy_path.c_str()
+        );
+    }
+    return 0;
+}
+
+auto setup_cleanup_command(std::span<char* const> arguments) -> int {
+    std::optional<std::filesystem::path> config_path;
+    std::string confirmation;
+    bool dry_run = false;
+    bool yes = false;
+    for (std::size_t index = 0; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--dry-run") {
+            dry_run = true;
+            ++index;
+        } else if (argument == "--yes") {
+            yes = true;
+            ++index;
+        } else if (argument == "--config" || argument == "--confirm-ledger") {
+            if (index + 1U >= arguments.size()) {
+                print_setup_usage();
+                return 2;
+            }
+            if (argument == "--config") {
+                config_path = arguments[index + 1U];
+            } else {
+                confirmation = arguments[index + 1U];
+            }
+            index += 2U;
+        } else if (argument == "-h" || argument == "--help") {
+            print_setup_usage();
+            return 0;
+        } else {
+            print_setup_usage();
+            return 2;
+        }
+    }
+    if (dry_run && yes) {
+        return print_error(
+            "setup_cleanup_conflicting_flags",
+            "--dry-run and --yes cannot be combined.",
+            "glove setup cleanup --dry-run"
+        );
+    }
+    if (!config_path) {
+        auto directories = resolve_directories(current_environment());
+        if (!directories) {
+            return print_error(
+                "setup_cleanup_invalid", directories.error(), "glove setup cleanup --help"
+            );
+        }
+        config_path = default_config_path(*directories);
+    }
+    if (!config_path->is_absolute()) {
+        return print_error(
+            "setup_cleanup_invalid",
+            "Cleanup configuration path must be absolute.",
+            "glove setup cleanup --help"
+        );
+    }
+    auto plan = plan_setup_cleanup(config_path->lexically_normal());
+    if (!plan) {
+        return print_error(
+            "setup_cleanup_preview_failed", plan.error(), "glove setup cleanup --help"
+        );
+    }
+    auto digest = setup_ledger_sha256(plan->ledger);
+    if (!digest) {
+        return print_error(
+            "setup_cleanup_preview_failed", digest.error(), "glove setup cleanup --help"
+        );
+    }
+    std::printf(
+        "Setup cleanup preview\nLedger: %s\nLedger SHA-256: %s\n",
+        plan->ledger.ledger_path.c_str(),
+        digest->c_str()
+    );
+    for (const auto& item : plan->items) {
+        const char* action = !item.resource.owned ? "retain"
+                             : item.absent        ? "absent"
+                             : item.removable     ? "remove"
+                                                  : "blocked";
+        std::printf(
+            "  %-7s %-22s %s (%s)\n",
+            action,
+            item.resource.kind.c_str(),
+            item.resource.path.c_str(),
+            item.reason.c_str()
+        );
+    }
+    std::printf("  remove  setup_ledger           %s\n", plan->ledger.ledger_path.c_str());
+    if (plan->blocked()) {
+        return print_error(
+            "setup_cleanup_blocked",
+            "Owned resources contain changed or unmanaged state; nothing was removed.",
+            "Stop services, preserve durable data, and run the preview again."
+        );
+    }
+    if (dry_run) {
+        std::printf("Dry run: no files were changed.\n");
+        return 0;
+    }
+    if (!yes || confirmation.empty()) {
+        return print_error(
+            "setup_cleanup_confirmation_required",
+            "Cleanup requires the exact ledger digest from this preview.",
+            "glove setup cleanup --yes --confirm-ledger " + *digest
+        );
+    }
+    if (auto removed = execute_setup_cleanup(*plan, confirmation); !removed) {
+        return print_error(
+            "setup_cleanup_failed", removed.error(), "glove setup cleanup --dry-run"
+        );
+    }
+    std::printf("Glove setup-owned resources removed; retained resources were unchanged.\n");
+    return 0;
+}
+
+auto setup_adopt_command(std::span<char* const> arguments) -> int {
+    std::optional<std::filesystem::path> config_path;
+    bool dry_run = false;
+    bool yes = false;
+    for (std::size_t index = 0; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--dry-run") {
+            dry_run = true;
+            ++index;
+        } else if (argument == "--yes") {
+            yes = true;
+            ++index;
+        } else if (argument == "--config" && index + 1U < arguments.size()) {
+            config_path = arguments[index + 1U];
+            index += 2U;
+        } else if (argument == "-h" || argument == "--help") {
+            print_setup_usage();
+            return 0;
+        } else {
+            print_setup_usage();
+            return 2;
+        }
+    }
+    if (dry_run && yes) {
+        return print_error(
+            "setup_adopt_conflicting_flags",
+            "--dry-run and --yes cannot be combined.",
+            "glove setup adopt --dry-run"
+        );
+    }
+    if (!config_path) {
+        auto directories = resolve_directories(current_environment());
+        if (!directories) {
+            return print_error(
+                "setup_adopt_invalid", directories.error(), "glove setup adopt --help"
+            );
+        }
+        config_path = default_config_path(*directories);
+    }
+    if (!config_path->is_absolute()) {
+        return print_error(
+            "setup_adopt_invalid",
+            "Adoption configuration path must be absolute.",
+            "glove setup adopt --help"
+        );
+    }
+    auto ledger = plan_setup_adoption(config_path->lexically_normal());
+    if (!ledger) {
+        return print_error("setup_adopt_invalid", ledger.error(), "glove doctor");
+    }
+    auto digest = setup_ledger_sha256(*ledger);
+    if (!digest) {
+        return print_error("setup_adopt_invalid", digest.error(), "glove doctor");
+    }
+    std::printf(
+        "Setup adoption preview\nConfiguration: %s\nLedger: %s\nLedger SHA-256: %s\n",
+        ledger->config_path.c_str(),
+        ledger->ledger_path.c_str(),
+        digest->c_str()
+    );
+    for (const auto& resource : ledger->resources) {
+        std::printf("  retain  %-22s %s\n", resource.kind.c_str(), resource.path.c_str());
+    }
+    if (dry_run) {
+        std::printf("Dry run: no files were changed.\n");
+        return 0;
+    }
+    if (!yes) {
+        return print_error(
+            "setup_adopt_confirmation_required",
+            "Adoption records existing resources as retained and creates no cleanup ownership.",
+            "glove setup adopt --config " + ledger->config_path.string() + " --yes"
+        );
+    }
+    if (auto adopted = execute_setup_adoption(*ledger); !adopted) {
+        return print_error("setup_adopt_failed", adopted.error(), "glove doctor");
+    }
+    std::printf("Existing Glove resources adopted as retained; cleanup ownership remains empty.\n");
+    return 0;
 }
 
 } // namespace
@@ -225,6 +635,15 @@ auto setup_command(std::span<char* const> arguments) -> int {
         print_setup_usage();
         return 2;
     }
+    if (!arguments.empty() && std::string_view{arguments.front()} == "policy") {
+        return setup_policy_command(arguments.subspan(1));
+    }
+    if (!arguments.empty() && std::string_view{arguments.front()} == "cleanup") {
+        return setup_cleanup_command(arguments.subspan(1));
+    }
+    if (!arguments.empty() && std::string_view{arguments.front()} == "adopt") {
+        return setup_adopt_command(arguments.subspan(1));
+    }
     setup_options options;
     bool yes = false;
     bool runtime_overridden = false;
@@ -235,6 +654,9 @@ auto setup_command(std::span<char* const> arguments) -> int {
             ++index;
         } else if (argument == "--yes") {
             yes = true;
+            ++index;
+        } else if (argument == "--persistent") {
+            options.persistent_service = true;
             ++index;
         } else if (
             argument == "--config" || argument == "--path-root" || argument == "--session-policy" ||
@@ -298,7 +720,30 @@ auto setup_command(std::span<char* const> arguments) -> int {
         guidance.recommended_path.empty() ? "unsupported" : guidance.recommended_path.c_str()
     );
     std::printf("Runtime:       %s\n", plan->service.runtime_directory.c_str());
+    if (plan->migrate_runtime_from) {
+        std::printf(
+            "Runtime migration: %s -> %s (old directory is retained)\n",
+            plan->migrate_runtime_from->c_str(),
+            plan->service.runtime_directory.c_str()
+        );
+    }
     std::printf("State:         %s\n", plan->service.audit_key.parent_path().c_str());
+    if (plan->service.apple_container) {
+        std::printf(
+            "Managed guest: %s\n  image=%s\n  closure=%s\n",
+            plan->service.apple_container->cli.c_str(),
+            plan->service.apple_container->image_digest.c_str(),
+            plan->service.apple_container->harness_closure_digest
+                ? plan->service.apple_container->harness_closure_digest->c_str()
+                : "probe-only"
+        );
+    }
+    std::printf(
+        "Service scope: %s\n",
+        plan->service.persistent_service
+            ? "persistent across logout/reboot (enables Linux user lingering)"
+            : "current login session"
+    );
     if (plan->canonical_protected_root) {
         std::printf(
             "Protected root: %s (%s)\n",
@@ -322,7 +767,13 @@ auto setup_command(std::span<char* const> arguments) -> int {
     if (auto executed = execute_setup(*plan); !executed) {
         return print_error("setup_failed", executed.error(), "glove doctor");
     }
-    std::printf("Glove machine setup completed.\nNext:\n  glove daemon start\n  glove doctor\n");
+    std::printf(
+        "Glove machine setup completed.\nNext:\n"
+        "  glove daemon start --config %s\n"
+        "  glove doctor --config %s\n",
+        plan->config_path.c_str(),
+        plan->config_path.c_str()
+    );
     if (plan->service.session_policy) {
         std::printf("  glove policy validate --file %s\n", plan->service.session_policy->c_str());
     }
@@ -466,11 +917,112 @@ auto doctor_command(std::span<char* const> arguments) -> int {
 auto config_command(std::span<char* const> arguments) -> int {
     if (arguments.empty() || std::string_view{arguments.front()} == "--help") {
         std::fprintf(
-            stderr, "usage: glove config <path|show|validate> [--config <absolute-file>]\n"
+            stderr,
+            "usage:\n"
+            "  glove config <path|show|validate> [--config <absolute-file>]\n"
+            "  glove config derive --config <absolute-source> --session-policy <absolute-file>\n"
+            "      --output <absolute-file> [--dry-run | --yes]\n"
         );
         return arguments.empty() ? 2 : 0;
     }
     const std::string_view action{arguments.front()};
+    if (action == "derive") {
+        std::filesystem::path source;
+        std::filesystem::path session_policy;
+        std::filesystem::path output;
+        bool dry_run = false;
+        bool yes = false;
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (argument == "--dry-run") {
+                dry_run = true;
+                ++index;
+            } else if (argument == "--yes") {
+                yes = true;
+                ++index;
+            } else if (index + 1U < arguments.size()) {
+                if (argument == "--config") {
+                    source = arguments[index + 1U];
+                } else if (argument == "--session-policy") {
+                    session_policy = arguments[index + 1U];
+                } else if (argument == "--output") {
+                    output = arguments[index + 1U];
+                } else {
+                    return print_error(
+                        "config_derive_argument_invalid",
+                        "Unknown config derivation argument.",
+                        "glove config --help"
+                    );
+                }
+                index += 2U;
+            } else {
+                return print_error(
+                    "config_derive_argument_invalid",
+                    "Config derivation argument is missing a value.",
+                    "glove config --help"
+                );
+            }
+        }
+        if (source.empty() || session_policy.empty() || output.empty() || !source.is_absolute() ||
+            !session_policy.is_absolute() || !output.is_absolute() ||
+            source.lexically_normal() != source ||
+            session_policy.lexically_normal() != session_policy ||
+            output.lexically_normal() != output || source == output || dry_run == yes) {
+            return print_error(
+                "config_derive_invalid",
+                "Derivation requires distinct normalized absolute paths and exactly one of "
+                "--dry-run or --yes.",
+                "glove config --help"
+            );
+        }
+        auto derived = load_config(source);
+        if (!derived) {
+            return print_error("config_derive_source_invalid", derived.error(), "glove doctor");
+        }
+        if (auto valid_policy = validate_session_policy_file(session_policy); !valid_policy) {
+            return print_error(
+                "config_derive_policy_invalid", valid_policy.error(), "glove policy validate"
+            );
+        }
+        derived->session_policy = session_policy;
+        if (auto valid_config = validate(*derived); !valid_config) {
+            return print_error(
+                "config_derive_result_invalid", valid_config.error(), "glove config --help"
+            );
+        }
+        auto encoded = encode_config(*derived);
+        if (!encoded) {
+            return print_error(
+                "config_derive_encode_failed", encoded.error(), "glove config --help"
+            );
+        }
+        bool changed = false;
+        if (!dry_run) {
+            if (std::filesystem::exists(output)) {
+                auto existing = load_config(output);
+                if (!existing || *existing != *derived) {
+                    return print_error(
+                        "config_derive_output_conflict",
+                        "Existing derived config differs; refusing to overwrite.",
+                        "Choose a new --output path or restore the reviewed source."
+                    );
+                }
+            } else if (auto written = write_config_exclusive(output, *derived); !written) {
+                return print_error(
+                    "config_derive_write_failed", written.error(), "glove config --help"
+                );
+            } else {
+                changed = true;
+            }
+        }
+        std::printf(
+            "%s configuration: %s\n%s",
+            dry_run ? "Would create" : (changed ? "Created" : "Verified"),
+            output.c_str(),
+            encoded->c_str()
+        );
+        return 0;
+    }
     std::optional<std::filesystem::path> config_path;
     if (arguments.size() == 3 && std::string_view{arguments[1]} == "--config") {
         config_path = arguments[2];
@@ -655,6 +1207,9 @@ auto policy_command(std::span<char* const> arguments) -> int {
             .launch_executable = staged->launch_executable.string(),
             .launch_arguments = staged->launch_arguments,
             .read_only_paths = {},
+            .snapshot_digest = staged->snapshot_digest,
+            .snapshot_logical_bytes = staged->snapshot_logical_bytes,
+            .snapshot_entries = staged->snapshot_entries,
             .changed = staged->changed,
             .dry_run = options.dry_run,
         };
@@ -691,6 +1246,15 @@ auto policy_command(std::span<char* const> arguments) -> int {
         for (const auto& path : staged->read_only_paths) {
             std::printf("Read-only dependency root:  %s\n", path.c_str());
         }
+        if (!staged->snapshot_digest.empty()) {
+            std::printf(
+                "Protected snapshot digest:  %s\n"
+                "Snapshot logical size:      %llu bytes across %llu entries\n",
+                staged->snapshot_digest.c_str(),
+                static_cast<unsigned long long>(staged->snapshot_logical_bytes),
+                static_cast<unsigned long long>(staged->snapshot_entries)
+            );
+        }
         std::printf(
             "Next:\n"
             "  Use --json to pass this exact launch closure to policy generation.\n"
@@ -704,7 +1268,7 @@ auto policy_command(std::span<char* const> arguments) -> int {
 #if defined(__linux__)
         options.backend = supervisor::sandbox_backend::linux_production;
 #else
-        options.backend = supervisor::sandbox_backend::macos_experimental;
+        options.backend = supervisor::sandbox_backend::apple_container;
 #endif
         for (std::size_t index = 1; index < arguments.size();) {
             const std::string_view argument{arguments[index]};
@@ -720,8 +1284,8 @@ auto policy_command(std::span<char* const> arguments) -> int {
             } else if (argument == "--backend") {
                 if (value == "linux_production") {
                     options.backend = supervisor::sandbox_backend::linux_production;
-                } else if (value == "macos_experimental") {
-                    options.backend = supervisor::sandbox_backend::macos_experimental;
+                } else if (value == "apple_container") {
+                    options.backend = supervisor::sandbox_backend::apple_container;
                 } else {
                     return print_error(
                         "policy_backend_invalid",

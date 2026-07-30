@@ -2,6 +2,7 @@
 
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/session_registry.hpp"
+#include "glove/control/session_runtime.hpp"
 
 #include "linux_session_preparation.hpp"
 
@@ -123,7 +124,7 @@ private:
 // durably reserves start authorization, and adopts each launched PTY into the
 // bounded nonblocking index. Exact start retries return the current durable
 // record instead of spawning a duplicate process.
-class linux_session_runtime final {
+class linux_session_runtime final : public session_runtime {
 public:
     struct implementation;
 
@@ -147,39 +148,54 @@ public:
         std::size_t max_sessions = default_max_live_linux_pty_sessions
     ) -> std::expected<std::unique_ptr<linux_session_runtime>, std::string>;
 
+    [[nodiscard]] auto backend_id() const noexcept -> std::string_view override {
+        return "linux_production";
+    }
+    [[nodiscard]] auto agent_runtime_adapter_schema_version() const noexcept
+        -> std::uint8_t override {
+        return 1;
+    }
+    [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override {
+        return {"codex", "claude-code", "pi", "copilot", "opencode"};
+    }
+
+    [[nodiscard]] auto resource_capabilities() const noexcept
+        -> container::resource_enforcement_capabilities override;
     [[nodiscard]] auto start(
         container::receipt_audit_producer& receipt_producer,
         const session_start_authorization& authorization,
         std::string_view idempotency_namespace,
         std::uint64_t now_ms
-    ) -> std::expected<session_record, std::string>;
+    ) -> std::expected<session_record, std::string> override;
     [[nodiscard]] auto
     reconcile(container::receipt_audit_producer& receipt_producer, std::uint64_t now_ms)
-        -> std::expected<session_reconciliation_report, std::string>;
-    [[nodiscard]] auto list() const -> std::expected<std::vector<std::string>, std::string>;
+        -> std::expected<session_reconciliation_report, std::string> override;
+    [[nodiscard]] auto list() const
+        -> std::expected<std::vector<std::string>, std::string> override;
     [[nodiscard]] auto
     read(std::string_view session_id, std::uint64_t cursor, std::size_t max_bytes) const
-        -> std::expected<container::linux_detail::pty_transcript_read, std::string>;
+        -> std::expected<session_transcript_read, std::string> override;
     [[nodiscard]] auto wait_read(
         std::string_view session_id,
         std::uint64_t cursor,
         std::size_t max_bytes,
         std::uint64_t timeout_ms
-    ) -> std::expected<container::linux_detail::pty_transcript_read, std::string>;
+    ) -> std::expected<session_transcript_read, std::string> override;
     [[nodiscard]] auto write_input(std::string_view session_id, std::string_view bytes)
-        -> std::expected<void, std::string>;
+        -> std::expected<void, std::string> override;
     [[nodiscard]] auto
     resize(std::string_view session_id, std::uint16_t rows, std::uint16_t columns)
-        -> std::expected<void, std::string>;
-    [[nodiscard]] auto
-    signal(std::string_view session_id, container::linux_detail::pty_session_signal requested)
-        -> std::expected<void, std::string>;
-    [[nodiscard]] auto stop(std::string_view session_id) -> std::expected<void, std::string>;
+        -> std::expected<void, std::string> override;
+    [[nodiscard]] auto signal(std::string_view session_id, session_signal requested)
+        -> std::expected<void, std::string> override;
+    [[nodiscard]] auto stop(std::string_view session_id)
+        -> std::expected<void, std::string> override;
     [[nodiscard]] auto stop(std::string_view session_id, std::string_view idempotency_key)
-        -> std::expected<void, std::string>;
+        -> std::expected<void, std::string> override;
     [[nodiscard]] auto wait(std::string_view session_id)
-        -> std::expected<session_exited_record, std::string>;
-    [[nodiscard]] auto cleanup(std::string_view session_id) -> std::expected<void, std::string>;
+        -> std::expected<session_terminal_record, std::string> override;
+    [[nodiscard]] auto cleanup(std::string_view session_id)
+        -> std::expected<void, std::string> override;
 
 private:
     std::unique_ptr<implementation> state_;

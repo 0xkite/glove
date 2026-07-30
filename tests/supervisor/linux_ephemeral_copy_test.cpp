@@ -83,6 +83,15 @@ auto retained_mode(std::uint64_t max_bytes) -> glove::supervisor::path_exposure_
     };
 }
 
+auto ephemeral_mode(std::uint64_t max_bytes) -> glove::supervisor::path_exposure_mode {
+    return {
+        .access = glove::supervisor::path_access::ephemeral_write,
+        .materialization = glove::supervisor::path_materialization::copy,
+        .max_bytes = max_bytes,
+        .cleanup_policy = glove::supervisor::path_cleanup_policy::remove,
+    };
+}
+
 auto count_entries(const std::filesystem::path& path) -> std::size_t {
     return static_cast<std::size_t>(std::distance(
         std::filesystem::directory_iterator{path}, std::filesystem::directory_iterator{}
@@ -233,12 +242,50 @@ auto run() -> int {
         {
             .root_id = "projects",
             .host_root = std::filesystem::canonical(tree.root()).string(),
-            .allowed_modes = {retained_mode(retained_quota_bytes)},
+            .allowed_modes =
+                {retained_mode(retained_quota_bytes), ephemeral_mode(retained_quota_bytes)},
             .max_ttl_secs = 3'600,
             .allowed_runtime_template_ids = {"codex-safe"},
         },
     });
     REQUIRE(exposures.has_value());
+    auto ephemeral_exposure = exposures->create(
+        {
+            .request_id = "ephemeral-create",
+            .exposure_id = "ephemeral",
+            .root_id = "projects",
+            .host_path = std::filesystem::canonical(source).string(),
+            .display_label = "Ephemeral test",
+            .allowed_modes = {ephemeral_mode(retained_quota_bytes)},
+            .ttl_secs = 600,
+            .allowed_runtime_template_ids = {"codex-safe"},
+        },
+        1'000
+    );
+    REQUIRE(ephemeral_exposure.has_value());
+    const glove::supervisor::path_exposure_grant ephemeral_request{
+        .exposure_id = ephemeral_exposure->exposure_id,
+        .generation = ephemeral_exposure->generation,
+        .scope_digest = ephemeral_exposure->scope_digest,
+        .access = glove::supervisor::path_access::ephemeral_write,
+        .materialization = glove::supervisor::path_materialization::copy,
+        .max_bytes = retained_quota_bytes,
+        .ttl_secs = 300,
+        .cleanup_policy = glove::supervisor::path_cleanup_policy::remove,
+    };
+    auto ephemeral_grant = exposures->resolve_grant(ephemeral_request, "codex-safe", 2'000);
+    REQUIRE(ephemeral_grant.has_value());
+    auto exposed_ephemeral =
+        glove::supervisor::linux_detail::ephemeral_copy_materialization::create(
+            materialization_root.string(), "session-ephemeral", *ephemeral_grant
+        );
+    REQUIRE(exposed_ephemeral.has_value());
+    auto no_retained_stage = exposed_ephemeral->finalize_retained();
+    REQUIRE(no_retained_stage.has_value());
+    REQUIRE(!*no_retained_stage);
+    REQUIRE(exposed_ephemeral->cleanup().has_value());
+    REQUIRE(count_entries(materialization_root) == 0);
+
     auto retained_exposure = exposures->create(
         {
             .request_id = "retained-create",

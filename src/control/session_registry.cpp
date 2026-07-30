@@ -61,6 +61,7 @@ struct persisted_session {
     std::string process_cgroup_path_digest;
     std::optional<linux_cgroup_recovery_identity> cgroup_identity;
     std::optional<linux_filesystem_recovery_identity> filesystem_identity;
+    std::optional<managed_runtime_recovery_identity> managed_runtime_identity;
     std::string failure_code;
     std::uint64_t finished_at_ms = 0;
     std::uint64_t receipt_started_at_ms = 0;
@@ -218,6 +219,13 @@ auto valid_cgroup_identity(const linux_cgroup_recovery_identity& identity) noexc
     return identity.schema_version == 1 && identity.device != 0 && identity.inode != 0;
 }
 
+auto valid_managed_runtime_identity(const managed_runtime_recovery_identity& identity) noexcept
+    -> bool {
+    return identity.schema_version == 1 && identity.backend == "apple_container" &&
+           valid_identifier(identity.instance_id) &&
+           valid_digest(identity.launch_identity_digest);
+}
+
 auto no_process_identity(const wire::persisted_session& record) noexcept -> bool {
     return record.process_identity_schema_version == 0 && record.process_pid == 0 &&
            record.process_boot_id.empty() && record.process_start_time_ticks == 0 &&
@@ -226,7 +234,8 @@ auto no_process_identity(const wire::persisted_session& record) noexcept -> bool
 }
 
 auto no_resource_identity(const wire::persisted_session& record) noexcept -> bool {
-    return no_process_identity(record) && !record.cgroup_identity && !record.filesystem_identity;
+    return no_process_identity(record) && !record.cgroup_identity && !record.filesystem_identity &&
+           !record.managed_runtime_identity;
 }
 
 auto process_identity_from_wire(const wire::persisted_session& record)
@@ -326,6 +335,31 @@ auto append_cgroup_identity(
     output.push_back(identity->schema_version);
     append_u64(output, identity->device);
     append_u64(output, identity->inode);
+}
+
+auto append_managed_runtime_identity(
+    std::vector<unsigned char>& output,
+    const std::optional<managed_runtime_recovery_identity>& identity
+) -> std::expected<void, std::string> {
+    if (!identity) {
+        return {};
+    }
+    constexpr std::string_view extension_domain = "glove.managed-runtime-identity.v1";
+    output.push_back(1U);
+    if (!append_string(output, extension_domain)) {
+        return std::unexpected(std::string{"managed runtime hash domain is invalid"});
+    }
+    output.push_back(identity->schema_version);
+    for (const auto value : {
+             std::string_view{identity->backend},
+             std::string_view{identity->instance_id},
+             std::string_view{identity->launch_identity_digest},
+         }) {
+        if (!append_string(output, value)) {
+            return std::unexpected(std::string{"managed runtime identity exceeds its hash bound"});
+        }
+    }
+    return {};
 }
 
 auto decode_u32(std::span<const unsigned char, 4> input) noexcept -> std::uint32_t {
@@ -543,6 +577,11 @@ auto record_material(const wire::persisted_session& record)
             !appended) {
             return std::unexpected(appended.error());
         }
+        if (auto appended =
+                append_managed_runtime_identity(material, record.managed_runtime_identity);
+            !appended) {
+            return std::unexpected(appended.error());
+        }
     }
     if (record.state == "running" || record.state == "stopping" || record.state == "exited" ||
         record.state == "failed") {
@@ -741,6 +780,62 @@ auto hash_stopping_commitment(const session_running_commitment& running)
         return std::unexpected(std::string{"stopping process cgroup identity exceeds its bound"});
     }
     if (auto appended = append_filesystem_identity(material, running.filesystem_identity);
+        !appended) {
+        return std::unexpected(appended.error());
+    }
+    return container::sha256_hex(material);
+}
+
+auto hash_managed_execution_binding(const managed_session_execution_binding& binding)
+    -> std::expected<std::string, std::string> {
+    std::vector<unsigned char> material;
+    material.reserve(512U);
+    constexpr std::string_view domain = "glove.managed-session-execution-binding";
+    if (!append_string(material, domain)) {
+        return std::unexpected(std::string{"managed execution binding hash domain is invalid"});
+    }
+    material.push_back(binding.schema_version);
+    for (const auto value : {
+             std::string_view{binding.session_id},
+             std::string_view{binding.controller_plan_digest},
+             std::string_view{binding.plan_content_digest},
+             std::string_view{binding.authorization_id},
+             std::string_view{binding.profile_digest},
+         }) {
+        if (!append_string(material, value)) {
+            return std::unexpected(
+                std::string{"managed execution binding field exceeds its bound"}
+            );
+        }
+    }
+    if (auto appended = append_managed_runtime_identity(material, binding.runtime_identity);
+        !appended) {
+        return std::unexpected(appended.error());
+    }
+    return container::sha256_hex(material);
+}
+
+auto hash_managed_running_commitment(
+    const managed_session_running_commitment& running, std::string_view domain
+) -> std::expected<std::string, std::string> {
+    std::vector<unsigned char> material;
+    material.reserve(512U);
+    if (!append_string(material, domain)) {
+        return std::unexpected(std::string{"managed lifecycle hash domain is invalid"});
+    }
+    material.push_back(running.schema_version);
+    for (const auto value : {
+             std::string_view{running.session_id},
+             std::string_view{running.controller_plan_digest},
+             std::string_view{running.plan_content_digest},
+             std::string_view{running.authorization_id},
+             std::string_view{running.profile_digest},
+         }) {
+        if (!append_string(material, value)) {
+            return std::unexpected(std::string{"managed lifecycle field exceeds its bound"});
+        }
+    }
+    if (auto appended = append_managed_runtime_identity(material, running.runtime_identity);
         !appended) {
         return std::unexpected(appended.error());
     }
@@ -1017,11 +1112,20 @@ auto valid_record_shape(const wire::persisted_session& record, std::uint64_t seq
                          record.starting_at_ms < record.authorization_expires_at_ms;
     const bool prepared_resources =
         record.cgroup_identity && valid_cgroup_identity(*record.cgroup_identity) &&
-        record.filesystem_identity && valid_filesystem_identity(*record.filesystem_identity);
+        record.filesystem_identity && valid_filesystem_identity(*record.filesystem_identity) &&
+        !record.managed_runtime_identity;
+    const bool managed_resources =
+        no_process_identity(record) && !record.cgroup_identity && !record.filesystem_identity &&
+        record.managed_runtime_identity &&
+        valid_managed_runtime_identity(*record.managed_runtime_identity);
     if (record.operation == "mark_starting" && record.state == "starting") {
         return started && record.running_at_ms == 0 && no_stop_intent &&
                no_process_identity(record) && prepared_resources && record.failure_code.empty() &&
                record.finished_at_ms == 0 && no_terminal_receipt;
+    }
+    if (record.operation == "mark_managed_starting" && record.state == "starting") {
+        return started && record.running_at_ms == 0 && no_stop_intent && managed_resources &&
+               record.failure_code.empty() && record.finished_at_ms == 0 && no_terminal_receipt;
     }
     const auto process_identity = process_identity_from_wire(record);
     const bool running = record.running_at_ms >= record.starting_at_ms &&
@@ -1033,10 +1137,23 @@ auto valid_record_shape(const wire::persisted_session& record, std::uint64_t seq
         return started && running && no_stop_intent && record.failure_code.empty() &&
                record.finished_at_ms == 0 && no_terminal_receipt;
     }
+    const bool managed_running =
+        record.running_at_ms >= record.starting_at_ms &&
+        record.running_at_ms < record.authorization_expires_at_ms && managed_resources;
+    if (record.operation == "mark_managed_running" && record.state == "running") {
+        return started && managed_running && no_stop_intent && record.failure_code.empty() &&
+               record.finished_at_ms == 0 && no_terminal_receipt;
+    }
     const bool stopping = running && record.stopping_at_ms >= record.running_at_ms;
     if (record.operation == "mark_stopping" && record.state == "stopping") {
         return started && stopping && record.failure_code.empty() && record.finished_at_ms == 0 &&
                no_terminal_receipt;
+    }
+    const bool managed_stopping =
+        managed_running && record.stopping_at_ms >= record.running_at_ms;
+    if (record.operation == "mark_managed_stopping" && record.state == "stopping") {
+        return started && managed_stopping && record.failure_code.empty() &&
+               record.finished_at_ms == 0 && no_terminal_receipt;
     }
     const auto termination = termination_cause_from_wire(record.termination_cause);
     const bool valid_exit_code =
@@ -1055,6 +1172,17 @@ auto valid_record_shape(const wire::persisted_session& record, std::uint64_t seq
                valid_digest(record.receipt_digest) && valid_digest(record.receipt_previous_hmac) &&
                valid_digest(record.receipt_hmac) && valid_exit_code;
     }
+    if (record.operation == "mark_managed_exited" && record.state == "exited") {
+        return started && managed_running &&
+               (no_stop_intent || record.stopping_at_ms >= record.running_at_ms) &&
+               record.failure_code.empty() && record.receipt_started_at_ms != 0 &&
+               record.receipt_started_at_ms <= record.running_at_ms &&
+               record.finished_at_ms >=
+                   (no_stop_intent ? record.running_at_ms : record.stopping_at_ms) &&
+               valid_digest(record.receipt_key_id) && record.receipt_sequence != 0 &&
+               valid_digest(record.receipt_digest) && valid_digest(record.receipt_previous_hmac) &&
+               valid_digest(record.receipt_hmac) && valid_exit_code;
+    }
     const auto failure = failure_code_from_wire(record.failure_code);
     const bool prelaunch_failure =
         record.running_at_ms == 0 && no_process_identity(record) && prepared_resources;
@@ -1064,6 +1192,22 @@ auto valid_record_shape(const wire::persisted_session& record, std::uint64_t seq
          (*failure == session_failure_code::supervisor_error ||
           *failure == session_failure_code::recovered_without_process ||
           *failure == session_failure_code::recovered_terminated));
+    const bool valid_managed_failure_origin =
+        managed_resources &&
+        ((record.running_at_ms == 0 && no_stop_intent) ||
+         (record.running_at_ms != 0 &&
+          (no_stop_intent || record.stopping_at_ms >= record.running_at_ms) && failure &&
+          (*failure == session_failure_code::supervisor_error ||
+           *failure == session_failure_code::recovered_without_process ||
+           *failure == session_failure_code::recovered_terminated)));
+    if (record.operation == "mark_managed_failed" && record.state == "failed") {
+        return started && failure && valid_managed_failure_origin && no_terminal_receipt &&
+               record.finished_at_ms >=
+                   (record.stopping_at_ms != 0
+                        ? record.stopping_at_ms
+                        : (record.running_at_ms != 0 ? record.running_at_ms
+                                                     : record.starting_at_ms));
+    }
     return record.operation == "mark_failed" && record.state == "failed" && started && failure &&
            valid_failure_origin && no_terminal_receipt &&
            record.finished_at_ms >=
@@ -1230,17 +1374,31 @@ auto accept_recovered_record(
             prior.canonical_plan_json != record.canonical_plan_json) {
             return std::unexpected(std::string{"session registry starting transition is invalid"});
         }
-        const session_execution_binding binding{
-            .schema_version = record.schema_version,
-            .session_id = record.session_id,
-            .controller_plan_digest = record.controller_plan_digest,
-            .plan_content_digest = record.plan_content_digest,
-            .authorization_id = record.authorization_id,
-            .profile_digest = record.launch_profile_digest,
-            .cgroup_identity = *record.cgroup_identity,
-            .filesystem_identity = *record.filesystem_identity,
-        };
-        auto binding_digest = hash_execution_binding(binding);
+        std::expected<std::string, std::string> binding_digest =
+            std::unexpected(std::string{"unknown starting operation"});
+        if (record.operation == "mark_managed_starting" && record.managed_runtime_identity) {
+            binding_digest = hash_managed_execution_binding(managed_session_execution_binding{
+                .schema_version = record.schema_version,
+                .session_id = record.session_id,
+                .controller_plan_digest = record.controller_plan_digest,
+                .plan_content_digest = record.plan_content_digest,
+                .authorization_id = record.authorization_id,
+                .profile_digest = record.launch_profile_digest,
+                .runtime_identity = *record.managed_runtime_identity,
+            });
+        } else if (record.operation == "mark_starting" && record.cgroup_identity &&
+                   record.filesystem_identity) {
+            binding_digest = hash_execution_binding(session_execution_binding{
+                .schema_version = record.schema_version,
+                .session_id = record.session_id,
+                .controller_plan_digest = record.controller_plan_digest,
+                .plan_content_digest = record.plan_content_digest,
+                .authorization_id = record.authorization_id,
+                .profile_digest = record.launch_profile_digest,
+                .cgroup_identity = *record.cgroup_identity,
+                .filesystem_identity = *record.filesystem_identity,
+            });
+        }
         if (!binding_digest || *binding_digest != record.request_digest) {
             return std::unexpected(
                 std::string{"session registry execution binding commitment mismatch"}
@@ -1264,24 +1422,40 @@ auto accept_recovered_record(
             prior.starting_at_ms != record.starting_at_ms ||
             prior.cgroup_identity != record.cgroup_identity ||
             prior.filesystem_identity != record.filesystem_identity ||
+            prior.managed_runtime_identity != record.managed_runtime_identity ||
             prior.canonical_plan_json != record.canonical_plan_json) {
             return std::unexpected(std::string{"session registry running transition is invalid"});
         }
-        auto process_identity = process_identity_from_wire(record);
-        if (!process_identity) {
-            return std::unexpected(std::string{"session registry process identity is invalid"});
+        std::expected<std::string, std::string> running_digest =
+            std::unexpected(std::string{"unknown running operation"});
+        if (record.operation == "mark_managed_running" && record.managed_runtime_identity) {
+            running_digest = hash_managed_running_commitment(
+                managed_session_running_commitment{
+                    .schema_version = record.schema_version,
+                    .session_id = record.session_id,
+                    .controller_plan_digest = record.controller_plan_digest,
+                    .plan_content_digest = record.plan_content_digest,
+                    .authorization_id = record.authorization_id,
+                    .profile_digest = record.launch_profile_digest,
+                    .runtime_identity = *record.managed_runtime_identity,
+                },
+                "glove.managed-session-running-commitment"
+            );
+        } else if (record.operation == "mark_running" && record.filesystem_identity) {
+            auto process_identity = process_identity_from_wire(record);
+            if (process_identity) {
+                running_digest = hash_running_commitment(session_running_commitment{
+                    .schema_version = record.schema_version,
+                    .session_id = record.session_id,
+                    .controller_plan_digest = record.controller_plan_digest,
+                    .plan_content_digest = record.plan_content_digest,
+                    .authorization_id = record.authorization_id,
+                    .profile_digest = record.launch_profile_digest,
+                    .process_identity = std::move(*process_identity),
+                    .filesystem_identity = *record.filesystem_identity,
+                });
+            }
         }
-        const session_running_commitment running{
-            .schema_version = record.schema_version,
-            .session_id = record.session_id,
-            .controller_plan_digest = record.controller_plan_digest,
-            .plan_content_digest = record.plan_content_digest,
-            .authorization_id = record.authorization_id,
-            .profile_digest = record.launch_profile_digest,
-            .process_identity = std::move(*process_identity),
-            .filesystem_identity = *record.filesystem_identity,
-        };
-        auto running_digest = hash_running_commitment(running);
         if (!running_digest || *running_digest != record.request_digest) {
             return std::unexpected(std::string{"session registry running commitment mismatch"});
         }
@@ -1304,24 +1478,40 @@ auto accept_recovered_record(
             prior.running_at_ms != record.running_at_ms || !same_process_identity(prior, record) ||
             prior.cgroup_identity != record.cgroup_identity ||
             prior.filesystem_identity != record.filesystem_identity ||
+            prior.managed_runtime_identity != record.managed_runtime_identity ||
             prior.canonical_plan_json != record.canonical_plan_json) {
             return std::unexpected(std::string{"session registry stopping transition is invalid"});
         }
-        auto process_identity = process_identity_from_wire(record);
-        if (!process_identity) {
-            return std::unexpected(std::string{"session registry process identity is invalid"});
+        std::expected<std::string, std::string> stopping_digest =
+            std::unexpected(std::string{"unknown stopping operation"});
+        if (record.operation == "mark_managed_stopping" && record.managed_runtime_identity) {
+            stopping_digest = hash_managed_running_commitment(
+                managed_session_running_commitment{
+                    .schema_version = record.schema_version,
+                    .session_id = record.session_id,
+                    .controller_plan_digest = record.controller_plan_digest,
+                    .plan_content_digest = record.plan_content_digest,
+                    .authorization_id = record.authorization_id,
+                    .profile_digest = record.launch_profile_digest,
+                    .runtime_identity = *record.managed_runtime_identity,
+                },
+                "glove.managed-session-stopping-commitment"
+            );
+        } else if (record.operation == "mark_stopping" && record.filesystem_identity) {
+            auto process_identity = process_identity_from_wire(record);
+            if (process_identity) {
+                stopping_digest = hash_stopping_commitment(session_running_commitment{
+                    .schema_version = record.schema_version,
+                    .session_id = record.session_id,
+                    .controller_plan_digest = record.controller_plan_digest,
+                    .plan_content_digest = record.plan_content_digest,
+                    .authorization_id = record.authorization_id,
+                    .profile_digest = record.launch_profile_digest,
+                    .process_identity = std::move(*process_identity),
+                    .filesystem_identity = *record.filesystem_identity,
+                });
+            }
         }
-        const session_running_commitment stopping{
-            .schema_version = record.schema_version,
-            .session_id = record.session_id,
-            .controller_plan_digest = record.controller_plan_digest,
-            .plan_content_digest = record.plan_content_digest,
-            .authorization_id = record.authorization_id,
-            .profile_digest = record.launch_profile_digest,
-            .process_identity = std::move(*process_identity),
-            .filesystem_identity = *record.filesystem_identity,
-        };
-        auto stopping_digest = hash_stopping_commitment(stopping);
         if (!stopping_digest || *stopping_digest != record.request_digest) {
             return std::unexpected(std::string{"session registry stopping commitment mismatch"});
         }
@@ -1347,6 +1537,7 @@ auto accept_recovered_record(
             !same_process_identity(prior, record) ||
             prior.cgroup_identity != record.cgroup_identity ||
             prior.filesystem_identity != record.filesystem_identity ||
+            prior.managed_runtime_identity != record.managed_runtime_identity ||
             prior.canonical_plan_json != record.canonical_plan_json) {
             return std::unexpected(std::string{"session registry exit transition is invalid"});
         }
@@ -1397,6 +1588,7 @@ auto accept_recovered_record(
             !same_process_identity(prior, record) ||
             prior.cgroup_identity != record.cgroup_identity ||
             prior.filesystem_identity != record.filesystem_identity ||
+            prior.managed_runtime_identity != record.managed_runtime_identity ||
             prior.canonical_plan_json != record.canonical_plan_json) {
             return std::unexpected(std::string{"session registry failure transition is invalid"});
         }
@@ -1722,6 +1914,81 @@ auto failed_record_from_wire(const wire::persisted_session& record)
         .process_identity = std::move(process_identity),
         .cgroup_identity = record.cgroup_identity,
         .filesystem_identity = record.filesystem_identity,
+        .failed_at_ms = record.finished_at_ms,
+        .code = *code,
+    };
+}
+
+auto managed_lifecycle_from_wire(const wire::persisted_session& record)
+    -> session_registry_result<managed_session_lifecycle_record> {
+    if ((record.state != "starting" && record.state != "running" &&
+         record.state != "stopping" && record.state != "exited" && record.state != "failed") ||
+        !valid_digest(record.launch_profile_digest) || record.starting_at_ms == 0 ||
+        (record.running_at_ms != 0 && record.running_at_ms < record.starting_at_ms) ||
+        (record.stopping_at_ms != 0 && record.stopping_at_ms < record.running_at_ms) ||
+        !no_process_identity(record) || record.cgroup_identity || record.filesystem_identity ||
+        !record.managed_runtime_identity ||
+        !valid_managed_runtime_identity(*record.managed_runtime_identity)) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "session has no durable managed runtime commitment"
+        ));
+    }
+    return managed_session_lifecycle_record{
+        .session = public_record(record),
+        .authorization_id = record.authorization_id,
+        .authorization_expires_at_ms = record.authorization_expires_at_ms,
+        .profile_digest = record.launch_profile_digest,
+        .starting_at_ms = record.starting_at_ms,
+        .running_at_ms = record.running_at_ms,
+        .stopping_at_ms = record.stopping_at_ms,
+        .runtime_identity = *record.managed_runtime_identity,
+    };
+}
+
+auto managed_exited_from_wire(const wire::persisted_session& record)
+    -> session_registry_result<managed_session_exited_record> {
+    auto lifecycle = managed_lifecycle_from_wire(record);
+    const auto termination = termination_cause_from_wire(record.termination_cause);
+    if (!lifecycle || record.state != "exited" || record.running_at_ms == 0 ||
+        record.finished_at_ms <
+            (record.stopping_at_ms == 0 ? record.running_at_ms : record.stopping_at_ms) ||
+        !valid_digest(record.receipt_key_id) || record.receipt_sequence == 0 ||
+        !valid_digest(record.receipt_digest) || !valid_digest(record.receipt_hmac) ||
+        !termination) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "session has no durable managed terminal receipt"
+        ));
+    }
+    return managed_session_exited_record{
+        .lifecycle = std::move(*lifecycle),
+        .finished_at_ms = record.finished_at_ms,
+        .receipt_key_id = record.receipt_key_id,
+        .receipt_sequence = record.receipt_sequence,
+        .receipt_digest = record.receipt_digest,
+        .receipt_hmac = record.receipt_hmac,
+        .termination_cause = *termination,
+        .exit_code = record.exit_code,
+    };
+}
+
+auto managed_failed_from_wire(const wire::persisted_session& record)
+    -> session_registry_result<managed_session_failed_record> {
+    auto lifecycle = managed_lifecycle_from_wire(record);
+    const auto code = failure_code_from_wire(record.failure_code);
+    if (!lifecycle || record.state != "failed" || !code ||
+        record.finished_at_ms <
+            (record.stopping_at_ms != 0
+                 ? record.stopping_at_ms
+                 : (record.running_at_ms != 0 ? record.running_at_ms : record.starting_at_ms))) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "session has no durable managed failure commitment"
+        ));
+    }
+    return managed_session_failed_record{
+        .lifecycle = std::move(*lifecycle),
         .failed_at_ms = record.finished_at_ms,
         .code = *code,
     };
@@ -2134,6 +2401,7 @@ auto session_registry::create(
         .process_cgroup_path_digest = {},
         .cgroup_identity = std::nullopt,
         .filesystem_identity = std::nullopt,
+        .managed_runtime_identity = std::nullopt,
         .failure_code = {},
         .finished_at_ms = 0,
         .receipt_started_at_ms = 0,
@@ -2296,6 +2564,7 @@ auto session_registry::reserve_start(
         .process_cgroup_path_digest = {},
         .cgroup_identity = std::nullopt,
         .filesystem_identity = std::nullopt,
+        .managed_runtime_identity = std::nullopt,
         .failure_code = {},
         .finished_at_ms = 0,
         .receipt_started_at_ms = 0,
@@ -2550,6 +2819,7 @@ auto session_registry::mark_starting(
         .process_cgroup_path_digest = {},
         .cgroup_identity = binding.cgroup_identity,
         .filesystem_identity = binding.filesystem_identity,
+        .managed_runtime_identity = std::nullopt,
         .failure_code = {},
         .finished_at_ms = 0,
         .receipt_started_at_ms = 0,
@@ -2736,6 +3006,7 @@ auto session_registry::mark_running(
         .process_cgroup_path_digest = running_commitment.process_identity.cgroup_path_digest,
         .cgroup_identity = prior.cgroup_identity,
         .filesystem_identity = prior.filesystem_identity,
+        .managed_runtime_identity = std::nullopt,
         .failure_code = {},
         .finished_at_ms = 0,
         .receipt_started_at_ms = 0,
@@ -2882,6 +3153,7 @@ auto session_registry::mark_stopping(
         .process_cgroup_path_digest = prior.process_cgroup_path_digest,
         .cgroup_identity = cgroup_identity,
         .filesystem_identity = filesystem_identity,
+        .managed_runtime_identity = std::nullopt,
         .failure_code = {},
         .finished_at_ms = 0,
         .receipt_started_at_ms = 0,
@@ -3045,6 +3317,7 @@ auto session_registry::mark_exited(
         .process_cgroup_path_digest = prior.process_cgroup_path_digest,
         .cgroup_identity = cgroup_identity,
         .filesystem_identity = filesystem_identity,
+        .managed_runtime_identity = std::nullopt,
         .failure_code = {},
         .finished_at_ms = terminal.receipt.finished_at_ms,
         .receipt_started_at_ms = terminal.receipt.started_at_ms,
@@ -3209,6 +3482,7 @@ auto session_registry::mark_failed(
         .process_cgroup_path_digest = prior.process_cgroup_path_digest,
         .cgroup_identity = cgroup_identity,
         .filesystem_identity = filesystem_identity,
+        .managed_runtime_identity = std::nullopt,
         .failure_code = std::string{failure_name},
         .finished_at_ms = now_ms,
         .receipt_started_at_ms = 0,
@@ -3262,6 +3536,565 @@ auto session_registry::failed_status(std::string_view session_id) const
     return failed_record_from_wire(state_->records[existing->second]);
 }
 
+auto session_registry::mark_managed_starting(
+    const managed_session_execution_binding& binding,
+    const container::receipt_audit_producer::terminal_reservation& receipt_reservation,
+    std::string_view idempotency_key,
+    std::uint64_t now_ms
+) -> session_registry_result<managed_session_lifecycle_record> {
+    if (binding.schema_version != 1 || !valid_identifier(binding.session_id) ||
+        !valid_digest(binding.controller_plan_digest) ||
+        !valid_digest(binding.plan_content_digest) || !valid_identifier(binding.authorization_id) ||
+        !valid_digest(binding.profile_digest) ||
+        !valid_managed_runtime_identity(binding.runtime_identity) ||
+        !valid_identifier(idempotency_key) || now_ms == 0) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid managed session execution commitment"
+        ));
+    }
+    if (!receipt_reservation.matches_execution(
+            binding.session_id, binding.controller_plan_digest, binding.profile_digest
+        )) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_authorization,
+            "managed execution commitment has no matching terminal receipt reservation"
+        ));
+    }
+    auto request_digest = hash_managed_execution_binding(binding);
+    if (!request_digest) {
+        return std::unexpected(storage_failure(request_digest.error()));
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    if (const auto replay = state_->requests.find(std::string{idempotency_key});
+        replay != state_->requests.end()) {
+        const auto& record = state_->records[replay->second];
+        if (record.operation != "mark_managed_starting" ||
+            record.session_id != binding.session_id ||
+            record.controller_plan_digest != binding.controller_plan_digest ||
+            record.plan_content_digest != binding.plan_content_digest ||
+            record.authorization_id != binding.authorization_id ||
+            record.launch_profile_digest != binding.profile_digest ||
+            record.managed_runtime_identity != binding.runtime_identity ||
+            record.request_digest != *request_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::idempotency_conflict,
+                "managed starting idempotency payload changed"
+            ));
+        }
+        return managed_lifecycle_from_wire(record);
+    }
+    const auto existing = state_->sessions.find(binding.session_id);
+    if (existing == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    const auto& prior = state_->records[existing->second];
+    if (prior.state != "preparing" || prior.session_id != binding.session_id ||
+        prior.controller_plan_digest != binding.controller_plan_digest ||
+        prior.plan_content_digest != binding.plan_content_digest ||
+        prior.authorization_id != binding.authorization_id ||
+        prior.authorization_expires_at_ms <= now_ms || prior.expires_at_ms <= now_ms) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_authorization,
+            "managed execution commitment does not bind the current authorized session"
+        ));
+    }
+    auto launch = state_->validator->resolve_runtime_launch_json(prior.canonical_plan_json, now_ms);
+    if (!launch || launch->requires_direct_write_approval) {
+        return std::unexpected(failure(
+            launch ? session_registry_error_code::invalid_authorization
+                   : session_registry_error_code::invalid_plan,
+            "stored session plan is not eligible for managed start"
+        ));
+    }
+    if (state_->records.size() >= max_records) {
+        return std::unexpected(
+            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+        );
+    }
+    wire::persisted_session record{
+        .schema_version = 1,
+        .sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U,
+        .operation = "mark_managed_starting",
+        .idempotency_key = std::string{idempotency_key},
+        .session_id = prior.session_id,
+        .controller_plan_digest = prior.controller_plan_digest,
+        .request_digest = std::move(*request_digest),
+        .plan_content_digest = prior.plan_content_digest,
+        .state = "starting",
+        .policy_revision = prior.policy_revision,
+        .expires_at_ms = prior.expires_at_ms,
+        .created_at_ms = prior.created_at_ms,
+        .authorization_id = prior.authorization_id,
+        .authorized_at_ms = prior.authorized_at_ms,
+        .authorization_expires_at_ms = prior.authorization_expires_at_ms,
+        .launch_profile_digest = binding.profile_digest,
+        .starting_at_ms = now_ms,
+        .running_at_ms = 0,
+        .stopping_at_ms = 0,
+        .process_identity_schema_version = 0,
+        .process_pid = 0,
+        .process_boot_id = {},
+        .process_start_time_ticks = 0,
+        .process_cgroup_device = 0,
+        .process_cgroup_inode = 0,
+        .process_cgroup_path_digest = {},
+        .cgroup_identity = std::nullopt,
+        .filesystem_identity = std::nullopt,
+        .managed_runtime_identity = binding.runtime_identity,
+        .failure_code = {},
+        .finished_at_ms = 0,
+        .receipt_started_at_ms = 0,
+        .receipt_key_id = {},
+        .receipt_sequence = 0,
+        .receipt_digest = {},
+        .receipt_previous_hmac = {},
+        .receipt_hmac = {},
+        .termination_cause = {},
+        .exit_code = std::nullopt,
+        .canonical_plan_json = prior.canonical_plan_json,
+        .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
+                                                 : state_->records.back().this_hash,
+        .this_hash = {},
+    };
+    auto appended = append_record_locked(*state_, std::move(record));
+    if (!appended) {
+        return std::unexpected(appended.error());
+    }
+    return managed_lifecycle_from_wire(state_->records.back());
+}
+
+auto session_registry::mark_managed_running(
+    const managed_session_running_commitment& running,
+    const container::receipt_audit_producer::terminal_reservation& receipt_reservation,
+    std::string_view idempotency_key,
+    std::uint64_t now_ms
+) -> session_registry_result<managed_session_lifecycle_record> {
+    if (running.schema_version != 1 || !valid_identifier(running.session_id) ||
+        !valid_digest(running.controller_plan_digest) ||
+        !valid_digest(running.plan_content_digest) ||
+        !valid_identifier(running.authorization_id) || !valid_digest(running.profile_digest) ||
+        !valid_managed_runtime_identity(running.runtime_identity) ||
+        !valid_identifier(idempotency_key) || now_ms == 0) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid managed session running commitment"
+        ));
+    }
+    if (!receipt_reservation.matches_execution(
+            running.session_id, running.controller_plan_digest, running.profile_digest
+        )) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_authorization,
+            "managed running commitment has no matching terminal receipt reservation"
+        ));
+    }
+    auto request_digest =
+        hash_managed_running_commitment(running, "glove.managed-session-running-commitment");
+    if (!request_digest) {
+        return std::unexpected(storage_failure(request_digest.error()));
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    if (const auto replay = state_->requests.find(std::string{idempotency_key});
+        replay != state_->requests.end()) {
+        const auto& record = state_->records[replay->second];
+        if (record.operation != "mark_managed_running" ||
+            record.session_id != running.session_id ||
+            record.controller_plan_digest != running.controller_plan_digest ||
+            record.plan_content_digest != running.plan_content_digest ||
+            record.authorization_id != running.authorization_id ||
+            record.launch_profile_digest != running.profile_digest ||
+            record.managed_runtime_identity != running.runtime_identity ||
+            record.request_digest != *request_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::idempotency_conflict,
+                "managed running idempotency payload changed"
+            ));
+        }
+        return managed_lifecycle_from_wire(record);
+    }
+    const auto existing = state_->sessions.find(running.session_id);
+    if (existing == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    const auto& prior = state_->records[existing->second];
+    if (prior.state != "starting" || prior.session_id != running.session_id ||
+        prior.controller_plan_digest != running.controller_plan_digest ||
+        prior.plan_content_digest != running.plan_content_digest ||
+        prior.authorization_id != running.authorization_id ||
+        prior.launch_profile_digest != running.profile_digest ||
+        prior.managed_runtime_identity != running.runtime_identity ||
+        now_ms < prior.starting_at_ms || now_ms >= prior.authorization_expires_at_ms ||
+        now_ms >= prior.expires_at_ms) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_authorization,
+            "managed running commitment does not bind the current authorized session"
+        ));
+    }
+    auto launch = state_->validator->resolve_runtime_launch_json(prior.canonical_plan_json, now_ms);
+    if (!launch || launch->requires_direct_write_approval) {
+        return std::unexpected(failure(
+            launch ? session_registry_error_code::invalid_authorization
+                   : session_registry_error_code::invalid_plan,
+            "stored session plan is not eligible before managed child release"
+        ));
+    }
+    if (state_->records.size() >= max_records) {
+        return std::unexpected(
+            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+        );
+    }
+    wire::persisted_session record = prior;
+    record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+    record.operation = "mark_managed_running";
+    record.idempotency_key = std::string{idempotency_key};
+    record.request_digest = std::move(*request_digest);
+    record.state = "running";
+    record.running_at_ms = now_ms;
+    record.previous_hash = state_->records.back().this_hash;
+    record.this_hash.clear();
+    auto appended = append_record_locked(*state_, std::move(record));
+    if (!appended) {
+        return std::unexpected(appended.error());
+    }
+    return managed_lifecycle_from_wire(state_->records.back());
+}
+
+auto session_registry::mark_managed_stopping(
+    const managed_session_running_commitment& running,
+    std::string_view idempotency_key,
+    std::uint64_t now_ms
+) -> session_registry_result<managed_session_lifecycle_record> {
+    if (running.schema_version != 1 || !valid_identifier(running.session_id) ||
+        !valid_digest(running.controller_plan_digest) ||
+        !valid_digest(running.plan_content_digest) ||
+        !valid_identifier(running.authorization_id) || !valid_digest(running.profile_digest) ||
+        !valid_managed_runtime_identity(running.runtime_identity) ||
+        !valid_identifier(idempotency_key) || now_ms == 0) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid managed session stopping commitment"
+        ));
+    }
+    auto request_digest =
+        hash_managed_running_commitment(running, "glove.managed-session-stopping-commitment");
+    if (!request_digest) {
+        return std::unexpected(storage_failure(request_digest.error()));
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    if (const auto replay = state_->requests.find(std::string{idempotency_key});
+        replay != state_->requests.end()) {
+        const auto& record = state_->records[replay->second];
+        if (record.operation != "mark_managed_stopping" ||
+            record.session_id != running.session_id ||
+            record.controller_plan_digest != running.controller_plan_digest ||
+            record.plan_content_digest != running.plan_content_digest ||
+            record.authorization_id != running.authorization_id ||
+            record.launch_profile_digest != running.profile_digest ||
+            record.managed_runtime_identity != running.runtime_identity ||
+            record.request_digest != *request_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::idempotency_conflict,
+                "managed stopping idempotency payload changed"
+            ));
+        }
+        return managed_lifecycle_from_wire(record);
+    }
+    const auto existing = state_->sessions.find(running.session_id);
+    if (existing == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    const auto& prior = state_->records[existing->second];
+    if (prior.state != "running" || prior.session_id != running.session_id ||
+        prior.controller_plan_digest != running.controller_plan_digest ||
+        prior.plan_content_digest != running.plan_content_digest ||
+        prior.authorization_id != running.authorization_id ||
+        prior.launch_profile_digest != running.profile_digest ||
+        prior.managed_runtime_identity != running.runtime_identity ||
+        now_ms < prior.running_at_ms) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "managed stopping commitment does not match the durable running session"
+        ));
+    }
+    if (state_->records.size() >= max_records) {
+        return std::unexpected(
+            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+        );
+    }
+    wire::persisted_session record = prior;
+    record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+    record.operation = "mark_managed_stopping";
+    record.idempotency_key = std::string{idempotency_key};
+    record.request_digest = std::move(*request_digest);
+    record.state = "stopping";
+    record.stopping_at_ms = now_ms;
+    record.previous_hash = state_->records.back().this_hash;
+    record.this_hash.clear();
+    auto appended = append_record_locked(*state_, std::move(record));
+    if (!appended) {
+        return std::unexpected(appended.error());
+    }
+    return managed_lifecycle_from_wire(state_->records.back());
+}
+
+auto session_registry::mark_managed_exited(
+    const container::authenticated_resource_enforcement_receipt& terminal,
+    const container::receipt_audit_producer& receipt_producer,
+    std::string_view idempotency_key
+) -> session_registry_result<managed_session_exited_record> {
+    const auto termination_name = termination_cause_name(terminal.receipt.termination_cause);
+    auto receipt_digest = container::resource_enforcement_receipt_digest(terminal.receipt);
+    if (terminal.schema_version != 1 || terminal.sequence == 0 || !valid_digest(terminal.key_id) ||
+        !valid_identifier(terminal.session_id) || !valid_digest(terminal.controller_plan_digest) ||
+        terminal.receipt.schema_version != 1 || !valid_digest(terminal.receipt.profile_digest) ||
+        !valid_digest(terminal.receipt_digest) || !valid_digest(terminal.previous_hmac) ||
+        !valid_digest(terminal.this_hmac) || termination_name.empty() ||
+        terminal.receipt.started_at_ms == 0 ||
+        terminal.receipt.finished_at_ms < terminal.receipt.started_at_ms ||
+        !valid_identifier(idempotency_key) || !receipt_digest ||
+        *receipt_digest != terminal.receipt_digest) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid authenticated managed session terminal envelope"
+        ));
+    }
+    auto confirmed = receipt_producer.confirms_terminal(terminal);
+    if (!confirmed) {
+        return std::unexpected(storage_failure(confirmed.error()));
+    }
+    if (!*confirmed) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_authorization,
+            "managed terminal envelope is not durable in the receipt journal"
+        ));
+    }
+    auto request_digest = hash_terminal_envelope(terminal);
+    if (!request_digest) {
+        return std::unexpected(storage_failure(request_digest.error()));
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    if (const auto replay = state_->requests.find(std::string{idempotency_key});
+        replay != state_->requests.end()) {
+        const auto& record = state_->records[replay->second];
+        if (record.operation != "mark_managed_exited" ||
+            record.session_id != terminal.session_id ||
+            record.controller_plan_digest != terminal.controller_plan_digest ||
+            record.launch_profile_digest != terminal.receipt.profile_digest ||
+            record.receipt_sequence != terminal.sequence ||
+            record.receipt_digest != terminal.receipt_digest ||
+            record.receipt_hmac != terminal.this_hmac || record.request_digest != *request_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::idempotency_conflict,
+                "managed terminal idempotency payload changed"
+            ));
+        }
+        return managed_exited_from_wire(record);
+    }
+    const auto existing = state_->sessions.find(terminal.session_id);
+    if (existing == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    const auto& prior = state_->records[existing->second];
+    if ((prior.state != "running" && prior.state != "stopping") ||
+        !prior.managed_runtime_identity || prior.session_id != terminal.session_id ||
+        prior.controller_plan_digest != terminal.controller_plan_digest ||
+        prior.launch_profile_digest != terminal.receipt.profile_digest ||
+        terminal.receipt.started_at_ms > prior.running_at_ms ||
+        terminal.receipt.finished_at_ms <
+            (prior.state == "stopping" ? prior.stopping_at_ms : prior.running_at_ms)) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "managed terminal envelope does not match the durable running session"
+        ));
+    }
+    if (state_->records.size() >= max_records) {
+        return std::unexpected(
+            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+        );
+    }
+    wire::persisted_session record = prior;
+    record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+    record.operation = "mark_managed_exited";
+    record.idempotency_key = std::string{idempotency_key};
+    record.request_digest = std::move(*request_digest);
+    record.state = "exited";
+    record.finished_at_ms = terminal.receipt.finished_at_ms;
+    record.receipt_started_at_ms = terminal.receipt.started_at_ms;
+    record.receipt_key_id = terminal.key_id;
+    record.receipt_sequence = terminal.sequence;
+    record.receipt_digest = terminal.receipt_digest;
+    record.receipt_previous_hmac = terminal.previous_hmac;
+    record.receipt_hmac = terminal.this_hmac;
+    record.termination_cause = std::string{termination_name};
+    record.exit_code = terminal.receipt.exit_code;
+    record.previous_hash = state_->records.back().this_hash;
+    record.this_hash.clear();
+    auto appended = append_record_locked(*state_, std::move(record));
+    if (!appended) {
+        return std::unexpected(appended.error());
+    }
+    return managed_exited_from_wire(state_->records.back());
+}
+
+auto session_registry::mark_managed_failed(
+    const session_failure_commitment& failure_commitment,
+    std::string_view idempotency_key,
+    std::uint64_t now_ms
+) -> session_registry_result<managed_session_failed_record> {
+    const auto failure_name = failure_code_name(failure_commitment.code);
+    if (failure_commitment.schema_version != 1 ||
+        !valid_identifier(failure_commitment.session_id) ||
+        !valid_digest(failure_commitment.controller_plan_digest) ||
+        !valid_digest(failure_commitment.plan_content_digest) ||
+        !valid_identifier(failure_commitment.authorization_id) ||
+        !valid_digest(failure_commitment.profile_digest) || !valid_identifier(idempotency_key) ||
+        now_ms == 0 || !failure_code_from_wire(failure_name)) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid managed session failure commitment"
+        ));
+    }
+    auto request_digest = hash_failure_commitment(failure_commitment);
+    if (!request_digest) {
+        return std::unexpected(storage_failure(request_digest.error()));
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    if (const auto replay = state_->requests.find(std::string{idempotency_key});
+        replay != state_->requests.end()) {
+        const auto& record = state_->records[replay->second];
+        if (record.operation != "mark_managed_failed" ||
+            record.session_id != failure_commitment.session_id ||
+            record.controller_plan_digest != failure_commitment.controller_plan_digest ||
+            record.plan_content_digest != failure_commitment.plan_content_digest ||
+            record.authorization_id != failure_commitment.authorization_id ||
+            record.launch_profile_digest != failure_commitment.profile_digest ||
+            record.failure_code != failure_name || record.request_digest != *request_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::idempotency_conflict,
+                "managed failure idempotency payload changed"
+            ));
+        }
+        return managed_failed_from_wire(record);
+    }
+    const auto existing = state_->sessions.find(failure_commitment.session_id);
+    if (existing == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    const auto& prior = state_->records[existing->second];
+    if ((prior.state != "starting" && prior.state != "running" &&
+         prior.state != "stopping") ||
+        !prior.managed_runtime_identity ||
+        prior.controller_plan_digest != failure_commitment.controller_plan_digest ||
+        prior.plan_content_digest != failure_commitment.plan_content_digest ||
+        prior.authorization_id != failure_commitment.authorization_id ||
+        prior.launch_profile_digest != failure_commitment.profile_digest ||
+        now_ms < (prior.state == "stopping"
+                      ? prior.stopping_at_ms
+                      : (prior.state == "running" ? prior.running_at_ms : prior.starting_at_ms)) ||
+        ((prior.state == "running" || prior.state == "stopping") &&
+         failure_commitment.code != session_failure_code::supervisor_error &&
+         failure_commitment.code != session_failure_code::recovered_without_process &&
+         failure_commitment.code != session_failure_code::recovered_terminated)) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "managed failure commitment does not match the durable session"
+        ));
+    }
+    if (state_->records.size() >= max_records) {
+        return std::unexpected(
+            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+        );
+    }
+    wire::persisted_session record = prior;
+    record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+    record.operation = "mark_managed_failed";
+    record.idempotency_key = std::string{idempotency_key};
+    record.request_digest = std::move(*request_digest);
+    record.state = "failed";
+    record.failure_code = std::string{failure_name};
+    record.finished_at_ms = now_ms;
+    record.previous_hash = state_->records.back().this_hash;
+    record.this_hash.clear();
+    auto appended = append_record_locked(*state_, std::move(record));
+    if (!appended) {
+        return std::unexpected(appended.error());
+    }
+    return managed_failed_from_wire(state_->records.back());
+}
+
+auto session_registry::managed_lifecycle_status(std::string_view session_id) const
+    -> session_registry_result<managed_session_lifecycle_record> {
+    if (!valid_identifier(session_id)) {
+        return std::unexpected(
+            failure(session_registry_error_code::invalid_request, "invalid session identity")
+        );
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    const auto existing = state_->sessions.find(std::string{session_id});
+    if (existing == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    return managed_lifecycle_from_wire(state_->records[existing->second]);
+}
+
+auto session_registry::managed_recovery_candidates() const
+    -> session_registry_result<std::vector<managed_session_lifecycle_record>> {
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    std::vector<managed_session_lifecycle_record> candidates;
+    candidates.reserve(state_->sessions.size());
+    for (const auto& [session_id, index] : state_->sessions) {
+        const auto& record = state_->records[index];
+        if ((record.state != "starting" && record.state != "running" &&
+             record.state != "stopping") ||
+            !record.managed_runtime_identity) {
+            continue;
+        }
+        auto candidate = managed_lifecycle_from_wire(record);
+        if (!candidate) {
+            return std::unexpected(candidate.error());
+        }
+        candidates.push_back(std::move(*candidate));
+    }
+    std::ranges::sort(candidates, {}, [](const auto& candidate) -> std::string_view {
+        return candidate.session.session_id;
+    });
+    return candidates;
+}
+
 auto session_registry::recovery_candidates() const
     -> session_registry_result<std::vector<session_recovery_record>> {
     const std::scoped_lock lock{state_->mutex};
@@ -3273,6 +4106,9 @@ auto session_registry::recovery_candidates() const
     for (const auto& [session_id, index] : state_->sessions) {
         const auto& record = state_->records[index];
         if (record.state != "starting" && record.state != "running" && record.state != "stopping") {
+            continue;
+        }
+        if (record.managed_runtime_identity) {
             continue;
         }
         candidates.push_back({

@@ -3,13 +3,23 @@
 #include "glove/supervisor/linux_session_filesystem.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
+#include "../container/sha256.hpp"
 #include "linux_session_recovery.hpp"
 
+#include <fcntl.h>
+#include <linux/mount.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
+#include <filesystem>
 #include <string_view>
 #include <utility>
 
@@ -119,16 +129,282 @@ auto validate_inputs(const session_start_inputs& inputs, std::uint64_t started_a
     return {};
 }
 
+void close_mounts(std::vector<supervisor::linux_detail::session_mount>& mounts) noexcept {
+    for (auto& mount : mounts) {
+        if (mount.descriptor_fd >= 0) {
+            ::close(mount.descriptor_fd);
+            mount.descriptor_fd = -1;
+        }
+    }
+}
+
+void close_descriptors(std::vector<int>& descriptors) noexcept {
+    for (int& descriptor : descriptors) {
+        if (descriptor >= 0) {
+            ::close(descriptor);
+            descriptor = -1;
+        }
+    }
+}
+
+struct resolved_secret_mounts {
+    std::vector<supervisor::linux_detail::session_mount> mounts;
+    std::vector<int> lease_locks;
+};
+
+auto write_all_at(int destination, int source, std::uint64_t size)
+    -> std::expected<void, std::string> {
+    std::array<unsigned char, 16U * 1024U> buffer{};
+    std::uint64_t offset = 0;
+    while (offset < size) {
+        const auto requested =
+            static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), size - offset));
+        const auto read = ::pread(source, buffer.data(), requested, static_cast<off_t>(offset));
+        if (read <= 0) {
+            return std::unexpected(std::string{"read credential source: "} + std::strerror(errno));
+        }
+        std::size_t written = 0;
+        while (written < static_cast<std::size_t>(read)) {
+            const auto result = ::pwrite(
+                destination,
+                buffer.data() + written,
+                static_cast<std::size_t>(read) - written,
+                static_cast<off_t>(offset + written)
+            );
+            if (result <= 0) {
+                return std::unexpected(
+                    std::string{"write managed credential lease: "} + std::strerror(errno)
+                );
+            }
+            written += static_cast<std::size_t>(result);
+        }
+        offset += static_cast<std::uint64_t>(read);
+    }
+    if (::ftruncate(destination, static_cast<off_t>(size)) != 0 || ::fsync(destination) != 0) {
+        return std::unexpected(
+            std::string{"commit managed credential lease: "} + std::strerror(errno)
+        );
+    }
+    return {};
+}
+
+auto resolve_secret_mounts(
+    const std::vector<supervisor::secret_mount_policy>& policies,
+    const std::string& materialization_root
+) -> std::expected<resolved_secret_mounts, std::string> {
+    constexpr std::uint64_t max_secret_file_bytes = std::uint64_t{1024} * 1024U;
+    resolved_secret_mounts resolved;
+    resolved.mounts.reserve(policies.size());
+    resolved.lease_locks.reserve(policies.size());
+    if (policies.empty()) {
+        return resolved;
+    }
+    const auto lease_root = std::filesystem::path{materialization_root} / ".credential-leases";
+    std::error_code filesystem_error;
+    const bool lease_root_created = std::filesystem::create_directory(lease_root, filesystem_error);
+    if (!lease_root_created && filesystem_error && filesystem_error != std::errc::file_exists) {
+        return std::unexpected(
+            std::string{"create managed credential lease root: "} + filesystem_error.message()
+        );
+    }
+    if (lease_root_created && ::chmod(lease_root.c_str(), 0700) != 0) {
+        return std::unexpected(
+            std::string{"protect managed credential lease root: "} + std::strerror(errno)
+        );
+    }
+    const int lease_root_fd = ::open( // NOLINT(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+        lease_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+    );
+    struct stat lease_root_status{};
+    if (lease_root_fd < 0 || ::fstat(lease_root_fd, &lease_root_status) != 0 ||
+        !S_ISDIR(lease_root_status.st_mode) || lease_root_status.st_uid != ::geteuid() ||
+        (static_cast<unsigned int>(lease_root_status.st_mode) & 0777U) != 0700U) {
+        if (lease_root_fd >= 0) {
+            ::close(lease_root_fd);
+        }
+        return std::unexpected(
+            std::string{"managed credential lease root is not an owner-only directory"}
+        );
+    }
+    for (const auto& policy : policies) {
+        const int source = ::open( // NOLINT(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+            policy.source_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        );
+        if (source < 0) {
+            ::close(lease_root_fd);
+            close_mounts(resolved.mounts);
+            close_descriptors(resolved.lease_locks);
+            return std::unexpected(std::string{"open local secret handle "} + policy.handle);
+        }
+        struct stat before{};
+        const bool safe = ::fstat(source, &before) == 0 && S_ISREG(before.st_mode) &&
+                          before.st_uid == ::geteuid() && before.st_nlink == 1 &&
+                          (static_cast<unsigned int>(before.st_mode) & 0777U) == 0600U &&
+                          before.st_size > 0 &&
+                          static_cast<std::uint64_t>(before.st_size) <= max_secret_file_bytes;
+        if (!safe) {
+            ::close(source);
+            ::close(lease_root_fd);
+            close_mounts(resolved.mounts);
+            close_descriptors(resolved.lease_locks);
+            return std::unexpected(
+                std::string{"local secret handle is not an owner-only bounded regular file: "} +
+                policy.handle
+            );
+        }
+        auto source_digest = container::detail::sha256_fd_hex(source, max_secret_file_bytes);
+        struct stat source_after_hash{};
+        const bool source_stable = source_digest && ::fstat(source, &source_after_hash) == 0 &&
+                                   before.st_dev == source_after_hash.st_dev &&
+                                   before.st_ino == source_after_hash.st_ino &&
+                                   before.st_mode == source_after_hash.st_mode &&
+                                   before.st_size == source_after_hash.st_size &&
+                                   before.st_mtim.tv_sec == source_after_hash.st_mtim.tv_sec &&
+                                   before.st_mtim.tv_nsec == source_after_hash.st_mtim.tv_nsec;
+        if (!source_stable) {
+            ::close(source);
+            ::close(lease_root_fd);
+            close_mounts(resolved.mounts);
+            close_descriptors(resolved.lease_locks);
+            return std::unexpected(
+                std::string{"credential source changed while importing handle: "} + policy.handle
+            );
+        }
+        const std::string lease_identity =
+            policy.runtime_id + ":" + policy.handle + ":" + *source_digest;
+        const auto* lease_identity_bytes =
+            reinterpret_cast<const unsigned char*>(lease_identity.data());
+        auto lease_digest =
+            container::detail::sha256_hex(std::span{lease_identity_bytes, lease_identity.size()});
+        if (!lease_digest) {
+            ::close(source);
+            ::close(lease_root_fd);
+            close_mounts(resolved.mounts);
+            close_descriptors(resolved.lease_locks);
+            return std::unexpected(std::string{"derive managed credential lease identity"});
+        }
+        const std::string lease_name = "lease-" + *lease_digest;
+        const int lease = ::openat( // NOLINT(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+            lease_root_fd,
+            lease_name.c_str(),
+            O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+            0600
+        );
+        if (lease < 0 || ::flock(lease, LOCK_EX | LOCK_NB) != 0) {
+            const int saved = errno;
+            if (lease >= 0) {
+                ::close(lease);
+            }
+            ::close(source);
+            ::close(lease_root_fd);
+            close_mounts(resolved.mounts);
+            close_descriptors(resolved.lease_locks);
+            return std::unexpected(
+                saved == EWOULDBLOCK
+                    ? std::string{"managed credential lease is already in use: "} + policy.handle
+                    : std::string{"open managed credential lease: "} + std::strerror(saved)
+            );
+        }
+        struct stat lease_status{};
+        const bool safe_lease =
+            ::fstat(lease, &lease_status) == 0 && S_ISREG(lease_status.st_mode) &&
+            lease_status.st_uid == ::geteuid() && lease_status.st_nlink == 1 &&
+            (static_cast<unsigned int>(lease_status.st_mode) & 0777U) == 0600U &&
+            lease_status.st_size >= 0 &&
+            static_cast<std::uint64_t>(lease_status.st_size) <= max_secret_file_bytes;
+        if (!safe_lease) {
+            ::close(lease);
+            ::close(source);
+            ::close(lease_root_fd);
+            close_mounts(resolved.mounts);
+            close_descriptors(resolved.lease_locks);
+            return std::unexpected(
+                std::string{
+                    "managed credential lease is not an owner-only bounded regular file: "
+                } +
+                policy.handle
+            );
+        }
+        if (lease_status.st_size == 0) {
+            if (auto copied =
+                    write_all_at(lease, source, static_cast<std::uint64_t>(before.st_size));
+                !copied) {
+                ::close(lease);
+                ::close(source);
+                ::close(lease_root_fd);
+                close_mounts(resolved.mounts);
+                close_descriptors(resolved.lease_locks);
+                return std::unexpected(copied.error());
+            }
+            if (::fstat(lease, &lease_status) != 0) {
+                ::close(lease);
+                ::close(source);
+                ::close(lease_root_fd);
+                close_mounts(resolved.mounts);
+                close_descriptors(resolved.lease_locks);
+                return std::unexpected(std::string{"inspect initialized credential lease"});
+            }
+        }
+        const int descriptor = static_cast<int>(
+            // Linux has no typed libc wrapper for open_tree(2).
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+            ::syscall(SYS_open_tree, lease, "", AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)
+        );
+        ::close(source);
+        if (descriptor < 0) {
+            if (descriptor >= 0) {
+                ::close(descriptor);
+            }
+            ::close(lease);
+            ::close(lease_root_fd);
+            close_mounts(resolved.mounts);
+            close_descriptors(resolved.lease_locks);
+            return std::unexpected(
+                std::string{"identity-pin managed credential lease failed: "} + policy.handle
+            );
+        }
+        resolved.mounts.push_back({
+            .descriptor_fd = descriptor,
+            .target_path = policy.target_path,
+            .alias = "secret:" + policy.handle,
+            .quota_partition = "",
+            .quota_bytes = 0,
+            .source_identity =
+                supervisor::path_identity{
+                    .device = static_cast<std::uint64_t>(lease_status.st_dev),
+                    .inode = static_cast<std::uint64_t>(lease_status.st_ino),
+                    .mode = static_cast<std::uint32_t>(lease_status.st_mode),
+                },
+            .source_content_digest = std::nullopt,
+            .projection_id = std::nullopt,
+            .projection_destination_alias = std::nullopt,
+            .runtime_adapter_id = std::nullopt,
+            .runtime_context_digest = std::nullopt,
+            .secret_handle = policy.handle,
+            .secret_runtime_id = policy.runtime_id,
+            .writable = true,
+            .directory = false,
+        });
+        resolved.lease_locks.push_back(lease);
+    }
+    ::close(lease_root_fd);
+    return resolved;
+}
+
 } // namespace
 
 linux_session_preparer::linux_session_preparer(
-    std::string materialization_root, container::linux_detail::cgroup_v2_root cgroup_root
+    std::string materialization_root,
+    container::linux_detail::cgroup_v2_root cgroup_root,
+    std::shared_ptr<audit::sink> egress_audit
 ) noexcept
     : materialization_root_{std::move(materialization_root)},
-      cgroup_root_{std::move(cgroup_root)} {}
+      cgroup_root_{std::move(cgroup_root)},
+      egress_audit_{std::move(egress_audit)} {}
 
-auto linux_session_preparer::create(std::string materialization_root)
-    -> std::expected<linux_session_preparer, std::string> {
+auto linux_session_preparer::create(
+    std::string materialization_root, std::shared_ptr<audit::sink> egress_audit
+) -> std::expected<linux_session_preparer, std::string> {
     if (materialization_root.empty()) {
         return std::unexpected(std::string{"Linux preparation materialization root is required"});
     }
@@ -136,7 +412,9 @@ auto linux_session_preparer::create(std::string materialization_root)
     if (!cgroup_root) {
         return std::unexpected(cgroup_root.error());
     }
-    return linux_session_preparer{std::move(materialization_root), std::move(*cgroup_root)};
+    return linux_session_preparer{
+        std::move(materialization_root), std::move(*cgroup_root), std::move(egress_audit)
+    };
 }
 
 auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_t started_at_ms)
@@ -153,8 +431,9 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         requested_profile.runtime_filesystem.push_back({.path = path, .writable = false});
     }
     requested_profile.environment = owned_inputs.launch.environment;
-    if (const auto adapter =
-            supervisor::native_skill_runtime_adapter_for(owned_inputs.launch.runtime_id)) {
+    const auto adapter =
+        supervisor::native_skill_runtime_adapter_for(owned_inputs.launch.runtime_id);
+    if (adapter) {
         const bool overrides_managed_environment =
             std::ranges::any_of(adapter->managed_environment, [&](const auto& managed) {
                 const auto separator = managed.find('=');
@@ -175,10 +454,66 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
             adapter->managed_environment.end()
         );
     }
+    std::unique_ptr<net::egress_proxy> egress_proxy;
+    if (!owned_inputs.launch.egress_targets.empty()) {
+        if (!egress_audit_) {
+            return std::unexpected(
+                std::string{"online Linux session requires a durable egress audit sink"}
+            );
+        }
+        net::egress_options options;
+        options.allow.reserve(owned_inputs.launch.egress_targets.size());
+        for (const auto& target : owned_inputs.launch.egress_targets) {
+            options.allow.push_back({
+                .host = target.host,
+                .port = target.port,
+                .allow_private = target.allow_private,
+            });
+        }
+        options.on_event = [sink = egress_audit_,
+                            session_id = owned_inputs.session.session_id,
+                            policy_id = owned_inputs.launch.egress_policy_id](
+                               const net::egress_event& event
+                           ) -> std::expected<void, std::string> {
+            audit::event record{
+                .what = audit::action::egress,
+                .tool_name = session_id + ":" + policy_id + ":" + event.host + ":" +
+                             std::to_string(event.port),
+                .arguments_json = {},
+                .status = event.allowed ? mcp::tool_call_status::ok
+                                        : mcp::tool_call_status::invalid_arguments,
+                .error_message = event.detail,
+            };
+            return sink->record(record);
+        };
+        auto started = net::start_egress_proxy(std::move(options));
+        if (!started) {
+            return std::unexpected(std::string{"start audited egress broker: "} + started.error());
+        }
+        requested_profile.proxy = container::proxy_settings{
+            .port = (*started)->port(),
+            .url = (*started)->proxy_url(),
+        };
+        egress_proxy = std::move(*started);
+    }
     requested_profile.required_limits = limits;
     auto profile = container::validate(requested_profile);
     if (!profile) {
         return std::unexpected(std::string{"Linux preparation profile: "} + profile.error());
+    }
+    if (std::ranges::any_of(owned_inputs.path_grants, [](const auto& grant) {
+            const std::filesystem::path target{grant.target_path()};
+            const std::filesystem::path workspace{"/workspace"};
+            return std::mismatch(workspace.begin(), workspace.end(), target.begin(), target.end())
+                       .first == workspace.end();
+        })) {
+        profile->work_dir = "/workspace";
+    } else if (adapter) {
+        // A no-path harness session starts inside its own Glove-materialized
+        // private home. This avoids treating the synthesized root filesystem
+        // as a project while keeping explicit /workspace grants operator-
+        // visible and subject to the harness's normal trust decision.
+        profile->work_dir = "/home/agent";
     }
     if (auto supported = container::require_resource_enforcement(
             *profile, container::linux_detail::managed_session_capabilities()
@@ -231,6 +566,19 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
     if (!lifecycle) {
         return std::unexpected(lifecycle.error());
     }
+    auto secret_mounts =
+        resolve_secret_mounts(owned_inputs.launch.secret_mounts, materialization_root_);
+    if (!secret_mounts) {
+        return std::unexpected(secret_mounts.error());
+    }
+    if (auto installed =
+            (*lifecycle)
+                ->install_secret_mounts(
+                    std::move(secret_mounts->mounts), std::move(secret_mounts->lease_locks)
+                );
+        !installed) {
+        return std::unexpected(installed.error());
+    }
     auto binding = container::linux_detail::bind_managed_session(
         *profile, owned_inputs.launch.argv, **lifecycle, owned_inputs.session.controller_plan_digest
     );
@@ -255,6 +603,7 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         .cgroup_identity = cgroup_identity,
         .filesystem_identity = std::move(filesystem_identity),
         .lifecycle = std::move(*lifecycle),
+        .egress_proxy = std::move(egress_proxy),
     };
 }
 

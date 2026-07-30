@@ -286,6 +286,7 @@ struct supervisor_capabilities {
     // Zero until Glove creates a private agent home and expands exact Sage
     // bundles into the selected harness's native discovery locations.
     std::uint8_t agent_runtime_adapter_schema_version = 0;
+    std::vector<std::string> managed_runtime_ids;
     std::uint8_t path_exposure_admin_schema_version = 0;
     std::uint8_t path_exposure_catalog_schema_version = 0;
     std::uint8_t retained_write_schema_version = 0;
@@ -586,7 +587,7 @@ struct receipt_audit_protocol::implementation {
     std::optional<container::receipt_audit_producer_config> producer_config;
     std::shared_ptr<const supervisor::session_plan_validator> plan_validator;
     std::shared_ptr<session_registry> sessions;
-    std::shared_ptr<linux_detail::linux_session_runtime> session_runtime;
+    std::shared_ptr<session_runtime> session_runtime;
     std::shared_ptr<supervisor::path_exposure_registry> path_exposures;
     std::string materialization_root;
     std::mutex producer_mutex;
@@ -646,10 +647,10 @@ auto handle_capabilities(
         );
     }
     wire::resource_enforcement_capabilities linux_enforcement;
-#if defined(__linux__)
+    wire::resource_enforcement_capabilities apple_enforcement;
     if (state.session_runtime) {
-        const auto capabilities = container::linux_detail::managed_session_capabilities();
-        linux_enforcement = {
+        const auto capabilities = state.session_runtime->resource_capabilities();
+        wire::resource_enforcement_capabilities advertised{
             .cpu_time = capabilities.cpu_time,
             .memory = capabilities.memory,
             .pids = capabilities.pids,
@@ -658,9 +659,18 @@ auto handle_capabilities(
             .terminal_output = capabilities.terminal_output,
             .receipt_schema_version = capabilities.receipt_schema_version,
         };
+        if (state.session_runtime->backend_id() == "linux_production") {
+            linux_enforcement = advertised;
+        } else if (state.session_runtime->backend_id() == "apple_container") {
+            apple_enforcement = advertised;
+        }
     }
+#if defined(__linux__)
     const auto retained_write_schema_version =
-        state.session_runtime && state.path_exposures ? std::uint8_t{1} : std::uint8_t{0};
+        state.session_runtime && state.session_runtime->backend_id() == "linux_production" &&
+                state.path_exposures
+            ? std::uint8_t{1}
+            : std::uint8_t{0};
 #else
     constexpr std::uint8_t retained_write_schema_version = 0;
 #endif
@@ -687,14 +697,15 @@ auto handle_capabilities(
                     .stop_session = state.session_runtime != nullptr,
                     .cleanup_session = state.session_runtime != nullptr,
                 },
-            // Linux managed sessions own a fresh private Codex home and
+            // Managed sessions own a fresh private harness home and
             // derive its native skills from verified Sage library bundles.
             .agent_runtime_adapter_schema_version =
-#if defined(__linux__)
-                state.session_runtime ? std::uint8_t{1} : std::uint8_t{0},
-#else
-                std::uint8_t{0},
-#endif
+                state.session_runtime
+                    ? state.session_runtime->agent_runtime_adapter_schema_version()
+                    : std::uint8_t{0},
+            .managed_runtime_ids =
+                state.session_runtime ? state.session_runtime->managed_runtime_ids()
+                                      : std::vector<std::string>{},
             .path_exposure_admin_schema_version =
                 state.path_exposures ? std::uint8_t{1} : std::uint8_t{0},
             .path_exposure_catalog_schema_version =
@@ -708,8 +719,8 @@ auto handle_capabilities(
                     .resource_enforcement = linux_enforcement,
                 },
                 backend_capabilities{
-                    .backend = "macos_experimental",
-                    .resource_enforcement = {},
+                    .backend = "apple_container",
+                    .resource_enforcement = apple_enforcement,
                 },
             },
         }
@@ -742,38 +753,58 @@ auto session_profile_digest(const session_registry& sessions, const session_reco
         return std::nullopt;
     case session_state::starting: {
         auto status = sessions.starting_status(record.session_id);
-        if (!status) {
-            return std::unexpected(status.error());
+        if (status) {
+            return status->profile_digest;
         }
-        return status->profile_digest;
+        auto managed = sessions.managed_lifecycle_status(record.session_id);
+        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
+                             managed->profile_digest
+                         }
+                       : std::unexpected(managed.error());
     }
     case session_state::running: {
         auto status = sessions.running_status(record.session_id);
-        if (!status) {
-            return std::unexpected(status.error());
+        if (status) {
+            return status->profile_digest;
         }
-        return status->profile_digest;
+        auto managed = sessions.managed_lifecycle_status(record.session_id);
+        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
+                             managed->profile_digest
+                         }
+                       : std::unexpected(managed.error());
     }
     case session_state::stopping: {
         auto status = sessions.stopping_status(record.session_id);
-        if (!status) {
-            return std::unexpected(status.error());
+        if (status) {
+            return status->profile_digest;
         }
-        return status->profile_digest;
+        auto managed = sessions.managed_lifecycle_status(record.session_id);
+        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
+                             managed->profile_digest
+                         }
+                       : std::unexpected(managed.error());
     }
     case session_state::exited: {
         auto status = sessions.exited_status(record.session_id);
-        if (!status) {
-            return std::unexpected(status.error());
+        if (status) {
+            return status->profile_digest;
         }
-        return status->profile_digest;
+        auto managed = sessions.managed_lifecycle_status(record.session_id);
+        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
+                             managed->profile_digest
+                         }
+                       : std::unexpected(managed.error());
     }
     case session_state::failed: {
         auto status = sessions.failed_status(record.session_id);
-        if (!status) {
-            return std::unexpected(status.error());
+        if (status) {
+            return status->profile_digest;
         }
-        return status->profile_digest;
+        auto managed = sessions.managed_lifecycle_status(record.session_id);
+        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
+                             managed->profile_digest
+                         }
+                       : std::unexpected(managed.error());
     }
     }
     return std::unexpected(
@@ -1229,13 +1260,13 @@ auto handle_signal(
         return error_response(request_id, "invalid_request", "invalid session signal request");
     }
 #if defined(__linux__)
-    std::optional<container::linux_detail::pty_session_signal> requested;
+    std::optional<session_signal> requested;
     if (payload->signal == "interrupt") {
-        requested = container::linux_detail::pty_session_signal::interrupt;
+        requested = session_signal::interrupt;
     } else if (payload->signal == "terminate") {
-        requested = container::linux_detail::pty_session_signal::terminate;
+        requested = session_signal::terminate;
     } else if (payload->signal == "hangup") {
-        requested = container::linux_detail::pty_session_signal::hangup;
+        requested = session_signal::hangup;
     }
     if (!requested) {
         return error_response(request_id, "invalid_request", "invalid session signal request");
@@ -1759,15 +1790,10 @@ auto receipt_audit_protocol::create(
     std::shared_ptr<container::receipt_audit_producer> producer,
     std::shared_ptr<const supervisor::session_plan_validator> plan_validator,
     std::shared_ptr<session_registry> sessions,
-    std::shared_ptr<linux_detail::linux_session_runtime> session_runtime,
+    std::shared_ptr<session_runtime> session_runtime,
     std::shared_ptr<supervisor::path_exposure_registry> path_exposures,
     std::string materialization_root
 ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string> {
-#if !defined(__linux__)
-    if (session_runtime) {
-        return std::unexpected(std::string{"receipt audit protocol runtime is unsupported"});
-    }
-#endif
     if (!valid_hex_secret(bootstrap_secret_hex) || !producer || (sessions && !plan_validator) ||
         (session_runtime && (!sessions || !plan_validator || materialization_root.empty()))) {
         return std::unexpected(std::string{"receipt audit protocol configuration is invalid"});
@@ -1789,15 +1815,10 @@ auto receipt_audit_protocol::create(
     container::receipt_audit_producer_config producer_config,
     std::shared_ptr<const supervisor::session_plan_validator> plan_validator,
     std::shared_ptr<session_registry> sessions,
-    std::shared_ptr<linux_detail::linux_session_runtime> session_runtime,
+    std::shared_ptr<session_runtime> session_runtime,
     std::shared_ptr<supervisor::path_exposure_registry> path_exposures,
     std::string materialization_root
 ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string> {
-#if !defined(__linux__)
-    if (session_runtime) {
-        return std::unexpected(std::string{"receipt audit protocol runtime is unsupported"});
-    }
-#endif
     if (!valid_hex_secret(bootstrap_secret_hex) || producer_config.key_path.empty() ||
         producer_config.journal_path.empty() || (sessions && !plan_validator) ||
         (session_runtime && (!sessions || !plan_validator || materialization_root.empty()))) {

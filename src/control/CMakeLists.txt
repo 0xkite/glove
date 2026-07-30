@@ -6,7 +6,16 @@ add_library(glove_control STATIC
 )
 add_library(glove::control ALIAS glove_control)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(APPLE)
+    target_sources(glove_control PRIVATE
+        apple_container_session_runtime.cpp
+    )
+    target_include_directories(glove_control PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/container
+        ${CMAKE_SOURCE_DIR}/src/container/linux
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(glove_control PRIVATE
         linux_process_identity.cpp
         linux_session_recovery.cpp
@@ -24,6 +33,8 @@ target_link_libraries(glove_control
         glove_options
         glove_container
         glove_supervisor
+        glove::audit
+        glove::net
     PRIVATE
         glaze::glaze
 )

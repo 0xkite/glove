@@ -6,8 +6,14 @@
 
 template<> struct glz::meta<glove::container::sandbox_backend> {
     using enum glove::container::sandbox_backend;
-    static constexpr auto value =
-        enumerate("linux_production", linux_production, "macos_experimental", macos_experimental);
+    static constexpr auto value = enumerate(
+        "linux_production",
+        linux_production,
+        "apple_container",
+        apple_container,
+        "macos_experimental",
+        macos_experimental
+    );
 };
 
 template<> struct glz::meta<glove::container::enforcement_mechanism> {

@@ -203,6 +203,17 @@ auto run() -> int {
          }) {
         const auto adapter = glove::supervisor::native_skill_runtime_adapter_for(runtime_id);
         REQUIRE(adapter.has_value());
+        if (runtime_id == "codex") {
+            REQUIRE(
+                adapter->managed_arguments ==
+                std::vector<std::string>{"--dangerously-bypass-approvals-and-sandbox"}
+            );
+            REQUIRE(adapter->managed_configuration.has_value());
+            REQUIRE(adapter->managed_configuration->filename == "config.toml");
+        } else {
+            REQUIRE(adapter->managed_arguments.empty());
+            REQUIRE(!adapter->managed_configuration);
+        }
         auto native = glove::supervisor::resolve_native_skill_runtime_projection(
             *adapter, *codex_projections
         );
@@ -234,6 +245,16 @@ auto run() -> int {
             std::istreambuf_iterator<char>{materialized_skill}, std::istreambuf_iterator<char>{}
         };
         REQUIRE(materialized_contents == "# Sage core\n");
+        if (runtime_id == "codex") {
+            std::ifstream managed_config{home / ".codex/config.toml", std::ios::binary};
+            REQUIRE(static_cast<bool>(managed_config));
+            const std::string config_contents{
+                std::istreambuf_iterator<char>{managed_config},
+                std::istreambuf_iterator<char>{},
+            };
+            REQUIRE(config_contents.find("[projects.\"/home/agent\"]") != std::string::npos);
+            REQUIRE(config_contents.find("trust_level = \"trusted\"") != std::string::npos);
+        }
     }
     REQUIRE(!glove::supervisor::native_skill_runtime_adapter_for("untrusted-runtime"));
 

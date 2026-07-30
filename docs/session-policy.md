@@ -18,6 +18,14 @@ variables, or raw secrets.
 Capabilities are derived from successfully constructed components. macOS does
 not advertise managed-session resource enforcement.
 
+`max_plan_ttl_ms` must exceed every resource profile's `wall_time_ms` by at
+least one second. That headroom is reserved for approval and launch; Glove and
+Sage reject a policy that cannot launch its own resource profiles. The guided
+generator uses a ten-minute plan lifetime. It emits a two-minute `small`
+profile for probes and short turns plus an explicit five-minute `interactive`
+profile for model-backed turns that may spend most of their lifetime waiting on
+audited egress.
+
 `agent_runtime_adapter_schema_version` is independent of the raw process/PTY
 lifecycle. It is `1` only for an active Linux managed-session runtime: Glove
 creates a fresh private harness home, expands verified Sage `skill` bundles
@@ -32,6 +40,13 @@ belonging to an operator-installed harness (such as its package directory).
 Glove mounts those paths read-only; Sage selects only the template ID and its
 digest, never an executable or a host path. Runtime paths cannot be `/`,
 relative, duplicate, or overlap a pinned executable.
+
+Credential policies name exact owner-protected source files, but controller
+plans contain only opaque handles. Linux launch imports each source into a
+content-versioned Glove-owned lease, serializes use with an exclusive lock,
+and mounts the lease writable at the adapter's exact path in its private home.
+This supports vendor token rotation without granting the sandbox access to the
+operator's source file or broader harness home.
 
 For a supported native-skill runtime on Linux, an operator can replace a
 pinned `executable_path` with a matching `runtime_discovery` value and an empty
@@ -60,10 +75,12 @@ templates use the same local discovery boundary only for SBPL-contained local
 execution and remain experimental: Glove does not advertise resource
 enforcement or remote managed-session capability there.
 
-Package-manager bin directories are often group-writable. Point the policy at
-a dedicated service-owned runtime directory instead; an operator may place a
-runtime-named symlink there to the package-managed executable. The directory—not
-the Sage plan—remains the authority for the selected harness.
+Package-manager bin directories are often group-writable. Explicit setup
+discovery may inspect one, but it is not launch authority. `policy stage`
+content-addresses and copies a supported unsafe single-root package/interpreter
+closure into a dedicated protected runtime directory before the normal launch
+resolver admits it. The protected snapshot—not the Sage plan or original
+package-manager tree—remains the authority for the selected harness.
 
 The owner-local workflow is programmatic:
 
@@ -85,7 +102,8 @@ roots, resolving the adapter executable, and calculating its digest.
 Arguments, canonical environment, read-only dependency paths, allowed aliases,
 and projection destinations are repeatable explicit flags. `policy stage`
 never reads or copies a harness home and never overwrites an existing entry
-point. Pinned mode is the portable default for a Linux service in an
+point. Its report includes the content digest when package/interpreter closure
+copying was required. Pinned mode is the portable default for a Linux service in an
 unprivileged user namespace: unmapped host-root ancestors retain an ambiguous
 overflow UID and discovery continues to reject them rather than assuming they
 were root-owned.

@@ -110,7 +110,7 @@ auto plan_validator_for(const std::filesystem::path& source)
     return session_plan_validator::build(
         session_plan_policy{
             .revision = 1,
-            .max_plan_ttl_ms = 20'000,
+            .max_plan_ttl_ms = 180'000,
             .runtime_templates =
                 {
                     runtime_template_policy{
@@ -144,6 +144,8 @@ auto plan_validator_for(const std::filesystem::path& source)
             .egress_policy_ids = {"deny-all"},
             .tool_policy_ids = {"no-upstream-tools"},
             .secret_handles = {"github-readonly"},
+            .egress_policies = {},
+            .secret_mounts = {},
         },
         std::move(*paths)
     );

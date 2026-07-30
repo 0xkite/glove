@@ -1,7 +1,9 @@
 #include "linux_resource_lifecycle.hpp"
 
 #include <sys/wait.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <new>
@@ -86,6 +88,57 @@ linux_resource_lifecycle::~linux_resource_lifecycle() noexcept {
     } catch (...) { // NOLINT(bugprone-empty-catch) -- destruction is best-effort and non-throwing.
         // Owned resource destructors retry best-effort cleanup without throwing.
     }
+    release_secret_resources();
+}
+
+void linux_resource_lifecycle::release_secret_resources() noexcept {
+    for (auto& mount : secret_mounts_) {
+        if (mount.descriptor_fd >= 0) {
+            ::close(mount.descriptor_fd);
+            mount.descriptor_fd = -1;
+        }
+    }
+    for (const int descriptor : secret_lease_locks_) {
+        if (descriptor >= 0) {
+            ::close(descriptor);
+        }
+    }
+    secret_mounts_.clear();
+    secret_lease_locks_.clear();
+}
+
+auto linux_resource_lifecycle::install_secret_mounts(
+    std::vector<supervisor::linux_detail::session_mount> mounts, std::vector<int> lease_locks
+) -> std::expected<void, std::string> {
+    const auto close_inputs = [&] {
+        for (auto& mount : mounts) {
+            if (mount.descriptor_fd >= 0) {
+                ::close(mount.descriptor_fd);
+                mount.descriptor_fd = -1;
+            }
+        }
+        for (const int descriptor : lease_locks) {
+            if (descriptor >= 0) {
+                ::close(descriptor);
+            }
+        }
+    };
+    if (!secret_mounts_.empty() || !secret_lease_locks_.empty() || mounts.size() > 32U ||
+        mounts.size() != lease_locks.size() ||
+        std::ranges::any_of(
+            mounts,
+            [](const auto& mount) {
+                return mount.descriptor_fd < 0 || !mount.secret_handle ||
+                       !mount.secret_runtime_id || !mount.writable || mount.directory;
+            }
+        ) ||
+        std::ranges::any_of(lease_locks, [](int descriptor) { return descriptor < 0; })) {
+        close_inputs();
+        return std::unexpected(std::string{"invalid Linux secret mount set"});
+    }
+    secret_mounts_ = std::move(mounts);
+    secret_lease_locks_ = std::move(lease_locks);
+    return {};
 }
 
 auto linux_resource_lifecycle::create(
@@ -280,6 +333,10 @@ auto linux_resource_lifecycle::cleanup_resources() -> std::expected<void, std::s
     if (!first_error.empty()) {
         return std::unexpected(std::move(first_error));
     }
+    // The child is gone and its isolated resources are finalized. Credential
+    // rotation must persist for the next session, while the terminal
+    // transcript may remain queryable until explicit session cleanup.
+    release_secret_resources();
     return {};
 }
 

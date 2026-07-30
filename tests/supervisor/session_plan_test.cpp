@@ -88,7 +88,7 @@ auto policy_json(const std::filesystem::path& source) -> std::string {
            launch_digest() +
            R"(","sandbox_backend":"linux_production","allowed_path_aliases":["workspace"],"allowed_projection_destinations":["libraries"],"launch":{"executable_path":"/usr/bin/true","arguments":["--version"],"environment":["PATH=/usr/bin:/bin","TERM=xterm-256color"]}}],"path_aliases":[{"alias":"workspace","host_path":")" +
            std::filesystem::canonical(source).string() +
-           R"(","target_path":"/workspace","max_ttl_secs":120,"access":[{"access":"ephemeral_write","materialization":"copy","create_policy":"empty_directory","cleanup_policy":"remove","max_bytes":2097152}]}],"library_projection_destinations":[{"alias":"libraries","target_path":"/opt/sage/library-bundles"}],"resource_profiles":[{"profile_id":"small","cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576}],"egress_policy_ids":["no-network"],"tool_policy_ids":["sage-readonly"],"secret_handles":["codex-token"]})";
+           R"(","target_path":"/workspace","max_ttl_secs":120,"access":[{"access":"ephemeral_write","materialization":"copy","create_policy":"empty_directory","cleanup_policy":"remove","max_bytes":2097152}]}],"library_projection_destinations":[{"alias":"libraries","target_path":"/opt/sage/library-bundles"}],"resource_profiles":[{"profile_id":"small","cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576}],"egress_policy_ids":["no-network"],"tool_policy_ids":["sage-readonly"],"secret_handles":["codex-token"],"egress_policies":[{"policy_id":"no-network","targets":[]}],"secret_mounts":[{"handle":"codex-token","runtime_id":"codex","source_path":"/tmp/codex-auth.json","target_path":"/home/agent/.codex/auth.json"}]})";
 }
 
 auto validator_for(
@@ -155,6 +155,13 @@ auto validator_for(
             .egress_policy_ids = {"no-network"},
             .tool_policy_ids = {"sage-readonly"},
             .secret_handles = {"codex-token"},
+            .egress_policies = {egress_policy{.policy_id = "no-network", .targets = {}}},
+            .secret_mounts = {secret_mount_policy{
+                .handle = "codex-token",
+                .runtime_id = "codex",
+                .source_path = "/tmp/codex-auth.json",
+                .target_path = "/home/agent/.codex/auth.json",
+            }},
         },
         std::move(*paths),
         std::move(exposures)
@@ -207,8 +214,10 @@ auto run() -> int {
     REQUIRE(!glove::supervisor::runtime_launch_template_digest(relative_runtime_path).has_value());
     auto overlapping_runtime_path = launch_template();
     overlapping_runtime_path.read_only_paths = {"/usr/bin"};
+    // Immutable interpreter/package closure may intentionally contain the
+    // separately identity-pinned executable.
     REQUIRE(
-        !glove::supervisor::runtime_launch_template_digest(overlapping_runtime_path).has_value()
+        glove::supervisor::runtime_launch_template_digest(overlapping_runtime_path).has_value()
     );
     auto unsorted_environment = launch_template();
     std::ranges::reverse(unsorted_environment.environment);
@@ -295,6 +304,13 @@ auto run() -> int {
             .egress_policy_ids = {"no-network"},
             .tool_policy_ids = {"sage-readonly"},
             .secret_handles = {"codex-token"},
+            .egress_policies = {egress_policy{.policy_id = "no-network", .targets = {}}},
+            .secret_mounts = {secret_mount_policy{
+                .handle = "codex-token",
+                .runtime_id = "codex",
+                .source_path = "/tmp/codex-auth.json",
+                .target_path = "/home/agent/.codex/auth.json",
+            }},
         },
         std::move(*discovery_paths)
     );
@@ -305,7 +321,11 @@ auto run() -> int {
     REQUIRE(discovered_launch.has_value());
     REQUIRE(
         discovered_launch->argv ==
-        std::vector<std::string>({std::filesystem::canonical(codex).string(), "--version"})
+        std::vector<std::string>({
+            std::filesystem::canonical(codex).string(),
+            "--version",
+            "--dangerously-bypass-approvals-and-sandbox",
+        })
     );
     REQUIRE(::chmod(harness_bin.c_str(), 0777) == 0);
     REQUIRE(!discovery_validator->resolve_runtime_launch_json(discovery_plan, 1'000).has_value());
@@ -342,9 +362,50 @@ auto run() -> int {
     REQUIRE(launch->runtime_id == "codex");
     REQUIRE(launch->runtime_template_id == "codex-safe");
     REQUIRE(launch->adapter_command_digest == launch_digest());
-    REQUIRE(launch->argv == std::vector<std::string>({"/usr/bin/true", "--version"}));
+    REQUIRE(
+        launch->argv ==
+        std::vector<std::string>({
+            "/usr/bin/true",
+            "--version",
+            "--dangerously-bypass-approvals-and-sandbox",
+        })
+    );
     REQUIRE(launch->environment == launch_template().environment);
     REQUIRE(launch->limits.cpu_time_ms == 1'000);
+    REQUIRE(launch->egress_policy_id == "no-network");
+    REQUIRE(launch->egress_targets.empty());
+    REQUIRE(launch->secret_mounts.size() == 1U);
+    REQUIRE(launch->secret_mounts.front().handle == "codex-token");
+    REQUIRE(launch->secret_mounts.front().source_path == "/tmp/codex-auth.json");
+    REQUIRE(launch->secret_mounts.front().target_path == "/home/agent/.codex/auth.json");
+
+    const auto online_policy_path = temp.root() / "online-session-policy.json";
+    {
+        auto online_policy = replace_once(
+            policy_json(source),
+            R"("egress_policy_ids":["no-network"])",
+            R"("egress_policy_ids":["openai"])"
+        );
+        online_policy = replace_once(
+            std::move(online_policy),
+            R"("egress_policies":[{"policy_id":"no-network","targets":[]}])",
+            R"("egress_policies":[{"policy_id":"openai","targets":[{"host":"api.openai.com","port":443,"allow_private":false}]}])"
+        );
+        std::ofstream{online_policy_path} << online_policy;
+    }
+    REQUIRE(::chmod(online_policy_path.c_str(), 0600) == 0);
+    auto online_validator = session_plan_validator::load(online_policy_path);
+    REQUIRE(online_validator.has_value());
+    const auto online_plan = replace_once(
+        valid_plan(), R"("egress_policy_id":"no-network")", R"("egress_policy_id":"openai")"
+    );
+    auto online_launch = online_validator->resolve_runtime_launch_json(online_plan, 1'000);
+    REQUIRE(online_launch.has_value());
+    REQUIRE(online_launch->egress_policy_id == "openai");
+    REQUIRE(online_launch->egress_targets.size() == 1U);
+    REQUIRE(online_launch->egress_targets.front().host == "api.openai.com");
+    REQUIRE(online_launch->egress_targets.front().port == 443);
+    REQUIRE(!online_launch->egress_targets.front().allow_private);
     auto libraries = validator->resolve_library_projections_json(valid_plan(), 1'000);
     REQUIRE(libraries.has_value());
     REQUIRE(libraries->size() == 1U);
@@ -514,6 +575,8 @@ auto run() -> int {
         .egress_policy_ids = {"no-network"},
         .tool_policy_ids = {"sage-readonly"},
         .secret_handles = {"codex-token"},
+        .egress_policies = {},
+        .secret_mounts = {},
     };
     path_alias_policy invalid_destination_path{
         .alias = "workspace",

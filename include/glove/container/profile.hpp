@@ -80,6 +80,7 @@ enum class resource_termination_cause : std::uint8_t {
 
 enum class sandbox_backend : std::uint8_t {
     linux_production,
+    apple_container,
     macos_experimental,
 };
 

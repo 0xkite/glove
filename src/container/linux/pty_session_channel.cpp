@@ -70,9 +70,24 @@ auto add_flags(int descriptor, int get_command, int flags) -> bool {
 
 auto make_wake_pipe() -> std::expected<std::array<unique_fd, 2>, std::string> {
     std::array<int, 2> descriptors = {-1, -1};
+#if defined(__linux__)
     if (::pipe2(descriptors.data(), O_CLOEXEC | O_NONBLOCK) != 0) {
         return std::unexpected(error_message("create PTY channel wake pipe"));
     }
+#else
+    if (::pipe(descriptors.data()) != 0) {
+        return std::unexpected(error_message("create PTY channel wake pipe"));
+    }
+    if (!add_flags(descriptors[0], F_GETFD, FD_CLOEXEC) ||
+        !add_flags(descriptors[1], F_GETFD, FD_CLOEXEC) ||
+        !add_flags(descriptors[0], F_GETFL, O_NONBLOCK) ||
+        !add_flags(descriptors[1], F_GETFL, O_NONBLOCK)) {
+        const int saved = errno;
+        static_cast<void>(::close(descriptors[0]));
+        static_cast<void>(::close(descriptors[1]));
+        return std::unexpected(error_message("configure PTY channel wake pipe", saved));
+    }
+#endif
     return std::array<unique_fd, 2>{unique_fd{descriptors[0]}, unique_fd{descriptors[1]}};
 }
 
@@ -121,10 +136,18 @@ auto open_pty_pair() -> std::expected<pty_pair, std::string> {
         return std::unexpected(error_message("prepare PTY slave"));
     }
     std::array<char, 256> slave_name{};
+#if defined(__APPLE__)
+    const char* resolved_slave = ::ptsname(master.get());
+    if (resolved_slave == nullptr || std::strlen(resolved_slave) >= slave_name.size()) {
+        return std::unexpected(error_message("resolve PTY slave"));
+    }
+    std::memcpy(slave_name.data(), resolved_slave, std::strlen(resolved_slave) + 1U);
+#else
     const int name_result = ::ptsname_r(master.get(), slave_name.data(), slave_name.size());
     if (name_result != 0) {
         return std::unexpected(error_message("resolve PTY slave", name_result));
     }
+#endif
     unique_fd slave{::open(slave_name.data(), O_RDWR | O_NOCTTY | O_CLOEXEC)};
     if (slave.get() < 0) {
         return std::unexpected(error_message("open PTY slave"));

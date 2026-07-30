@@ -124,6 +124,30 @@ auto run() -> int {
     REQUIRE(!path_exposure_registry::build({std::move(unsupported_policy)}).has_value());
 
     auto request = create_request(canonical_source, "request-1", "sage-workspace");
+    REQUIRE(registry->validate_create_policy(request).has_value());
+    auto wrong_root = request;
+    wrong_root.root_id = "unknown";
+    auto root_mismatch = registry->validate_create_policy(wrong_root);
+    REQUIRE(!root_mismatch.has_value());
+    REQUIRE(root_mismatch.error().find("allowed roots: projects") != std::string::npos);
+    auto excessive_ttl = request;
+    excessive_ttl.ttl_secs = 7'201;
+    auto ttl_mismatch = registry->validate_create_policy(excessive_ttl);
+    REQUIRE(!ttl_mismatch.has_value());
+    REQUIRE(ttl_mismatch.error().find("maximum 7200 seconds") != std::string::npos);
+    auto excessive_mode = request;
+    excessive_mode.allowed_modes = {retained_mode(67'108'865)};
+    auto mode_mismatch = registry->validate_create_policy(excessive_mode);
+    REQUIRE(!mode_mismatch.has_value());
+    REQUIRE(mode_mismatch.error().find("max_bytes=67108865") != std::string::npos);
+    REQUIRE(mode_mismatch.error().find("retained_write(max_bytes=67108864)") != std::string::npos);
+    auto unknown_runtime = request;
+    unknown_runtime.allowed_runtime_template_ids = {"opencode-safe"};
+    auto runtime_mismatch = registry->validate_create_policy(unknown_runtime);
+    REQUIRE(!runtime_mismatch.has_value());
+    REQUIRE(runtime_mismatch.error().find("opencode-safe") != std::string::npos);
+    REQUIRE(runtime_mismatch.error().find("codex-safe, pi-safe") != std::string::npos);
+
     auto created = registry->create(request, 1'000);
     REQUIRE(created.has_value());
     REQUIRE(created->generation == 1);

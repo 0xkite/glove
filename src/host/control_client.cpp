@@ -1,5 +1,7 @@
 #include "glove/host/control_client.hpp"
 
+#include "glove/supervisor/path_exposure.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
@@ -363,6 +365,33 @@ auto mode_for(const project_enrollment& request) -> control_wire::exposure_mode 
     return {};
 }
 
+auto policy_mode_for(const project_enrollment& request) -> supervisor::path_exposure_mode {
+    switch (request.access) {
+    case project_access::read:
+        return {
+            .access = supervisor::path_access::read,
+            .materialization = supervisor::path_materialization::bind,
+            .max_bytes = 0,
+            .cleanup_policy = supervisor::path_cleanup_policy::retain,
+        };
+    case project_access::ephemeral_write:
+        return {
+            .access = supervisor::path_access::ephemeral_write,
+            .materialization = supervisor::path_materialization::copy,
+            .max_bytes = request.max_bytes,
+            .cleanup_policy = supervisor::path_cleanup_policy::remove,
+        };
+    case project_access::retained_write:
+        return {
+            .access = supervisor::path_access::retained_write,
+            .materialization = supervisor::path_materialization::copy,
+            .max_bytes = request.max_bytes,
+            .cleanup_policy = supervisor::path_cleanup_policy::retain,
+        };
+    }
+    return {};
+}
+
 } // namespace
 
 auto supervisor_health(const config& service) -> result<void> {
@@ -389,6 +418,28 @@ auto enroll_project(const config& service, const project_enrollment& request)
     const auto canonical_project = std::filesystem::canonical(request.project, error);
     if (error || !std::filesystem::is_directory(canonical_project)) {
         return std::unexpected(std::string{"project must be an existing directory"});
+    }
+    if (service.path_exposure_policy) {
+        auto policy =
+            supervisor::path_exposure_registry::inspect_policy(*service.path_exposure_policy);
+        if (!policy) {
+            return std::unexpected("cannot inspect project enrollment policy: " + policy.error());
+        }
+        auto permitted = policy->validate_create_policy(
+            supervisor::path_exposure_create_request{
+                .request_id = request.idempotency_key,
+                .exposure_id = request.exposure_id,
+                .root_id = request.root_id,
+                .host_path = canonical_project.string(),
+                .display_label = request.display_label,
+                .allowed_modes = {policy_mode_for(request)},
+                .ttl_secs = request.ttl_secs,
+                .allowed_runtime_template_ids = request.runtime_template_ids,
+            }
+        );
+        if (!permitted) {
+            return std::unexpected("project enrollment policy mismatch: " + permitted.error());
+        }
     }
     auto payload = glz::write_json(
         control_wire::create_exposure{

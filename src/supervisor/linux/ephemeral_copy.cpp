@@ -1605,11 +1605,11 @@ result<ephemeral_copy_materialization> ephemeral_copy_materialization::create(
     materialization.regular_files_ = state.regular_files;
     materialization.directories_ = state.directories;
     materialization.source_identity_ = grant.identity();
-    materialization.session_id_ = std::string{session_id};
-    materialization.exposure_generation_ = grant.exposure_generation();
-    materialization.exposure_scope_digest_ = std::string{grant.exposure_scope_digest()};
-    materialization.source_identity_digest_ = std::string{grant.source_identity_digest()};
     if (retained) {
+        materialization.session_id_ = std::string{session_id};
+        materialization.exposure_generation_ = grant.exposure_generation();
+        materialization.exposure_scope_digest_ = std::string{grant.exposure_scope_digest()};
+        materialization.source_identity_digest_ = std::string{grant.source_identity_digest()};
         auto baseline =
             snapshot_path_tree(materialization.content_fd_, materialization.quota_bytes_);
         if (!baseline) {

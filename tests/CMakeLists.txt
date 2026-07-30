@@ -453,6 +453,26 @@ target_link_libraries(reflect_codegen_availability_test PRIVATE glove_kernel)
 add_test(NAME reflect_codegen_availability COMMAND reflect_codegen_availability_test)
 
 if(APPLE)
+    add_executable(
+        control_apple_container_session_runtime_test
+        control/apple_container_session_runtime_test.cpp
+    )
+    target_link_libraries(
+        control_apple_container_session_runtime_test
+        PRIVATE glove_control
+    )
+    target_include_directories(control_apple_container_session_runtime_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+    )
+    add_test(
+        NAME control_apple_container_session_runtime
+        COMMAND control_apple_container_session_runtime_test
+    )
+    set_tests_properties(control_apple_container_session_runtime PROPERTIES
+        TIMEOUT 60
+        SKIP_RETURN_CODE 77
+    )
+
     add_executable(mcp_stdio_transport_test mcp/stdio_transport_test.cpp)
     target_link_libraries(mcp_stdio_transport_test PRIVATE glove_kernel)
     add_test(NAME mcp_stdio_transport COMMAND mcp_stdio_transport_test)

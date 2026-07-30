@@ -391,6 +391,10 @@ auto main(int argc, char** argv) -> int {
         return 0;
     }
     std::string_view sub{argv[1]};
+    if (sub == "-V" || sub == "--version") {
+        std::printf("glove %.*s\n", static_cast<int>(glove::version.size()), glove::version.data());
+        return 0;
+    }
     if (sub == "run") {
         return run_subcommand(std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)});
     }

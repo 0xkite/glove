@@ -5,6 +5,7 @@
 #include "linux_resource_lifecycle.hpp"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -188,6 +189,41 @@ auto natural_exit_terminal_test(
     REQUIRE(wait_stopped(child));
     auto lifecycle = make_lifecycle(root, materialization_root, "lifecycle-exit", limits, started);
     REQUIRE(lifecycle.has_value());
+    temporary_tree lease_tree;
+    REQUIRE(lease_tree.prepare());
+    const auto lease_path = lease_tree.materialization_root() / "terminal-secret-lease";
+    const int lease_lock =
+        ::open(lease_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    REQUIRE(lease_lock >= 0);
+    REQUIRE(::flock(lease_lock, LOCK_EX | LOCK_NB) == 0);
+    const int mount_descriptor = ::dup(lease_lock);
+    REQUIRE(mount_descriptor >= 0);
+    REQUIRE((*lifecycle)
+                ->install_secret_mounts(
+                    {{
+                        .descriptor_fd = mount_descriptor,
+                        .target_path = "/home/agent/.codex/auth.json",
+                        .alias = "secret:codex-auth",
+                        .quota_partition = {},
+                        .quota_bytes = 0,
+                        .source_identity = std::nullopt,
+                        .source_content_digest = std::nullopt,
+                        .projection_id = std::nullopt,
+                        .projection_destination_alias = std::nullopt,
+                        .runtime_adapter_id = std::nullopt,
+                        .runtime_context_digest = std::nullopt,
+                        .secret_handle = "codex-auth",
+                        .secret_runtime_id = "codex",
+                        .writable = true,
+                        .directory = false,
+                    }},
+                    {lease_lock}
+                )
+                .has_value());
+    const int contender = ::open(lease_path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    REQUIRE(contender >= 0);
+    REQUIRE(::flock(contender, LOCK_EX | LOCK_NB) != 0);
+    REQUIRE(errno == EWOULDBLOCK || errno == EAGAIN);
     REQUIRE((*lifecycle)->attach(child).has_value());
     REQUIRE(::kill(child, SIGCONT) == 0);
     auto status = wait_bounded(child);
@@ -197,6 +233,8 @@ auto natural_exit_terminal_test(
     REQUIRE(terminal->termination_cause == resource_termination_cause::exited);
     REQUIRE(terminal->exit_code == 7);
     REQUIRE(terminal->observed.disk_bytes <= limits.disk_bytes);
+    REQUIRE(::flock(contender, LOCK_EX | LOCK_NB) == 0);
+    REQUIRE(::close(contender) == 0);
     auto repeated = (*lifecycle)->finish(*status, epoch_ms());
     REQUIRE(repeated == terminal);
     return 0;

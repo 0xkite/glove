@@ -527,6 +527,92 @@ struct path_exposure_registry::implementation {
     std::unique_ptr<path_exposure_journal> journal;
 };
 
+auto path_exposure_registry::validate_create_policy(
+    const path_exposure_create_request& request
+) const -> std::expected<void, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"path exposure registry is unavailable"});
+    }
+    const std::scoped_lock lock{state_->mutex};
+    const auto root = state_->roots.find(request.root_id);
+    if (root == state_->roots.end()) {
+        std::string allowed;
+        for (const auto& [root_id, record] : state_->roots) {
+            (void)record;
+            allowed += allowed.empty() ? root_id : ", " + root_id;
+        }
+        return std::unexpected(
+            "root '" + request.root_id + "' is not configured; allowed roots: " + allowed
+        );
+    }
+    if (request.ttl_secs > root->second.policy.max_ttl_secs) {
+        return std::unexpected(
+            "TTL " + std::to_string(request.ttl_secs) + " seconds exceeds root '" +
+            request.root_id + "' maximum " + std::to_string(root->second.policy.max_ttl_secs) +
+            " seconds"
+        );
+    }
+    auto modes = canonical_modes(request.allowed_modes);
+    if (!modes) {
+        return std::unexpected(modes.error());
+    }
+    const auto rejected_mode = std::ranges::find_if(*modes, [&](const auto& mode) {
+        return !mode_is_subset(mode, root->second.policy.allowed_modes);
+    });
+    if (rejected_mode != modes->end()) {
+        const auto access_name = [](path_access access) -> std::string_view {
+            switch (access) {
+            case path_access::read:
+                return "read";
+            case path_access::ephemeral_write:
+                return "ephemeral_write";
+            case path_access::retained_write:
+                return "retained_write";
+            case path_access::direct_write:
+                return "direct_write";
+            }
+            return "unknown";
+        };
+        std::string allowed;
+        for (const auto& mode : root->second.policy.allowed_modes) {
+            const auto tuple = std::string{access_name(mode.access)} +
+                               "(max_bytes=" + std::to_string(mode.max_bytes) + ")";
+            allowed += allowed.empty() ? tuple : ", " + tuple;
+        }
+        return std::unexpected(
+            "mode " + std::string{access_name(rejected_mode->access)} +
+            " with max_bytes=" + std::to_string(rejected_mode->max_bytes) +
+            " is not allowed; allowed mode quotas: " + allowed
+        );
+    }
+    auto runtimes = canonical_runtimes(request.allowed_runtime_template_ids);
+    if (!runtimes) {
+        return std::unexpected(runtimes.error());
+    }
+    std::vector<std::string> rejected_runtimes;
+    for (const auto& runtime : *runtimes) {
+        if (!std::ranges::binary_search(
+                root->second.policy.allowed_runtime_template_ids, runtime
+            )) {
+            rejected_runtimes.push_back(runtime);
+        }
+    }
+    if (!rejected_runtimes.empty()) {
+        std::string rejected;
+        for (const auto& runtime : rejected_runtimes) {
+            rejected += rejected.empty() ? runtime : ", " + runtime;
+        }
+        std::string allowed;
+        for (const auto& runtime : root->second.policy.allowed_runtime_template_ids) {
+            allowed += allowed.empty() ? runtime : ", " + runtime;
+        }
+        return std::unexpected(
+            "runtime templates not allowed: " + rejected + "; allowed runtimes: " + allowed
+        );
+    }
+    return {};
+}
+
 path_exposure_recovery_target::path_exposure_recovery_target(
     int parent_descriptor_fd, std::string basename, std::string source_identity_digest
 )

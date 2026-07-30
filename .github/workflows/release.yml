@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Linux build requirements
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 libc++-18-dev libc++abi-18-dev lld-18 \
+            libseccomp-dev cmake ninja-build pkg-config
+
+      - name: Configure
+        env:
+          CC: ${{ runner.os == 'Linux' && 'clang-18' || 'clang' }}
+          CXX: ${{ runner.os == 'Linux' && 'clang++-18' || 'clang++' }}
+          CXXFLAGS: ${{ runner.os == 'Linux' && '-stdlib=libc++' || '' }}
+          LDFLAGS: ${{ runner.os == 'Linux' && '-stdlib=libc++ -fuse-ld=lld' || '' }}
+        run: cmake --preset release
+
+      - name: Verify packaging runtime
+        run: python3 --version
+
+      - name: Build
+        run: cmake --build --preset release --parallel 2
+
+      - name: Verify release tag identity
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(build/release/src/glove --version)"
+          version="${version#glove }"
+          [[ "$RELEASE_TAG" == "v$version" ]] || {
+            printf 'tag %s does not match embedded Glove version %s\n' \
+              "$RELEASE_TAG" "$version" >&2
+            exit 1
+          }
+          [[ "$(build/release/src/gloved --version)" == "gloved $version" ]]
+
+      - name: Package
+        run: |
+          chmod +x scripts/package-release.sh
+          scripts/package-release.sh \
+            --target "${{ matrix.target }}" \
+            --binary-dir build/release/src \
+            --output-dir dist \
+            --source-revision "$GITHUB_SHA"
+
+      - name: Attest release archive
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: glove-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish immutable assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) | sort)
+          (( ${#assets[@]} > 0 ))
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+            [[ "$draft" == "true" ]] || {
+              printf 'release %s is already immutable and published\n' "$TAG" >&2
+              exit 1
+            }
+          else
+            gh release create "$TAG" --draft --verify-tag --generate-notes
+          fi
+          gh release upload "$TAG" "${assets[@]}"
+          gh release edit "$TAG" --draft=false

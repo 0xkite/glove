@@ -174,3 +174,36 @@ GLOVE_TEST_HOST_SECRET=must-not-cross container run \
         printf "outer_vm_perimeter=passed cpus=%s memory_kib=%s\n" \
             "${online_cpus}" "${memory_kib}"
     '
+
+# Exercise the shipping executor itself, not only ad hoc container commands.
+# The receipt intentionally excludes command arguments and terminal content.
+image_digest="$(
+    container image inspect "${image}" |
+        sed -n 's/^[[:space:]]*"digest"[[:space:]]*:[[:space:]]*"\(sha256:[0-9a-f]\{64\}\)",*$/\1/p' |
+        head -n 1
+)"
+[[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf '%s\n' "built image has no exact OCI index digest" >&2
+    exit 1
+}
+session_artifacts="$(mktemp -d "${TMPDIR:-/tmp}/glove-apple-live.XXXXXX")"
+cleanup_session_artifacts() {
+    find "$session_artifacts" -mindepth 1 -delete
+    rmdir "$session_artifacts"
+}
+trap cleanup_session_artifacts EXIT
+"${root}/scripts/apple-container-session.sh" \
+    --session-id shipping-probe \
+    --image "${image}" \
+    --image-digest "${image_digest}" \
+    --receipt "${session_artifacts}/receipt.json" \
+    --cpus 1 \
+    --memory 512M \
+    --pids 32 \
+    --wall-seconds 30 \
+    --terminal-bytes 4096 \
+    -- /bin/sh -c 'printf GLOVE_APPLE_CONTAINER_LIVE_OK'
+grep -q '"backend": "apple_container"' "${session_artifacts}/receipt.json"
+grep -q '"cleanup_verified": true' "${session_artifacts}/receipt.json"
+grep -q '"termination_reason": "exit"' "${session_artifacts}/receipt.json"
+printf '%s\n' "apple_container_live_session=passed"

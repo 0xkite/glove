@@ -28,4 +28,6 @@ jobs:
         run: scripts/preflight.sh
 
       - name: Run macOS shipping lane
-        run: scripts/macos-shipping-lane.sh --start-system
+        run: |
+          chmod +x scripts/apple-container-session.sh scripts/macos-shipping-lane.sh
+          scripts/macos-shipping-lane.sh --start-system

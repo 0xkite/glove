@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "glove_version": "@GLOVE_VERSION@",
+  "sage": {
+    "minimum_version": "0.9.22",
+    "agent_session_plan_schema_versions": [1, 2],
+    "receipt_audit_schema_version": 1,
+    "session_control_schema_version": 1
+  },
+  "platforms": {
+    "linux": {
+      "managed_session_backend": "linux_production",
+      "managed_session_protocol_available": true
+    },
+    "macos": {
+      "shipping_backend": "apple_container",
+      "managed_session_backend": "apple_container",
+      "managed_session_protocol_available": true,
+      "agent_runtime_adapter_schema_version": 1,
+      "runtime_identity_source": "paired_sage_release"
+    }
+  }
+}

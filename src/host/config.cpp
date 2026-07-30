@@ -15,8 +15,16 @@
 
 namespace glove::host {
 namespace config_wire_types {
+struct apple_container_wire {
+    std::string cli;
+    std::string image;
+    std::string image_digest;
+    std::optional<std::string> harness_closure_digest;
+};
+
 struct config_wire {
     std::uint8_t schema_version = 0;
+    bool persistent_service = false;
     std::string runtime_directory;
     std::string audit_key;
     std::string receipt_journal;
@@ -26,12 +34,14 @@ struct config_wire {
     std::optional<std::string> library_bundle_root;
     std::optional<std::string> path_exposure_policy;
     std::optional<std::string> path_exposure_journal;
+    std::optional<apple_container_wire> apple_container;
 };
 } // namespace config_wire_types
 
 namespace {
 
 using config_wire_types::config_wire;
+using config_wire_types::apple_container_wire;
 
 constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 constexpr std::uint64_t max_config_bytes = std::uint64_t{1024} * 1024U;
@@ -151,6 +161,9 @@ auto all_configured_paths(const config& value) -> std::vector<std::filesystem::p
             paths.push_back(**optional);
         }
     }
+    if (value.apple_container) {
+        paths.push_back(value.apple_container->cli);
+    }
     return paths;
 }
 
@@ -190,17 +203,8 @@ auto resolve_directories(const environment& values) -> result<directories> {
         );
     }
 
-    std::filesystem::path runtime_fallback = *state_root / "glove/runtime";
-#if defined(__APPLE__)
-    if (values.temporary_directory) {
-        const std::filesystem::path temporary{*values.temporary_directory};
-        if (temporary.is_absolute() && temporary != temporary.root_path()) {
-            runtime_fallback = temporary / ("glove-" + std::to_string(::geteuid()));
-        }
-    }
-#endif
-    auto runtime_root =
-        absolute_directory(values.xdg_runtime_dir, runtime_fallback, "runtime root");
+    const auto runtime_fallback = *state_root / "glove/runtime";
+    auto runtime_root = absolute_directory(std::nullopt, runtime_fallback, "runtime root");
     if (!runtime_root) {
         return std::unexpected(runtime_root.error());
     }
@@ -209,7 +213,7 @@ auto resolve_directories(const environment& values) -> result<directories> {
         .state = *state_root / "glove",
         .data = *data_root / "glove",
         .cache = *cache_root / "glove",
-        .runtime = values.xdg_runtime_dir ? *runtime_root / "glove" : *runtime_root,
+        .runtime = *runtime_root,
     };
 }
 
@@ -242,6 +246,31 @@ auto validate(const config& value) -> result<void> {
     if ((value.materialization_root || value.library_bundle_root) && !value.session_store) {
         return std::unexpected(std::string{"managed-session roots require a session store"});
     }
+    if (value.apple_container) {
+        const auto& apple = *value.apple_container;
+        const auto digest = std::string_view{apple.image_digest};
+        const bool valid_digest =
+            digest.size() == 71U && digest.starts_with("sha256:") &&
+            std::ranges::all_of(digest.substr(7), [](char byte) {
+                return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+            });
+        const bool valid_closure_digest =
+            !apple.harness_closure_digest ||
+            (apple.harness_closure_digest->size() == 71U &&
+             apple.harness_closure_digest->starts_with("sha256:") &&
+             std::ranges::all_of(
+                 std::string_view{*apple.harness_closure_digest}.substr(7), [](char byte) {
+                     return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+                 }
+             ));
+        if (!value.session_store || !value.materialization_root || apple.image.empty() ||
+            apple.image.size() > 256U || apple.image.find_first_of(" \t\r\n") != std::string::npos ||
+            !valid_digest || !valid_closure_digest) {
+            return std::unexpected(std::string{
+                "Apple Container runtime requires managed-session roots and an exact image digest"
+            });
+        }
+    }
     if (value.path_exposure_policy.has_value() != value.path_exposure_journal.has_value()) {
         return std::unexpected(
             std::string{"path exposure policy and journal must be configured together"}
@@ -263,6 +292,7 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
     }
     config decoded{
         .schema_version = encoded.schema_version,
+        .persistent_service = encoded.persistent_service,
         .runtime_directory = encoded.runtime_directory,
         .audit_key = encoded.audit_key,
         .receipt_journal = encoded.receipt_journal,
@@ -272,6 +302,16 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
         .library_bundle_root = optional_path(encoded.library_bundle_root),
         .path_exposure_policy = optional_path(encoded.path_exposure_policy),
         .path_exposure_journal = optional_path(encoded.path_exposure_journal),
+        .apple_container =
+            encoded.apple_container
+                ? std::optional<apple_container_config>{apple_container_config{
+                      .cli = encoded.apple_container->cli,
+                      .image = encoded.apple_container->image,
+                      .image_digest = encoded.apple_container->image_digest,
+                      .harness_closure_digest =
+                          encoded.apple_container->harness_closure_digest,
+                  }}
+                : std::nullopt,
     };
     if (auto valid = validate(decoded); !valid) {
         return std::unexpected(valid.error());
@@ -286,6 +326,7 @@ auto encode_config(const config& value) -> result<std::string> {
     auto encoded = glz::write_json(
         config_wire{
             .schema_version = value.schema_version,
+            .persistent_service = value.persistent_service,
             .runtime_directory = value.runtime_directory.string(),
             .audit_key = value.audit_key.string(),
             .receipt_journal = value.receipt_journal.string(),
@@ -295,6 +336,16 @@ auto encode_config(const config& value) -> result<std::string> {
             .library_bundle_root = optional_string(value.library_bundle_root),
             .path_exposure_policy = optional_string(value.path_exposure_policy),
             .path_exposure_journal = optional_string(value.path_exposure_journal),
+            .apple_container =
+                value.apple_container
+                    ? std::optional<apple_container_wire>{apple_container_wire{
+                          .cli = value.apple_container->cli.string(),
+                          .image = value.apple_container->image,
+                          .image_digest = value.apple_container->image_digest,
+                          .harness_closure_digest =
+                              value.apple_container->harness_closure_digest,
+                      }}
+                    : std::nullopt,
         }
     );
     if (!encoded) {
@@ -302,6 +353,54 @@ auto encode_config(const config& value) -> result<std::string> {
     }
     encoded->push_back('\n');
     return std::move(*encoded);
+}
+
+auto write_config_exclusive(const std::filesystem::path& path, const config& value)
+    -> result<void> {
+    if (!path.is_absolute() || path == path.root_path() || path.lexically_normal() != path ||
+        path.filename().empty()) {
+        return std::unexpected(
+            std::string{"configuration output path must be normalized absolute"}
+        );
+    }
+    std::error_code error;
+    const auto parent = std::filesystem::canonical(path.parent_path(), error);
+    struct stat parent_metadata{};
+    if (error || ::lstat(parent.c_str(), &parent_metadata) != 0 ||
+        !S_ISDIR(parent_metadata.st_mode) || parent_metadata.st_uid != ::geteuid() ||
+        (static_cast<unsigned int>(parent_metadata.st_mode) & 0777U) != 0700U) {
+        return std::unexpected(
+            std::string{"configuration output directory must exist with current-user mode 0700"}
+        );
+    }
+    auto encoded = encode_config(value);
+    if (!encoded) {
+        return std::unexpected(encoded.error());
+    }
+    const unique_fd descriptor{
+        ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)
+    };
+    if (descriptor.get() < 0) {
+        return std::unexpected(system_error("create configuration"));
+    }
+    std::size_t consumed = 0;
+    while (consumed < encoded->size()) {
+        const auto written =
+            ::write(descriptor.get(), encoded->data() + consumed, encoded->size() - consumed);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            (void)::unlink(path.c_str());
+            return std::unexpected(system_error("write configuration"));
+        }
+        consumed += static_cast<std::size_t>(written);
+    }
+    if (::fsync(descriptor.get()) != 0) {
+        (void)::unlink(path.c_str());
+        return std::unexpected(system_error("sync configuration"));
+    }
+    return {};
 }
 
 } // namespace glove::host

@@ -660,16 +660,19 @@ auto build_rootfs(
     // Explicit grants are layered after private /tmp and /var/tmp so a
     // selected file beneath either path remains visible instead of being
     // hidden by the tmpfs mount.
+    for (const auto& rule : prof.runtime_filesystem) {
+        if (auto bound = bind_path(new_root, rule.path, false); !bound) {
+            return bound;
+        }
+    }
+    // Runtime/package closures may contain the executable. Bind the exact
+    // descriptor last so a broader read-only closure cannot replace the
+    // identity committed by the managed launch binding.
     auto program_bound = agent_program_fd >= 0
                              ? bind_program_descriptor(new_root, agent_program, agent_program_fd)
                              : bind_path(new_root, agent_program, false);
     if (!program_bound) {
         return program_bound;
-    }
-    for (const auto& rule : prof.runtime_filesystem) {
-        if (auto bound = bind_path(new_root, rule.path, false); !bound) {
-            return bound;
-        }
     }
     for (const auto& rule : prof.filesystem) {
         if (auto bound = bind_path(new_root, rule.path, rule.writable); !bound) {
@@ -1404,8 +1407,17 @@ auto validate_managed_mounts(
             (!S_ISDIR(status.st_mode) && !S_ISREG(status.st_mode))) {
             return std::unexpected(std::string{"invalid managed session mount descriptor"});
         }
-        for (const auto& existing : target_paths) {
-            if (path_within(target, existing) || path_within(existing, target)) {
+        for (std::size_t index = 0; index < target_paths.size(); ++index) {
+            const auto& existing = target_paths[index];
+            const auto& existing_mount = mounts[index];
+            const bool layered_secret =
+                existing_mount.runtime_adapter_id && mount.secret_handle &&
+                mount.secret_runtime_id &&
+                *existing_mount.runtime_adapter_id == *mount.secret_runtime_id &&
+                existing_mount.target_path == "/home/agent" && target != existing &&
+                path_within(target, existing);
+            if ((path_within(target, existing) || path_within(existing, target)) &&
+                !layered_secret) {
                 return std::unexpected(std::string{"overlapping managed session mount targets"});
             }
         }
@@ -1436,10 +1448,18 @@ auto prepare_managed_launch(
     if (argv.empty()) {
         return std::unexpected(std::string{"managed session: empty argv"});
     }
-    auto checked = validate(prof);
+    // Managed work directories are lifecycle projections and therefore are
+    // not present in the ordinary profile filesystem rules. Validate the
+    // base profile first; bind_managed_launch_projection_from_fd performs the
+    // authoritative backing-mount check below before any child is released.
+    auto profile_without_managed_work_dir = prof;
+    const auto managed_work_dir = profile_without_managed_work_dir.work_dir;
+    profile_without_managed_work_dir.work_dir.reset();
+    auto checked = validate(profile_without_managed_work_dir);
     if (!checked) {
         return std::unexpected(std::string{"profile: "} + checked.error());
     }
+    checked->work_dir = managed_work_dir;
     if (checked->required_limits != std::optional<resource_limits>{lifecycle.limits()}) {
         return std::unexpected(std::string{"managed session resource limits mismatch"});
     }

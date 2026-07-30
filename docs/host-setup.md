@@ -10,14 +10,84 @@ Glove recognizes Codex, Claude Code, Pi, Copilot, and OpenCode from its core
 adapter catalog. Discovery never trusts inherited `PATH`. Give it one or more
 explicit directories:
 
+For the normal guided path, detect every supported client in reviewed
+directories, derive each immutable interpreter/package closure, stage
+owner-controlled entry points, and generate a complete offline policy in one
+operation:
+
+```sh
+glove setup policy \
+  --search-path /absolute/reviewed/bin \
+  --runtime codex \
+  --harness-root "$HOME/.local/share/glove/harnesses" \
+  --path-root /absolute/project-root \
+  --output "$HOME/.config/glove/session-policy.json" \
+  --dry-run
+
+glove setup policy \
+  --search-path /absolute/reviewed/bin \
+  --runtime codex \
+  --harness-root "$HOME/.local/share/glove/harnesses" \
+  --path-root /absolute/project-root \
+  --output "$HOME/.config/glove/session-policy.json" \
+  --yes
+```
+
+The dry run performs the same detection, selected-runtime closure derivation,
+template digest, and complete-policy encoding without changing files. Apply is explicit,
+creates the policy as owner-only mode `0600`, refuses changed existing files,
+and validates the result through the production loader. Missing clients remain
+visible in the report and are not errors when at least one supported harness is
+ready. Repeat `--runtime` only when the policy should authorize more than one
+detected client; omitting it selects all detected clients. The generated
+defaults are deny-network and still require review before machine setup.
+
+Online model-backed sessions extend the same local policy explicitly. Repeat
+`--egress POLICY HOST PORT` for each reviewed public endpoint, and add one
+`--secret RUNTIME HANDLE SOURCE TARGET` for each exact credential file:
+
+```sh
+glove setup policy \
+  --search-path /absolute/reviewed/bin \
+  --runtime codex \
+  --harness-root "$HOME/.local/share/glove/harnesses" \
+  --path-root /absolute/project-root \
+  --output "$HOME/.config/glove/session-policy.json" \
+  --egress openai-online api.openai.com 443 \
+  --egress openai-online chatgpt.com 443 \
+  --egress openai-online auth.openai.com 443 \
+  --egress openai-online ab.chatgpt.com 443 \
+  --secret codex codex-auth /absolute/protected/auth.json /home/agent/.codex/auth.json \
+  --dry-run
+```
+
+These are the currently observed Codex CLI model, authentication, and
+configuration endpoints. Keep them as exact host/port grants: do not replace
+them with wildcard domains, and review denied egress receipts before adding a
+new endpoint.
+
+The source must already be a current-user, single-link, non-symlink regular
+file with mode `0600`. Sage plans carry only the handle and egress-policy ID,
+never the local path or credential bytes. At first launch Glove imports the
+identity-pinned source into an owner-only managed credential lease. Only that
+lease is mounted writable inside the private managed home, so vendor OAuth
+refresh-token rotation persists without modifying or exposing the operator's
+credential file. A nonblocking exclusive lease prevents concurrent sessions
+from racing the same rotating credential. When the protected source content
+changes after an operator re-login, its digest selects a fresh lease. Egress
+remains deny-by-default; every allowed or denied CONNECT decision is durably
+audited before an allowed connection is released.
+
+The lower-level commands remain available for custom policies. To inspect only:
+
 ```sh
 glove policy detect --search-path /absolute/protected/harness-bin --json
 ```
 
-Package-manager bin directories are commonly group-writable and will be
-rejected with the exact untrusted ancestor. After inspecting the absolute
-vendor executable, preview and explicitly create an adapter-named entry point
-in an owner-controlled directory:
+Package-manager and version-manager directories are commonly group-writable.
+Setup may inspect them only because the operator supplied the directory
+explicitly; that discovery is not launch authority. Preview and explicitly
+stage the selected vendor executable into an owner-controlled directory:
 
 ```sh
 glove policy stage \
@@ -33,13 +103,37 @@ glove policy stage \
   --yes
 ```
 
-Staging creates only a protected symlink to the canonical executable. It does
-not copy or expose the operator's credential/config home. The stage report
-automatically resolves native binaries or safe shebang interpreters and emits
-the exact launch executable, script argument, and minimal immutable read-only
-dependency roots. Homebrew clients are closed over installed formula kegs;
-adjacent version-manager interpreters are closed over that one version root.
-Unsupported shebangs and root-wide dependency grants fail closed.
+For an already trusted closure, staging creates a protected symlink to the
+canonical executable. For a group-writable single-root interpreter/package
+closure, it copies the closure into a content-addressed, owner-protected,
+read-only snapshot, verifies the source and copy digests match, then runs the
+normal launch-trust resolver against the snapshot. It never copies or exposes
+the operator's credential/config home. The report emits the snapshot digest,
+exact launch executable, script argument, and minimal read-only dependency
+root. Unsafe multi-root, escaping-symlink, special-file, root-wide, oversized,
+or changed-during-copy closures fail closed.
+
+To retain an existing host's audit key, receipt/session journals, runtime
+socket, and materialization roots while adopting a newly reviewed session
+policy, derive a new config instead of running fresh machine setup:
+
+```sh
+glove config derive \
+  --config /absolute/current-config.json \
+  --session-policy /absolute/new-session-policy.json \
+  --output /absolute/derived-config.json \
+  --dry-run
+
+glove config derive \
+  --config /absolute/current-config.json \
+  --session-policy /absolute/new-session-policy.json \
+  --output /absolute/derived-config.json \
+  --yes
+```
+
+Derivation validates both inputs, changes only the session-policy path, writes
+exclusively into an existing owner-only directory, and is idempotent only when
+the existing output matches exactly.
 
 Generate a strict `runtime_templates[]` entry through the same resolver and
 digest algorithm used by managed launch:
@@ -116,6 +210,32 @@ Setup is idempotent for the same inputs and never overwrites changed protected
 files. The policy must already be a current-user, mode-0600 regular file.
 `glove setup`, including `--dry-run`, validates it through the same strict
 loader as `gloved` before planning machine changes.
+
+Successful setup writes an owner-only `setup-ledger.json` beside the audit
+state. The ledger distinguishes resources Glove created from resources it
+adopted and content-binds owned files. Cleanup is always a separate,
+digest-confirmed operation:
+
+```sh
+glove setup cleanup --dry-run
+glove setup cleanup --yes --confirm-ledger <sha256-from-preview>
+```
+
+Cleanup retains adopted resources, refuses changed files, and stops when an
+owned directory contains durable or unmanaged state. It does not infer
+deletion authority from a path alone.
+
+For a manually staged or older installation, create a fail-safe ledger without
+claiming cleanup ownership:
+
+```sh
+glove setup adopt --config /absolute/existing/config.json --dry-run
+glove setup adopt --config /absolute/existing/config.json --yes
+```
+
+Adoption validates the existing configuration, protected files, session
+policy, and managed directories, then records every discovered resource as
+retained.
 
 By default Glove uses:
 

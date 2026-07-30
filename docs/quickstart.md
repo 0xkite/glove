@@ -11,6 +11,12 @@ CMake fetches Glaze during configuration.
 
 ## Build and verify
 
+For published Sage/Glove binaries, use the `install-sage-glove.sh` shipped in
+the Sage Unix archive. Its dry run verifies both release attestations,
+checksums, identities, protocol manifests, target, and service templates before
+the paired activation. This source-build path remains available for
+development.
+
 Configure, build, test, and install a Release build to
 `${GLOVE_INSTALL_PREFIX:-$HOME/.local}`:
 
@@ -76,6 +82,9 @@ glove setup guide --json
 The guide makes Apple Containers' VM/storage cost and the platform's nested
 kernel capability differences explicit. This is the default macOS shipping
 lane, just as the delegated-kernel lane is the default Linux shipping path.
+Applied setup also records an owner-only resource ledger. Use
+`glove setup cleanup --dry-run` to inspect the exact owned-versus-retained
+cleanup set; removal requires the ledger digest printed by that preview.
 
 ## Contained MCP agent
 

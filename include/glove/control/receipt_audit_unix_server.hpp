@@ -2,6 +2,7 @@
 
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/session_registry.hpp"
+#include "glove/control/session_runtime.hpp"
 #include "glove/supervisor/path_exposure.hpp"
 #include "glove/supervisor/session_plan.hpp"
 
@@ -13,17 +14,13 @@
 
 namespace glove::control {
 
-namespace linux_detail {
-class linux_session_runtime;
-}
-
 struct receipt_audit_unix_server_config {
     std::filesystem::path socket_path;
     std::filesystem::path bootstrap_secret_path;
     container::receipt_audit_producer_config producer;
     std::shared_ptr<const supervisor::session_plan_validator> plan_validator;
     std::shared_ptr<session_registry> sessions;
-    std::shared_ptr<linux_detail::linux_session_runtime> session_runtime;
+    std::shared_ptr<session_runtime> session_runtime;
     std::shared_ptr<supervisor::path_exposure_registry> path_exposures;
     std::string materialization_root;
     std::uint64_t io_timeout_ms = 5'000;

@@ -3,14 +3,21 @@
 
 #include <glaze/glaze.hpp>
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <cstdint>
+#include <cerrno>
 #include <expected>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace glove::audit {
@@ -30,6 +37,25 @@ struct wire_event {
 };
 
 namespace {
+
+auto system_error(std::string_view operation) -> std::string {
+    return std::string{operation} + ": " +
+           std::error_code{errno, std::generic_category()}.message();
+}
+
+auto write_all(int descriptor, std::string_view bytes) -> std::expected<void, std::string> {
+    while (!bytes.empty()) {
+        const auto written = ::write(descriptor, bytes.data(), bytes.size());
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return std::unexpected(system_error("write audit event"));
+        }
+        bytes.remove_prefix(static_cast<std::size_t>(written));
+    }
+    return {};
+}
 
 auto status_name(glove::mcp::tool_call_status s) -> std::string_view {
     using glove::mcp::tool_call_status;
@@ -68,7 +94,13 @@ auto action_name(action a) -> std::string_view {
 
 class jsonl_sink final : public sink {
 public:
-    explicit jsonl_sink(std::ofstream stream) : stream_{std::move(stream)} {}
+    explicit jsonl_sink(int descriptor) : descriptor_{descriptor} {}
+
+    ~jsonl_sink() override {
+        if (descriptor_ >= 0) {
+            ::close(descriptor_);
+        }
+    }
 
     auto record(const event& e) -> std::expected<void, std::string> override {
         wire_event w{
@@ -91,28 +123,52 @@ public:
         }
 
         std::scoped_lock lock{mu_};
-        stream_ << *encoded << '\n';
-        if (!stream_) {
-            return std::unexpected(std::string{"jsonl_sink: write failed"});
+        encoded->push_back('\n');
+        if (auto written = write_all(descriptor_, *encoded); !written) {
+            return written;
         }
-        stream_.flush();
+        if (::fsync(descriptor_) != 0) {
+            return std::unexpected(system_error("sync audit event"));
+        }
         return {};
     }
 
 private:
     std::mutex mu_;
-    std::ofstream stream_;
+    int descriptor_ = -1;
 };
 
 } // namespace
 
 auto make_jsonl_sink(const std::filesystem::path& path)
     -> std::expected<std::shared_ptr<sink>, std::string> {
-    std::ofstream stream{path, std::ios::out | std::ios::app | std::ios::binary};
-    if (!stream) {
-        return std::unexpected(std::string{"jsonl_sink: cannot open "} + path.string());
+    if (!path.is_absolute() || path == path.root_path() || path.lexically_normal() != path) {
+        return std::unexpected(std::string{"jsonl_sink: path must be dedicated and absolute"});
     }
-    return std::make_shared<jsonl_sink>(std::move(stream));
+    const int descriptor = ::open( // NOLINT(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+        path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600
+    );
+    if (descriptor < 0) {
+        return std::unexpected(system_error("open audit journal"));
+    }
+    struct stat metadata{};
+    if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
+        (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0600U) {
+        ::close(descriptor);
+        return std::unexpected(
+            std::string{"audit journal must be an owner-only single-link regular file"}
+        );
+    }
+    while (::flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        const auto error = system_error("lock audit journal");
+        ::close(descriptor);
+        return std::unexpected(error);
+    }
+    return std::make_shared<jsonl_sink>(descriptor);
 }
 
 } // namespace glove::audit

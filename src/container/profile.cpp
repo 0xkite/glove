@@ -146,7 +146,9 @@ auto resource_enforcement_capabilities::complete() const noexcept -> bool {
         cpu_time == enforcement_mechanism::rlimit || cpu_time == enforcement_mechanism::cgroup_v2;
     const auto memory_supported =
         memory == enforcement_mechanism::rlimit || memory == enforcement_mechanism::cgroup_v2;
-    return cpu_supported && memory_supported && pids == enforcement_mechanism::cgroup_v2 &&
+    const auto pids_supported =
+        pids == enforcement_mechanism::rlimit || pids == enforcement_mechanism::cgroup_v2;
+    return cpu_supported && memory_supported && pids_supported &&
            wall_time == enforcement_mechanism::watchdog &&
            disk == enforcement_mechanism::filesystem_quota &&
            terminal_output == enforcement_mechanism::byte_counter && receipt_schema_version == 1;

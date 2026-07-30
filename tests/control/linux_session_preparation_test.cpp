@@ -146,6 +146,9 @@ auto make_inputs(
                 .limits = limits,
                 .expires_at_ms = now_ms + 60'000,
                 .requires_direct_write_approval = false,
+                .egress_policy_id = "",
+                .egress_targets = {},
+                .secret_mounts = {},
             },
         .path_grants = std::move(grants),
         .library_projections = {},
@@ -186,7 +189,7 @@ auto run() -> int {
     }
 
     auto wrong_backend =
-        make_inputs(source, page, now_ms, glove::supervisor::sandbox_backend::macos_experimental);
+        make_inputs(source, page, now_ms, glove::supervisor::sandbox_backend::apple_container);
     REQUIRE(wrong_backend.has_value());
     REQUIRE(!preparer->prepare(std::move(*wrong_backend), now_ms).has_value());
     REQUIRE(std::filesystem::is_empty(materializations));
@@ -233,6 +236,7 @@ auto run() -> int {
         REQUIRE(prepared->plan_content_digest == content_digest);
         REQUIRE(prepared->profile.required_limits.has_value());
         REQUIRE(prepared->profile.required_limits->disk_bytes == page * 16U);
+        REQUIRE(prepared->profile.work_dir == "/workspace");
         REQUIRE(
             prepared->profile.environment == std::vector<std::string>({
                                                  "PATH=/usr/bin:/bin",
@@ -285,6 +289,96 @@ auto run() -> int {
     }
     REQUIRE(std::filesystem::is_empty(materializations));
     REQUIRE(std::filesystem::exists(source / "tracked.txt"));
+
+    const auto credential_source = tree.root() / "codex-auth.json";
+    std::ofstream{credential_source, std::ios::binary | std::ios::trunc}
+        << R"({"tokens":{"refresh_token":"source-v1"}})";
+    REQUIRE(::chmod(credential_source.c_str(), 0600) == 0);
+    const auto add_credential = [&](glove::control::session_start_inputs& inputs) {
+        inputs.launch.secret_mounts.push_back({
+            .handle = "codex-auth",
+            .runtime_id = "codex",
+            .source_path = credential_source.string(),
+            .target_path = "/home/agent/.codex/auth.json",
+        });
+    };
+
+    auto first_credentialed = make_inputs(source, page, now_ms);
+    REQUIRE(first_credentialed.has_value());
+    first_credentialed->session.session_id = "credential-lease-first";
+    first_credentialed->authorization_id = "approval-credential-lease-first";
+    add_credential(*first_credentialed);
+    auto first_prepared = preparer->prepare(std::move(*first_credentialed), now_ms);
+    REQUIRE(first_prepared.has_value());
+    const auto credential_mounts = first_prepared->lifecycle->mounts();
+    const auto credential_mount = std::ranges::find(
+        credential_mounts,
+        "/home/agent/.codex/auth.json",
+        &glove::supervisor::linux_detail::session_mount::target_path
+    );
+    REQUIRE(credential_mount != credential_mounts.end());
+    REQUIRE(credential_mount->writable);
+    REQUIRE(credential_mount->secret_handle == "codex-auth");
+
+    const auto lease_root = materializations / ".credential-leases";
+    REQUIRE(std::filesystem::is_directory(lease_root));
+    std::vector<std::filesystem::path> leases;
+    for (const auto& entry : std::filesystem::directory_iterator{lease_root}) {
+        if (entry.is_regular_file()) {
+            leases.push_back(entry.path());
+        }
+    }
+    REQUIRE(leases.size() == 1);
+    struct stat lease_status{};
+    REQUIRE(::lstat(leases.front().c_str(), &lease_status) == 0);
+    REQUIRE((static_cast<unsigned int>(lease_status.st_mode) & 0777U) == 0600U);
+
+    auto competing_credentialed = make_inputs(source, page, now_ms);
+    REQUIRE(competing_credentialed.has_value());
+    competing_credentialed->session.session_id = "credential-lease-competing";
+    competing_credentialed->authorization_id = "approval-credential-lease-competing";
+    add_credential(*competing_credentialed);
+    auto competing = preparer->prepare(std::move(*competing_credentialed), now_ms);
+    REQUIRE(!competing.has_value());
+    REQUIRE(competing.error().find("already in use") != std::string::npos);
+
+    std::ofstream{leases.front(), std::ios::binary | std::ios::trunc}
+        << R"({"tokens":{"refresh_token":"rotated-by-agent"}})";
+    first_prepared->lifecycle.reset();
+
+    auto resumed_credentialed = make_inputs(source, page, now_ms);
+    REQUIRE(resumed_credentialed.has_value());
+    resumed_credentialed->session.session_id = "credential-lease-resumed";
+    resumed_credentialed->authorization_id = "approval-credential-lease-resumed";
+    add_credential(*resumed_credentialed);
+    auto resumed = preparer->prepare(std::move(*resumed_credentialed), now_ms);
+    REQUIRE(resumed.has_value());
+    std::ifstream resumed_lease{leases.front(), std::ios::binary};
+    const std::string resumed_content{
+        std::istreambuf_iterator<char>{resumed_lease}, std::istreambuf_iterator<char>{}
+    };
+    REQUIRE(resumed_content.find("rotated-by-agent") != std::string::npos);
+    resumed->lifecycle.reset();
+
+    // A deliberate operator re-login changes the protected source content and
+    // therefore selects a fresh immutable lease identity.
+    std::ofstream{credential_source, std::ios::binary | std::ios::trunc}
+        << R"({"tokens":{"refresh_token":"source-v2"}})";
+    auto replaced_credentialed = make_inputs(source, page, now_ms);
+    REQUIRE(replaced_credentialed.has_value());
+    replaced_credentialed->session.session_id = "credential-lease-replaced";
+    replaced_credentialed->authorization_id = "approval-credential-lease-replaced";
+    add_credential(*replaced_credentialed);
+    auto replaced = preparer->prepare(std::move(*replaced_credentialed), now_ms);
+    REQUIRE(replaced.has_value());
+    replaced->lifecycle.reset();
+    leases.clear();
+    for (const auto& entry : std::filesystem::directory_iterator{lease_root}) {
+        if (entry.is_regular_file()) {
+            leases.push_back(entry.path());
+        }
+    }
+    REQUIRE(leases.size() == 2);
     return 0;
 }
 

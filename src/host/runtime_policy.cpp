@@ -1,10 +1,12 @@
 #include "glove/host/runtime_policy.hpp"
 
+#include "glove/container/digest.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -15,6 +17,7 @@
 #include <cerrno>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <sstream>
@@ -37,6 +40,73 @@ struct runtime_template {
     supervisor::runtime_launch_template launch;
 };
 
+struct path_access {
+    std::string access;
+    std::string materialization;
+    std::string create_policy;
+    std::string cleanup_policy;
+    std::uint64_t max_bytes = 0;
+};
+
+struct path_alias {
+    std::string alias;
+    std::string host_path;
+    std::string target_path;
+    std::uint64_t max_ttl_secs = 0;
+    std::vector<path_access> access;
+};
+
+struct projection_destination {
+    std::string alias;
+    std::string target_path;
+};
+
+struct resource_profile {
+    std::string profile_id;
+    std::uint64_t cpu_time_ms = 0;
+    std::uint64_t memory_bytes = 0;
+    std::uint64_t pids = 0;
+    std::uint64_t wall_time_ms = 0;
+    std::uint64_t disk_bytes = 0;
+    std::uint64_t terminal_output_bytes = 0;
+};
+
+struct egress_target_policy {
+    std::string host;
+    std::uint16_t port = 443;
+    bool allow_private = false;
+};
+
+struct egress_policy {
+    std::string policy_id;
+    std::vector<egress_target_policy> targets;
+};
+
+struct secret_mount_policy {
+    std::string handle;
+    std::string runtime_id;
+    std::string source_path;
+    std::string target_path;
+};
+
+struct session_policy {
+    std::uint8_t schema_version = 1;
+    std::uint64_t revision = 1;
+    // The plan lifetime includes an operator-approval window in addition to
+    // the sandbox wall limit. Keep the generated policy usable without
+    // weakening either bound.
+    std::uint64_t max_plan_ttl_ms = 600'000;
+    std::vector<runtime_template> runtime_templates;
+    std::vector<path_alias> path_aliases;
+    std::vector<projection_destination> library_projection_destinations;
+    std::vector<resource_profile> resource_profiles;
+    std::vector<std::string> egress_policy_ids = {"no-network"};
+    std::vector<std::string> tool_policy_ids = {"sage-readonly"};
+    std::vector<std::string> secret_handles;
+    std::vector<egress_policy> egress_policies;
+    std::vector<secret_mount_policy> secret_mounts;
+};
+
 } // namespace runtime_policy_wire
 
 namespace {
@@ -49,8 +119,11 @@ auto valid_identifier(std::string_view value) -> bool {
            });
 }
 
-auto canonical_paths(const std::vector<std::filesystem::path>& paths, std::string_view field)
-    -> result<std::vector<std::string>> {
+auto canonical_paths(
+    const std::vector<std::filesystem::path>& paths,
+    std::string_view field,
+    bool allow_planned_paths = false
+) -> result<std::vector<std::string>> {
     std::vector<std::string> canonical;
     canonical.reserve(paths.size());
     for (std::size_t index = 0; index < paths.size(); ++index) {
@@ -62,6 +135,10 @@ auto canonical_paths(const std::vector<std::filesystem::path>& paths, std::strin
         std::error_code error;
         const auto resolved = std::filesystem::canonical(paths[index], error);
         if (error) {
+            if (allow_planned_paths && paths[index].lexically_normal() == paths[index]) {
+                canonical.push_back(paths[index].string());
+                continue;
+            }
             return std::unexpected(
                 std::string{field} + "[" + std::to_string(index) +
                 "] cannot be canonicalized: " + error.message()
@@ -85,13 +162,287 @@ auto canonical_identifiers(std::vector<std::string> values, std::string_view fie
 }
 
 auto backend_name(supervisor::sandbox_backend backend) -> std::string {
-    return backend == supervisor::sandbox_backend::linux_production ? "linux_production"
-                                                                    : "macos_experimental";
+    switch (backend) {
+    case supervisor::sandbox_backend::linux_production:
+        return "linux_production";
+    case supervisor::sandbox_backend::apple_container:
+        return "apple_container";
+    case supervisor::sandbox_backend::macos_experimental:
+        return "macos_experimental";
+    }
+    return "unsupported";
 }
 
 auto system_error(std::string_view operation, int error_number = errno) -> std::string {
     return std::string{operation} + ": " +
            std::error_code{error_number, std::generic_category()}.message();
+}
+
+auto read_policy_contents(const std::filesystem::path& path) -> result<std::optional<std::string>> {
+    const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        if (errno == ENOENT) {
+            return std::nullopt;
+        }
+        return std::unexpected(system_error("open session policy"));
+    }
+    struct stat metadata{};
+    if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
+        (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0600U || metadata.st_size < 0 ||
+        static_cast<std::uint64_t>(metadata.st_size) > 1024U * 1024U) {
+        (void)::close(descriptor);
+        return std::unexpected(
+            std::string{"existing session policy ownership, mode, link count, or size is unsafe"}
+        );
+    }
+    std::string contents(static_cast<std::size_t>(metadata.st_size), '\0');
+    std::size_t consumed = 0;
+    while (consumed < contents.size()) {
+        const auto count =
+            ::read(descriptor, contents.data() + consumed, contents.size() - consumed);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            const auto error = system_error("read existing session policy");
+            (void)::close(descriptor);
+            return std::unexpected(error);
+        }
+        consumed += static_cast<std::size_t>(count);
+    }
+    if (::close(descriptor) != 0) {
+        return std::unexpected(system_error("close existing session policy"));
+    }
+    return contents;
+}
+
+auto write_owner_file_exclusive(const std::filesystem::path& path, std::string_view contents)
+    -> result<void> {
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (descriptor < 0) {
+        return std::unexpected(system_error("create session policy"));
+    }
+    std::size_t consumed = 0;
+    while (consumed < contents.size()) {
+        const auto count =
+            ::write(descriptor, contents.data() + consumed, contents.size() - consumed);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            const auto error = system_error("write session policy");
+            (void)::close(descriptor);
+            (void)::unlink(path.c_str());
+            return std::unexpected(error);
+        }
+        consumed += static_cast<std::size_t>(count);
+    }
+    const int sync_result = ::fsync(descriptor);
+    const int sync_error = errno;
+    const int close_result = ::close(descriptor);
+    if (sync_result != 0 || close_result != 0) {
+        errno = sync_result != 0 ? sync_error : errno;
+        const auto error = system_error("sync session policy");
+        (void)::unlink(path.c_str());
+        return std::unexpected(error);
+    }
+    return {};
+}
+
+class policy_update_lock {
+public:
+    policy_update_lock() = default;
+    policy_update_lock(const policy_update_lock&) = delete;
+    auto operator=(const policy_update_lock&) -> policy_update_lock& = delete;
+
+    policy_update_lock(policy_update_lock&& other) noexcept
+        : descriptor_{std::exchange(other.descriptor_, -1)} {}
+
+    auto operator=(policy_update_lock&& other) noexcept -> policy_update_lock& {
+        if (this != &other) {
+            close();
+            descriptor_ = std::exchange(other.descriptor_, -1);
+        }
+        return *this;
+    }
+
+    ~policy_update_lock() { close(); }
+
+    [[nodiscard]] static auto acquire(const std::filesystem::path& policy_path)
+        -> result<policy_update_lock> {
+        const auto lock_path = policy_path.string() + ".lock";
+        const int descriptor =
+            ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (descriptor < 0) {
+            return std::unexpected(system_error("open session policy update lock"));
+        }
+        struct stat metadata{};
+        if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+            metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
+            (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0600U) {
+            (void)::close(descriptor);
+            return std::unexpected(
+                std::string{"session policy update lock ownership or mode is unsafe"}
+            );
+        }
+        if (::flock(descriptor, LOCK_EX) != 0) {
+            const auto error = system_error("lock session policy update");
+            (void)::close(descriptor);
+            return std::unexpected(error);
+        }
+        policy_update_lock lock;
+        lock.descriptor_ = descriptor;
+        return lock;
+    }
+
+private:
+    void close() noexcept {
+        if (descriptor_ >= 0) {
+            (void)::flock(descriptor_, LOCK_UN);
+            (void)::close(descriptor_);
+            descriptor_ = -1;
+        }
+    }
+
+    int descriptor_ = -1;
+};
+
+auto encode_session_policy(const runtime_policy_wire::session_policy& policy)
+    -> result<std::string> {
+    auto encoded = glz::write_json(policy);
+    if (!encoded) {
+        return std::unexpected(
+            std::string{"encode complete session policy: "} +
+            glz::format_error(encoded.error(), std::string{})
+        );
+    }
+    encoded->push_back('\n');
+    return *encoded;
+}
+
+struct prepared_policy_update {
+    std::string contents;
+    std::optional<std::string> previous_contents;
+    bool changed = false;
+};
+
+auto derive_policy_update(
+    runtime_policy_wire::session_policy policy, const std::filesystem::path& policy_path
+) -> result<prepared_policy_update> {
+    auto previous = read_policy_contents(policy_path);
+    if (!previous) {
+        return std::unexpected(previous.error());
+    }
+    if (!*previous) {
+        auto contents = encode_session_policy(policy);
+        if (!contents) {
+            return std::unexpected(contents.error());
+        }
+        return prepared_policy_update{
+            .contents = std::move(*contents),
+            .previous_contents = std::nullopt,
+            .changed = true,
+        };
+    }
+    if (auto valid = validate_session_policy_file(policy_path); !valid) {
+        return std::unexpected(std::string{"existing session policy is invalid: "} + valid.error());
+    }
+
+    runtime_policy_wire::session_policy existing_policy;
+    if (const auto decoded = glz::read_json(existing_policy, **previous)) {
+        return std::unexpected(
+            std::string{"decode existing session policy: "} + glz::format_error(decoded, **previous)
+        );
+    }
+    if (existing_policy.revision == 0) {
+        return std::unexpected(std::string{"existing session policy revision is invalid"});
+    }
+    policy.revision = existing_policy.revision;
+    auto candidate_at_existing_revision = encode_session_policy(policy);
+    if (!candidate_at_existing_revision) {
+        return std::unexpected(candidate_at_existing_revision.error());
+    }
+    auto canonical_existing = encode_session_policy(existing_policy);
+    if (!canonical_existing) {
+        return std::unexpected(canonical_existing.error());
+    }
+    if (*candidate_at_existing_revision == *canonical_existing) {
+        return prepared_policy_update{
+            .contents = std::move(*candidate_at_existing_revision),
+            .previous_contents = std::move(**previous),
+            .changed = false,
+        };
+    }
+    if (existing_policy.revision == std::numeric_limits<std::uint64_t>::max()) {
+        return std::unexpected(std::string{"session policy revision is exhausted"});
+    }
+    policy.revision = existing_policy.revision + 1U;
+    auto incremented = encode_session_policy(policy);
+    if (!incremented) {
+        return std::unexpected(incremented.error());
+    }
+    return prepared_policy_update{
+        .contents = std::move(*incremented),
+        .previous_contents = std::move(**previous),
+        .changed = true,
+    };
+}
+
+auto activate_policy_update(
+    const std::filesystem::path& policy_path, const prepared_policy_update& update
+) -> result<void> {
+    if (!update.changed) {
+        return {};
+    }
+    const auto candidate_path = std::filesystem::path{
+        policy_path.string() + ".candidate-" + std::to_string(::getpid()) + "-" +
+            std::to_string(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()
+                )
+                    .count()
+            ),
+    };
+    if (auto written = write_owner_file_exclusive(candidate_path, update.contents); !written) {
+        return std::unexpected(written.error());
+    }
+    if (auto valid = validate_session_policy_file(candidate_path); !valid) {
+        (void)::unlink(candidate_path.c_str());
+        return std::unexpected(
+            std::string{"generated session policy failed validation: "} + valid.error()
+        );
+    }
+    auto current = read_policy_contents(policy_path);
+    if (!current) {
+        (void)::unlink(candidate_path.c_str());
+        return std::unexpected(current.error());
+    }
+    if (*current != update.previous_contents) {
+        (void)::unlink(candidate_path.c_str());
+        return std::unexpected(
+            std::string{"session policy changed while its update was being prepared"}
+        );
+    }
+    if (::rename(candidate_path.c_str(), policy_path.c_str()) != 0) {
+        const auto error = system_error("activate session policy update");
+        (void)::unlink(candidate_path.c_str());
+        return std::unexpected(error);
+    }
+    const int parent =
+        ::open(policy_path.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent < 0) {
+        return std::unexpected(system_error("open session policy directory after activation"));
+    }
+    const int sync_result = ::fsync(parent);
+    const int sync_error = errno;
+    (void)::close(parent);
+    if (sync_result != 0) {
+        return std::unexpected(
+            system_error("sync session policy directory after activation", sync_error)
+        );
+    }
+    return {};
 }
 
 auto ensure_protected_directory(const std::filesystem::path& path) -> result<void> {
@@ -133,6 +484,29 @@ auto ensure_protected_directory(const std::filesystem::path& path) -> result<voi
         }
     }
     return {};
+}
+
+auto canonical_owner_secret(const std::filesystem::path& path) -> result<std::filesystem::path> {
+    if (!path.is_absolute() || path == path.root_path() || path.lexically_normal() != path) {
+        return std::unexpected(std::string{"secret source must be a normalized absolute file"});
+    }
+    struct stat link_status{};
+    if (::lstat(path.c_str(), &link_status) != 0 || S_ISLNK(link_status.st_mode)) {
+        return std::unexpected(std::string{"secret source must not be a symbolic link"});
+    }
+    std::error_code error;
+    const auto canonical = std::filesystem::canonical(path, error);
+    struct stat metadata{};
+    if (error || ::stat(canonical.c_str(), &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
+        (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0600U || metadata.st_size <= 0 ||
+        metadata.st_size > 1024 * 1024 || metadata.st_dev != link_status.st_dev ||
+        metadata.st_ino != link_status.st_ino) {
+        return std::unexpected(
+            std::string{"secret source must be one owner-only, single-link regular file"}
+        );
+    }
+    return canonical;
 }
 
 auto path_within(const std::filesystem::path& candidate, const std::filesystem::path& root) noexcept
@@ -336,6 +710,157 @@ struct runtime_dependency_closure {
     std::vector<std::filesystem::path> read_only_paths;
 };
 
+constexpr std::uint64_t max_snapshot_bytes = std::uint64_t{2} * 1024U * 1024U * 1024U;
+constexpr std::size_t max_snapshot_entries = 200'000U;
+
+auto append_snapshot_file_digest(
+    const std::filesystem::path& path,
+    std::string_view relative,
+    std::string& manifest,
+    std::uint64_t& total_bytes
+) -> result<void> {
+    const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        return std::unexpected(system_error("open harness snapshot file"));
+    }
+    struct stat metadata{};
+    if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) || metadata.st_size < 0) {
+        const auto error = system_error("inspect harness snapshot file");
+        (void)::close(descriptor);
+        return std::unexpected(error);
+    }
+    const auto size = static_cast<std::uint64_t>(metadata.st_size);
+    if (size > max_snapshot_bytes || total_bytes > max_snapshot_bytes - size) {
+        (void)::close(descriptor);
+        return std::unexpected(std::string{"harness snapshot exceeds the 2 GiB safety limit"});
+    }
+    auto digest = container::sha256_fd_hex(descriptor, std::max<std::uint64_t>(size, 1U));
+    const int close_result = ::close(descriptor);
+    if (!digest || close_result != 0) {
+        return std::unexpected(
+            digest ? system_error("close harness snapshot file")
+                   : "hash harness snapshot file: " + digest.error()
+        );
+    }
+    total_bytes += size;
+    manifest.append("f\0", 2);
+    manifest.append(relative);
+    manifest.push_back('\0');
+    manifest.append((metadata.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0 ? "x" : "-");
+    manifest.push_back('\0');
+    manifest.append(std::to_string(size));
+    manifest.push_back('\0');
+    manifest.append(*digest);
+    manifest.push_back('\0');
+    return {};
+}
+
+auto snapshot_tree_digest(
+    const std::filesystem::path& root,
+    std::uint64_t* logical_bytes = nullptr,
+    std::uint64_t* entry_count = nullptr
+) -> result<std::string> {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(root, error);
+    if (error) {
+        return std::unexpected("inspect harness snapshot root: " + error.message());
+    }
+    std::string manifest;
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_entries = 0;
+    if (std::filesystem::is_regular_file(status)) {
+        if (auto appended =
+                append_snapshot_file_digest(root, root.filename().string(), manifest, total_bytes);
+            !appended) {
+            return std::unexpected(appended.error());
+        }
+        total_entries = 1;
+    } else if (std::filesystem::is_directory(status)) {
+        std::vector<std::filesystem::path> entries;
+        for (std::filesystem::recursive_directory_iterator
+                 iterator{root, std::filesystem::directory_options::none, error},
+             end;
+             iterator != end;
+             iterator.increment(error)) {
+            if (error) {
+                return std::unexpected("enumerate harness snapshot: " + error.message());
+            }
+            if (entries.size() >= max_snapshot_entries) {
+                return std::unexpected(
+                    std::string{"harness snapshot exceeds the 200000 entry safety limit"}
+                );
+            }
+            entries.push_back(iterator->path());
+        }
+        total_entries = static_cast<std::uint64_t>(entries.size());
+        std::ranges::sort(entries, [&](const auto& left, const auto& right) {
+            return left.lexically_relative(root).generic_string() <
+                   right.lexically_relative(root).generic_string();
+        });
+        const auto canonical_root = std::filesystem::canonical(root, error);
+        if (error) {
+            return std::unexpected("canonicalize harness snapshot root: " + error.message());
+        }
+        for (const auto& entry : entries) {
+            const auto relative = entry.lexically_relative(root).generic_string();
+            const auto entry_status = std::filesystem::symlink_status(entry, error);
+            if (error) {
+                return std::unexpected("inspect harness snapshot entry: " + error.message());
+            }
+            if (std::filesystem::is_directory(entry_status)) {
+                manifest.append("d\0", 2);
+                manifest.append(relative);
+                manifest.push_back('\0');
+            } else if (std::filesystem::is_regular_file(entry_status)) {
+                if (auto appended =
+                        append_snapshot_file_digest(entry, relative, manifest, total_bytes);
+                    !appended) {
+                    return std::unexpected(appended.error());
+                }
+            } else if (std::filesystem::is_symlink(entry_status)) {
+                const auto target = std::filesystem::read_symlink(entry, error);
+                if (error || target.is_absolute()) {
+                    return std::unexpected(
+                        std::string{"harness snapshot contains an unsafe symbolic link"}
+                    );
+                }
+                const auto resolved = std::filesystem::canonical(entry, error);
+                if (error || !path_within(resolved, canonical_root)) {
+                    return std::unexpected(
+                        std::string{"harness snapshot symbolic link escapes its closure"}
+                    );
+                }
+                manifest.append("l\0", 2);
+                manifest.append(relative);
+                manifest.push_back('\0');
+                manifest.append(target.generic_string());
+                manifest.push_back('\0');
+            } else {
+                return std::unexpected(
+                    std::string{"harness snapshot contains an unsupported special file"}
+                );
+            }
+        }
+    } else {
+        return std::unexpected(std::string{"harness snapshot root must be a file or directory"});
+    }
+    const auto bytes = std::span{
+        reinterpret_cast<const unsigned char*>(manifest.data()),
+        manifest.size(),
+    };
+    auto digest = container::sha256_hex(bytes);
+    if (!digest) {
+        return std::unexpected(std::string{"hash harness snapshot manifest"});
+    }
+    if (logical_bytes != nullptr) {
+        *logical_bytes = total_bytes;
+    }
+    if (entry_count != nullptr) {
+        *entry_count = total_entries;
+    }
+    return *digest;
+}
+
 auto package_root_for(const std::filesystem::path& source) -> std::filesystem::path {
     std::error_code error;
     for (auto current = source.parent_path(); current != current.root_path();
@@ -411,6 +936,8 @@ auto derive_runtime_dependency_closure(
             );
         }
         roots.push_back(installation_root);
+    } else {
+        roots.push_back(interpreter);
     }
     return runtime_dependency_closure{
         .executable = std::move(interpreter),
@@ -419,33 +946,355 @@ auto derive_runtime_dependency_closure(
     };
 }
 
+auto path_ancestors_are_launch_trusted(const std::filesystem::path& path) -> bool {
+    std::error_code error;
+    auto current = std::filesystem::is_directory(path, error)
+                       ? std::filesystem::canonical(path, error)
+                       : std::filesystem::canonical(path, error).parent_path();
+    if (error || current.empty()) {
+        return false;
+    }
+    for (;;) {
+        struct stat metadata{};
+        if (::stat(current.c_str(), &metadata) != 0 || !S_ISDIR(metadata.st_mode) ||
+            (metadata.st_uid != 0 && metadata.st_uid != ::geteuid())) {
+            return false;
+        }
+        const bool writable_by_other = (metadata.st_mode & (S_IWGRP | S_IWOTH)) != 0;
+        const bool root_owned_sticky = metadata.st_uid == 0 && (metadata.st_mode & S_ISVTX) != 0;
+        if (writable_by_other && !root_owned_sticky) {
+            return false;
+        }
+        if (current == current.root_path()) {
+            return true;
+        }
+        current = current.parent_path();
+    }
+}
+
+auto closure_launch_is_trusted(const runtime_dependency_closure& closure) -> bool {
+    return path_ancestors_are_launch_trusted(closure.executable) &&
+           std::ranges::all_of(closure.read_only_paths, path_ancestors_are_launch_trusted);
+}
+
+struct planned_runtime_snapshot {
+    std::string digest;
+    std::uint64_t logical_bytes = 0;
+    std::uint64_t entries = 0;
+    std::filesystem::path snapshot_root;
+    std::filesystem::path payload_root;
+    std::filesystem::path mapped_source;
+    std::vector<std::filesystem::path> source_roots;
+    runtime_dependency_closure closure;
+};
+
+auto snapshot_payload_root(const std::filesystem::path& payload_root, std::size_t index)
+    -> std::filesystem::path {
+    return payload_root / ("root-" + std::to_string(index));
+}
+
+auto map_snapshot_path(
+    const std::filesystem::path& source,
+    std::span<const std::filesystem::path> closure_roots,
+    const std::filesystem::path& payload_root
+) -> result<std::filesystem::path> {
+    for (std::size_t index = 0; index < closure_roots.size(); ++index) {
+        const auto& closure_root = closure_roots[index];
+        const auto mapped_root = snapshot_payload_root(payload_root, index);
+        if (std::filesystem::is_regular_file(closure_root)) {
+            if (source == closure_root) {
+                return mapped_root / closure_root.filename();
+            }
+            continue;
+        }
+        if (path_within(source, closure_root)) {
+            return mapped_root / source.lexically_relative(closure_root);
+        }
+    }
+    return std::unexpected(std::string{"runtime path is outside its snapshot closure"});
+}
+
+auto snapshot_closure_digest(
+    std::span<const std::filesystem::path> roots,
+    std::uint64_t* logical_bytes = nullptr,
+    std::uint64_t* entry_count = nullptr
+) -> result<std::string> {
+    if (roots.empty() || roots.size() > 64U) {
+        return std::unexpected(std::string{"runtime snapshot has an invalid closure root count"});
+    }
+    std::string manifest{"glove.runtime-snapshot.v2", 25U};
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_entries = 0;
+    for (const auto& root : roots) {
+        std::uint64_t root_bytes = 0;
+        std::uint64_t root_entries = 0;
+        auto digest = snapshot_tree_digest(root, &root_bytes, &root_entries);
+        if (!digest) {
+            return std::unexpected(digest.error());
+        }
+        if (root_bytes > max_snapshot_bytes - total_bytes ||
+            root_entries > max_snapshot_entries - total_entries) {
+            return std::unexpected(
+                std::string{"combined harness snapshot exceeds its safety limit"}
+            );
+        }
+        total_bytes += root_bytes;
+        total_entries += root_entries;
+        manifest.push_back('\0');
+        manifest.append(*digest);
+    }
+    const auto bytes = std::span{
+        reinterpret_cast<const unsigned char*>(manifest.data()),
+        manifest.size(),
+    };
+    auto digest = container::sha256_hex(bytes);
+    if (!digest) {
+        return std::unexpected(std::string{"hash combined harness snapshot manifest"});
+    }
+    if (logical_bytes != nullptr) {
+        *logical_bytes = total_bytes;
+    }
+    if (entry_count != nullptr) {
+        *entry_count = total_entries;
+    }
+    return *digest;
+}
+
+auto materialized_snapshot_digest(const std::filesystem::path& payload_root, std::size_t root_count)
+    -> result<std::string> {
+    std::vector<std::filesystem::path> roots;
+    roots.reserve(root_count);
+    for (std::size_t index = 0; index < root_count; ++index) {
+        roots.push_back(snapshot_payload_root(payload_root, index));
+    }
+    return snapshot_closure_digest(roots);
+}
+
+auto plan_runtime_snapshot(
+    const std::filesystem::path& protected_directory,
+    const std::filesystem::path& source,
+    const runtime_dependency_closure& closure
+) -> result<planned_runtime_snapshot> {
+    std::uint64_t logical_bytes = 0;
+    std::uint64_t entries = 0;
+    auto digest = snapshot_closure_digest(closure.read_only_paths, &logical_bytes, &entries);
+    if (!digest) {
+        return std::unexpected(digest.error());
+    }
+    const auto snapshot_root = protected_directory / "snapshots" / *digest;
+    const auto payload_root = snapshot_root / "payload";
+    auto mapped_source = map_snapshot_path(source, closure.read_only_paths, payload_root);
+    auto mapped_executable =
+        map_snapshot_path(closure.executable, closure.read_only_paths, payload_root);
+    if (!mapped_source || !mapped_executable) {
+        return std::unexpected(!mapped_source ? mapped_source.error() : mapped_executable.error());
+    }
+    std::vector<std::string> mapped_arguments;
+    mapped_arguments.reserve(closure.arguments.size());
+    for (const auto& argument : closure.arguments) {
+        const std::filesystem::path candidate{argument};
+        if (!candidate.is_absolute()) {
+            mapped_arguments.push_back(argument);
+            continue;
+        }
+        auto mapped = map_snapshot_path(candidate, closure.read_only_paths, payload_root);
+        if (!mapped) {
+            return std::unexpected(mapped.error());
+        }
+        mapped_arguments.push_back(mapped->string());
+    }
+    return planned_runtime_snapshot{
+        .digest = std::move(*digest),
+        .logical_bytes = logical_bytes,
+        .entries = entries,
+        .snapshot_root = snapshot_root,
+        .payload_root = payload_root,
+        .mapped_source = std::move(*mapped_source),
+        .source_roots = closure.read_only_paths,
+        .closure = {
+            .executable = std::move(*mapped_executable),
+            .arguments = std::move(mapped_arguments),
+            .read_only_paths = {payload_root},
+        },
+    };
+}
+
+auto protect_snapshot_tree(const std::filesystem::path& payload_root) -> result<void> {
+    std::error_code error;
+    std::vector<std::filesystem::path> entries;
+    if (std::filesystem::is_directory(payload_root, error)) {
+        for (std::filesystem::recursive_directory_iterator
+                 iterator{payload_root, std::filesystem::directory_options::none, error},
+             end;
+             iterator != end;
+             iterator.increment(error)) {
+            if (error) {
+                return std::unexpected("enumerate staged harness snapshot: " + error.message());
+            }
+            entries.push_back(iterator->path());
+        }
+    }
+    std::ranges::reverse(entries);
+    for (const auto& entry : entries) {
+        const auto status = std::filesystem::symlink_status(entry, error);
+        if (error) {
+            return std::unexpected("inspect staged harness snapshot: " + error.message());
+        }
+        if (std::filesystem::is_symlink(status)) {
+            continue;
+        }
+        const mode_t mode =
+            std::filesystem::is_directory(status)
+                ? 0500
+                : ((status.permissions() &
+                    (std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
+                     std::filesystem::perms::others_exec)) != std::filesystem::perms::none
+                       ? 0500
+                       : 0400);
+        if (::chmod(entry.c_str(), mode) != 0) {
+            return std::unexpected(system_error("protect staged harness snapshot"));
+        }
+    }
+    if (::chmod(payload_root.c_str(), 0500) != 0) {
+        return std::unexpected(system_error("protect staged harness snapshot root"));
+    }
+    return {};
+}
+
+auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> result<bool> {
+    std::error_code error;
+    if (std::filesystem::exists(plan.snapshot_root, error)) {
+        auto existing_digest =
+            materialized_snapshot_digest(plan.payload_root, plan.source_roots.size());
+        if (!existing_digest || *existing_digest != plan.digest) {
+            return std::unexpected(
+                std::string{"existing runtime snapshot does not match its content address"}
+            );
+        }
+        return false;
+    }
+    if (error) {
+        return std::unexpected("inspect runtime snapshot: " + error.message());
+    }
+    const auto snapshots = plan.snapshot_root.parent_path();
+    if (auto prepared = ensure_protected_directory(snapshots); !prepared) {
+        return std::unexpected(prepared.error());
+    }
+    const auto temporary =
+        snapshots / (".staging-" + plan.digest + "-" + std::to_string(::getpid()));
+    if (std::filesystem::exists(temporary, error) || error) {
+        return std::unexpected(std::string{"runtime snapshot staging path already exists"});
+    }
+    if (!std::filesystem::create_directory(temporary, error) || error) {
+        return std::unexpected("create runtime snapshot staging directory: " + error.message());
+    }
+    const auto temporary_payload = temporary / "payload";
+    const auto remove_temporary = [&] {
+        std::error_code ignored;
+        std::filesystem::permissions(
+            temporary,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::add,
+            ignored
+        );
+        std::filesystem::remove_all(temporary, ignored);
+    };
+    if (!std::filesystem::create_directory(temporary_payload, error) || error) {
+        remove_temporary();
+        return std::unexpected("create runtime snapshot payload: " + error.message());
+    }
+    for (std::size_t index = 0; index < plan.source_roots.size() && !error; ++index) {
+        const auto& closure_root = plan.source_roots[index];
+        const auto destination = snapshot_payload_root(temporary_payload, index);
+        if (std::filesystem::is_directory(closure_root, error)) {
+            std::filesystem::copy(
+                closure_root,
+                destination,
+                std::filesystem::copy_options::recursive |
+                    std::filesystem::copy_options::copy_symlinks,
+                error
+            );
+        } else {
+            std::filesystem::create_directory(destination, error);
+            if (!error) {
+                std::filesystem::copy_file(
+                    closure_root,
+                    destination / closure_root.filename(),
+                    std::filesystem::copy_options::none,
+                    error
+                );
+            }
+        }
+    }
+    if (error) {
+        remove_temporary();
+        return std::unexpected("copy runtime snapshot: " + error.message());
+    }
+    auto copied_digest = materialized_snapshot_digest(temporary_payload, plan.source_roots.size());
+    if (!copied_digest || *copied_digest != plan.digest) {
+        remove_temporary();
+        return std::unexpected(
+            copied_digest ? std::string{"runtime source changed while it was being snapshotted"}
+                          : copied_digest.error()
+        );
+    }
+    if (auto protected_tree = protect_snapshot_tree(temporary_payload); !protected_tree) {
+        remove_temporary();
+        return std::unexpected(protected_tree.error());
+    }
+    if (::rename(temporary.c_str(), plan.snapshot_root.c_str()) != 0) {
+        const int rename_error = errno;
+        remove_temporary();
+        if (rename_error == EEXIST || rename_error == ENOTEMPTY) {
+            auto existing_digest =
+                materialized_snapshot_digest(plan.payload_root, plan.source_roots.size());
+            if (existing_digest && *existing_digest == plan.digest) {
+                return false;
+            }
+        }
+        return std::unexpected(system_error("publish runtime snapshot", rename_error));
+    }
+    return true;
+}
+
 } // namespace
 
 auto detect_runtime_harnesses(const std::vector<std::filesystem::path>& executable_search_paths)
     -> std::vector<detected_runtime_harness> {
-    std::vector<std::string> raw_paths;
-    raw_paths.reserve(executable_search_paths.size());
-    for (const auto& path : executable_search_paths) {
-        raw_paths.push_back(path.string());
-    }
     std::vector<detected_runtime_harness> detected;
     for (const auto& adapter : supervisor::native_skill_runtime_adapters()) {
-        supervisor::runtime_launch_template launch{
-            .runtime_discovery = adapter.runtime_id,
-            .executable_path = {},
-            .executable_search_paths = raw_paths,
-            .arguments = {},
-            .environment = {},
-            .read_only_paths = {},
-        };
-        auto resolved = supervisor::resolve_runtime_executable(launch);
+        std::filesystem::path source_entry;
+        std::string diagnostic =
+            "expected executable '" + adapter.executable_name + "' was not found";
+        for (const auto& root : executable_search_paths) {
+            if (!root.is_absolute()) {
+                diagnostic = "harness search path must be absolute";
+                continue;
+            }
+            const auto candidate = (root / adapter.executable_name).lexically_normal();
+            std::error_code error;
+            const auto resolved = std::filesystem::canonical(candidate, error);
+            const auto status =
+                error ? std::filesystem::file_status{} : std::filesystem::status(resolved, error);
+            const auto executable_bits = std::filesystem::perms::owner_exec |
+                                         std::filesystem::perms::group_exec |
+                                         std::filesystem::perms::others_exec;
+            if (!error && std::filesystem::is_regular_file(status) &&
+                (status.permissions() & executable_bits) != std::filesystem::perms::none) {
+                // Setup discovery is not launch authorization. Preserve the
+                // explicit adapter-named entry so staging can derive and copy
+                // its package/interpreter topology before launch trust runs.
+                source_entry = candidate;
+                diagnostic.clear();
+                break;
+            }
+        }
         detected.push_back({
             .runtime_id = adapter.runtime_id,
             .executable_name = adapter.executable_name,
-            .available = resolved.has_value(),
-            .resolved_executable =
-                resolved ? std::filesystem::path{*resolved} : std::filesystem::path{},
-            .diagnostic = resolved ? std::string{} : resolved.error(),
+            .available = !source_entry.empty(),
+            .resolved_executable = std::move(source_entry),
+            .diagnostic = std::move(diagnostic),
         });
     }
     return detected;
@@ -487,26 +1336,74 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
     if (!dependency_closure) {
         return std::unexpected(dependency_closure.error());
     }
+    std::optional<planned_runtime_snapshot> snapshot;
+    if (!closure_launch_is_trusted(*dependency_closure)) {
+        auto planned = plan_runtime_snapshot(directory, source, *dependency_closure);
+        if (!planned) {
+            return std::unexpected("derive protected runtime snapshot: " + planned.error());
+        }
+        snapshot = std::move(*planned);
+    }
+    const auto expected_entry_target = snapshot ? snapshot->mapped_source : source;
+    const auto& launch_closure = snapshot ? snapshot->closure : *dependency_closure;
+    struct stat existing{};
+    bool entry_exists = false;
+    bool entry_requires_update = false;
+    if (::lstat(entry_point.c_str(), &existing) == 0) {
+        const auto resolved = std::filesystem::canonical(entry_point, error);
+        if (!error && resolved == expected_entry_target) {
+            entry_exists = true;
+        } else if (
+            !error && S_ISLNK(existing.st_mode) && existing.st_uid == ::geteuid() &&
+            path_within(resolved, directory / "snapshots")
+        ) {
+            // A prior setup revision may point at an older immutable snapshot.
+            // Only that exact managed topology is replaceable; arbitrary files,
+            // directories, and links outside this adapter's snapshot store
+            // remain protected from overwrite.
+            entry_exists = true;
+            entry_requires_update = true;
+        } else {
+            return std::unexpected(
+                "refusing to overwrite existing harness entry point: " + entry_point.string()
+            );
+        }
+    } else if (errno != ENOENT) {
+        return std::unexpected(system_error("inspect harness entry point"));
+    }
     bool changed = false;
     if (!options.dry_run) {
         if (auto prepared = ensure_protected_directory(directory); !prepared) {
             return std::unexpected(prepared.error());
         }
-        struct stat existing{};
-        if (::lstat(entry_point.c_str(), &existing) == 0) {
-            const auto resolved = std::filesystem::canonical(entry_point, error);
-            if (error || resolved != source) {
-                return std::unexpected(
-                    "refusing to overwrite existing harness entry point: " + entry_point.string()
-                );
+        if (snapshot) {
+            auto materialized = materialize_runtime_snapshot(*snapshot);
+            if (!materialized) {
+                return std::unexpected(materialized.error());
             }
-        } else {
-            if (errno != ENOENT) {
-                return std::unexpected(system_error("inspect harness entry point"));
+            changed = *materialized;
+        }
+        if (!entry_exists || entry_requires_update) {
+            const auto staged_entry = directory / ("." + adapter->executable_name + ".next-" +
+                                                   std::to_string(::getpid()));
+            if (::symlink(expected_entry_target.c_str(), staged_entry.c_str()) != 0) {
+                return std::unexpected(system_error("stage protected harness entry point"));
             }
-            if (::symlink(source.c_str(), entry_point.c_str()) != 0) {
-                return std::unexpected(system_error("create protected harness entry point"));
+            if (::rename(staged_entry.c_str(), entry_point.c_str()) != 0) {
+                const auto message = system_error("activate protected harness entry point");
+                (void)::unlink(staged_entry.c_str());
+                return std::unexpected(message);
             }
+            const int directory_fd =
+                ::open(directory.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+            if (directory_fd < 0 || ::fsync(directory_fd) != 0) {
+                const auto message = system_error("sync protected harness entry point");
+                if (directory_fd >= 0) {
+                    (void)::close(directory_fd);
+                }
+                return std::unexpected(message);
+            }
+            (void)::close(directory_fd);
             changed = true;
         }
         supervisor::runtime_launch_template launch{
@@ -518,8 +1415,8 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
             .read_only_paths = {},
         };
         auto resolved = supervisor::resolve_runtime_executable(launch);
-        if (!resolved || std::filesystem::path{*resolved} != source) {
-            if (changed) {
+        if (!resolved || std::filesystem::path{*resolved} != expected_entry_target) {
+            if (!entry_exists) {
                 (void)::unlink(entry_point.c_str());
             }
             return std::unexpected(
@@ -531,11 +1428,14 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
     return staged_runtime_harness{
         .runtime_id = options.runtime_id,
         .executable_name = adapter->executable_name,
-        .source_executable = source,
+        .source_executable = options.source_executable.lexically_normal(),
         .protected_entry_point = entry_point,
-        .launch_executable = std::move(dependency_closure->executable),
-        .launch_arguments = std::move(dependency_closure->arguments),
-        .read_only_paths = std::move(dependency_closure->read_only_paths),
+        .launch_executable = launch_closure.executable,
+        .launch_arguments = launch_closure.arguments,
+        .read_only_paths = launch_closure.read_only_paths,
+        .snapshot_digest = snapshot ? snapshot->digest : std::string{},
+        .snapshot_logical_bytes = snapshot ? snapshot->logical_bytes : 0,
+        .snapshot_entries = snapshot ? snapshot->entries : 0,
         .changed = changed,
     };
 }
@@ -562,7 +1462,9 @@ auto generate_runtime_policy(const runtime_policy_generation_options& options)
                         "inherited PATH is not trusted"}
         );
     }
-    auto read_only_paths = canonical_paths(options.read_only_paths, "read_only_paths");
+    auto read_only_paths = canonical_paths(
+        options.read_only_paths, "read_only_paths", options.allow_planned_snapshot_paths
+    );
     if (!read_only_paths) {
         return std::unexpected(read_only_paths.error());
     }
@@ -588,7 +1490,9 @@ auto generate_runtime_policy(const runtime_policy_generation_options& options)
         launch.runtime_discovery = options.runtime_id;
         launch.executable_search_paths = std::move(*search_paths);
     } else {
-        auto executable = canonical_paths({options.executable_path}, "executable_path");
+        auto executable = canonical_paths(
+            {options.executable_path}, "executable_path", options.allow_planned_snapshot_paths
+        );
         if (!executable) {
             return std::unexpected(executable.error());
         }
@@ -597,8 +1501,16 @@ auto generate_runtime_policy(const runtime_policy_generation_options& options)
         constexpr auto executable_bits = std::filesystem::perms::owner_exec |
                                          std::filesystem::perms::group_exec |
                                          std::filesystem::perms::others_exec;
-        if (error || !std::filesystem::is_regular_file(status) ||
-            (status.permissions() & executable_bits) == std::filesystem::perms::none) {
+        const bool planned_executable =
+            options.allow_planned_snapshot_paths && error &&
+            std::ranges::any_of(*read_only_paths, [&](const auto& root) {
+                return path_within(
+                    std::filesystem::path{executable->front()}, std::filesystem::path{root}
+                );
+            });
+        if (!planned_executable &&
+            (error || !std::filesystem::is_regular_file(status) ||
+             (status.permissions() & executable_bits) == std::filesystem::perms::none)) {
             return std::unexpected(
                 std::string{"executable_path must resolve to an executable regular file"}
             );
@@ -643,6 +1555,306 @@ auto generate_runtime_policy(const runtime_policy_generation_options& options)
         .resolved_executable = std::filesystem::path{*executable},
         .adapter_command_digest = std::move(*digest),
         .policy_template_json = std::move(*json),
+    };
+}
+
+auto prepare_session_policy(const session_policy_prepare_options& options)
+    -> result<prepared_session_policy> {
+    if (options.executable_search_paths.empty()) {
+        return std::unexpected(
+            std::string{"at least one explicit harness search path is required"}
+        );
+    }
+    if (!options.protected_harness_root.is_absolute() || !options.workspace_root.is_absolute() ||
+        !options.policy_path.is_absolute()) {
+        return std::unexpected(
+            std::string{"harness root, workspace root, and policy path must be absolute"}
+        );
+    }
+    std::error_code error;
+    const auto harness_root =
+        std::filesystem::weakly_canonical(options.protected_harness_root, error);
+    if (error || harness_root == harness_root.root_path()) {
+        return std::unexpected(std::string{"protected harness root is invalid"});
+    }
+    const auto workspace = std::filesystem::canonical(options.workspace_root, error);
+    if (error || !std::filesystem::is_directory(workspace)) {
+        return std::unexpected(std::string{"workspace root must be an existing directory"});
+    }
+    const auto policy_parent = std::filesystem::weakly_canonical(
+        options.policy_path.lexically_normal().parent_path(), error
+    );
+    if (error) {
+        return std::unexpected("canonicalize session policy directory: " + error.message());
+    }
+    const auto policy_path = policy_parent / options.policy_path.filename();
+    if (policy_path == policy_path.root_path() || policy_path.filename().empty()) {
+        return std::unexpected(std::string{"session policy path is invalid"});
+    }
+
+    auto detections = detect_runtime_harnesses(options.executable_search_paths);
+    auto selected_runtimes =
+        canonical_identifiers(options.selected_runtime_ids, "selected_runtime_ids");
+    if (!selected_runtimes) {
+        return std::unexpected(selected_runtimes.error());
+    }
+    std::vector<staged_runtime_harness> planned_runtimes;
+    std::vector<runtime_policy_wire::runtime_template> templates;
+    for (const auto& detected : detections) {
+        if (!detected.available ||
+            (!selected_runtimes->empty() &&
+             !std::ranges::binary_search(*selected_runtimes, detected.runtime_id))) {
+            continue;
+        }
+        auto staged = stage_runtime_harness({
+            .runtime_id = detected.runtime_id,
+            .source_executable = detected.resolved_executable,
+            .protected_directory = harness_root / detected.runtime_id,
+            .dry_run = true,
+        });
+        if (!staged) {
+            return std::unexpected(
+                "derive " + detected.runtime_id + " launch closure: " + staged.error()
+            );
+        }
+        auto generated = generate_runtime_policy({
+            .runtime_id = detected.runtime_id,
+            .runtime_template_id = detected.runtime_id + "-safe",
+            .backend = options.backend,
+            .executable_path = staged->launch_executable,
+            .executable_search_paths = {},
+            .arguments = staged->launch_arguments,
+            .environment = {},
+            .read_only_paths = staged->read_only_paths,
+            .allowed_path_aliases = {"workspace"},
+            .allowed_projection_destinations = {"libraries"},
+            .allow_planned_snapshot_paths = !staged->snapshot_digest.empty(),
+        });
+        if (!generated) {
+            return std::unexpected(
+                "generate " + detected.runtime_id + " template: " + generated.error()
+            );
+        }
+        runtime_policy_wire::runtime_template policy_template;
+        if (const auto decoded = glz::read_json(policy_template, generated->policy_template_json)) {
+            return std::unexpected(
+                "decode generated " + detected.runtime_id +
+                " template: " + glz::format_error(decoded, generated->policy_template_json)
+            );
+        }
+        planned_runtimes.push_back(std::move(*staged));
+        templates.push_back(std::move(policy_template));
+    }
+    if (planned_runtimes.empty()) {
+        return std::unexpected(
+            selected_runtimes->empty()
+                ? std::string{"none of the supported harnesses were found in the explicit search "
+                              "paths"}
+                : std::string{"none of the selected harnesses were found in the explicit search "
+                              "paths"}
+        );
+    }
+    for (const auto& selected : *selected_runtimes) {
+        if (!std::ranges::any_of(planned_runtimes, [&](const auto& runtime) {
+                return runtime.runtime_id == selected;
+            })) {
+            return std::unexpected(
+                "selected runtime is not available in the explicit search paths: " + selected
+            );
+        }
+    }
+
+    constexpr std::uint64_t mebibyte = std::uint64_t{1024} * 1024U;
+    std::vector<std::string> egress_policy_ids = {"no-network"};
+    std::vector<runtime_policy_wire::egress_policy> egress_policies;
+    egress_policies.reserve(options.egress_policies.size());
+    std::set<std::string> egress_ids;
+    for (const auto& egress : options.egress_policies) {
+        if (!valid_identifier(egress.policy_id) || egress.policy_id == "no-network" ||
+            egress.targets.empty() || egress.targets.size() > 128U ||
+            !egress_ids.insert(egress.policy_id).second) {
+            return std::unexpected(std::string{"online egress policy is invalid or duplicated"});
+        }
+        egress_policy_ids.push_back(egress.policy_id);
+        runtime_policy_wire::egress_policy encoded_egress{
+            .policy_id = egress.policy_id,
+            .targets = {},
+        };
+        std::set<std::pair<std::string, std::uint16_t>> targets;
+        encoded_egress.targets.reserve(egress.targets.size());
+        for (const auto& target : egress.targets) {
+            if (target.host.empty() || target.host.size() > 253U || target.port == 0 ||
+                target.host.find('\0') != std::string::npos ||
+                std::ranges::any_of(
+                    target.host, [](unsigned char byte) { return byte <= 0x20U || byte == 0x7fU; }
+                ) ||
+                !targets.emplace(target.host, target.port).second) {
+                return std::unexpected(
+                    std::string{"online egress target is invalid or duplicated"}
+                );
+            }
+            encoded_egress.targets.push_back({
+                .host = target.host,
+                .port = target.port,
+                .allow_private = target.allow_private,
+            });
+        }
+        egress_policies.push_back(std::move(encoded_egress));
+    }
+    std::vector<std::string> secret_handles;
+    std::vector<runtime_policy_wire::secret_mount_policy> secret_mounts;
+    secret_handles.reserve(options.secret_mounts.size());
+    secret_mounts.reserve(options.secret_mounts.size());
+    std::set<std::string> handles;
+    std::set<std::pair<std::string, std::string>> secret_targets;
+    for (const auto& secret : options.secret_mounts) {
+        const bool runtime_exists = std::ranges::any_of(planned_runtimes, [&](const auto& runtime) {
+            return runtime.runtime_id == secret.runtime_id;
+        });
+        const std::filesystem::path target{secret.target_path};
+        const std::filesystem::path managed_home{"/home/agent"};
+        auto source = canonical_owner_secret(secret.source_path);
+        const auto home_mismatch =
+            std::mismatch(managed_home.begin(), managed_home.end(), target.begin(), target.end());
+        if (!source || !valid_identifier(secret.handle) || secret.handle.size() > 120U ||
+            !valid_identifier(secret.runtime_id) || !runtime_exists || !target.is_absolute() ||
+            target.lexically_normal() != target || target == managed_home ||
+            home_mismatch.first != managed_home.end() || !handles.insert(secret.handle).second ||
+            !secret_targets.emplace(secret.runtime_id, secret.target_path).second) {
+            return std::unexpected(
+                source ? std::string{"secret mount is invalid or duplicated"} : source.error()
+            );
+        }
+        secret_handles.push_back(secret.handle);
+        secret_mounts.push_back({
+            .handle = secret.handle,
+            .runtime_id = secret.runtime_id,
+            .source_path = source->string(),
+            .target_path = secret.target_path,
+        });
+    }
+    runtime_policy_wire::session_policy policy{
+        .runtime_templates = std::move(templates),
+        .path_aliases = {{
+            .alias = "workspace",
+            .host_path = workspace.string(),
+            .target_path = "/workspace",
+            .max_ttl_secs = 86'400,
+            .access =
+                {
+                    {
+                        .access = "read",
+                        .materialization = "bind",
+                        .create_policy = "never",
+                        .cleanup_policy = "retain",
+                        .max_bytes = 0,
+                    },
+                    {
+                        .access = "ephemeral_write",
+                        .materialization = "copy",
+                        .create_policy = "empty_directory",
+                        .cleanup_policy = "remove",
+                        .max_bytes = 1024U * mebibyte,
+                    },
+                    {
+                        .access = "retained_write",
+                        .materialization = "copy",
+                        .create_policy = "empty_directory",
+                        .cleanup_policy = "retain",
+                        .max_bytes = 1024U * mebibyte,
+                    },
+                },
+        }},
+        .library_projection_destinations = {{
+            .alias = "libraries",
+            .target_path = "/opt/sage/library-bundles",
+        }},
+        .resource_profiles =
+            {
+                {
+                    .profile_id = "small",
+                    .cpu_time_ms = 60'000,
+                    .memory_bytes = 1024U * mebibyte,
+                    // Node-based harnesses account runtime worker threads against the
+                    // cgroup pids controller. Keep the profile bounded while leaving
+                    // enough headroom for deterministic and short agent turns.
+                    .pids = 256,
+                    .wall_time_ms = 120'000,
+                    .disk_bytes = 2048U * mebibyte,
+                    .terminal_output_bytes = 16U * mebibyte,
+                },
+                {
+                    // Model-backed interactive turns may spend most of their
+                    // lifetime waiting on audited egress. Keep that use explicit
+                    // instead of silently weakening the small probe profile.
+                    .profile_id = "interactive",
+                    .cpu_time_ms = 120'000,
+                    .memory_bytes = 1024U * mebibyte,
+                    .pids = 256,
+                    .wall_time_ms = 300'000,
+                    .disk_bytes = 2048U * mebibyte,
+                    .terminal_output_bytes = 16U * mebibyte,
+                },
+            },
+        .egress_policy_ids = std::move(egress_policy_ids),
+        .tool_policy_ids = {"sage-readonly"},
+        .secret_handles = std::move(secret_handles),
+        .egress_policies = std::move(egress_policies),
+        .secret_mounts = std::move(secret_mounts),
+    };
+    std::optional<policy_update_lock> update_lock;
+    if (!options.dry_run) {
+        if (auto prepared = ensure_protected_directory(policy_path.parent_path()); !prepared) {
+            return std::unexpected(prepared.error());
+        }
+        auto acquired = policy_update_lock::acquire(policy_path);
+        if (!acquired) {
+            return std::unexpected(acquired.error());
+        }
+        update_lock.emplace(std::move(*acquired));
+    }
+    auto update = derive_policy_update(std::move(policy), policy_path);
+    if (!update) {
+        return std::unexpected(update.error());
+    }
+    if (options.dry_run) {
+        return prepared_session_policy{
+            .policy_path = policy_path,
+            .detections = std::move(detections),
+            .runtimes = std::move(planned_runtimes),
+            .policy_json = std::move(update->contents),
+            .changed = update->changed,
+            .dry_run = true,
+        };
+    }
+
+    bool changed = false;
+    std::vector<staged_runtime_harness> applied_runtimes;
+    applied_runtimes.reserve(planned_runtimes.size());
+    for (const auto& runtime : planned_runtimes) {
+        auto staged = stage_runtime_harness({
+            .runtime_id = runtime.runtime_id,
+            .source_executable = runtime.source_executable,
+            .protected_directory = harness_root / runtime.runtime_id,
+            .dry_run = false,
+        });
+        if (!staged) {
+            return std::unexpected("stage " + runtime.runtime_id + ": " + staged.error());
+        }
+        changed = changed || staged->changed;
+        applied_runtimes.push_back(std::move(*staged));
+    }
+    if (auto activated = activate_policy_update(policy_path, *update); !activated) {
+        return std::unexpected(activated.error());
+    }
+    changed = changed || update->changed;
+    return prepared_session_policy{
+        .policy_path = policy_path,
+        .detections = std::move(detections),
+        .runtimes = std::move(applied_runtimes),
+        .policy_json = std::move(update->contents),
+        .changed = changed,
+        .dry_run = false,
     };
 }
 

@@ -99,6 +99,19 @@ auto valid_plan_at(std::uint64_t now_ms) -> std::string {
     return plan;
 }
 
+auto managed_plan() -> std::string {
+    auto plan = valid_plan();
+    const auto offset = plan.find(R"("sandbox_backend":"linux_production")");
+    if (offset != std::string::npos) {
+        plan.replace(
+            offset,
+            std::string_view{R"("sandbox_backend":"linux_production")"}.size(),
+            R"("sandbox_backend":"apple_container")"
+        );
+    }
+    return plan;
+}
+
 auto direct_write_plan() -> std::string {
     auto plan = valid_plan();
     const std::string ephemeral =
@@ -185,7 +198,11 @@ auto filesystem_identity() -> glove::control::linux_filesystem_recovery_identity
     };
 }
 
-auto validator_for(const std::filesystem::path& source)
+auto validator_for(
+    const std::filesystem::path& source,
+    glove::supervisor::sandbox_backend backend =
+        glove::supervisor::sandbox_backend::linux_production
+)
     -> glove::supervisor::result<glove::supervisor::session_plan_validator> {
     using namespace glove::supervisor;
     auto paths = path_alias_registry::build({
@@ -225,7 +242,7 @@ auto validator_for(const std::filesystem::path& source)
                         .runtime_template_id = "codex-safe",
                         .runtime_id = "codex",
                         .adapter_command_digest = runtime_digest(),
-                        .backend = sandbox_backend::linux_production,
+                        .backend = backend,
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {"libraries"},
                         .launch = launch_template(),
@@ -252,6 +269,16 @@ auto validator_for(const std::filesystem::path& source)
             .egress_policy_ids = {"no-network"},
             .tool_policy_ids = {"sage-readonly"},
             .secret_handles = {"codex-token"},
+            .egress_policies = {},
+            .secret_mounts =
+                {
+                    secret_mount_policy{
+                        .handle = "codex-token",
+                        .runtime_id = "codex",
+                        .source_path = (source / "codex-auth.json").string(),
+                        .target_path = "/home/agent/.codex/auth.json",
+                    },
+                },
         },
         std::move(*paths)
     );
@@ -364,12 +391,22 @@ auto run() -> int {
     REQUIRE((*registry)->record_count() == 1);
 
     auto reserved = (*registry)->reserve_start(authorization, "reserve-session-1", 1'002);
+    if (!reserved) {
+        std::fprintf(stderr, "reserve_start failed: %s\n", reserved.error().message.c_str());
+    }
     REQUIRE(reserved.has_value());
     REQUIRE(reserved->session.state == glove::control::session_state::preparing);
     REQUIRE(reserved->authorization_id == authorization.authorization_id);
     REQUIRE(reserved->authorization_expires_at_ms == authorization.expires_at_ms);
     REQUIRE(reserved->launch.runtime_template_id == "codex-safe");
-    REQUIRE(reserved->launch.argv == std::vector<std::string>({"/usr/bin/true", "--version"}));
+    REQUIRE(
+        reserved->launch.argv ==
+        std::vector<std::string>({
+            "/usr/bin/true",
+            "--version",
+            "--dangerously-bypass-approvals-and-sandbox",
+        })
+    );
     REQUIRE((*registry)->record_count() == 2);
     REQUIRE(
         !(*registry)->resolve_start_inputs("session-1", "approval-session-wrong", 1'002).has_value()
@@ -1090,8 +1127,146 @@ auto run() -> int {
     return 0;
 }
 
+auto run_managed_runtime_registry() -> int {
+    temporary_directory temp;
+    REQUIRE(!temp.root().empty());
+    const auto source = temp.root() / "source";
+    REQUIRE(std::filesystem::create_directory(source));
+    auto validator =
+        validator_for(source, glove::supervisor::sandbox_backend::apple_container);
+    REQUIRE(validator.has_value());
+    auto shared_validator =
+        std::make_shared<const glove::supervisor::session_plan_validator>(std::move(*validator));
+    const auto store_path = temp.root() / "managed-sessions.journal";
+    auto registry =
+        glove::control::session_registry::open_or_create(store_path, shared_validator);
+    REQUIRE(registry.has_value());
+    auto created = (*registry)->create(
+        "managed-session", controller_digest, managed_plan(), "managed-create", 1'000
+    );
+    REQUIRE(created.has_value());
+    const glove::control::session_start_authorization authorization{
+        .schema_version = 1,
+        .authorization_id = "managed-approval",
+        .session_id = created->session_id,
+        .controller_plan_digest = created->controller_plan_digest,
+        .plan_content_digest = created->plan_content_digest,
+        .approved_at_ms = 1'001,
+        .expires_at_ms = 5'000,
+    };
+    REQUIRE((*registry)->reserve_start(authorization, "managed-reserve", 1'002).has_value());
+
+    const auto audit_key_path = temp.root() / "managed-receipt.key";
+    {
+        std::ofstream output{audit_key_path, std::ios::binary | std::ios::trunc};
+        output << audit_key << '\n';
+    }
+    REQUIRE(::chmod(audit_key_path.c_str(), 0600) == 0);
+    auto producer = glove::container::receipt_audit_producer::initialize({
+        .key_path = audit_key_path,
+        .journal_path = temp.root() / "managed-receipts.journal",
+    });
+    REQUIRE(producer.has_value());
+    REQUIRE((*producer)->acknowledge_bootstrap((*producer)->anchor()).has_value());
+    const glove::control::managed_runtime_recovery_identity runtime_identity{
+        .schema_version = 1,
+        .backend = "apple_container",
+        .instance_id = "glove-managed-session",
+        .launch_identity_digest = std::string(64, '7'),
+    };
+    const glove::control::managed_session_execution_binding binding{
+        .schema_version = 1,
+        .session_id = created->session_id,
+        .controller_plan_digest = created->controller_plan_digest,
+        .plan_content_digest = created->plan_content_digest,
+        .authorization_id = authorization.authorization_id,
+        .profile_digest = std::string(64, '8'),
+        .runtime_identity = runtime_identity,
+    };
+    auto receipt_reservation = (*producer)->reserve_terminal(
+        binding.session_id, binding.controller_plan_digest, binding.profile_digest
+    );
+    REQUIRE(receipt_reservation.has_value());
+    auto starting = (*registry)->mark_managed_starting(
+        binding, *receipt_reservation, "managed-starting", 1'003
+    );
+    REQUIRE(starting.has_value());
+    REQUIRE(starting->runtime_identity == runtime_identity);
+    REQUIRE((*registry)->managed_recovery_candidates()->size() == 1);
+    REQUIRE((*registry)->recovery_candidates()->empty());
+    REQUIRE(
+        (*registry)->mark_managed_starting(
+            binding, *receipt_reservation, "managed-starting", 9'000
+        ) == starting
+    );
+    auto changed_binding = binding;
+    changed_binding.runtime_identity.instance_id = "changed-instance";
+    REQUIRE(!(*registry)
+                 ->mark_managed_starting(
+                     changed_binding, *receipt_reservation, "managed-starting", 1'004
+                 )
+                 .has_value());
+
+    const glove::control::managed_session_running_commitment running_commitment{
+        .schema_version = 1,
+        .session_id = binding.session_id,
+        .controller_plan_digest = binding.controller_plan_digest,
+        .plan_content_digest = binding.plan_content_digest,
+        .authorization_id = binding.authorization_id,
+        .profile_digest = binding.profile_digest,
+        .runtime_identity = runtime_identity,
+    };
+    auto running = (*registry)->mark_managed_running(
+        running_commitment, *receipt_reservation, "managed-running", 1'004
+    );
+    REQUIRE(running.has_value());
+    REQUIRE(running->session.state == glove::control::session_state::running);
+    auto stopping =
+        (*registry)->mark_managed_stopping(running_commitment, "managed-stopping", 1'005);
+    REQUIRE(stopping.has_value());
+    REQUIRE(stopping->session.state == glove::control::session_state::stopping);
+
+    registry->reset();
+    registry = glove::control::session_registry::open_or_create(store_path, shared_validator);
+    REQUIRE(registry.has_value());
+    auto recovered = (*registry)->managed_recovery_candidates();
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->size() == 1);
+    REQUIRE(recovered->front() == *stopping);
+
+    auto receipt = terminal_receipt(binding.profile_digest, 1'003, 1'006);
+    receipt.backend = glove::container::sandbox_backend::apple_container;
+    receipt.backend_id = "apple-container:vm-v1";
+    auto terminal = (*producer)->commit_terminal(
+        std::move(*receipt_reservation),
+        binding.session_id,
+        binding.controller_plan_digest,
+        std::move(receipt)
+    );
+    REQUIRE(terminal.has_value());
+    auto exited =
+        (*registry)->mark_managed_exited(*terminal, **producer, "managed-exited");
+    REQUIRE(exited.has_value());
+    REQUIRE(exited->lifecycle.runtime_identity == runtime_identity);
+    REQUIRE(exited->termination_cause == glove::container::resource_termination_cause::exited);
+    REQUIRE((*registry)->managed_recovery_candidates()->empty());
+
+    registry->reset();
+    registry = glove::control::session_registry::open_or_create(store_path, shared_validator);
+    REQUIRE(registry.has_value());
+    REQUIRE((*registry)->record_count() == 6);
+    REQUIRE(
+        (*registry)->managed_lifecycle_status(binding.session_id)->session.state ==
+        glove::control::session_state::exited
+    );
+    return 0;
+}
+
 } // namespace
 
 int main() {
-    return run();
+    if (const auto result = run(); result != 0) {
+        return result;
+    }
+    return run_managed_runtime_registry();
 }

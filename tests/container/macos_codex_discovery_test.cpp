@@ -134,7 +134,7 @@ auto run_runtime(
                 .runtime_template_id = std::string{runtime.id} + "-local",
                 .runtime_id = std::string{runtime.id},
                 .adapter_command_digest = *digest,
-                .backend = sandbox_backend::macos_experimental,
+                .backend = sandbox_backend::apple_container,
                 .allowed_path_aliases = {"workspace"},
                 .allowed_projection_destinations = {"libraries"},
                 .launch = launch,
@@ -153,7 +153,9 @@ auto run_runtime(
             }},
             .egress_policy_ids = {"no-network"},
             .tool_policy_ids = {"sage-readonly"},
-            .secret_handles = {std::string{runtime.id} + "-token"},
+            .secret_handles = {},
+            .egress_policies = {},
+            .secret_mounts = {},
         },
         std::move(*paths)
     );
@@ -162,12 +164,10 @@ auto run_runtime(
         R"({"schema_version":1,"runtime_id":")" + std::string{runtime.id} +
         R"(","runtime_template_id":")" + std::string{runtime.id} +
         R"(-local","adapter_command_digest":")" + *digest +
-        R"(","sandbox_backend":"macos_experimental","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"alias":"workspace","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","destination_alias":"libraries"}],"secret_handles":[")" +
-        std::string{runtime.id} +
-        R"(-token"],"limits":{"cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":1048576,"terminal_output_bytes":1048576},"policy_revision":1,"expires_at_ms":61000})";
+        R"(","sandbox_backend":"apple_container","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"alias":"workspace","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","destination_alias":"libraries"}],"secret_handles":[],"limits":{"cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":1048576,"terminal_output_bytes":1048576},"policy_revision":1,"expires_at_ms":61000})";
     auto resolved = validator->resolve_runtime_launch_json(plan, 1'000);
     REQUIRE(resolved.has_value());
-    REQUIRE(resolved->backend == sandbox_backend::macos_experimental);
+    REQUIRE(resolved->backend == sandbox_backend::apple_container);
     REQUIRE(std::filesystem::path{resolved->argv.front()}.is_absolute());
     // Harness distributions may resolve to a versioned Mach-O or an entrypoint
     // script. Assert policy resolution, not packaging-specific basenames.

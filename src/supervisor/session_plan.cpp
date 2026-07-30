@@ -142,6 +142,24 @@ struct resource_profile_policy {
     }
 };
 
+struct egress_target_policy {
+    std::string host;
+    std::uint16_t port = 443;
+    bool allow_private = false;
+};
+
+struct egress_policy {
+    std::string policy_id;
+    std::vector<egress_target_policy> targets;
+};
+
+struct secret_mount_policy {
+    std::string handle;
+    std::string runtime_id;
+    std::string source_path;
+    std::string target_path;
+};
+
 struct session_plan_policy {
     std::uint8_t schema_version = 0;
     std::uint64_t revision = 0;
@@ -153,6 +171,8 @@ struct session_plan_policy {
     std::vector<std::string> egress_policy_ids;
     std::vector<std::string> tool_policy_ids;
     std::vector<std::string> secret_handles;
+    std::vector<egress_policy> egress_policies;
+    std::vector<secret_mount_policy> secret_mounts;
 };
 
 } // namespace wire
@@ -170,6 +190,7 @@ constexpr std::size_t max_runtime_templates = 64U;
 constexpr std::size_t max_resource_profiles = 64U;
 constexpr std::size_t max_policy_identifiers = 128U;
 constexpr std::size_t max_projection_destinations = 128U;
+constexpr std::size_t max_egress_targets = 128U;
 constexpr std::size_t max_launch_fields = 256U;
 constexpr std::size_t max_launch_string_bytes = std::size_t{64} * 1024U;
 constexpr std::size_t max_launch_path_bytes = 4'096U;
@@ -339,13 +360,9 @@ auto validate_runtime_launch_template_impl(const runtime_launch_template& launch
                 "] must be a canonical absolute non-root path"
             );
         }
-        if (!discovered_adapter &&
-            (path_within(path, executable) || path_within(executable, path))) {
-            return std::unexpected(
-                "launch.read_only_paths[" + std::to_string(index) +
-                "] overlaps launch.executable_path"
-            );
-        }
+        // A package/interpreter closure may contain the pinned executable.
+        // The Linux composer layers the executable descriptor after these
+        // read-only roots, preserving its separately committed identity.
         if (std::ranges::any_of(paths, [&](const auto& existing) {
                 return path_within(path, existing) || path_within(existing, path);
             })) {
@@ -530,6 +547,9 @@ auto canonical_unique(const std::vector<Value>& values, Projection projection) -
 auto parse_backend(std::string_view value) -> std::expected<sandbox_backend, std::string> {
     if (value == "linux_production") {
         return sandbox_backend::linux_production;
+    }
+    if (value == "apple_container") {
+        return sandbox_backend::apple_container;
     }
     if (value == "macos_experimental") {
         return sandbox_backend::macos_experimental;
@@ -848,6 +868,61 @@ auto validate_secret_projection(const wire::session_plan& plan, const session_pl
     return {};
 }
 
+auto valid_egress_policies(const session_plan_policy& policy) -> bool {
+    if (policy.egress_policies.size() > max_policy_identifiers) {
+        return false;
+    }
+    std::set<std::string> identifiers;
+    for (const auto& egress : policy.egress_policies) {
+        if (!valid_identifier(egress.policy_id) ||
+            !contains(policy.egress_policy_ids, egress.policy_id) ||
+            !identifiers.insert(egress.policy_id).second ||
+            egress.targets.size() > max_egress_targets) {
+            return false;
+        }
+        std::set<std::pair<std::string, std::uint16_t>> targets;
+        for (const auto& target : egress.targets) {
+            if (target.host.empty() || target.host.size() > 253U || target.port == 0 ||
+                target.host.find('\0') != std::string::npos ||
+                std::ranges::any_of(
+                    target.host, [](unsigned char byte) { return byte <= 0x20U || byte == 0x7fU; }
+                ) ||
+                !targets.emplace(target.host, target.port).second) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+auto valid_secret_mounts(const session_plan_policy& policy) -> bool {
+    if (policy.secret_mounts.size() > max_policy_identifiers) {
+        return false;
+    }
+    std::set<std::string> handles;
+    std::set<std::pair<std::string, std::string>> targets;
+    const std::filesystem::path managed_home{"/home/agent"};
+    for (const auto& secret : policy.secret_mounts) {
+        const std::filesystem::path source{secret.source_path};
+        const std::filesystem::path target{secret.target_path};
+        const bool runtime_exists =
+            std::ranges::any_of(policy.runtime_templates, [&](const auto& runtime) {
+                return runtime.runtime_id == secret.runtime_id;
+            });
+        if (!valid_identifier(secret.handle) || secret.handle.size() > 120U ||
+            !valid_identifier(secret.runtime_id) ||
+            !contains(policy.secret_handles, secret.handle) || !runtime_exists ||
+            !source.is_absolute() || source == source.root_path() ||
+            source.lexically_normal() != source || !target.is_absolute() ||
+            target.lexically_normal() != target || target == managed_home ||
+            !path_within(target, managed_home) || !handles.insert(secret.handle).second ||
+            !targets.emplace(secret.runtime_id, secret.target_path).second) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 auto validate_runtime_launch_template(const runtime_launch_template& launch) -> result<void> {
@@ -1024,7 +1099,9 @@ auto session_plan_validator::load(
         encoded.library_projection_destinations.size() > max_projection_destinations ||
         encoded.egress_policy_ids.size() > max_policy_identifiers ||
         encoded.tool_policy_ids.size() > max_policy_identifiers ||
-        encoded.secret_handles.size() > max_policy_identifiers) {
+        encoded.secret_handles.size() > max_policy_identifiers ||
+        encoded.egress_policies.size() > max_policy_identifiers ||
+        encoded.secret_mounts.size() > max_policy_identifiers) {
         return std::unexpected(std::string{"session policy collection exceeds its bound"});
     }
 
@@ -1106,6 +1183,33 @@ auto session_plan_validator::load(
         }
         resource_profiles.push_back(limits);
     }
+    std::vector<egress_policy> egress_policies;
+    egress_policies.reserve(encoded.egress_policies.size());
+    for (auto& egress : encoded.egress_policies) {
+        std::vector<egress_target_policy> targets;
+        targets.reserve(egress.targets.size());
+        for (auto& target : egress.targets) {
+            targets.push_back({
+                .host = std::move(target.host),
+                .port = target.port,
+                .allow_private = target.allow_private,
+            });
+        }
+        egress_policies.push_back({
+            .policy_id = std::move(egress.policy_id),
+            .targets = std::move(targets),
+        });
+    }
+    std::vector<secret_mount_policy> secret_mounts;
+    secret_mounts.reserve(encoded.secret_mounts.size());
+    for (auto& secret : encoded.secret_mounts) {
+        secret_mounts.push_back({
+            .handle = std::move(secret.handle),
+            .runtime_id = std::move(secret.runtime_id),
+            .source_path = std::move(secret.source_path),
+            .target_path = std::move(secret.target_path),
+        });
+    }
     return build(
         session_plan_policy{
             .revision = encoded.revision,
@@ -1116,6 +1220,8 @@ auto session_plan_validator::load(
             .egress_policy_ids = std::move(encoded.egress_policy_ids),
             .tool_policy_ids = std::move(encoded.tool_policy_ids),
             .secret_handles = std::move(encoded.secret_handles),
+            .egress_policies = std::move(egress_policies),
+            .secret_mounts = std::move(secret_mounts),
         },
         std::move(*path_registry),
         std::move(exposures)
@@ -1136,7 +1242,8 @@ auto session_plan_validator::build(
         policy.secret_handles.size() > max_policy_identifiers ||
         !valid_projection_destinations(policy.library_projection_destinations) ||
         !unique_identifiers(policy.egress_policy_ids) ||
-        !unique_identifiers(policy.tool_policy_ids) || !unique_identifiers(policy.secret_handles)) {
+        !unique_identifiers(policy.tool_policy_ids) || !unique_identifiers(policy.secret_handles) ||
+        !valid_egress_policies(policy) || !valid_secret_mounts(policy)) {
         return std::unexpected(std::string{"session plan policy is incomplete"});
     }
 
@@ -1167,13 +1274,24 @@ auto session_plan_validator::build(
     }
 
     for (std::size_t index = 0; index < policy.resource_profiles.size(); ++index) {
-        if (!complete_limits(policy.resource_profiles[index]) ||
+        const auto& profile = policy.resource_profiles[index];
+        const bool plan_outlives_sandbox =
+            profile.wall_time_ms <= std::numeric_limits<std::uint64_t>::max() - 1'000U &&
+            policy.max_plan_ttl_ms >= profile.wall_time_ms + 1'000U;
+        if (!complete_limits(profile) || !plan_outlives_sandbox ||
             std::ranges::find(
                 policy.resource_profiles.begin(),
                 policy.resource_profiles.begin() + static_cast<std::ptrdiff_t>(index),
-                policy.resource_profiles[index]
+                profile
             ) != policy.resource_profiles.begin() + static_cast<std::ptrdiff_t>(index)) {
-            return std::unexpected(std::string{"session plan resource policy is invalid"});
+            return std::unexpected(
+                plan_outlives_sandbox
+                    ? std::string{"session plan resource policy is invalid"}
+                    : std::string{
+                          "session plan policy TTL must outlive every sandbox wall limit by at "
+                          "least one second"
+                      }
+            );
         }
     }
 
@@ -1344,9 +1462,46 @@ auto session_plan_validator::resolve_runtime_launch_json(
         return std::unexpected(executable.error());
     }
     std::vector<std::string> argv;
-    argv.reserve(launch.arguments.size() + 1U);
+    const auto adapter = native_skill_runtime_adapter_for(runtime->runtime_id);
+    if (adapter &&
+        (adapter->managed_arguments.size() > max_launch_fields - launch.arguments.size() ||
+         std::ranges::any_of(adapter->managed_arguments, [&](const auto& managed) {
+             return std::ranges::find(launch.arguments, managed) != launch.arguments.end();
+         }))) {
+        return std::unexpected(
+            std::string{"runtime launch conflicts with managed adapter arguments"}
+        );
+    }
+    argv.reserve(
+        launch.arguments.size() + 1U + (adapter ? adapter->managed_arguments.size() : 0U)
+    );
     argv.push_back(std::move(*executable));
     argv.insert(argv.end(), launch.arguments.begin(), launch.arguments.end());
+    if (adapter) {
+        argv.insert(
+            argv.end(), adapter->managed_arguments.begin(), adapter->managed_arguments.end()
+        );
+    }
+    std::vector<egress_target_policy> egress_targets;
+    const auto egress = std::ranges::find_if(policy_.egress_policies, [&](const auto& candidate) {
+        return candidate.policy_id == plan.egress_policy_id;
+    });
+    if (egress != policy_.egress_policies.end()) {
+        egress_targets = egress->targets;
+    } else if (plan.egress_policy_id != "no-network" && plan.egress_policy_id != "deny-all") {
+        return std::unexpected(std::string{"runtime egress policy is unavailable"});
+    }
+    std::vector<secret_mount_policy> secret_mounts;
+    secret_mounts.reserve(plan.secret_handles.size());
+    for (const auto& handle : plan.secret_handles) {
+        const auto secret = std::ranges::find_if(policy_.secret_mounts, [&](const auto& candidate) {
+            return candidate.handle == handle && candidate.runtime_id == runtime->runtime_id;
+        });
+        if (secret == policy_.secret_mounts.end()) {
+            return std::unexpected(std::string{"runtime secret broker is unavailable"});
+        }
+        secret_mounts.push_back(*secret);
+    }
     return runtime_launch_projection{
         .validation = *validation,
         .runtime_id = runtime->runtime_id,
@@ -1358,10 +1513,12 @@ auto session_plan_validator::resolve_runtime_launch_json(
         .read_only_paths = launch.read_only_paths,
         .limits = plan.limits,
         .expires_at_ms = plan.expires_at_ms,
-        .requires_direct_write_approval =
-            std::ranges::any_of(plan.path_grants, [](const auto& grant) {
-                return grant.access == "direct_write";
-            }),
+        .requires_direct_write_approval = std::ranges::any_of(
+            plan.path_grants, [](const auto& grant) { return grant.access == "direct_write"; }
+        ),
+        .egress_policy_id = plan.egress_policy_id,
+        .egress_targets = std::move(egress_targets),
+        .secret_mounts = std::move(secret_mounts),
     };
 }
 

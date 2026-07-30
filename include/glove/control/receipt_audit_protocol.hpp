@@ -2,6 +2,7 @@
 
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/session_registry.hpp"
+#include "glove/control/session_runtime.hpp"
 #include "glove/supervisor/path_exposure.hpp"
 #include "glove/supervisor/session_plan.hpp"
 
@@ -13,10 +14,6 @@
 #include <string_view>
 
 namespace glove::control {
-
-namespace linux_detail {
-class linux_session_runtime;
-}
 
 inline constexpr std::size_t max_control_frame_bytes = std::size_t{1024} * 1024U;
 
@@ -46,7 +43,7 @@ public:
         std::shared_ptr<container::receipt_audit_producer> producer,
         std::shared_ptr<const supervisor::session_plan_validator> plan_validator = {},
         std::shared_ptr<session_registry> sessions = {},
-        std::shared_ptr<linux_detail::linux_session_runtime> session_runtime = {},
+        std::shared_ptr<session_runtime> managed_runtime = {},
         std::shared_ptr<supervisor::path_exposure_registry> path_exposures = {},
         std::string materialization_root = {}
     ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string>;
@@ -59,7 +56,7 @@ public:
         container::receipt_audit_producer_config producer_config,
         std::shared_ptr<const supervisor::session_plan_validator> plan_validator = {},
         std::shared_ptr<session_registry> sessions = {},
-        std::shared_ptr<linux_detail::linux_session_runtime> session_runtime = {},
+        std::shared_ptr<session_runtime> managed_runtime = {},
         std::shared_ptr<supervisor::path_exposure_registry> path_exposures = {},
         std::string materialization_root = {}
     ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string>;

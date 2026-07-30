@@ -1,13 +1,17 @@
+#include "glove/audit/sink.hpp"
 #include "glove/control/receipt_audit_unix_server.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/host/config.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/path_exposure_journal.hpp"
 #include "glove/supervisor/session_plan.hpp"
+#include "glove/version.hpp"
 
 #if defined(__linux__)
 #    include "linux_session_executor.hpp"
 #    include "linux_session_preparation.hpp"
+#elif defined(__APPLE__)
+#    include "control/apple_container_session_runtime.hpp"
 #endif
 
 #include <fcntl.h>
@@ -99,6 +103,7 @@ struct options {
     std::optional<std::filesystem::path> library_bundle_root;
     std::optional<std::filesystem::path> path_exposure_policy;
     std::optional<std::filesystem::path> path_exposure_journal;
+    std::optional<glove::host::apple_container_config> apple_container;
 };
 
 auto parse_options(int argc, char** argv) -> std::expected<options, std::string> {
@@ -117,6 +122,7 @@ auto parse_options(int argc, char** argv) -> std::expected<options, std::string>
             .library_bundle_root = configured->library_bundle_root,
             .path_exposure_policy = configured->path_exposure_policy,
             .path_exposure_journal = configured->path_exposure_journal,
+            .apple_container = configured->apple_container,
         };
     }
     if (argc < 7 || argc > 19 || argc % 2 == 0) {
@@ -234,6 +240,7 @@ auto parse_options(int argc, char** argv) -> std::expected<options, std::string>
     parsed.library_bundle_root = std::move(library_bundle_root);
     parsed.path_exposure_policy = std::move(path_exposure_policy);
     parsed.path_exposure_journal = std::move(path_exposure_journal);
+    parsed.apple_container = std::nullopt;
     return parsed;
 }
 
@@ -525,15 +532,20 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         }
         sessions = std::shared_ptr<glove::control::session_registry>{std::move(*opened)};
     }
-    std::shared_ptr<glove::control::linux_detail::linux_session_runtime> session_runtime;
+    std::shared_ptr<glove::control::session_runtime> session_runtime;
 #if defined(__linux__)
     std::optional<glove::control::linux_detail::linux_session_preparer> session_preparer;
     if (configured.materialization_root) {
         if (auto valid = validate_materialization_root(*configured.materialization_root); !valid) {
             return std::unexpected(valid.error());
         }
+        auto audit =
+            glove::audit::make_jsonl_sink(configured.journal.parent_path() / "egress-audit.jsonl");
+        if (!audit) {
+            return std::unexpected(std::string{"open egress audit journal: "} + audit.error());
+        }
         auto prepared = glove::control::linux_detail::linux_session_preparer::create(
-            configured.materialization_root->string()
+            configured.materialization_root->string(), std::move(*audit)
         );
         if (!prepared) {
             return std::unexpected(
@@ -551,9 +563,48 @@ auto run(const options& configured) -> std::expected<void, std::string> {
             std::move(*runtime)
         };
     }
+#elif defined(__APPLE__)
+    if (configured.apple_container) {
+        if (!configured.materialization_root || !sessions) {
+            return std::unexpected(
+                std::string{"Apple Container runtime requires managed-session storage"}
+            );
+        }
+        auto audit =
+            glove::audit::make_jsonl_sink(configured.journal.parent_path() / "egress-audit.jsonl");
+        if (!audit) {
+            return std::unexpected(std::string{"open egress audit journal: "} + audit.error());
+        }
+        auto runtime =
+            glove::control::apple_detail::apple_container_session_runtime::create(
+                *sessions,
+                {
+                    .container_cli = configured.apple_container->cli,
+                    .image_reference = configured.apple_container->image,
+                    .image_digest = configured.apple_container->image_digest,
+                    .harness_closure_digest =
+                        configured.apple_container->harness_closure_digest,
+                    .egress_audit = std::move(*audit),
+                    .session_root = *configured.materialization_root,
+                }
+            );
+        if (!runtime) {
+            return std::unexpected(
+                std::string{"create Apple Container session runtime: "} + runtime.error()
+            );
+        }
+        session_runtime =
+            std::shared_ptr<glove::control::apple_detail::apple_container_session_runtime>{
+                std::move(*runtime)
+            };
+    } else if (configured.materialization_root) {
+        return std::unexpected(
+            std::string{"managed session launch requires Apple Container configuration"}
+        );
+    }
 #else
     if (configured.materialization_root) {
-        return std::unexpected(std::string{"managed session launch requires Linux"});
+        return std::unexpected(std::string{"managed session launch is unsupported"});
     }
 #endif
     if (auto recovered = remove_stale_socket(runtime_directory->get()); !recovered) {
@@ -612,6 +663,11 @@ void print_usage() {
 
 auto main(int argc, char** argv) -> int {
     try {
+        if (argc == 2 &&
+            (std::string_view{argv[1]} == "-V" || std::string_view{argv[1]} == "--version")) {
+            std::cout << "gloved " << glove::version << '\n';
+            return 0;
+        }
         auto configured = parse_options(argc, argv);
         if (!configured) {
             print_usage();

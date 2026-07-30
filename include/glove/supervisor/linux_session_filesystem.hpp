@@ -28,6 +28,10 @@ struct session_mount {
     // are not controller input and are committed by managed_launch_binding.
     std::optional<std::string> runtime_adapter_id;
     std::optional<std::string> runtime_context_digest;
+    // Present only for a local secret-handle projection. The handle and
+    // runtime identity are committed; source paths and secret bytes are not.
+    std::optional<std::string> secret_handle;
+    std::optional<std::string> secret_runtime_id;
     bool writable = false;
     bool directory = false;
 };

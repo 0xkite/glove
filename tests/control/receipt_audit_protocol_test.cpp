@@ -181,6 +181,7 @@ struct supervisor_capabilities {
     receipt_audit_capabilities receipt_audit;
     session_control_capabilities session_control;
     std::uint8_t agent_runtime_adapter_schema_version = 0;
+    std::vector<std::string> managed_runtime_ids;
     std::uint8_t path_exposure_admin_schema_version = 0;
     std::uint8_t path_exposure_catalog_schema_version = 0;
     std::uint8_t retained_write_schema_version = 0;
@@ -315,6 +316,8 @@ auto plan_validator_for(const std::filesystem::path& source)
             .egress_policy_ids = {"no-network"},
             .tool_policy_ids = {"sage-readonly"},
             .secret_handles = {"codex-token"},
+            .egress_policies = {},
+            .secret_mounts = {},
         },
         std::move(*paths)
     );
@@ -445,6 +448,7 @@ auto run() -> int {
     REQUIRE(!capabilities.session_control.stop_session);
     REQUIRE(!capabilities.session_control.cleanup_session);
     REQUIRE(capabilities.agent_runtime_adapter_schema_version == 0);
+    REQUIRE(capabilities.managed_runtime_ids.empty());
     REQUIRE(capabilities.path_exposure_admin_schema_version == 0);
     REQUIRE(capabilities.path_exposure_catalog_schema_version == 0);
     REQUIRE(capabilities.retained_write_schema_version == 0);
@@ -461,7 +465,7 @@ auto run() -> int {
         REQUIRE(backend.resource_enforcement.receipt_schema_version == 0);
     }
     REQUIRE(capabilities.backends[0].backend == "linux_production");
-    REQUIRE(capabilities.backends[1].backend == "macos_experimental");
+    REQUIRE(capabilities.backends[1].backend == "apple_container");
 
     constexpr std::array<std::string_view, 11> unavailable_session_methods{
         "validate_plan",

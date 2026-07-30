@@ -91,7 +91,7 @@ auto same_file(const struct stat& left, const struct stat& right) -> bool {
            modification_time_matches(left, right);
 }
 
-auto load_policy(const std::filesystem::path& path) -> result<std::string> {
+auto load_policy_contents(const std::filesystem::path& path) -> result<std::string> {
     if (!path.is_absolute()) {
         return std::unexpected(std::string{"path exposure policy path must be absolute"});
     }
@@ -176,14 +176,9 @@ auto parse_cleanup(std::string_view value) -> result<path_cleanup_policy> {
     return std::unexpected(std::string{"path exposure policy cleanup is invalid"});
 }
 
-} // namespace
-
-auto path_exposure_registry::load(
-    const std::filesystem::path& policy_path,
-    const std::filesystem::path& journal_path,
-    std::uint64_t max_journal_bytes
-) -> result<path_exposure_registry> {
-    auto contents = load_policy(policy_path);
+auto parse_policy(const std::filesystem::path& policy_path)
+    -> result<std::vector<path_exposure_root_policy>> {
+    auto contents = load_policy_contents(policy_path);
     if (!contents) {
         return std::unexpected(contents.error());
     }
@@ -219,7 +214,30 @@ auto path_exposure_registry::load(
             .allowed_runtime_template_ids = std::move(encoded_root.allowed_runtime_template_ids),
         });
     }
-    return open(std::move(roots), journal_path, max_journal_bytes);
+    return roots;
+}
+
+} // namespace
+
+auto path_exposure_registry::inspect_policy(const std::filesystem::path& policy_path)
+    -> result<path_exposure_registry> {
+    auto roots = parse_policy(policy_path);
+    if (!roots) {
+        return std::unexpected(roots.error());
+    }
+    return build(std::move(*roots));
+}
+
+auto path_exposure_registry::load(
+    const std::filesystem::path& policy_path,
+    const std::filesystem::path& journal_path,
+    std::uint64_t max_journal_bytes
+) -> result<path_exposure_registry> {
+    auto roots = parse_policy(policy_path);
+    if (!roots) {
+        return std::unexpected(roots.error());
+    }
+    return open(std::move(*roots), journal_path, max_journal_bytes);
 }
 
 } // namespace glove::supervisor

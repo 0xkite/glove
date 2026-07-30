@@ -412,6 +412,8 @@ auto scratch_mount(int source_fd, std::string target, std::string alias, std::ui
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .secret_handle = std::nullopt,
+        .secret_runtime_id = std::nullopt,
         .writable = true,
         .directory = true,
     };
@@ -498,6 +500,8 @@ auto append_read_mount(const resolved_path_grant& grant, std::vector<session_mou
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .secret_handle = std::nullopt,
+        .secret_runtime_id = std::nullopt,
         .writable = false,
         .directory = static_cast<bool>(S_ISDIR(mode)),
     };
@@ -537,6 +541,8 @@ auto append_ephemeral_mount(
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .secret_handle = std::nullopt,
+        .secret_runtime_id = std::nullopt,
         .writable = true,
         .directory = materialized->is_directory(),
     };
@@ -574,6 +580,8 @@ auto append_library_mounts(
             .projection_destination_alias = projection.destination_alias,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .secret_handle = std::nullopt,
+            .secret_runtime_id = std::nullopt,
             .writable = false,
             .directory = false,
         };

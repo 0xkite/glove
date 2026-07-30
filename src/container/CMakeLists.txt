@@ -17,7 +17,13 @@ target_include_directories(glove_container
 )
 
 if(APPLE)
-    target_sources(glove_container PRIVATE macos/sandbox_spawner.cpp)
+    target_sources(glove_container PRIVATE
+        macos/sandbox_spawner.cpp
+        linux/pty_session_channel.cpp
+    )
+    target_include_directories(glove_container PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/linux
+    )
 
     # Sanitized test agents load one compiler runtime dylib before main().  A
     # deny-default sandbox must grant that exact image or the loader terminates

@@ -68,6 +68,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .secret_handle = std::nullopt,
+            .secret_runtime_id = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -83,6 +85,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .secret_handle = std::nullopt,
+            .secret_runtime_id = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -103,6 +107,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .secret_handle = std::nullopt,
+            .secret_runtime_id = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -123,6 +129,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .secret_handle = std::nullopt,
+            .secret_runtime_id = std::nullopt,
             .writable = false,
             .directory = true,
         },
@@ -160,6 +168,26 @@ auto run() -> int {
     auto argv_binding = make_binding(first_profile, changed_argv, first_mounts);
     REQUIRE(argv_binding.has_value());
     REQUIRE(argv_binding->profile_digest != first->profile_digest);
+
+    auto workspace_profile = first_profile;
+    workspace_profile.work_dir = "/workspace";
+    auto workspace_binding = make_binding(workspace_profile, argv, first_mounts);
+    REQUIRE(workspace_binding.has_value());
+    REQUIRE(workspace_binding->profile_digest != first->profile_digest);
+
+    auto invalid_work_dir = first_profile;
+    invalid_work_dir.work_dir = "/tmp";
+    REQUIRE(!make_binding(invalid_work_dir, argv, first_mounts).has_value());
+
+    auto unbacked_work_dir_mounts = first_mounts;
+    for (auto& mount : unbacked_work_dir_mounts) {
+        if (mount.target_path == "/workspace/project") {
+            mount.target_path = "/project";
+        } else if (mount.target_path == "/workspace/reference") {
+            mount.target_path = "/reference";
+        }
+    }
+    REQUIRE(!make_binding(workspace_profile, argv, unbacked_work_dir_mounts).has_value());
 
     auto changed_mounts = first_mounts;
     changed_mounts[0].target_path = "/workspace/tmp";
@@ -213,6 +241,8 @@ auto run() -> int {
         .projection_destination_alias = "libraries",
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .secret_handle = std::nullopt,
+        .secret_runtime_id = std::nullopt,
         .writable = false,
         .directory = false,
     });
@@ -255,6 +285,66 @@ auto run() -> int {
     auto changed_egress_capability = make_binding(online_profile, argv, first_mounts);
     REQUIRE(changed_egress_capability.has_value());
     REQUIRE(changed_egress_capability->profile_digest != online_binding->profile_digest);
+
+    auto credentialed_profile = first_profile;
+    credentialed_profile.managed_home_dir = "/home/agent";
+    auto credentialed_mounts = first_mounts;
+    credentialed_mounts.push_back({
+        .descriptor_fd = 16,
+        .target_path = "/home/agent",
+        .alias = "__runtime_home_codex",
+        .quota_partition = "__scratch",
+        .quota_bytes = limits().disk_bytes * 3U / 4U,
+        .source_identity = std::nullopt,
+        .source_content_digest = std::nullopt,
+        .projection_id = std::nullopt,
+        .projection_destination_alias = std::nullopt,
+        .runtime_adapter_id = "codex",
+        .runtime_context_digest = std::string(64U, 'c'),
+        .secret_handle = std::nullopt,
+        .secret_runtime_id = std::nullopt,
+        .writable = true,
+        .directory = true,
+    });
+    credentialed_mounts.push_back({
+        .descriptor_fd = 17,
+        .target_path = "/home/agent/.codex/auth.json",
+        .alias = "secret:codex-auth",
+        .quota_partition = "",
+        .quota_bytes = 0,
+        .source_identity =
+            glove::supervisor::path_identity{
+                .device = 7,
+                .inode = 14,
+                .mode = static_cast<std::uint32_t>(S_IFREG | 0600),
+            },
+        .source_content_digest = std::nullopt,
+        .projection_id = std::nullopt,
+        .projection_destination_alias = std::nullopt,
+        .runtime_adapter_id = std::nullopt,
+        .runtime_context_digest = std::nullopt,
+        .secret_handle = "codex-auth",
+        .secret_runtime_id = "codex",
+        .writable = true,
+        .directory = false,
+    });
+    auto credentialed_binding = make_binding(credentialed_profile, argv, credentialed_mounts);
+    REQUIRE(credentialed_binding.has_value());
+    REQUIRE(credentialed_binding->profile_digest != first->profile_digest);
+    credentialed_profile.work_dir = "/home/agent";
+    auto private_home_binding = make_binding(credentialed_profile, argv, credentialed_mounts);
+    REQUIRE(private_home_binding.has_value());
+    REQUIRE(private_home_binding->profile_digest != credentialed_binding->profile_digest);
+    credentialed_profile.work_dir = "/tmp";
+    REQUIRE(!make_binding(credentialed_profile, argv, credentialed_mounts).has_value());
+
+    auto mismatched_secret = credentialed_mounts;
+    mismatched_secret.back().secret_runtime_id = "claude";
+    REQUIRE(!make_binding(credentialed_profile, argv, mismatched_secret).has_value());
+
+    auto secret_outside_home = credentialed_mounts;
+    secret_outside_home.back().target_path = "/run/secrets/codex-auth";
+    REQUIRE(!make_binding(credentialed_profile, argv, secret_outside_home).has_value());
 
     std::string executable_pattern = "/tmp/glove-launch-binding-exec-XXXXXX";
     const int executable_fd = ::mkstemp(executable_pattern.data());

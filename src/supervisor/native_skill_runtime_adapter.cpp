@@ -88,6 +88,14 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .home_mount_alias = "__runtime_home_codex",
             .skill_root_components = {".codex", "skills"},
             .managed_environment = {"CODEX_HOME=/home/agent/.codex"},
+            .managed_arguments = {"--dangerously-bypass-approvals-and-sandbox"},
+            .managed_configuration =
+                native_skill_runtime_configuration{
+                    .filename = "config.toml",
+                    .contents =
+                        "[projects.\"/home/agent\"]\n"
+                        "trust_level = \"trusted\"\n",
+                },
         };
     }
     if (runtime_id == "claude-code") {
@@ -97,6 +105,8 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .home_mount_alias = "__runtime_home_claude-code",
             .skill_root_components = {".claude", "skills"},
             .managed_environment = {},
+            .managed_arguments = {},
+            .managed_configuration = std::nullopt,
         };
     }
     if (runtime_id == "pi") {
@@ -106,6 +116,8 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .home_mount_alias = "__runtime_home_pi",
             .skill_root_components = {".pi", "agent", "skills"},
             .managed_environment = {},
+            .managed_arguments = {},
+            .managed_configuration = std::nullopt,
         };
     }
     if (runtime_id == "copilot") {
@@ -115,6 +127,8 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .home_mount_alias = "__runtime_home_copilot",
             .skill_root_components = {".copilot", "skills"},
             .managed_environment = {"COPILOT_HOME=/home/agent/.copilot"},
+            .managed_arguments = {},
+            .managed_configuration = std::nullopt,
         };
     }
     if (runtime_id == "opencode") {
@@ -124,6 +138,8 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .home_mount_alias = "__runtime_home_opencode",
             .skill_root_components = {".config", "opencode", "skills"},
             .managed_environment = {"XDG_CONFIG_HOME=/home/agent/.config"},
+            .managed_arguments = {},
+            .managed_configuration = std::nullopt,
         };
     }
     return std::nullopt;
@@ -196,12 +212,41 @@ auto native_skill_runtime_projection_digest(
     }
     canonical_encoder encoder;
     for (const std::string_view value : {
-             std::string_view{"glove.native-skill-runtime-projection"},
+             std::string_view{"glove.native-skill-runtime-projection-v2"},
              std::string_view{adapter.runtime_id},
+             std::string_view{adapter.executable_name},
+             std::string_view{adapter.home_mount_alias},
              std::string_view{*skill_digest},
          }) {
         if (auto appended = encoder.append_string(value); !appended) {
             return std::unexpected(appended.error());
+        }
+    }
+    for (const auto& values : {
+             std::span<const std::string>{adapter.skill_root_components},
+             std::span<const std::string>{adapter.managed_environment},
+             std::span<const std::string>{adapter.managed_arguments},
+         }) {
+        if (auto appended = encoder.append_size(values.size()); !appended) {
+            return std::unexpected(appended.error());
+        }
+        for (const auto& value : values) {
+            if (auto appended = encoder.append_string(value); !appended) {
+                return std::unexpected(appended.error());
+            }
+        }
+    }
+    if (auto appended = encoder.append_size(adapter.managed_configuration ? 1U : 0U); !appended) {
+        return std::unexpected(appended.error());
+    }
+    if (adapter.managed_configuration) {
+        for (const std::string_view value : {
+                 std::string_view{adapter.managed_configuration->filename},
+                 std::string_view{adapter.managed_configuration->contents},
+             }) {
+            if (auto appended = encoder.append_string(value); !appended) {
+                return std::unexpected(appended.error());
+            }
         }
     }
     auto digest = container::sha256_hex(encoder.bytes());
@@ -234,6 +279,32 @@ auto materialize_native_skill_runtime_projection(
         }
         opened_directories.push_back(*directory);
         parent_fd = *directory;
+    }
+    if (adapter.managed_configuration) {
+        const int configuration_root_fd = opened_directories.front();
+        const int configuration_fd = ::openat(
+            configuration_root_fd,
+            adapter.managed_configuration->filename.c_str(),
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            0600
+        );
+        if (configuration_fd < 0) {
+            for (const int descriptor : opened_directories) {
+                ::close(descriptor);
+            }
+            return std::unexpected(errno_message("create native runtime configuration"));
+        }
+        auto wrote = write_all(configuration_fd, adapter.managed_configuration->contents);
+        const int sync_status = ::fsync(configuration_fd);
+        ::close(configuration_fd);
+        if (!wrote || sync_status != 0) {
+            for (const int descriptor : opened_directories) {
+                ::close(descriptor);
+            }
+            return std::unexpected(
+                wrote ? errno_message("sync native runtime configuration") : wrote.error()
+            );
+        }
     }
     for (const auto& skill : projection.skills) {
         const auto directory = skill.projection_id + "-" + skill.key;

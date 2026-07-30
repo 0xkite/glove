@@ -105,6 +105,8 @@ auto backend_name(sandbox_backend backend) noexcept -> std::string_view {
     switch (backend) {
     case sandbox_backend::linux_production:
         return "linux_production";
+    case sandbox_backend::apple_container:
+        return "apple_container";
     case sandbox_backend::macos_experimental:
         return "macos_experimental";
     }

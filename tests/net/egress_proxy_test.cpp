@@ -9,11 +9,14 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <thread>
 
@@ -89,6 +92,21 @@ auto connect_loopback(std::uint16_t port) -> int {
         return -1;
     }
     return s;
+}
+
+auto connect_unix(const std::filesystem::path& path) -> int {
+    const int socket = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket < 0 || path.string().size() >= sizeof(::sockaddr_un::sun_path)) {
+        return -1;
+    }
+    ::sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path.c_str(), path.string().size() + 1U);
+    if (::connect(socket, reinterpret_cast<::sockaddr*>(&address), sizeof(address)) != 0) {
+        ::close(socket);
+        return -1;
+    }
+    return socket;
 }
 
 auto read_some(int fd) -> std::string {
@@ -180,6 +198,46 @@ auto run() -> int {
 
     REQUIRE(allowed_events.load() == 1);
     REQUIRE(denied_events.load() == 2);
+
+    // Apple Container receives this broker through a forwarded Unix socket;
+    // authentication and allow-list behavior are identical to the loopback
+    // listener, while the advertised port names only the guest relay.
+    {
+        origin_server unix_origin;
+        REQUIRE(unix_origin.start());
+        std::string temporary = "/tmp/glove-egress-unix-test-XXXXXX";
+        REQUIRE(::mkdtemp(temporary.data()) != nullptr);
+        REQUIRE(::chmod(temporary.c_str(), 0700) == 0);
+        const auto socket_path = std::filesystem::path{temporary} / "egress.sock";
+        glove::net::egress_options unix_options;
+        unix_options.allow = {
+            {.host = "localhost", .port = unix_origin.port, .allow_private = true}
+        };
+        auto unix_proxy_or = glove::net::start_egress_proxy_on_unix_socket(
+            std::move(unix_options), socket_path, 31'820
+        );
+        REQUIRE(unix_proxy_or.has_value());
+        auto unix_proxy = std::move(*unix_proxy_or);
+        REQUIRE(unix_proxy->port() == 31'820);
+        int connection = connect_unix(socket_path);
+        REQUIRE(connection >= 0);
+        std::string request =
+            "CONNECT localhost:" + std::to_string(unix_origin.port) +
+            " HTTP/1.1\r\nProxy-Authorization: " + unix_proxy->proxy_authorization() +
+            "\r\n\r\n";
+        REQUIRE(
+            ::write(connection, request.data(), request.size()) ==
+            static_cast<::ssize_t>(request.size())
+        );
+        const std::string response = read_some(connection);
+        ::close(connection);
+        REQUIRE(response.find("200 Connection Established") != std::string::npos);
+        REQUIRE(response.find("ORIGIN_HELLO") != std::string::npos);
+        unix_proxy.reset();
+        REQUIRE(!std::filesystem::exists(socket_path));
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+    }
 
     // A hostname grant still cannot target loopback/private space unless the
     // rule says so explicitly.

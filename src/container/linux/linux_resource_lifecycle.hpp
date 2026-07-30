@@ -78,8 +78,15 @@ public:
     [[nodiscard]] auto limits() const noexcept -> const resource_limits& { return limits_; }
 
     [[nodiscard]] auto mounts() const -> std::vector<supervisor::linux_detail::session_mount> {
-        return filesystem_.mounts();
+        auto mounts = filesystem_.mounts();
+        mounts.insert(mounts.end(), secret_mounts_.begin(), secret_mounts_.end());
+        return mounts;
     }
+
+    [[nodiscard]] auto install_secret_mounts(
+        std::vector<supervisor::linux_detail::session_mount> mounts,
+        std::vector<int> lease_locks = {}
+    ) -> std::expected<void, std::string>;
 
     [[nodiscard]] auto finish(int wait_status, std::uint64_t finished_at_ms)
         -> std::expected<linux_resource_terminal_observation, std::string>;
@@ -94,6 +101,7 @@ private:
     [[nodiscard]] auto cleanup_cgroup() -> std::expected<void, std::string>;
     [[nodiscard]] auto cleanup_filesystem() -> std::expected<void, std::string>;
     [[nodiscard]] auto cleanup_resources() -> std::expected<void, std::string>;
+    void release_secret_resources() noexcept;
 
     cgroup_v2_session cgroup_;
     supervisor::linux_detail::linux_session_filesystem filesystem_;
@@ -116,6 +124,11 @@ private:
     bool filesystem_cleaned_ = false;
     std::optional<linux_resource_terminal_observation> pending_terminal_;
     std::optional<linux_resource_terminal_observation> terminal_;
+    std::vector<supervisor::linux_detail::session_mount> secret_mounts_;
+    // These descriptors carry exclusive flock(2) leases for rotating
+    // credentials. They intentionally outlive process creation and remain
+    // held until the child and its isolated resources are terminal.
+    std::vector<int> secret_lease_locks_;
 };
 
 } // namespace glove::container::linux_detail

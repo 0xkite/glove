@@ -167,6 +167,7 @@ struct linux_pty_session::implementation {
     std::uint64_t started_at_ms = 0;
     std::optional<session_running_commitment> running_commitment;
     std::unique_ptr<container::linux_detail::managed_pty_session> managed;
+    std::unique_ptr<net::egress_proxy> egress_proxy;
     std::mutex transition_mutex;
     std::mutex state_mutex;
     std::condition_variable state_changed;
@@ -535,6 +536,11 @@ auto linux_session_runtime::create(
     }
 }
 
+auto linux_session_runtime::resource_capabilities() const noexcept
+    -> container::resource_enforcement_capabilities {
+    return container::linux_detail::managed_session_capabilities();
+}
+
 auto linux_session_runtime::start(
     container::receipt_audit_producer& receipt_producer,
     const session_start_authorization& authorization,
@@ -626,9 +632,21 @@ auto linux_session_runtime::list() const -> std::expected<std::vector<std::strin
 
 auto linux_session_runtime::read(
     std::string_view session_id, std::uint64_t cursor, std::size_t max_bytes
-) const -> std::expected<container::linux_detail::pty_transcript_read, std::string> {
-    return state_ ? state_->sessions->read(session_id, cursor, max_bytes)
-                  : std::unexpected(std::string{"Linux session runtime is empty"});
+) const -> std::expected<session_transcript_read, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"Linux session runtime is empty"});
+    }
+    auto result = state_->sessions->read(session_id, cursor, max_bytes);
+    if (!result) {
+        return std::unexpected(result.error());
+    }
+    return session_transcript_read{
+        .oldest_cursor = result->oldest_cursor,
+        .next_cursor = result->next_cursor,
+        .truncated = result->truncated,
+        .eof = result->eof,
+        .bytes = std::move(result->bytes),
+    };
 }
 
 auto linux_session_runtime::wait_read(
@@ -636,9 +654,21 @@ auto linux_session_runtime::wait_read(
     std::uint64_t cursor,
     std::size_t max_bytes,
     std::uint64_t timeout_ms
-) -> std::expected<container::linux_detail::pty_transcript_read, std::string> {
-    return state_ ? state_->sessions->wait_read(session_id, cursor, max_bytes, timeout_ms)
-                  : std::unexpected(std::string{"Linux session runtime is empty"});
+) -> std::expected<session_transcript_read, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"Linux session runtime is empty"});
+    }
+    auto result = state_->sessions->wait_read(session_id, cursor, max_bytes, timeout_ms);
+    if (!result) {
+        return std::unexpected(result.error());
+    }
+    return session_transcript_read{
+        .oldest_cursor = result->oldest_cursor,
+        .next_cursor = result->next_cursor,
+        .truncated = result->truncated,
+        .eof = result->eof,
+        .bytes = std::move(result->bytes),
+    };
 }
 
 auto linux_session_runtime::write_input(std::string_view session_id, std::string_view bytes)
@@ -654,11 +684,24 @@ auto linux_session_runtime::resize(
                   : std::unexpected(std::string{"Linux session runtime is empty"});
 }
 
-auto linux_session_runtime::signal(
-    std::string_view session_id, container::linux_detail::pty_session_signal requested
-) -> std::expected<void, std::string> {
-    return state_ ? state_->sessions->signal(session_id, requested)
-                  : std::unexpected(std::string{"Linux session runtime is empty"});
+auto linux_session_runtime::signal(std::string_view session_id, session_signal requested)
+    -> std::expected<void, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"Linux session runtime is empty"});
+    }
+    container::linux_detail::pty_session_signal translated;
+    switch (requested) {
+    case session_signal::interrupt:
+        translated = container::linux_detail::pty_session_signal::interrupt;
+        break;
+    case session_signal::terminate:
+        translated = container::linux_detail::pty_session_signal::terminate;
+        break;
+    case session_signal::hangup:
+        translated = container::linux_detail::pty_session_signal::hangup;
+        break;
+    }
+    return state_->sessions->signal(session_id, translated);
 }
 
 auto linux_session_runtime::stop(std::string_view session_id) -> std::expected<void, std::string> {
@@ -673,9 +716,28 @@ auto linux_session_runtime::stop(std::string_view session_id, std::string_view i
 }
 
 auto linux_session_runtime::wait(std::string_view session_id)
-    -> std::expected<session_exited_record, std::string> {
-    return state_ ? state_->sessions->wait(session_id)
-                  : std::unexpected(std::string{"Linux session runtime is empty"});
+    -> std::expected<session_terminal_record, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"Linux session runtime is empty"});
+    }
+    auto exited = state_->sessions->wait(session_id);
+    if (!exited) {
+        return std::unexpected(exited.error());
+    }
+    return session_terminal_record{
+        .session = exited->session,
+        .profile_digest = exited->profile_digest,
+        .starting_at_ms = exited->starting_at_ms,
+        .running_at_ms = exited->running_at_ms,
+        .stopping_at_ms = exited->stopping_at_ms,
+        .finished_at_ms = exited->finished_at_ms,
+        .receipt_key_id = exited->receipt_key_id,
+        .receipt_sequence = exited->receipt_sequence,
+        .receipt_digest = exited->receipt_digest,
+        .receipt_hmac = exited->receipt_hmac,
+        .termination_cause = exited->termination_cause,
+        .exit_code = exited->exit_code,
+    };
 }
 
 auto linux_session_runtime::cleanup(std::string_view session_id)
@@ -750,6 +812,7 @@ auto start_linux_pty_session(
     } catch (const std::bad_alloc&) {
         return std::unexpected(std::string{"allocate Linux PTY session owner"});
     }
+    owner->state_->egress_proxy = std::move(prepared->egress_proxy);
     auto starting = registry.mark_starting(
         prepared->execution_binding(), owner->state_->reservation, starting_key, transition_time()
     );

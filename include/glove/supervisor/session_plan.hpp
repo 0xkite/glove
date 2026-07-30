@@ -16,6 +16,9 @@ namespace glove::supervisor {
 
 enum class sandbox_backend : std::uint8_t {
     linux_production,
+    apple_container,
+    // Decode-only compatibility for policies emitted before Apple Container
+    // became the default macOS shipping backend.
     macos_experimental,
 };
 
@@ -71,7 +74,7 @@ struct runtime_template_policy {
     std::string runtime_template_id;
     std::string runtime_id;
     std::string adapter_command_digest;
-    sandbox_backend backend = sandbox_backend::macos_experimental;
+    sandbox_backend backend = sandbox_backend::apple_container;
     std::vector<std::string> allowed_path_aliases;
     std::vector<std::string> allowed_projection_destinations;
     // Absent policies remain eligible for plan-only validation, never launch
@@ -88,6 +91,33 @@ struct library_projection_destination_policy {
     auto operator==(const library_projection_destination_policy&) const -> bool = default;
 };
 
+struct egress_target_policy {
+    std::string host;
+    std::uint16_t port = 443;
+    bool allow_private = false;
+
+    auto operator==(const egress_target_policy&) const -> bool = default;
+};
+
+struct egress_policy {
+    std::string policy_id;
+    std::vector<egress_target_policy> targets;
+
+    auto operator==(const egress_policy&) const -> bool = default;
+};
+
+// An identifier selected by the plan resolves only through this local policy.
+// The source never crosses the control or P2P wire. At preparation it is
+// identity-pinned and mounted read-only at the exact managed-home target.
+struct secret_mount_policy {
+    std::string handle;
+    std::string runtime_id;
+    std::string source_path;
+    std::string target_path;
+
+    auto operator==(const secret_mount_policy&) const -> bool = default;
+};
+
 // Protected, host-owned policy. Its exact revision must match every accepted
 // controller plan. Numeric limits are admitted only as exact configured
 // profiles, preventing a remote caller from selecting arbitrary quotas.
@@ -100,6 +130,8 @@ struct session_plan_policy {
     std::vector<std::string> egress_policy_ids;
     std::vector<std::string> tool_policy_ids;
     std::vector<std::string> secret_handles;
+    std::vector<egress_policy> egress_policies;
+    std::vector<secret_mount_policy> secret_mounts;
 };
 
 struct session_plan_validation {
@@ -117,13 +149,16 @@ struct runtime_launch_projection {
     std::string runtime_id;
     std::string runtime_template_id;
     std::string adapter_command_digest;
-    sandbox_backend backend = sandbox_backend::macos_experimental;
+    sandbox_backend backend = sandbox_backend::apple_container;
     std::vector<std::string> argv;
     std::vector<std::string> environment;
     std::vector<std::string> read_only_paths;
     resource_limits limits;
     std::uint64_t expires_at_ms = 0;
     bool requires_direct_write_approval = false;
+    std::string egress_policy_id;
+    std::vector<egress_target_policy> egress_targets;
+    std::vector<secret_mount_policy> secret_mounts;
 
     auto operator==(const runtime_launch_projection&) const -> bool = default;
 };

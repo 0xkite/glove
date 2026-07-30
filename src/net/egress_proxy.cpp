@@ -6,6 +6,8 @@
 #include <poll.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -352,12 +354,19 @@ void relay(int first, int second, const std::atomic<bool>& stop) {
 
 class proxy_impl final : public egress_proxy {
 public:
-    proxy_impl(int listen_fd, std::uint16_t port, egress_options opts, std::string token)
+    proxy_impl(
+        int listen_fd,
+        std::uint16_t port,
+        egress_options opts,
+        std::string token,
+        std::filesystem::path unix_socket = {}
+    )
         : listen_fd_{listen_fd},
           port_{port},
           opts_{std::move(opts)},
           token_{std::move(token)},
-          authorization_{"Basic " + base64("glove:" + token_)} {
+          authorization_{"Basic " + base64("glove:" + token_)},
+          unix_socket_{std::move(unix_socket)} {
         accept_thread_ = std::thread([this] { accept_loop(); });
     }
 
@@ -379,6 +388,9 @@ public:
             if (connection.joinable()) {
                 connection.join();
             }
+        }
+        if (!unix_socket_.empty()) {
+            (void)::unlink(unix_socket_.c_str());
         }
     }
 
@@ -480,6 +492,7 @@ private:
     egress_options opts_;
     std::string token_;
     std::string authorization_;
+    std::filesystem::path unix_socket_;
     std::atomic<bool> stopping_{false};
     std::thread accept_thread_;
     std::mutex connections_mutex_;
@@ -537,6 +550,62 @@ auto start_egress_proxy(egress_options opts)
     }
     std::unique_ptr<egress_proxy> proxy = std::make_unique<proxy_impl>(
         listener, ntohs(bound.sin_port), std::move(opts), std::move(*token)
+    );
+    return proxy;
+}
+
+auto start_egress_proxy_on_unix_socket(
+    egress_options opts,
+    const std::filesystem::path& socket_path,
+    std::uint16_t advertised_guest_port
+) -> std::expected<std::unique_ptr<egress_proxy>, std::string> {
+    if (!socket_path.is_absolute() || socket_path.lexically_normal() != socket_path ||
+        socket_path.string().size() >= sizeof(::sockaddr_un::sun_path) ||
+        advertised_guest_port == 0) {
+        return std::unexpected(std::string{"invalid egress Unix socket configuration"});
+    }
+    std::set<std::pair<std::string, std::uint16_t>> seen;
+    for (auto& rule : opts.allow) {
+        auto host = normalise_host(std::move(rule.host));
+        if (!host || rule.port == 0) {
+            return std::unexpected(
+                host ? std::string{"egress rule port must be non-zero"} : host.error()
+            );
+        }
+        rule.host = std::move(*host);
+        if (!seen.emplace(rule.host, rule.port).second) {
+            return std::unexpected(
+                std::string{"duplicate egress rule: "} + rule.host + ":" +
+                std::to_string(rule.port)
+            );
+        }
+    }
+    auto token = random_token();
+    if (!token) {
+        return std::unexpected(token.error());
+    }
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0) {
+        return std::unexpected(std::string{"create egress Unix socket: "} + std::strerror(errno));
+    }
+    ::sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, socket_path.c_str(), socket_path.string().size() + 1U);
+    if (::bind(listener, reinterpret_cast<::sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::chmod(socket_path.c_str(), 0600) != 0 || ::listen(listener, 16) != 0) {
+        const int saved = errno;
+        ::close(listener);
+        (void)::unlink(socket_path.c_str());
+        return std::unexpected(
+            std::string{"bind/listen egress Unix socket: "} + std::strerror(saved)
+        );
+    }
+    std::unique_ptr<egress_proxy> proxy = std::make_unique<proxy_impl>(
+        listener,
+        advertised_guest_port,
+        std::move(opts),
+        std::move(*token),
+        socket_path
     );
     return proxy;
 }

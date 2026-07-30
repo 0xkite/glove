@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -52,5 +53,14 @@ public:
 
 auto start_egress_proxy(egress_options opts)
     -> std::expected<std::unique_ptr<egress_proxy>, std::string>;
+
+// The same authenticated CONNECT broker over an owner-only Unix socket. This
+// is the VM boundary used by Apple Container: the guest receives only a
+// forwarded socket and a loopback relay, never a general network interface.
+auto start_egress_proxy_on_unix_socket(
+    egress_options opts,
+    const std::filesystem::path& socket_path,
+    std::uint16_t advertised_guest_port
+) -> std::expected<std::unique_ptr<egress_proxy>, std::string>;
 
 } // namespace glove::net

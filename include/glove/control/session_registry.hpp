@@ -260,6 +260,78 @@ struct session_recovery_record {
     auto operator==(const session_recovery_record&) const -> bool = default;
 };
 
+// Backend-neutral, path-free recovery authority for a managed runtime whose
+// lifecycle is not represented by Linux cgroup/process identities. The
+// backend owns the opaque instance identity and must independently prove it
+// still refers to the exact launch configuration before signaling or cleanup.
+struct managed_runtime_recovery_identity {
+    std::uint8_t schema_version = 1;
+    std::string backend;
+    std::string instance_id;
+    std::string launch_identity_digest;
+
+    auto operator==(const managed_runtime_recovery_identity&) const -> bool = default;
+};
+
+struct managed_session_execution_binding {
+    std::uint8_t schema_version = 1;
+    std::string session_id;
+    std::string controller_plan_digest;
+    std::string plan_content_digest;
+    std::string authorization_id;
+    std::string profile_digest;
+    managed_runtime_recovery_identity runtime_identity;
+
+    auto operator==(const managed_session_execution_binding&) const -> bool = default;
+};
+
+struct managed_session_running_commitment {
+    std::uint8_t schema_version = 1;
+    std::string session_id;
+    std::string controller_plan_digest;
+    std::string plan_content_digest;
+    std::string authorization_id;
+    std::string profile_digest;
+    managed_runtime_recovery_identity runtime_identity;
+
+    auto operator==(const managed_session_running_commitment&) const -> bool = default;
+};
+
+struct managed_session_lifecycle_record {
+    session_record session;
+    std::string authorization_id;
+    std::uint64_t authorization_expires_at_ms = 0;
+    std::string profile_digest;
+    std::uint64_t starting_at_ms = 0;
+    std::uint64_t running_at_ms = 0;
+    std::uint64_t stopping_at_ms = 0;
+    managed_runtime_recovery_identity runtime_identity;
+
+    auto operator==(const managed_session_lifecycle_record&) const -> bool = default;
+};
+
+struct managed_session_exited_record {
+    managed_session_lifecycle_record lifecycle;
+    std::uint64_t finished_at_ms = 0;
+    std::string receipt_key_id;
+    std::uint64_t receipt_sequence = 0;
+    std::string receipt_digest;
+    std::string receipt_hmac;
+    container::resource_termination_cause termination_cause =
+        container::resource_termination_cause::supervisor_error;
+    std::optional<int> exit_code;
+
+    auto operator==(const managed_session_exited_record&) const -> bool = default;
+};
+
+struct managed_session_failed_record {
+    managed_session_lifecycle_record lifecycle;
+    std::uint64_t failed_at_ms = 0;
+    session_failure_code code = session_failure_code::supervisor_error;
+
+    auto operator==(const managed_session_failed_record&) const -> bool = default;
+};
+
 enum class session_registry_error_code : std::uint8_t {
     invalid_request,
     invalid_plan,
@@ -386,6 +458,37 @@ public:
     ) -> session_registry_result<session_failed_record>;
     [[nodiscard]] auto failed_status(std::string_view session_id) const
         -> session_registry_result<session_failed_record>;
+    [[nodiscard]] auto mark_managed_starting(
+        const managed_session_execution_binding& binding,
+        const container::receipt_audit_producer::terminal_reservation& receipt_reservation,
+        std::string_view idempotency_key,
+        std::uint64_t now_ms
+    ) -> session_registry_result<managed_session_lifecycle_record>;
+    [[nodiscard]] auto mark_managed_running(
+        const managed_session_running_commitment& running,
+        const container::receipt_audit_producer::terminal_reservation& receipt_reservation,
+        std::string_view idempotency_key,
+        std::uint64_t now_ms
+    ) -> session_registry_result<managed_session_lifecycle_record>;
+    [[nodiscard]] auto mark_managed_stopping(
+        const managed_session_running_commitment& running,
+        std::string_view idempotency_key,
+        std::uint64_t now_ms
+    ) -> session_registry_result<managed_session_lifecycle_record>;
+    [[nodiscard]] auto mark_managed_exited(
+        const container::authenticated_resource_enforcement_receipt& terminal,
+        const container::receipt_audit_producer& receipt_producer,
+        std::string_view idempotency_key
+    ) -> session_registry_result<managed_session_exited_record>;
+    [[nodiscard]] auto mark_managed_failed(
+        const session_failure_commitment& failure,
+        std::string_view idempotency_key,
+        std::uint64_t now_ms
+    ) -> session_registry_result<managed_session_failed_record>;
+    [[nodiscard]] auto managed_lifecycle_status(std::string_view session_id) const
+        -> session_registry_result<managed_session_lifecycle_record>;
+    [[nodiscard]] auto managed_recovery_candidates() const
+        -> session_registry_result<std::vector<managed_session_lifecycle_record>>;
     // Returns every current starting/running/stopping session in deterministic session-
     // ID order. The registry has a fixed 10,000-record ceiling, so this startup
     // snapshot is bounded independently of caller input.
