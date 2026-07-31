@@ -4,6 +4,8 @@
 #include "glove/container/refinement_protocol.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
+#include "../container/receipt_json.hpp"
+
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <sys/stat.h>
@@ -69,6 +71,7 @@ struct session_plan {
     resource_limits limits;
     std::uint64_t policy_revision = 0;
     std::uint64_t expires_at_ms = 0;
+    std::optional<container::refinement_plan_binding> refinement;
 };
 
 struct session_plan_v2 {
@@ -85,6 +88,7 @@ struct session_plan_v2 {
     resource_limits limits;
     std::uint64_t policy_revision = 0;
     std::uint64_t expires_at_ms = 0;
+    std::optional<container::refinement_plan_binding> refinement;
 };
 
 struct session_plan_header {
@@ -404,6 +408,12 @@ public:
 
     void append_u32(std::uint32_t value) {
         for (const unsigned int shift : {24U, 16U, 8U, 0U}) {
+            bytes_.push_back(static_cast<unsigned char>(value >> shift));
+        }
+    }
+
+    void append_u64(std::uint64_t value) {
+        for (const unsigned int shift : {56U, 48U, 40U, 32U, 24U, 16U, 8U, 0U}) {
             bytes_.push_back(static_cast<unsigned char>(value >> shift));
         }
     }
@@ -835,7 +845,97 @@ auto common_v1_plan(const wire::session_plan_v2& plan) -> wire::session_plan {
         .limits = plan.limits,
         .policy_revision = plan.policy_revision,
         .expires_at_ms = plan.expires_at_ms,
+        .refinement = plan.refinement,
     };
+}
+
+auto valid_refinement_projection(
+    const container::refinement_projection_binding& projection
+) -> bool {
+    return valid_identifier(projection.projection_id) &&
+           valid_digest(projection.content_digest) &&
+           valid_identifier(projection.destination_alias);
+}
+
+auto validate_refinement_plan(
+    const wire::session_plan& plan, const runtime_template_policy& runtime
+) -> std::expected<void, std::string> {
+    const bool refinement_runtime =
+        plan.runtime_template_id == container::refinement_runtime_template_id;
+    if (!refinement_runtime) {
+        if (plan.refinement) {
+            return std::unexpected(
+                std::string{"refinement binding requires refinement-eval-v1"}
+            );
+        }
+        return {};
+    }
+    if (runtime.backend != sandbox_backend::linux_production || !plan.refinement ||
+        plan.refinement->schema_version != 1 || !plan.path_grants.empty() ||
+        !valid_refinement_projection(plan.refinement->fixture) ||
+        !valid_refinement_projection(plan.refinement->base) ||
+        !valid_refinement_projection(plan.refinement->candidate) ||
+        !valid_digest(plan.refinement->matched_context_digest) ||
+        plan.refinement->fixture.projection_id == plan.refinement->base.projection_id ||
+        plan.refinement->fixture.projection_id == plan.refinement->candidate.projection_id ||
+        plan.refinement->base.projection_id == plan.refinement->candidate.projection_id) {
+        return std::unexpected(std::string{"invalid refinement evaluation binding"});
+    }
+    const auto& selected =
+        plan.refinement->variant == container::refinement_variant::base
+            ? plan.refinement->base
+            : plan.refinement->candidate;
+    if (plan.library_projections.size() != 2U) {
+        return std::unexpected(
+            std::string{"refinement evaluation requires fixture and selected skill projections"}
+        );
+    }
+    const auto matches = [&](const container::refinement_projection_binding& expected) {
+        return std::ranges::any_of(plan.library_projections, [&](const auto& actual) {
+            return actual.projection_id == expected.projection_id &&
+                   actual.content_digest == expected.content_digest &&
+                   actual.destination_alias == expected.destination_alias;
+        });
+    };
+    if (!matches(plan.refinement->fixture) || !matches(selected)) {
+        return std::unexpected(
+            std::string{"refinement projections do not match the execution binding"}
+        );
+    }
+    return {};
+}
+
+auto refinement_plan_context_digest(const wire::session_plan& plan)
+    -> std::expected<std::string, std::string> {
+    if (!plan.refinement) {
+        return std::unexpected(std::string{"refinement plan binding is unavailable"});
+    }
+    launch_template_encoder encoder;
+    encoder.append_string("glove.refinement-plan-context");
+    encoder.append_u8(1);
+    encoder.append_string(plan.runtime_id);
+    encoder.append_string(plan.runtime_template_id);
+    encoder.append_string(plan.adapter_command_digest);
+    encoder.append_string(plan.sandbox_backend);
+    encoder.append_string(plan.egress_policy_id);
+    encoder.append_string(plan.tool_policy_id);
+    encoder.append_u32(static_cast<std::uint32_t>(plan.secret_handles.size()));
+    for (const auto& handle : plan.secret_handles) {
+        encoder.append_string(handle);
+    }
+    encoder.append_u64(plan.limits.cpu_time_ms);
+    encoder.append_u64(plan.limits.memory_bytes);
+    encoder.append_u32(plan.limits.pids);
+    encoder.append_u64(plan.limits.wall_time_ms);
+    encoder.append_u64(plan.limits.disk_bytes);
+    encoder.append_u64(plan.limits.terminal_output_bytes);
+    encoder.append_u64(plan.policy_revision);
+    for (const auto& projection : {plan.refinement->base, plan.refinement->candidate}) {
+        encoder.append_string(projection.projection_id);
+        encoder.append_string(projection.content_digest);
+        encoder.append_string(projection.destination_alias);
+    }
+    return container::sha256_hex(encoder.bytes());
 }
 
 auto validate_library_projection(
@@ -1354,13 +1454,6 @@ auto session_plan_validator::validate_json(std::string_view plan_json, std::uint
         !valid_identifier(plan.tool_policy_id) || !complete_limits(plan.limits)) {
         return std::unexpected(std::string{"session plan contains invalid authority identifiers"});
     }
-    if (plan.runtime_template_id == container::refinement_runtime_template_id &&
-        container::refinement_evaluation_capability_schema_version !=
-            container::refinement_evaluation_receipt_schema_version) {
-        return std::unexpected(
-            std::string{"refinement-eval-v1 requires unavailable dedicated result evidence"}
-        );
-    }
     if (plan.path_grants.size() > max_path_grants ||
         plan.library_projections.size() > max_library_projections ||
         plan.secret_handles.size() > max_secret_handles) {
@@ -1390,6 +1483,9 @@ auto session_plan_validator::validate_json(std::string_view plan_json, std::uint
     }
     if (auto libraries = validate_library_projection(plan, *runtime_entry); !libraries) {
         return std::unexpected(libraries.error());
+    }
+    if (auto refinement = validate_refinement_plan(plan, *runtime_entry); !refinement) {
+        return std::unexpected(refinement.error());
     }
     if (auto secrets = validate_secret_projection(plan, policy_); !secrets) {
         return std::unexpected(secrets.error());
@@ -1508,6 +1604,25 @@ auto session_plan_validator::resolve_runtime_launch_json(
         }
         secret_mounts.push_back(*secret);
     }
+    std::optional<container::refinement_execution_binding> refinement;
+    if (plan.refinement) {
+        auto plan_context = refinement_plan_context_digest(plan);
+        if (!plan_context) {
+            return std::unexpected(plan_context.error());
+        }
+        container::refinement_execution_binding execution;
+        static_cast<container::refinement_plan_binding&>(execution) =
+            container::refinement_plan_binding{
+                .schema_version = plan.refinement->schema_version,
+                .variant = plan.refinement->variant,
+                .fixture = plan.refinement->fixture,
+                .base = plan.refinement->base,
+                .candidate = plan.refinement->candidate,
+                .matched_context_digest = plan.refinement->matched_context_digest,
+            };
+        execution.plan_context_digest = std::move(*plan_context);
+        refinement = std::move(execution);
+    }
     return runtime_launch_projection{
         .validation = *validation,
         .runtime_id = runtime->runtime_id,
@@ -1525,6 +1640,7 @@ auto session_plan_validator::resolve_runtime_launch_json(
         .egress_policy_id = plan.egress_policy_id,
         .egress_targets = std::move(egress_targets),
         .secret_mounts = std::move(secret_mounts),
+        .refinement = std::move(refinement),
     };
 }
 
@@ -1654,6 +1770,28 @@ auto session_plan_validator::resolve_library_projection_targets_json(
         });
     }
     return resolved;
+}
+
+auto session_plan_validator::refinement_plan_context_digest_json(
+    std::string_view plan_json, std::uint64_t now_ms
+) const -> result<std::string> {
+    auto validation = validate_json(plan_json, now_ms);
+    if (!validation) {
+        return std::unexpected(validation.error());
+    }
+    wire::session_plan plan;
+    if (validation->schema_version == 2) {
+        wire::session_plan_v2 v2;
+        if (const auto error = read_untrusted_json<strict_read_options>(v2, plan_json); error) {
+            return std::unexpected(std::string{"invalid session plan v2 schema"});
+        }
+        plan = common_v1_plan(v2);
+    } else if (
+        const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error
+    ) {
+        return std::unexpected(std::string{"invalid session plan schema"});
+    }
+    return refinement_plan_context_digest(plan);
 }
 
 } // namespace glove::supervisor

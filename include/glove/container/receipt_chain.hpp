@@ -87,6 +87,12 @@ public:
         const resource_enforcement_receipt& receipt
     ) -> std::expected<authenticated_resource_enforcement_receipt, std::string>;
 
+    [[nodiscard]] auto append_refinement(
+        std::string_view session_id,
+        std::string_view controller_plan_digest,
+        const refinement_evaluation_receipt& receipt
+    ) -> std::expected<authenticated_refinement_evaluation_receipt, std::string>;
+
     [[nodiscard]] auto key_id() const noexcept -> std::string_view { return key_id_; }
 
     [[nodiscard]] auto sequence() const noexcept -> std::uint64_t { return sequence_; }
@@ -105,10 +111,8 @@ private:
 [[nodiscard]] auto resource_enforcement_receipt_digest(const resource_enforcement_receipt& receipt)
     -> std::expected<std::string, std::string>;
 
-// Low-level authenticated commitment for the dedicated refinement receipt.
-// Persistence and sequence ownership remain the responsibility of the future
-// refinement-aware journal; capability version stays zero until that wiring is
-// constructed.
+// Low-level stateless helper retained for verifier tests. Production append
+// sequencing is owned by receipt_audit_chain and receipt_audit_journal.
 [[nodiscard]] auto make_authenticated_refinement_evaluation_receipt(
     std::string_view key_hex,
     std::uint64_t sequence,

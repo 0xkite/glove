@@ -77,6 +77,10 @@ struct persisted_session {
     std::string this_hash;
 };
 
+struct plan_runtime_header {
+    std::string runtime_template_id;
+};
+
 } // namespace wire
 
 namespace {
@@ -89,6 +93,7 @@ constexpr std::size_t max_records = 10'000U;
 constexpr std::size_t max_identifier_bytes = 128U;
 constexpr std::uint64_t max_start_authorization_ttl_ms = 120'000U;
 constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
+constexpr glz::opts partial_read_options{.error_on_unknown_keys = false};
 
 class unique_fd {
 public:
@@ -164,6 +169,12 @@ auto valid_digest(std::string_view value) noexcept -> bool {
     return value.size() == digest_hex_bytes && std::ranges::all_of(value, [](unsigned char byte) {
                return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
            });
+}
+
+auto refinement_plan(std::string_view canonical_plan_json) -> bool {
+    wire::plan_runtime_header header;
+    return !glz::read<partial_read_options>(header, canonical_plan_json) &&
+           header.runtime_template_id == container::refinement_runtime_template_id;
 }
 
 auto valid_boot_id(std::string_view value) noexcept -> bool {
@@ -970,6 +981,28 @@ auto hash_terminal_envelope(const container::authenticated_resource_enforcement_
     );
 }
 
+auto hash_terminal_envelope(
+    const container::authenticated_refinement_evaluation_receipt& terminal
+) -> std::expected<std::string, std::string> {
+    return hash_terminal_reference(
+        terminal_reference{
+            .schema_version = terminal.schema_version,
+            .sequence = terminal.sequence,
+            .key_id = terminal.key_id,
+            .session_id = terminal.session_id,
+            .controller_plan_digest = terminal.controller_plan_digest,
+            .profile_digest = terminal.receipt.resource_receipt.profile_digest,
+            .receipt_digest = terminal.receipt_digest,
+            .previous_hmac = terminal.previous_hmac,
+            .this_hmac = terminal.this_hmac,
+            .termination_cause = terminal.receipt.resource_receipt.termination_cause,
+            .started_at_ms = terminal.receipt.resource_receipt.started_at_ms,
+            .finished_at_ms = terminal.receipt.resource_receipt.finished_at_ms,
+            .exit_code = terminal.receipt.resource_receipt.exit_code,
+        }
+    );
+}
+
 auto failure_code_name(session_failure_code code) -> std::string_view {
     switch (code) {
     case session_failure_code::authorization_expired:
@@ -1161,7 +1194,9 @@ auto valid_record_shape(const wire::persisted_session& record, std::uint64_t seq
         ((*termination == container::resource_termination_cause::exited && record.exit_code &&
           *record.exit_code >= 0 && *record.exit_code <= 255) ||
          (*termination != container::resource_termination_cause::exited && !record.exit_code));
-    if (record.operation == "mark_exited" && record.state == "exited") {
+    if ((record.operation == "mark_exited" ||
+         record.operation == "mark_refinement_exited") &&
+        record.state == "exited") {
         return started && running &&
                (no_stop_intent || record.stopping_at_ms >= record.running_at_ms) &&
                record.failure_code.empty() && record.receipt_started_at_ms != 0 &&
@@ -1878,6 +1913,7 @@ auto exited_record_from_wire(const wire::persisted_session& record)
         .receipt_hmac = record.receipt_hmac,
         .termination_cause = *termination,
         .exit_code = record.exit_code,
+        .refinement_receipt = record.operation == "mark_refinement_exited",
     };
 }
 
@@ -2197,6 +2233,7 @@ auto find_exited_replay_locked(
     if (state.poisoned || !verify_identity(state)) {
         return std::unexpected(storage_failure("session registry is poisoned"));
     }
+
     const auto existing = state.requests.find(std::string{idempotency_key});
     if (existing == state.requests.end()) {
         return exited_replay_lookup{};
@@ -2209,6 +2246,37 @@ auto find_exited_replay_locked(
         return std::unexpected(failure(
             session_registry_error_code::idempotency_conflict,
             "session terminal idempotency payload changed"
+        ));
+    }
+    auto exited = exited_record_from_wire(record);
+    if (!exited) {
+        return std::unexpected(exited.error());
+    }
+    return exited_replay_lookup{.found = true, .record = std::move(*exited)};
+}
+
+auto find_exited_replay_locked(
+    session_registry::implementation& state,
+    const container::authenticated_refinement_evaluation_receipt& terminal,
+    std::string_view request_digest,
+    std::string_view idempotency_key
+) -> session_registry_result<exited_replay_lookup> {
+    if (state.poisoned || !verify_identity(state)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    const auto existing = state.requests.find(std::string{idempotency_key});
+    if (existing == state.requests.end()) {
+        return exited_replay_lookup{};
+    }
+    const auto& record = state.records[existing->second];
+    if (record.operation != "mark_refinement_exited" ||
+        record.session_id != terminal.session_id ||
+        record.controller_plan_digest != terminal.controller_plan_digest ||
+        record.launch_profile_digest != terminal.receipt.resource_receipt.profile_digest ||
+        record.request_digest != request_digest) {
+        return std::unexpected(failure(
+            session_registry_error_code::idempotency_conflict,
+            "refinement session terminal idempotency payload changed"
         ));
     }
     auto exited = exited_record_from_wire(record);
@@ -3255,6 +3323,12 @@ auto session_registry::mark_exited(
         );
     }
     const auto& prior = state_->records[existing->second];
+    if (refinement_plan(prior.canonical_plan_json)) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_authorization,
+            "refinement sessions require a distinct refinement receipt"
+        ));
+    }
     if (prior.state != "running" && prior.state != "stopping") {
         return std::unexpected(failure(
             session_registry_error_code::invalid_state,
@@ -3352,6 +3426,7 @@ auto session_registry::mark_exited(
         .receipt_hmac = terminal.this_hmac,
         .termination_cause = terminal.receipt.termination_cause,
         .exit_code = terminal.receipt.exit_code,
+        .refinement_receipt = false,
     };
 }
 
@@ -3373,6 +3448,142 @@ auto session_registry::exited_status(std::string_view session_id) const
         );
     }
     return exited_record_from_wire(state_->records[existing->second]);
+}
+
+auto session_registry::mark_refinement_exited(
+        const container::authenticated_refinement_evaluation_receipt& terminal,
+        const container::receipt_audit_producer& receipt_producer,
+        std::string_view idempotency_key
+    ) -> session_registry_result<session_exited_record> {
+        const auto& resource = terminal.receipt.resource_receipt;
+        const auto termination_name = termination_cause_name(resource.termination_cause);
+        auto receipt_digest = container::refinement_evaluation_receipt_digest(terminal.receipt);
+        if (terminal.schema_version != 1 || terminal.sequence == 0 ||
+            !valid_digest(terminal.key_id) || !valid_identifier(terminal.session_id) ||
+            !valid_digest(terminal.controller_plan_digest) ||
+            terminal.receipt.schema_version !=
+                container::refinement_evaluation_receipt_schema_version ||
+            terminal.receipt.runtime_template_id != container::refinement_runtime_template_id ||
+            resource.schema_version != 1 || !valid_digest(resource.profile_digest) ||
+            !valid_digest(terminal.receipt_digest) || !valid_digest(terminal.previous_hmac) ||
+            !valid_digest(terminal.this_hmac) || termination_name.empty() ||
+            resource.started_at_ms == 0 || resource.finished_at_ms < resource.started_at_ms ||
+            !valid_identifier(idempotency_key) || !receipt_digest ||
+            *receipt_digest != terminal.receipt_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_request,
+                "invalid authenticated refinement terminal envelope"
+            ));
+        }
+        auto confirmed = receipt_producer.confirms_terminal(terminal);
+        if (!confirmed) {
+            return std::unexpected(storage_failure(confirmed.error()));
+        }
+        if (!*confirmed) {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_authorization,
+                "refinement terminal envelope is not durable in the receipt journal"
+            ));
+        }
+        auto request_digest = hash_terminal_envelope(terminal);
+        if (!request_digest) {
+            return std::unexpected(storage_failure(request_digest.error()));
+        }
+
+        const std::scoped_lock lock{state_->mutex};
+        auto replay = find_exited_replay_locked(*state_, terminal, *request_digest, idempotency_key);
+        if (!replay) {
+            return std::unexpected(replay.error());
+        }
+        if (replay->found) {
+            return std::move(replay->record);
+        }
+        const auto existing = state_->sessions.find(terminal.session_id);
+        if (existing == state_->sessions.end()) {
+            return std::unexpected(
+                failure(session_registry_error_code::not_found, "session was not found")
+            );
+        }
+        const auto& prior = state_->records[existing->second];
+        if (!refinement_plan(prior.canonical_plan_json)) {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_authorization,
+                "non-refinement sessions cannot accept a refinement receipt"
+            ));
+        }
+        if (prior.state != "running" && prior.state != "stopping") {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_state,
+                "session is not eligible for the refinement exited transition"
+            ));
+        }
+        if (prior.session_id != terminal.session_id ||
+            prior.controller_plan_digest != terminal.controller_plan_digest ||
+            prior.launch_profile_digest != resource.profile_digest ||
+            resource.started_at_ms > prior.running_at_ms ||
+            resource.finished_at_ms <
+                (prior.state == "stopping" ? prior.stopping_at_ms : prior.running_at_ms)) {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_state,
+                "refinement envelope does not match the durable running session"
+            ));
+        }
+        if (state_->records.size() >= max_records) {
+            return std::unexpected(
+                failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+            );
+        }
+        auto process_identity = process_identity_from_wire(prior);
+        if (!process_identity) {
+            state_->poisoned = true;
+            return std::unexpected(storage_failure("session registry process identity is invalid"));
+        }
+        const auto filesystem_identity = *prior.filesystem_identity;
+        const auto starting_at_ms = prior.starting_at_ms;
+        const auto running_at_ms = prior.running_at_ms;
+        const auto stopping_at_ms = prior.stopping_at_ms;
+
+        wire::persisted_session record = prior;
+        record.schema_version = 1;
+        record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+        record.operation = "mark_refinement_exited";
+        record.idempotency_key = std::string{idempotency_key};
+        record.request_digest = std::move(*request_digest);
+        record.state = "exited";
+        record.failure_code.clear();
+        record.finished_at_ms = resource.finished_at_ms;
+        record.receipt_started_at_ms = resource.started_at_ms;
+        record.receipt_key_id = terminal.key_id;
+        record.receipt_sequence = terminal.sequence;
+        record.receipt_digest = terminal.receipt_digest;
+        record.receipt_previous_hmac = terminal.previous_hmac;
+        record.receipt_hmac = terminal.this_hmac;
+        record.termination_cause = std::string{termination_name};
+        record.exit_code = resource.exit_code;
+        record.previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
+                                                       : state_->records.back().this_hash;
+        record.this_hash.clear();
+        auto appended = append_record_locked(*state_, std::move(record));
+        if (!appended) {
+            return std::unexpected(appended.error());
+        }
+        return session_exited_record{
+            .session = std::move(*appended),
+            .profile_digest = resource.profile_digest,
+            .starting_at_ms = starting_at_ms,
+            .running_at_ms = running_at_ms,
+            .stopping_at_ms = stopping_at_ms,
+            .process_identity = std::move(*process_identity),
+            .filesystem_identity = filesystem_identity,
+            .finished_at_ms = resource.finished_at_ms,
+            .receipt_key_id = terminal.key_id,
+            .receipt_sequence = terminal.sequence,
+            .receipt_digest = terminal.receipt_digest,
+            .receipt_hmac = terminal.this_hmac,
+            .termination_cause = resource.termination_cause,
+            .exit_code = resource.exit_code,
+            .refinement_receipt = true,
+        };
 }
 
 auto session_registry::mark_failed(
@@ -4121,6 +4332,7 @@ auto session_registry::recovery_candidates() const
             .process_identity = process_identity_from_wire(record),
             .cgroup_identity = record.cgroup_identity,
             .filesystem_identity = record.filesystem_identity,
+            .requires_refinement_receipt = refinement_plan(record.canonical_plan_json),
         });
     }
     std::ranges::sort(candidates, {}, [](const auto& candidate) -> std::string_view {
@@ -4152,6 +4364,10 @@ auto session_registry::canonical_plan(std::string_view session_id) const
 auto session_registry::record_count() const -> std::uint64_t {
     const std::scoped_lock lock{state_->mutex};
     return static_cast<std::uint64_t>(state_->records.size());
+}
+
+auto session_registry::library_projections_available() const noexcept -> bool {
+    return state_ && state_->library_bundles != nullptr;
 }
 
 } // namespace glove::control

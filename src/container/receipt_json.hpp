@@ -1,6 +1,7 @@
 #pragma once
 
 #include "glove/container/profile.hpp"
+#include "glove/container/refinement_protocol.hpp"
 
 #include <glaze/core/common.hpp>
 
@@ -56,4 +57,15 @@ template<> struct glz::meta<glove::container::resource_termination_cause> {
         "supervisor_error",
         supervisor_error
     );
+};
+
+template<> struct glz::meta<glove::container::refinement_variant> {
+    using enum glove::container::refinement_variant;
+    static constexpr auto value = enumerate("base", base, "candidate", candidate);
+};
+
+template<> struct glz::meta<glove::container::refinement_evidence_status> {
+    using enum glove::container::refinement_evidence_status;
+    static constexpr auto value =
+        enumerate("valid_outcome", valid_outcome, "invalid_outcome", invalid_outcome);
 };

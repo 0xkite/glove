@@ -1765,6 +1765,7 @@ auto launch_pty_child(
         .max_input_frame_bytes = options.max_input_frame_bytes,
         .input_timeout_ms = options.input_timeout_ms,
         .monitor = lifecycle.monitor(),
+        .refinement_evaluator = options.refinement_evaluator,
     });
     if (!channel) {
         return fail(channel.error());
@@ -1923,6 +1924,20 @@ struct linux_detail::managed_pty_session::implementation {
                 publish_error_locked(produced.error());
                 return;
             }
+            if (refinement_evaluator) {
+                auto transcript_commitment = terminal->transcript_commitment();
+                if (!transcript_commitment) {
+                    publish_error_locked(transcript_commitment.error());
+                    return;
+                }
+                auto evaluated =
+                    refinement_evaluator->finish(*produced, *transcript_commitment);
+                if (!evaluated) {
+                    publish_error_locked(evaluated.error());
+                    return;
+                }
+                refinement_receipt = std::move(*evaluated);
+            }
             receipt = std::move(*produced);
             finished = true;
             state_changed.notify_all();
@@ -1954,11 +1969,13 @@ struct linux_detail::managed_pty_session::implementation {
     resource_limits limits;
     std::unique_ptr<linux_resource_lifecycle> lifecycle;
     std::unique_ptr<pty_session_channel> terminal;
+    std::shared_ptr<refinement_transcript_evaluator> refinement_evaluator;
     std::unique_ptr<host_egress_bridge> egress;
     std::mutex state_mutex;
     std::condition_variable state_changed;
     bool finished = false;
     std::optional<resource_enforcement_receipt> receipt;
+    std::optional<refinement_evaluation_receipt> refinement_receipt;
     std::string error;
     std::thread waiter;
 };
@@ -2070,6 +2087,16 @@ auto linux_detail::managed_pty_session::wait()
     return *state_->receipt;
 }
 
+auto linux_detail::managed_pty_session::wait_refinement()
+    -> std::expected<std::optional<refinement_evaluation_receipt>, std::string> {
+    auto resource = wait();
+    if (!resource) {
+        return std::unexpected(resource.error());
+    }
+    const std::lock_guard state_lock{state_->state_mutex};
+    return state_->refinement_receipt;
+}
+
 auto linux_detail::start_managed_pty_session(
     const profile& prof,
     const std::vector<std::string>& argv,
@@ -2122,6 +2149,7 @@ auto linux_detail::start_managed_pty_session(
     session->state_->child = child->pid;
     session->state_->terminal = std::move(child->terminal);
     session->state_->egress = std::move(child->egress);
+    session->state_->refinement_evaluator = std::move(options.refinement_evaluator);
     auto started = session->state_->start_waiter();
     if (!started) {
         static_cast<void>(session->state_->lifecycle->request_stop());

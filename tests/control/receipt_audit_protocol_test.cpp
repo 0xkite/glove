@@ -1,3 +1,4 @@
+#include "glove/container/digest.hpp"
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/receipt_audit_protocol.hpp"
 #include "glove/supervisor/path_alias.hpp"
@@ -113,6 +114,53 @@ auto receipt() -> glove::container::resource_enforcement_receipt {
     };
 }
 
+auto refinement_receipt() -> glove::container::refinement_evaluation_receipt {
+    using namespace glove::container;
+    refinement_outcome outcome{
+        .schema = std::string{refinement_outcome_schema},
+        .encoding = std::string{refinement_outcome_encoding},
+        .metrics = {{"failed_assertions", 0}, {"latency_us", 750'000}, {"passed", 1}},
+    };
+    const auto outcome_bytes = canonical_refinement_outcome_bytes(outcome).value();
+    const auto outcome_digest = sha256_hex(std::span<const unsigned char>{
+        reinterpret_cast<const unsigned char*>(outcome_bytes.data()), outcome_bytes.size()
+    });
+    return {
+        .schema_version = refinement_evaluation_receipt_schema_version,
+        .runtime_template_id = std::string{refinement_runtime_template_id},
+        .resource_receipt = receipt(),
+        .evidence_status = refinement_evidence_status::valid_outcome,
+        .variant = refinement_variant::candidate,
+        .fixture = {"fixture", std::string(64, 'f'), "fixtures"},
+        .base = {"base", std::string(64, 'b'), "skills"},
+        .candidate = {"candidate", std::string(64, 'c'), "skills"},
+        .matched_context_digest = std::string(64, 'd'),
+        .outcome =
+            {
+                .schema = outcome.schema,
+                .encoding = outcome.encoding,
+                .digest = *outcome_digest,
+                .byte_length = outcome_bytes.size(),
+            },
+        .evaluated_outcome = outcome,
+        .transcript =
+            {
+                .schema = std::string{raw_pty_transcript_schema},
+                .digest = std::string(64, 'e'),
+                .byte_count = 1'024,
+                .complete = true,
+            },
+        .evaluator =
+            {
+                .schema = std::string{refinement_evaluator_schema},
+                .fixture_complete = true,
+                .transcript_utf8 = true,
+                .required_literals = 1,
+                .forbidden_literals = 1,
+            },
+    };
+}
+
 } // namespace
 
 namespace wire_test {
@@ -132,6 +180,8 @@ struct rpc_response {
 struct page_result {
     std::uint8_t schema_version = 0;
     std::vector<glove::container::authenticated_resource_enforcement_receipt> envelopes;
+    std::vector<glove::container::authenticated_refinement_evaluation_receipt>
+        refinement_envelopes;
     bool has_more = false;
     glove::container::receipt_audit_anchor local_anchor;
 };
@@ -376,6 +426,15 @@ auto run() -> int {
         REQUIRE(terminal.has_value());
         terminals.push_back(std::move(*terminal));
     }
+    auto refinement_reservation = (*producer)->reserve_terminal();
+    REQUIRE(refinement_reservation.has_value());
+    auto refinement_terminal = (*producer)->commit_refinement_terminal(
+        std::move(*refinement_reservation),
+        "session-refinement",
+        plan_digest,
+        refinement_receipt()
+    );
+    REQUIRE(refinement_terminal.has_value());
     const auto terminal_anchor = (*producer)->anchor();
     producer->reset();
 
@@ -881,6 +940,8 @@ auto run() -> int {
     ));
     REQUIRE(final_page.envelopes.size() == 1);
     REQUIRE(final_page.envelopes.front() == terminals.back());
+    REQUIRE(final_page.refinement_envelopes.size() == 1);
+    REQUIRE(final_page.refinement_envelopes.front() == *refinement_terminal);
     REQUIRE(!final_page.has_more);
     REQUIRE(final_page.local_anchor == terminal_anchor);
     REQUIRE(!(*recovered)->bootstrap_reconciled());
@@ -1028,6 +1089,7 @@ auto run() -> int {
         empty_page, fresh_page_response->result->str
     ));
     REQUIRE(empty_page.envelopes.empty());
+    REQUIRE(empty_page.refinement_envelopes.empty());
     REQUIRE(!empty_page.has_more);
     REQUIRE(empty_page.local_anchor == genesis);
     REQUIRE(std::filesystem::exists(fresh_config.journal_path));

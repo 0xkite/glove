@@ -50,6 +50,9 @@ public:
     // copy. A replaced, relinked, chmodded, resized, or rewritten object fails.
     [[nodiscard]] auto verify_identity() const -> std::expected<void, std::string>;
 
+    [[nodiscard]] auto read_bytes(std::uint64_t max_bytes) const
+        -> std::expected<std::vector<unsigned char>, std::string>;
+
 private:
     friend class library_bundle_store;
 

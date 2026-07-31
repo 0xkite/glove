@@ -114,6 +114,12 @@ public:
         std::string_view controller_plan_digest,
         const resource_enforcement_receipt& receipt
     ) -> std::expected<authenticated_resource_enforcement_receipt, std::string>;
+    [[nodiscard]] auto commit_refinement_terminal(
+        terminal_reservation reservation,
+        std::string_view session_id,
+        std::string_view controller_plan_digest,
+        const refinement_evaluation_receipt& receipt
+    ) -> std::expected<authenticated_refinement_evaluation_receipt, std::string>;
 
     // Exact durable-membership confirmation for registry terminalization and
     // crash recovery. The envelope is not trusted merely because the caller
@@ -121,12 +127,21 @@ public:
     [[nodiscard]] auto
     confirms_terminal(const authenticated_resource_enforcement_receipt& envelope) const
         -> std::expected<bool, std::string>;
+    [[nodiscard]] auto
+    confirms_terminal(const authenticated_refinement_evaluation_receipt& envelope) const
+        -> std::expected<bool, std::string>;
     [[nodiscard]] auto terminal_for_execution(
         std::string_view session_id,
         std::string_view controller_plan_digest,
         std::string_view profile_digest
     ) const
         -> std::expected<std::optional<authenticated_resource_enforcement_receipt>, std::string>;
+    [[nodiscard]] auto refinement_terminal_for_execution(
+        std::string_view session_id,
+        std::string_view controller_plan_digest,
+        std::string_view profile_digest
+    ) const
+        -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string>;
 
     [[nodiscard]] auto
     page_after(const receipt_audit_anchor& trusted_sage_anchor, std::size_t limit) const

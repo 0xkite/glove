@@ -6,7 +6,7 @@
     "agent_session_plan_schema_versions": [1, 2],
     "receipt_audit_schema_version": 1,
     "session_control_schema_version": 1,
-    "refinement_evaluation_protocol_schema_version": 0
+    "refinement_evaluation_protocol_schema_version": 1
   },
   "platforms": {
     "linux": {

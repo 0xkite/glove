@@ -22,8 +22,17 @@ inline constexpr std::size_t max_receipt_reconciliation_page = 1'000U;
 
 struct receipt_journal_page {
     std::vector<authenticated_resource_enforcement_receipt> envelopes;
+    std::vector<authenticated_refinement_evaluation_receipt> refinement_envelopes;
     bool has_more = false;
     receipt_audit_anchor local_anchor;
+};
+
+struct receipt_journal_record {
+    std::string kind;
+    std::optional<authenticated_resource_enforcement_receipt> resource;
+    std::optional<authenticated_refinement_evaluation_receipt> refinement;
+
+    auto operator==(const receipt_journal_record&) const -> bool = default;
 };
 
 // Durable Glove-owned receipt production. One live handle owns a nonblocking
@@ -68,6 +77,12 @@ public:
         const resource_enforcement_receipt& receipt
     ) -> std::expected<authenticated_resource_enforcement_receipt, std::string>;
 
+    [[nodiscard]] auto append_refinement(
+        std::string_view session_id,
+        std::string_view controller_plan_digest,
+        const refinement_evaluation_receipt& receipt
+    ) -> std::expected<authenticated_refinement_evaluation_receipt, std::string>;
+
     // This bounded exact-prefix page is a local reconciliation primitive, not
     // an authenticated transport or acknowledgement protocol.
     [[nodiscard]] auto
@@ -80,6 +95,9 @@ public:
     [[nodiscard]] auto
     contains_exact(const authenticated_resource_enforcement_receipt& envelope) const
         -> std::expected<bool, std::string>;
+    [[nodiscard]] auto
+    contains_exact(const authenticated_refinement_evaluation_receipt& envelope) const
+        -> std::expected<bool, std::string>;
 
     // Locate the one durable terminal envelope for an immutable execution.
     // Multiple matches are treated as journal corruption rather than choosing
@@ -90,6 +108,12 @@ public:
         std::string_view profile_digest
     ) const
         -> std::expected<std::optional<authenticated_resource_enforcement_receipt>, std::string>;
+    [[nodiscard]] auto refinement_terminal_for_execution(
+        std::string_view session_id,
+        std::string_view controller_plan_digest,
+        std::string_view profile_digest
+    ) const
+        -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string>;
 
     [[nodiscard]] auto anchor() const -> receipt_audit_anchor;
     [[nodiscard]] auto record_count() const -> std::uint64_t;

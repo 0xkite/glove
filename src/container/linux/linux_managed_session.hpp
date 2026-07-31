@@ -43,6 +43,7 @@ struct managed_pty_session_options {
     std::uint64_t input_timeout_ms = 1'000;
     std::uint16_t initial_rows = 24;
     std::uint16_t initial_columns = 80;
+    std::shared_ptr<refinement_transcript_evaluator> refinement_evaluator;
 };
 
 class managed_pty_session {
@@ -73,6 +74,8 @@ public:
     [[nodiscard]] auto stop(const managed_session_stop_gate& before_stop)
         -> std::expected<void, std::string>;
     [[nodiscard]] auto wait() -> std::expected<resource_enforcement_receipt, std::string>;
+    [[nodiscard]] auto wait_refinement()
+        -> std::expected<std::optional<refinement_evaluation_receipt>, std::string>;
 
 private:
     friend auto start_managed_pty_session(

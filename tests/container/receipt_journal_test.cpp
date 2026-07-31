@@ -1,4 +1,5 @@
 #include "glove/container/receipt_journal.hpp"
+#include "glove/container/digest.hpp"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -99,6 +100,54 @@ auto receipt(std::uint64_t cpu_time_ms = 500) -> glove::container::resource_enfo
     };
 }
 
+auto refinement_receipt(std::uint64_t cpu_time_ms = 500)
+    -> glove::container::refinement_evaluation_receipt {
+    using namespace glove::container;
+    refinement_outcome outcome{
+        .schema = std::string{refinement_outcome_schema},
+        .encoding = std::string{refinement_outcome_encoding},
+        .metrics = {{"failed_assertions", 0}, {"latency_us", 750'000}, {"passed", 1}},
+    };
+    const auto outcome_bytes = canonical_refinement_outcome_bytes(outcome).value();
+    const auto outcome_digest = sha256_hex(std::span<const unsigned char>{
+        reinterpret_cast<const unsigned char*>(outcome_bytes.data()), outcome_bytes.size()
+    });
+    return {
+        .schema_version = refinement_evaluation_receipt_schema_version,
+        .runtime_template_id = std::string{refinement_runtime_template_id},
+        .resource_receipt = receipt(cpu_time_ms),
+        .evidence_status = refinement_evidence_status::valid_outcome,
+        .variant = refinement_variant::candidate,
+        .fixture = {"fixture", std::string(64, 'f'), "fixtures"},
+        .base = {"base", std::string(64, 'b'), "skills"},
+        .candidate = {"candidate", std::string(64, 'c'), "skills"},
+        .matched_context_digest = std::string(64, 'd'),
+        .outcome =
+            {
+                .schema = outcome.schema,
+                .encoding = outcome.encoding,
+                .digest = *outcome_digest,
+                .byte_length = outcome_bytes.size(),
+            },
+        .evaluated_outcome = outcome,
+        .transcript =
+            {
+                .schema = std::string{raw_pty_transcript_schema},
+                .digest = std::string(64, 'e'),
+                .byte_count = 1'024,
+                .complete = true,
+            },
+        .evaluator =
+            {
+                .schema = std::string{refinement_evaluator_schema},
+                .fixture_complete = true,
+                .transcript_utf8 = true,
+                .required_literals = 1,
+                .forbidden_literals = 1,
+            },
+    };
+}
+
 auto read_bytes(const std::filesystem::path& path) -> std::vector<char> {
     std::ifstream input{path, std::ios::binary};
     return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
@@ -193,7 +242,20 @@ auto concurrent_appends_are_serialized_and_recoverable() -> int {
         for (std::uint64_t index = 0; index < 8; ++index) {
             workers.emplace_back([&, index] {
                 const auto session = "session-" + std::to_string(index);
-                if (writer->append(session, controller_plan_digest, receipt(500U + index))) {
+                const bool appended =
+                    index % 2U == 0
+                        ? writer->append(
+                              session, controller_plan_digest, receipt(500U + index)
+                          )
+                              .has_value()
+                        : writer
+                              ->append_refinement(
+                                  session,
+                                  controller_plan_digest,
+                                  refinement_receipt(500U + index)
+                              )
+                              .has_value();
+                if (appended) {
                     succeeded.fetch_add(1, std::memory_order_relaxed);
                 }
             });
@@ -211,6 +273,49 @@ auto concurrent_appends_are_serialized_and_recoverable() -> int {
     REQUIRE(reopened.has_value());
     REQUIRE((*reopened)->record_count() == 8);
     REQUIRE((*reopened)->anchor().sequence == 8);
+    return 0;
+}
+
+auto mixed_receipts_page_and_recover_without_substitution() -> int {
+    temporary_directory temp;
+    REQUIRE(!temp.root().empty());
+    const auto path = temp.root() / "receipts.journal";
+    auto genesis = glove::container::receipt_audit_anchor::create(audit_key);
+    REQUIRE(genesis.has_value());
+    auto journal = glove::container::receipt_audit_journal::create_new(path, audit_key);
+    REQUIRE(journal.has_value());
+    auto resource =
+        (*journal)->append("session-resource", controller_plan_digest, receipt());
+    REQUIRE(resource.has_value());
+    auto refinement = (*journal)->append_refinement(
+        "session-refinement", controller_plan_digest, refinement_receipt()
+    );
+    REQUIRE(refinement.has_value());
+    REQUIRE(resource->sequence == 1);
+    REQUIRE(refinement->sequence == 2);
+    REQUIRE(refinement->previous_hmac == resource->this_hmac);
+    auto page = (*journal)->page_after(**genesis, 10);
+    REQUIRE(page.has_value());
+    REQUIRE(page->envelopes == std::vector{*resource});
+    REQUIRE(page->refinement_envelopes == std::vector{*refinement});
+    REQUIRE((*journal)->contains_exact(*resource).value_or(false));
+    REQUIRE((*journal)->contains_exact(*refinement).value_or(false));
+    journal->reset();
+
+    auto reopened =
+        glove::container::receipt_audit_journal::open_existing(path, audit_key, **genesis);
+    REQUIRE(reopened.has_value());
+    auto found = (*reopened)->refinement_terminal_for_execution(
+        "session-refinement", controller_plan_digest, profile_digest
+    );
+    REQUIRE(found.has_value());
+    REQUIRE(found->has_value());
+    REQUIRE(**found == *refinement);
+    auto wrong_type = (*reopened)->terminal_for_execution(
+        "session-refinement", controller_plan_digest, profile_digest
+    );
+    REQUIRE(wrong_type.has_value());
+    REQUIRE(!wrong_type->has_value());
     return 0;
 }
 
@@ -367,6 +472,7 @@ auto journal_file_identity_and_key_are_fail_closed() -> int {
 auto run() -> int {
     REQUIRE(persistence_and_reconciliation() == 0);
     REQUIRE(concurrent_appends_are_serialized_and_recoverable() == 0);
+    REQUIRE(mixed_receipts_page_and_recover_without_substitution() == 0);
     REQUIRE(external_size_changes_poison_reconciliation() == 0);
     REQUIRE(torn_tail_requires_a_trusted_prefix() == 0);
     REQUIRE(accepted_tail_truncation_fails_reconciliation() == 0);

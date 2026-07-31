@@ -54,6 +54,7 @@ struct pty_session_channel_options {
     std::size_t max_input_frame_bytes = std::size_t{64} * 1024U;
     std::uint64_t input_timeout_ms = 1'000;
     std::shared_ptr<detail::wall_output_monitor> monitor;
+    std::shared_ptr<refinement_transcript_evaluator> refinement_evaluator;
 };
 
 struct pty_transcript_read {
@@ -141,6 +142,7 @@ private:
     std::size_t max_input_frame_bytes_ = 0;
     std::uint64_t input_timeout_ms_ = 0;
     std::shared_ptr<detail::wall_output_monitor> monitor_;
+    std::shared_ptr<refinement_transcript_evaluator> refinement_evaluator_;
 
     mutable std::mutex state_mutex_;
     std::condition_variable state_changed_;

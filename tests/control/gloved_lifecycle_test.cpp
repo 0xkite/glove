@@ -47,6 +47,8 @@ struct rpc_response {
 struct page_result {
     std::uint8_t schema_version = 0;
     std::vector<glove::container::authenticated_resource_enforcement_receipt> envelopes;
+    std::vector<glove::container::authenticated_refinement_evaluation_receipt>
+        refinement_envelopes;
     bool has_more = false;
     glove::container::receipt_audit_anchor local_anchor;
 };

@@ -396,6 +396,7 @@ auto receipt_audit_chain::append(
     if (!valid_identifier(session_id)) {
         return std::unexpected(std::string{"invalid receipt audit session identity"});
     }
+
     if (!valid_digest(controller_plan_digest)) {
         return std::unexpected(std::string{"invalid receipt audit controller plan digest"});
     }
@@ -415,6 +416,43 @@ auto receipt_audit_chain::append(
         return std::unexpected(this_hmac.error());
     }
     authenticated_resource_enforcement_receipt envelope{
+        .schema_version = 1,
+        .sequence = next_sequence,
+        .key_id = key_id_,
+        .session_id = std::string{session_id},
+        .controller_plan_digest = std::string{controller_plan_digest},
+        .receipt = receipt,
+        .receipt_digest = std::move(*receipt_digest),
+        .previous_hmac = head_hmac_,
+        .this_hmac = std::move(*this_hmac),
+    };
+    sequence_ = envelope.sequence;
+    head_hmac_ = envelope.this_hmac;
+    return envelope;
+}
+
+auto receipt_audit_chain::append_refinement(
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    const refinement_evaluation_receipt& receipt
+) -> std::expected<authenticated_refinement_evaluation_receipt, std::string> {
+    if (!valid_identifier(session_id) || !valid_digest(controller_plan_digest) ||
+        sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+        return std::unexpected(std::string{"invalid refinement receipt audit identity"});
+    }
+    auto receipt_digest = refinement_evaluation_receipt_digest(receipt);
+    if (!receipt_digest) {
+        return std::unexpected(receipt_digest.error());
+    }
+    const auto next_sequence = sequence_ + 1U;
+    const auto material = refinement_envelope_material(
+        next_sequence, key_id_, session_id, controller_plan_digest, *receipt_digest, head_hmac_
+    );
+    auto this_hmac = hmac_sha256_hex(key_, material.bytes());
+    if (!this_hmac) {
+        return std::unexpected(this_hmac.error());
+    }
+    authenticated_refinement_evaluation_receipt envelope{
         .schema_version = 1,
         .sequence = next_sequence,
         .key_id = key_id_,

@@ -201,6 +201,7 @@ struct session_exited_record {
     container::resource_termination_cause termination_cause =
         container::resource_termination_cause::supervisor_error;
     std::optional<int> exit_code;
+    bool refinement_receipt = false;
 
     auto operator==(const session_exited_record&) const -> bool = default;
 };
@@ -256,6 +257,7 @@ struct session_recovery_record {
     std::optional<linux_process_identity> process_identity;
     std::optional<linux_cgroup_recovery_identity> cgroup_identity;
     std::optional<linux_filesystem_recovery_identity> filesystem_identity;
+    bool requires_refinement_receipt = false;
 
     auto operator==(const session_recovery_record&) const -> bool = default;
 };
@@ -446,6 +448,11 @@ public:
         const container::receipt_audit_producer& receipt_producer,
         std::string_view idempotency_key
     ) -> session_registry_result<session_exited_record>;
+    [[nodiscard]] auto mark_refinement_exited(
+        const container::authenticated_refinement_evaluation_receipt& terminal,
+        const container::receipt_audit_producer& receipt_producer,
+        std::string_view idempotency_key
+    ) -> session_registry_result<session_exited_record>;
     [[nodiscard]] auto exited_status(std::string_view session_id) const
         -> session_registry_result<session_exited_record>;
     // Close a launch attempt without a resource receipt. Expired approval does
@@ -497,6 +504,7 @@ public:
     [[nodiscard]] auto canonical_plan(std::string_view session_id) const
         -> session_registry_result<std::string>;
     [[nodiscard]] auto record_count() const -> std::uint64_t;
+    [[nodiscard]] auto library_projections_available() const noexcept -> bool;
 
 private:
     std::unique_ptr<implementation> state_;

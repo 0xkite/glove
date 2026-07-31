@@ -1,5 +1,6 @@
 #pragma once
 
+#include "glove/container/refinement_protocol.hpp"
 #include "glove/supervisor/path_alias.hpp"
 #include "glove/supervisor/path_exposure.hpp"
 
@@ -159,6 +160,7 @@ struct runtime_launch_projection {
     std::string egress_policy_id;
     std::vector<egress_target_policy> egress_targets;
     std::vector<secret_mount_policy> secret_mounts;
+    std::optional<container::refinement_execution_binding> refinement;
 
     auto operator==(const runtime_launch_projection&) const -> bool = default;
 };
@@ -241,6 +243,14 @@ public:
     [[nodiscard]] auto
     resolve_library_projection_targets_json(std::string_view plan_json, std::uint64_t now_ms) const
         -> result<std::vector<resolved_library_projection_target>>;
+
+    // Derive the host-validated half of the matched refinement context. The
+    // supplied matched-context field is intentionally not an input to this
+    // digest, allowing a controller to construct the fixture and then submit
+    // the final exact digest.
+    [[nodiscard]] auto refinement_plan_context_digest_json(
+        std::string_view plan_json, std::uint64_t now_ms
+    ) const -> result<std::string>;
 
 private:
     session_plan_policy policy_;

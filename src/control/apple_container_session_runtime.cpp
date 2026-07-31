@@ -1128,6 +1128,7 @@ auto spawn_attach(
         .max_input_frame_bytes = std::size_t{64} * 1024U,
         .input_timeout_ms = 1'000,
         .monitor = monitor,
+        .refinement_evaluator = nullptr,
     });
     if (!channel) {
         static_cast<void>(::killpg(child, SIGKILL));

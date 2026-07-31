@@ -158,6 +158,8 @@ public:
     [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override {
         return {"codex", "claude-code", "pi", "copilot", "opencode"};
     }
+    [[nodiscard]] auto refinement_evaluation_protocol_schema_version() const noexcept
+        -> std::uint8_t override;
 
     [[nodiscard]] auto resource_capabilities() const noexcept
         -> container::resource_enforcement_capabilities override;

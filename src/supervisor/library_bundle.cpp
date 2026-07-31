@@ -8,7 +8,9 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <limits>
 #include <set>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -117,6 +119,7 @@ auto resolved_library_bundle::verify_identity() const -> std::expected<void, std
     if (descriptor_ < 0) {
         return std::unexpected(std::string{"library bundle descriptor is unavailable"});
     }
+
     auto metadata = inspect_bundle(descriptor_, digest_);
     if (!metadata) {
         return std::unexpected(metadata.error());
@@ -129,6 +132,38 @@ auto resolved_library_bundle::verify_identity() const -> std::expected<void, std
         return std::unexpected(std::string{"library bundle identity changed"});
     }
     return {};
+}
+
+auto resolved_library_bundle::read_bytes(std::uint64_t max_bytes) const
+    -> std::expected<std::vector<unsigned char>, std::string> {
+    if (descriptor_ < 0 || max_bytes == 0 || size_bytes_ == 0 || size_bytes_ > max_bytes ||
+        size_bytes_ > std::numeric_limits<std::size_t>::max()) {
+        return std::unexpected(std::string{"library bundle read bound is invalid"});
+    }
+    if (auto verified = verify_identity(); !verified) {
+        return std::unexpected(verified.error());
+    }
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(size_bytes_));
+    std::size_t consumed = 0;
+    while (consumed < bytes.size()) {
+        const auto result = ::pread(
+            descriptor_,
+            bytes.data() + consumed,
+            bytes.size() - consumed,
+            static_cast<off_t>(consumed)
+        );
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return std::unexpected(system_error("read library bundle"));
+        }
+        consumed += static_cast<std::size_t>(result);
+    }
+    if (auto verified = verify_identity(); !verified) {
+        return std::unexpected(verified.error());
+    }
+    return bytes;
 }
 
 library_bundle_store::library_bundle_store(

@@ -444,8 +444,37 @@ auto receipt_audit_producer::commit_terminal(
     return appended;
 }
 
+auto receipt_audit_producer::commit_refinement_terminal(
+    terminal_reservation reservation,
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    const refinement_evaluation_receipt& receipt
+) -> std::expected<authenticated_refinement_evaluation_receipt, std::string> {
+    if (reservation.owner_.get() != this) {
+        return std::unexpected(std::string{"terminal reservation belongs to another producer"});
+    }
+    if (!reservation.session_id_.empty() &&
+        !reservation.matches_execution(
+            session_id, controller_plan_digest, receipt.resource_receipt.profile_digest
+        )) {
+        return std::unexpected(
+            std::string{"terminal reservation does not match the refinement execution"}
+        );
+    }
+    auto appended =
+        journal_->append_refinement(session_id, controller_plan_digest, receipt);
+    reservation.release();
+    return appended;
+}
+
 auto receipt_audit_producer::confirms_terminal(
     const authenticated_resource_enforcement_receipt& envelope
+) const -> std::expected<bool, std::string> {
+    return journal_->contains_exact(envelope);
+}
+
+auto receipt_audit_producer::confirms_terminal(
+    const authenticated_refinement_evaluation_receipt& envelope
 ) const -> std::expected<bool, std::string> {
     return journal_->contains_exact(envelope);
 }
@@ -456,6 +485,17 @@ auto receipt_audit_producer::terminal_for_execution(
     std::string_view profile_digest
 ) const -> std::expected<std::optional<authenticated_resource_enforcement_receipt>, std::string> {
     return journal_->terminal_for_execution(session_id, controller_plan_digest, profile_digest);
+}
+
+auto receipt_audit_producer::refinement_terminal_for_execution(
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    std::string_view profile_digest
+) const
+    -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string> {
+    return journal_->refinement_terminal_for_execution(
+        session_id, controller_plan_digest, profile_digest
+    );
 }
 
 auto receipt_audit_producer::page_after(

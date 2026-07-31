@@ -35,6 +35,7 @@ struct linux_prepared_session {
     linux_filesystem_recovery_identity filesystem_identity;
     std::unique_ptr<container::linux_detail::linux_resource_lifecycle> lifecycle;
     std::unique_ptr<net::egress_proxy> egress_proxy;
+    std::shared_ptr<container::refinement_transcript_evaluator> refinement_evaluator;
 
     [[nodiscard]] auto execution_binding() const -> session_execution_binding {
         return {

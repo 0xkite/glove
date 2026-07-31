@@ -18,13 +18,53 @@ variables, or raw secrets.
 Capabilities are derived from successfully constructed components. macOS does
 not advertise managed-session resource enforcement.
 
-`refinement_evaluation_protocol_schema_version` is `0` until the trusted Glove
-runtime wrapper owns a dedicated bounded result pipe, closes its write
-descriptor before launching the model child, and durably journals the distinct
-authenticated refinement receipt. The typed frame and commitment primitives
-exist at schema version `1`, but `refinement-eval-v1` plans are rejected while
-the constructed capability remains `0`; they never fall back to the resource
-receipt V1.
+`refinement_evaluation_protocol_schema_version` is `1` only when the Linux
+managed runtime and protected library-bundle store are both constructed.
+macOS and a Linux runtime without that store report `0`.
+
+`refinement-eval-v1` plans require a strict `refinement` binding and exactly two
+library projections: the fixture and the selected base or candidate skill. The
+binding commits the fixture, base, and candidate projection IDs, SHA-256
+digests, and destination aliases, the selected variant, and a matched-context
+digest. Path grants are unavailable in V1. Missing bindings or an attempt to
+fall back to the resource receipt V1 are rejected.
+
+The fixture projection is canonical JSON using
+`glove.refinement-eval-fixture-v1`. Unknown fields, duplicate/noncanonical
+encoding, invalid UTF-8, unsafe bounds, or a projection/session/variant mismatch
+fail before child release. The fixture binds:
+
+- evaluation run, matched pair, session, and base/candidate variant;
+- proposal, base projection, candidate projection, fixture, and dataset
+  digests;
+- fixture ID, dataset reference, deterministic seed, model identity, harness,
+  and optional module identity/selectors;
+- the selected skill projection;
+- expected termination and exit code, optional maximum wall latency, and
+  canonical sorted required/forbidden UTF-8 transcript literals.
+
+Glove derives a plan-context digest from runtime, adapter, backend, network/tool
+policy IDs, secrets, six resource limits, policy revision, and both skill
+projection commitments. It excludes expiry and the selected variant/projection.
+The normalized fixture context excludes only session, variant, and selected
+skill projection. Their combined matched-context digest therefore permits only
+the intended variant/session/expiry/skill-projection deltas across a matched
+pair.
+
+The evaluator consumes the complete online PTY stream, independently of the
+bounded circular attach transcript. It never parses model output as a result
+frame. The synthesized metrics are `passed`, `latency_us`,
+`failed_assertions`, `required_literals`, and `forbidden_literals`. Token counts
+and tool/security/egress event assertions are intentionally absent because the
+current managed-session architecture does not expose those as trusted
+session-bound observations.
+
+The distinct authenticated refinement receipt carries the exact projections,
+variant, matched context, synthesized outcome and commitment, complete raw-PTY
+digest, resource receipt, and evaluator completeness. It shares the durable
+journal sequence with resource receipts but has separate receipt/envelope HMAC
+domains and a distinct registry transition. Torn-tail recovery, exact paging,
+replay rejection, and terminal reconciliation apply to both receipt kinds.
 
 `max_plan_ttl_ms` must exceed every resource profile's `wall_time_ms` by at
 least one second. That headroom is reserved for approval and launch; Glove and

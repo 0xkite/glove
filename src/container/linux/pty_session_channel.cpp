@@ -169,6 +169,7 @@ pty_session_channel::pty_session_channel(
       max_input_frame_bytes_{options.max_input_frame_bytes},
       input_timeout_ms_{options.input_timeout_ms},
       monitor_{std::move(options.monitor)},
+      refinement_evaluator_{std::move(options.refinement_evaluator)},
       transcript_{std::move(transcript)} {}
 
 pty_session_channel::~pty_session_channel() {
@@ -520,11 +521,21 @@ void pty_session_channel::drain_loop() {
 }
 
 void pty_session_channel::append_output(std::string_view bytes) {
-    const bool within_output_limit = monitor_->account_terminal_output(bytes.size());
-    const std::lock_guard lock{state_mutex_};
     const auto raw_bytes = std::span<const unsigned char>{
         reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()
     };
+    if (refinement_evaluator_) {
+        if (auto consumed = refinement_evaluator_->consume(raw_bytes); !consumed) {
+            static_cast<void>(
+                monitor_->request_termination(resource_termination_cause::supervisor_error)
+            );
+            const std::lock_guard lock{state_mutex_};
+            set_error_locked(error_code::worker_failure);
+            return;
+        }
+    }
+    const bool within_output_limit = monitor_->account_terminal_output(bytes.size());
+    const std::lock_guard lock{state_mutex_};
     if (auto hashed = transcript_hash_.update(raw_bytes); !hashed) {
         static_cast<void>(
             monitor_->request_termination(resource_termination_cause::supervisor_error)

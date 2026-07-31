@@ -149,6 +149,7 @@ auto make_inputs(
                 .egress_policy_id = "",
                 .egress_targets = {},
                 .secret_mounts = {},
+                .refinement = std::nullopt,
             },
         .path_grants = std::move(grants),
         .library_projections = {},

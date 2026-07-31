@@ -522,6 +522,64 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         return std::unexpected(supported.error());
     }
 
+    std::shared_ptr<container::refinement_transcript_evaluator> refinement_evaluator;
+    if (owned_inputs.launch.refinement) {
+        const auto fixture = std::ranges::find_if(
+            owned_inputs.library_projections,
+            [&](const auto& projection) {
+                return projection.projection_id ==
+                           owned_inputs.launch.refinement->fixture.projection_id &&
+                       projection.destination_alias ==
+                           owned_inputs.launch.refinement->fixture.destination_alias &&
+                       projection.bundle.content_digest() ==
+                           owned_inputs.launch.refinement->fixture.content_digest;
+            }
+        );
+        if (fixture == owned_inputs.library_projections.end()) {
+            return std::unexpected(
+                std::string{"refinement fixture projection is unavailable"}
+            );
+        }
+        auto fixture_bytes =
+            fixture->bundle.read_bytes(container::max_refinement_fixture_bytes);
+        if (!fixture_bytes) {
+            return std::unexpected(
+                std::string{"read refinement fixture projection: "} + fixture_bytes.error()
+            );
+        }
+        auto evaluator = container::refinement_transcript_evaluator::create(
+            *fixture_bytes,
+            owned_inputs.session.session_id,
+            *owned_inputs.launch.refinement
+        );
+        if (!evaluator) {
+            return std::unexpected(
+                std::string{"construct declarative refinement evaluator: "} + evaluator.error()
+            );
+        }
+        refinement_evaluator = std::move(*evaluator);
+        std::vector<supervisor::resolved_library_projection> selected_projections;
+        selected_projections.reserve(1);
+        for (auto& projection : owned_inputs.library_projections) {
+            if (projection.projection_id !=
+                owned_inputs.launch.refinement->fixture.projection_id) {
+                selected_projections.push_back(std::move(projection));
+            }
+        }
+        if (selected_projections.size() != 1U) {
+            return std::unexpected(
+                std::string{"refinement selected skill projection is ambiguous"}
+            );
+        }
+        owned_inputs.library_projections = std::move(selected_projections);
+    } else if (
+        owned_inputs.launch.runtime_template_id == container::refinement_runtime_template_id
+    ) {
+        return std::unexpected(
+            std::string{"refinement runtime is missing its evaluator binding"}
+        );
+    }
+
     auto filesystem = supervisor::linux_detail::linux_session_filesystem::create(
         materialization_root_,
         owned_inputs.session.session_id,
@@ -604,6 +662,7 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         .filesystem_identity = std::move(filesystem_identity),
         .lifecycle = std::move(*lifecycle),
         .egress_proxy = std::move(egress_proxy),
+        .refinement_evaluator = std::move(refinement_evaluator),
     };
 }
 

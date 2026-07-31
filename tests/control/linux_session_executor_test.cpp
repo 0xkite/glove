@@ -1,6 +1,8 @@
+#include "glove/container/digest.hpp"
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/receipt_audit_protocol.hpp"
 #include "glove/control/session_registry.hpp"
+#include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/path_alias.hpp"
 #include "glove/supervisor/session_plan.hpp"
 
@@ -14,6 +16,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -183,6 +186,18 @@ auto safe_runtime_digest() -> std::string {
     return digest.value_or(std::string{});
 }
 
+auto refinement_runtime_digest() -> std::string {
+    auto digest = glove::supervisor::runtime_launch_template_digest({
+        .runtime_discovery = {},
+        .executable_path = "/usr/bin/sh",
+        .executable_search_paths = {},
+        .arguments = {"-c", "printf 'alpha beta done'"},
+        .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+        .read_only_paths = {},
+    });
+    return digest.value_or(std::string{});
+}
+
 class temporary_tree {
 public:
     temporary_tree() {
@@ -238,7 +253,8 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
     }
     const auto safe_digest = safe_runtime_digest();
     const auto interactive_digest = interactive_runtime_digest();
-    if (safe_digest.empty() || interactive_digest.empty()) {
+    const auto refinement_digest = refinement_runtime_digest();
+    if (safe_digest.empty() || interactive_digest.empty() || refinement_digest.empty()) {
         return std::unexpected(std::string{"derive runtime digest"});
     }
     return session_plan_validator::build(
@@ -281,12 +297,37 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
                                 .read_only_paths = {},
                             },
                     },
+                    runtime_template_policy{
+                        .runtime_template_id = "refinement-eval-v1",
+                        .runtime_id = "refinement-harness",
+                        .adapter_command_digest = refinement_digest,
+                        .backend = sandbox_backend::linux_production,
+                        .allowed_path_aliases = {"workspace"},
+                        .allowed_projection_destinations = {"fixtures", "skills"},
+                        .launch =
+                            runtime_launch_template{
+                                .runtime_discovery = {},
+                                .executable_path = "/usr/bin/sh",
+                                .executable_search_paths = {},
+                                .arguments = {"-c", "printf 'alpha beta done'"},
+                                .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+                                .read_only_paths = {},
+                            },
+                    },
                 },
             .library_projection_destinations =
                 {
                     library_projection_destination_policy{
                         .alias = "libraries",
                         .target_path = "/opt/sage/library-bundles",
+                    },
+                    library_projection_destination_policy{
+                        .alias = "fixtures",
+                        .target_path = "/opt/glove/fixtures",
+                    },
+                    library_projection_destination_policy{
+                        .alias = "skills",
+                        .target_path = "/opt/glove/refinement-skills",
                     },
                 },
             .resource_profiles =
@@ -328,6 +369,33 @@ auto plan(
            "\"pids\":16,\"wall_time_ms\":5000,\"disk_bytes\":" + std::to_string(page * 16U) +
            ",\"terminal_output_bytes\":1048576},\"policy_revision\":7,\"expires_at_ms\":" +
            std::to_string(now_ms + 120'000) + "}";
+}
+
+auto refinement_plan(
+    std::uint64_t now_ms,
+    std::uint64_t page,
+    std::string_view fixture_digest,
+    std::string_view candidate_digest,
+    std::string_view matched_context_digest
+) -> std::string {
+    return std::string{
+               R"({"schema_version":1,"runtime_id":"refinement-harness","runtime_template_id":"refinement-eval-v1","adapter_command_digest":")"
+           } +
+           refinement_runtime_digest() +
+           R"(","sandbox_backend":"linux_production","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[],"library_projections":[{"projection_id":"candidate","content_digest":")" +
+           std::string{candidate_digest} +
+           R"(","destination_alias":"skills"},{"projection_id":"fixture","content_digest":")" +
+           std::string{fixture_digest} +
+           R"(","destination_alias":"fixtures"}],"secret_handles":[],"limits":{"cpu_time_ms":10000,"memory_bytes":134217728,"pids":16,"wall_time_ms":5000,"disk_bytes":)" +
+           std::to_string(page * 16U) +
+           R"(,"terminal_output_bytes":1048576},"policy_revision":7,"expires_at_ms":)" +
+           std::to_string(now_ms + 120'000) +
+           R"(,"refinement":{"schema_version":1,"variant":"candidate","fixture":{"projection_id":"fixture","content_digest":")" +
+           std::string{fixture_digest} +
+           R"(","destination_alias":"fixtures"},"base":{"projection_id":"base","content_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","destination_alias":"skills"},"candidate":{"projection_id":"candidate","content_digest":")" +
+           std::string{candidate_digest} +
+           R"(","destination_alias":"skills"},"matched_context_digest":")" +
+           std::string{matched_context_digest} + R"("}})";
 }
 
 auto run() -> int {
@@ -506,6 +574,7 @@ auto run() -> int {
             .input_timeout_ms = 1'000,
             .initial_rows = 24,
             .initial_columns = 80,
+            .refinement_evaluator = nullptr,
         },
         1
     );
@@ -564,6 +633,7 @@ auto run() -> int {
             .input_timeout_ms = 1'000,
             .initial_rows = 24,
             .initial_columns = 80,
+            .refinement_evaluator = nullptr,
         },
         1
     );
@@ -572,7 +642,13 @@ auto run() -> int {
         std::move(*wire_runtime_result)
     };
     auto protocol = glove::control::receipt_audit_protocol::create(
-        bootstrap_secret, shared_producer, shared_validator, shared_registry, session_runtime
+        bootstrap_secret,
+        shared_producer,
+        shared_validator,
+        shared_registry,
+        session_runtime,
+        {},
+        materializations.string()
     );
     REQUIRE(protocol.has_value());
     auto capabilities_frame = (*protocol)->handle_frame(
@@ -602,8 +678,11 @@ auto run() -> int {
     REQUIRE(capabilities.session_control.signal);
     REQUIRE(capabilities.session_control.detach);
     REQUIRE(capabilities.session_control.cleanup_session);
-    REQUIRE(capabilities.agent_runtime_adapter_schema_version == 0);
-    REQUIRE(capabilities.managed_runtime_ids.empty());
+    REQUIRE(capabilities.agent_runtime_adapter_schema_version == 1);
+    REQUIRE(
+        capabilities.managed_runtime_ids ==
+        std::vector<std::string>({"codex", "claude-code", "pi", "copilot", "opencode"})
+    );
     REQUIRE(capabilities.path_exposure_admin_schema_version == 0);
     REQUIRE(capabilities.path_exposure_catalog_schema_version == 0);
     REQUIRE(capabilities.retained_write_schema_version == 0);
@@ -970,6 +1049,198 @@ auto run() -> int {
     REQUIRE(shared_producer->anchor().sequence == 2);
     REQUIRE(std::filesystem::is_empty(materializations));
     REQUIRE(std::filesystem::exists(source / "tracked.txt"));
+
+    const auto capability_bundle_root = tree.root() / "capability-bundles";
+    REQUIRE(std::filesystem::create_directory(capability_bundle_root));
+    REQUIRE(::chmod(capability_bundle_root.c_str(), 0700) == 0);
+    auto capability_store =
+        glove::supervisor::library_bundle_store::open(capability_bundle_root);
+    REQUIRE(capability_store.has_value());
+    auto capability_registry = glove::control::session_registry::open_or_create(
+        tree.root() / "capability-sessions.journal",
+        shared_validator,
+        std::make_shared<const glove::supervisor::library_bundle_store>(
+            std::move(*capability_store)
+        )
+    );
+    REQUIRE(capability_registry.has_value());
+    auto capability_registry_shared =
+        std::shared_ptr<glove::control::session_registry>{std::move(*capability_registry)};
+    auto capability_runtime = glove::control::linux_detail::linux_session_runtime::create(
+        *capability_registry_shared, *preparer, {}, 1
+    );
+    REQUIRE(capability_runtime.has_value());
+    auto capability_runtime_shared =
+        std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
+            std::move(*capability_runtime)
+        };
+    REQUIRE(
+        capability_runtime_shared->refinement_evaluation_protocol_schema_version() == 1
+    );
+    auto capability_protocol = glove::control::receipt_audit_protocol::create(
+        bootstrap_secret,
+        shared_producer,
+        shared_validator,
+        capability_registry_shared,
+        capability_runtime_shared,
+        {},
+        materializations.string()
+    );
+    REQUIRE(capability_protocol.has_value());
+    auto refinement_capability_frame = (*capability_protocol)->handle_frame(
+        make_request(
+            "refinement-runtime-capabilities",
+            "capabilities",
+            "null",
+            std::nullopt,
+            interactive_now_ms + 20'000U
+        ),
+        interactive_now_ms + 12U
+    );
+    REQUIRE(refinement_capability_frame.has_value());
+    auto refinement_capability_response = decode_response(*refinement_capability_frame);
+    REQUIRE(refinement_capability_response.has_value());
+    REQUIRE(refinement_capability_response->result.has_value());
+    supervisor_capabilities refinement_capabilities;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        refinement_capabilities, refinement_capability_response->result->str
+    ));
+    REQUIRE(refinement_capabilities.refinement_evaluation_protocol_schema_version == 1);
+
+    const std::string candidate_bytes = R"({"candidate":"exact"})";
+    const auto candidate_digest = glove::container::sha256_hex(
+        std::span<const unsigned char>{
+            reinterpret_cast<const unsigned char*>(candidate_bytes.data()),
+            candidate_bytes.size()
+        }
+    );
+    REQUIRE(candidate_digest.has_value());
+    const auto placeholder_plan = refinement_plan(
+        interactive_now_ms,
+        page,
+        std::string(64, 'f'),
+        *candidate_digest,
+        std::string(64, '0')
+    );
+    auto plan_context = shared_validator->refinement_plan_context_digest_json(
+        placeholder_plan, interactive_now_ms
+    );
+    REQUIRE(plan_context.has_value());
+    glove::container::refinement_fixture_manifest fixture{
+        .schema = std::string{glove::container::refinement_fixture_schema},
+        .evaluation_run_id = "run-control",
+        .pair_id = "pair-control",
+        .session_id = "session-refinement",
+        .variant = glove::container::refinement_variant::candidate,
+        .proposal_digest = std::string(64, 'a'),
+        .base_projection_digest = std::string(64, 'b'),
+        .candidate_projection_digest = *candidate_digest,
+        .fixture_id = "fixture-control",
+        .fixture_digest = std::string(64, 'd'),
+        .dataset_ref = "fixture:control",
+        .dataset_fingerprint = std::string(64, 'e'),
+        .seed = 7,
+        .model =
+            {
+                .provider = "test",
+                .model_id = "synthetic",
+                .model_family = "synthetic",
+                .model_revision = std::nullopt,
+                .tier = "local",
+                .normalizer_version = 1,
+            },
+        .harness = "synthetic",
+        .module = std::nullopt,
+        .skill_projection_id = "candidate",
+        .skill_projection_digest = *candidate_digest,
+        .matched_context_digest = std::string(64, '0'),
+        .assertions =
+            {
+                .expected_termination =
+                    glove::container::resource_termination_cause::exited,
+                .expected_exit_code = 0,
+                .required_transcript_literals = {"alpha beta", "done"},
+                .forbidden_transcript_literals = {"forbidden"},
+                .max_latency_ms = 2'000,
+            },
+    };
+    fixture.matched_context_digest =
+        glove::container::refinement_fixture_context_digest(fixture, *plan_context).value();
+    const auto fixture_bytes =
+        glove::container::canonical_refinement_fixture_bytes(fixture);
+    REQUIRE(fixture_bytes.has_value());
+    const auto fixture_digest = glove::container::sha256_hex(
+        std::span<const unsigned char>{
+            reinterpret_cast<const unsigned char*>(fixture_bytes->data()),
+            fixture_bytes->size()
+        }
+    );
+    REQUIRE(fixture_digest.has_value());
+    for (const auto& [digest, contents] : std::array{
+             std::pair{*candidate_digest, candidate_bytes},
+             std::pair{*fixture_digest, *fixture_bytes},
+         }) {
+        std::ofstream output{
+            capability_bundle_root / (digest + ".json"), std::ios::binary | std::ios::trunc
+        };
+        output << contents;
+        output.flush();
+        REQUIRE(output.good());
+        REQUIRE(::chmod((capability_bundle_root / (digest + ".json")).c_str(), 0600) == 0);
+    }
+    const auto final_refinement_plan = refinement_plan(
+        interactive_now_ms,
+        page,
+        *fixture_digest,
+        *candidate_digest,
+        fixture.matched_context_digest
+    );
+    auto refinement_created = (*capability_protocol)->handle_frame(
+        make_request(
+            "create-refinement",
+            "create_session",
+            std::string{"{\"session_id\":\"session-refinement\",\"controller_plan_digest\":\""} +
+                std::string{controller_digest} + "\",\"plan\":" + final_refinement_plan + "}",
+            "create-session-refinement",
+            interactive_now_ms + 20'000U
+        ),
+        interactive_now_ms
+    );
+    REQUIRE(refinement_created.has_value());
+    auto refinement_created_response = decode_response(*refinement_created);
+    REQUIRE(refinement_created_response.has_value());
+    REQUIRE(refinement_created_response->result.has_value());
+    session_record_result refinement_record;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        refinement_record, refinement_created_response->result->str
+    ));
+    REQUIRE(
+        capability_runtime_shared->reconcile(*shared_producer, interactive_now_ms + 1U)
+            .has_value()
+    );
+    const glove::control::session_start_authorization refinement_authorization{
+        .schema_version = 1,
+        .authorization_id = "approval-session-refinement",
+        .session_id = "session-refinement",
+        .controller_plan_digest = std::string{controller_digest},
+        .plan_content_digest = refinement_record.plan_content_digest,
+        .approved_at_ms = interactive_now_ms + 2U,
+        .expires_at_ms = interactive_now_ms + 30'000U,
+    };
+    auto refinement_started = capability_runtime_shared->start(
+        *shared_producer,
+        refinement_authorization,
+        "execute-session-refinement",
+        interactive_now_ms + 3U
+    );
+    REQUIRE(refinement_started.has_value());
+    auto refinement_exited = capability_runtime_shared->wait("session-refinement");
+    REQUIRE(refinement_exited.has_value());
+    auto durable_refinement =
+        capability_registry_shared->exited_status("session-refinement");
+    REQUIRE(durable_refinement.has_value());
+    REQUIRE(durable_refinement->refinement_receipt);
+    REQUIRE(shared_producer->anchor().sequence == 3);
     return 0;
 }
 

@@ -77,6 +77,7 @@ auto run() -> int {
         .max_input_frame_bytes = 4,
         .input_timeout_ms = 1'000,
         .monitor = *monitor,
+        .refinement_evaluator = nullptr,
     });
     REQUIRE(channel.has_value());
 
@@ -140,6 +141,7 @@ auto run() -> int {
         .max_input_frame_bytes = 4,
         .input_timeout_ms = 1'000,
         .monitor = *quota_monitor,
+        .refinement_evaluator = nullptr,
     });
     REQUIRE(quota_channel.has_value());
     REQUIRE(write_all(quota_pair->slave_fd(), "12345"));

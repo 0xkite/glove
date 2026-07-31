@@ -673,6 +673,7 @@ auto real_native_harness_test(
                 .input_timeout_ms = 1'000,
                 .initial_rows = 24,
                 .initial_columns = 80,
+                .refinement_evaluator = nullptr,
             },
             [](::pid_t) -> std::expected<void, std::string> { return {}; }
         );
@@ -882,6 +883,7 @@ auto interactive_pty_attach_and_stop_test(
             .input_timeout_ms = 1'000,
             .initial_rows = 24,
             .initial_columns = 80,
+            .refinement_evaluator = nullptr,
         },
         [&](::pid_t child) -> std::expected<void, std::string> {
             gate_called = child > 0;
@@ -915,6 +917,114 @@ auto interactive_pty_attach_and_stop_test(
     stop_gate_called = false;
     REQUIRE((*session)->stop(before_stop).has_value());
     REQUIRE(!stop_gate_called);
+    REQUIRE(std::filesystem::is_empty(materialization_root));
+    return 0;
+}
+
+auto declarative_refinement_evaluator_test(
+    cgroup_v2_root& root,
+    const std::filesystem::path& materialization_root,
+    std::uint64_t page
+) -> int {
+    using namespace glove::container;
+    const auto limits = limits_for(page * 32U);
+    auto lifecycle =
+        make_lifecycle(root, materialization_root, {}, "managed-refinement", limits);
+    REQUIRE(lifecycle.has_value());
+    refinement_execution_binding execution;
+    execution.schema_version = 1;
+    execution.variant = refinement_variant::candidate;
+    execution.fixture = {"fixture", std::string(64, '0'), "fixtures"};
+    execution.base = {"base", std::string(64, 'b'), "skills"};
+    execution.candidate = {"candidate", std::string(64, 'c'), "skills"};
+    execution.matched_context_digest = std::string(64, '0');
+    execution.plan_context_digest = std::string(64, 'e');
+    refinement_fixture_manifest fixture{
+        .schema = std::string{refinement_fixture_schema},
+        .evaluation_run_id = "run-managed",
+        .pair_id = "pair-managed",
+        .session_id = "managed-refinement",
+        .variant = refinement_variant::candidate,
+        .proposal_digest = std::string(64, 'a'),
+        .base_projection_digest = execution.base.content_digest,
+        .candidate_projection_digest = execution.candidate.content_digest,
+        .fixture_id = "prompt-managed",
+        .fixture_digest = std::string(64, 'd'),
+        .dataset_ref = "fixture:managed",
+        .dataset_fingerprint = std::string(64, 'f'),
+        .seed = 42,
+        .model =
+            {
+                .provider = "test",
+                .model_id = "synthetic",
+                .model_family = "synthetic",
+                .model_revision = std::nullopt,
+                .tier = "local",
+                .normalizer_version = 1,
+            },
+        .harness = "synthetic",
+        .module = std::nullopt,
+        .skill_projection_id = execution.candidate.projection_id,
+        .skill_projection_digest = execution.candidate.content_digest,
+        .matched_context_digest = std::string(64, '0'),
+        .assertions =
+            {
+                .expected_termination = resource_termination_cause::exited,
+                .expected_exit_code = 0,
+                .required_transcript_literals = {"alpha beta", "done"},
+                .forbidden_transcript_literals = {"forbidden"},
+                .max_latency_ms = 2'000,
+            },
+    };
+    fixture.matched_context_digest =
+        refinement_fixture_context_digest(fixture, execution.plan_context_digest).value();
+    execution.matched_context_digest = fixture.matched_context_digest;
+    const auto encoded = canonical_refinement_fixture_bytes(fixture).value();
+    const auto encoded_bytes = std::span<const unsigned char>{
+        reinterpret_cast<const unsigned char*>(encoded.data()), encoded.size()
+    };
+    execution.fixture.content_digest = sha256_hex(encoded_bytes).value();
+    auto evaluator = refinement_transcript_evaluator::create(
+        encoded_bytes, fixture.session_id, execution
+    );
+    REQUIRE(evaluator.has_value());
+
+    const auto prof = launch_profile(limits);
+    const std::vector argv = {
+        std::string{"/usr/bin/sh"},
+        std::string{"-c"},
+        std::string{"printf 'alpha '; printf 'beta '; printf done"},
+    };
+    auto binding = glove::container::linux_detail::bind_managed_session(
+        prof, argv, **lifecycle, controller_plan_digest
+    );
+    REQUIRE(binding.has_value());
+    auto session = glove::container::linux_detail::start_managed_pty_session(
+        prof,
+        argv,
+        *binding,
+        std::move(*lifecycle),
+        {
+            .transcript_bytes = page,
+            .max_read_bytes = page,
+            .max_input_frame_bytes = page,
+            .input_timeout_ms = 1'000,
+            .initial_rows = 24,
+            .initial_columns = 80,
+            .refinement_evaluator = *evaluator,
+        },
+        [](::pid_t) -> std::expected<void, std::string> { return {}; }
+    );
+    REQUIRE(session.has_value());
+    auto resource = (*session)->wait();
+    REQUIRE(resource.has_value());
+    auto refinement = (*session)->wait_refinement();
+    REQUIRE(refinement.has_value());
+    REQUIRE(refinement->has_value());
+    REQUIRE(
+        (*refinement)->evaluated_outcome->metrics.at("passed") == 1
+    );
+    REQUIRE((*refinement)->transcript.byte_count == 15);
     REQUIRE(std::filesystem::is_empty(materialization_root));
     return 0;
 }
@@ -964,6 +1074,7 @@ auto run() -> int {
     REQUIRE(child_disk_exhaustion_test(*root, materialization_root, page) == 0);
     REQUIRE(child_output_exhaustion_test(*root, materialization_root, page) == 0);
     REQUIRE(interactive_pty_attach_and_stop_test(*root, materialization_root, page) == 0);
+    REQUIRE(declarative_refinement_evaluator_test(*root, materialization_root, page) == 0);
     return 0;
 }
 

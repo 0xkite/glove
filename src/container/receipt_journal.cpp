@@ -286,9 +286,19 @@ auto open_journal_path(const std::filesystem::path& path, bool create)
     return opened;
 }
 
-auto encode_envelope(const authenticated_resource_enforcement_receipt& envelope)
+auto valid_record(const receipt_journal_record& record) -> bool {
+    return (record.kind == "resource_enforcement_v1" && record.resource &&
+            !record.refinement) ||
+           (record.kind == "refinement_evaluation_v1" && !record.resource &&
+            record.refinement);
+}
+
+auto encode_record(const receipt_journal_record& record)
     -> std::expected<std::string, std::string> {
-    auto encoded = glz::write_json(envelope);
+    if (!valid_record(record)) {
+        return std::unexpected(std::string{"receipt journal record kind is invalid"});
+    }
+    auto encoded = glz::write_json(record);
     if (!encoded) {
         return std::unexpected(
             std::string{"receipt journal encode: "} +
@@ -301,15 +311,27 @@ auto encode_envelope(const authenticated_resource_enforcement_receipt& envelope)
     return *encoded;
 }
 
-auto decode_envelope(std::string_view payload)
-    -> std::expected<authenticated_resource_enforcement_receipt, std::string> {
-    authenticated_resource_enforcement_receipt envelope;
-    if (const auto error = glz::read<strict_read_options>(envelope, payload); error) {
+auto decode_record(std::string_view payload) -> std::expected<receipt_journal_record, std::string> {
+    receipt_journal_record record;
+    if (const auto error = glz::read<strict_read_options>(record, payload); !error) {
+        if (!valid_record(record)) {
+            return std::unexpected(std::string{"receipt journal record kind is invalid"});
+        }
+        return record;
+    }
+    // Journals created before refinement receipts used a naked resource
+    // envelope. Preserve exact recovery while all new writes use tagged records.
+    authenticated_resource_enforcement_receipt legacy;
+    if (const auto error = glz::read<strict_read_options>(legacy, payload); error) {
         return std::unexpected(
             std::string{"receipt journal decode: "} + glz::format_error(error, payload)
         );
     }
-    return envelope;
+    return receipt_journal_record{
+        .kind = "resource_enforcement_v1",
+        .resource = std::move(legacy),
+        .refinement = std::nullopt,
+    };
 }
 
 auto make_record(std::string_view payload) -> std::vector<unsigned char> {
@@ -324,7 +346,7 @@ auto make_record(std::string_view payload) -> std::vector<unsigned char> {
 auto anchor_is_prefix(
     const receipt_audit_anchor& peer,
     std::string_view key_id,
-    const std::vector<authenticated_resource_enforcement_receipt>& records
+    const std::vector<receipt_journal_record>& records
 ) -> bool {
     if (peer.key_id != key_id || peer.sequence > records.size()) {
         return false;
@@ -332,7 +354,9 @@ auto anchor_is_prefix(
     if (peer.sequence == 0) {
         return peer.head_hmac == std::string(64, '0');
     }
-    return peer.head_hmac == records[static_cast<std::size_t>(peer.sequence - 1U)].this_hmac;
+    const auto& record = records[static_cast<std::size_t>(peer.sequence - 1U)];
+    return peer.head_hmac ==
+           (record.resource ? record.resource->this_hmac : record.refinement->this_hmac);
 }
 
 auto validate_header(int descriptor, std::string_view expected_key_id)
@@ -361,7 +385,7 @@ auto validate_header(int descriptor, std::string_view expected_key_id)
 }
 
 struct recovered_journal {
-    std::vector<authenticated_resource_enforcement_receipt> records;
+    std::vector<receipt_journal_record> records;
     std::uint64_t durable_size = journal_header_bytes;
     bool torn_tail = false;
 };
@@ -405,19 +429,31 @@ auto recover_records(
         if (decode_u32(suffix) != payload_size) {
             return std::unexpected(std::string{"receipt journal record footer mismatch"});
         }
-        auto envelope = decode_envelope(payload);
-        if (!envelope) {
-            return std::unexpected(envelope.error());
+        auto record = decode_record(payload);
+        if (!record) {
+            return std::unexpected(record.error());
         }
-        auto verified = verify_receipt_audit_envelope(
-            *envelope, key_hex, envelope->session_id, envelope->controller_plan_digest, anchor
-        );
+        auto verified = record->resource
+                            ? verify_receipt_audit_envelope(
+                                  *record->resource,
+                                  key_hex,
+                                  record->resource->session_id,
+                                  record->resource->controller_plan_digest,
+                                  anchor
+                              )
+                            : verify_refinement_receipt_audit_envelope(
+                                  *record->refinement,
+                                  key_hex,
+                                  record->refinement->session_id,
+                                  record->refinement->controller_plan_digest,
+                                  anchor
+                              );
         if (!verified) {
             return std::unexpected(
                 std::string{"receipt journal chain verification: "} + verified.error()
             );
         }
-        recovered.records.push_back(std::move(*envelope));
+        recovered.records.push_back(std::move(*record));
         recovered.durable_size += record_bytes;
     }
     return recovered;
@@ -429,7 +465,7 @@ struct receipt_audit_journal::implementation {
     mutable std::mutex mutex;
     unique_fd descriptor;
     std::unique_ptr<receipt_audit_chain> chain;
-    std::vector<authenticated_resource_enforcement_receipt> records;
+    std::vector<receipt_journal_record> records;
     std::uint64_t durable_size = 0;
     std::uint64_t max_size = 0;
     bool repaired_tail = false;
@@ -589,7 +625,12 @@ auto receipt_audit_journal::append(
     }
     state_->chain->sequence_ = previous_sequence;
     state_->chain->head_hmac_.swap(previous_hmac);
-    auto payload = encode_envelope(*envelope);
+    receipt_journal_record journal_record{
+        .kind = "resource_enforcement_v1",
+        .resource = *envelope,
+        .refinement = std::nullopt,
+    };
+    auto payload = encode_record(journal_record);
     if (!payload) {
         return std::unexpected(payload.error());
     }
@@ -598,7 +639,7 @@ auto receipt_audit_journal::append(
         return std::unexpected(std::string{"receipt journal capacity exhausted"});
     }
     auto next_head = envelope->this_hmac;
-    state_->records.push_back(*envelope);
+    state_->records.push_back(std::move(journal_record));
 
     const auto rollback = [&]() -> std::expected<void, std::string> {
         if (state_->durable_size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
@@ -614,6 +655,82 @@ auto receipt_audit_journal::append(
         return {};
     };
 
+    auto written = write_at(state_->descriptor.get(), record, state_->durable_size);
+    if (!written) {
+        state_->records.pop_back();
+        auto restored = rollback();
+        return std::unexpected(
+            restored ? written.error() : written.error() + "; " + restored.error()
+        );
+    }
+    auto synced = sync_descriptor(state_->descriptor.get(), "receipt journal record sync");
+    if (!synced) {
+        state_->records.pop_back();
+        auto restored = rollback();
+        return std::unexpected(
+            restored ? synced.error() : synced.error() + "; " + restored.error()
+        );
+    }
+    state_->chain->sequence_ = envelope->sequence;
+    state_->chain->head_hmac_.swap(next_head);
+    state_->durable_size += record.size();
+    return envelope;
+}
+
+auto receipt_audit_journal::append_refinement(
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    const refinement_evaluation_receipt& receipt
+) -> std::expected<authenticated_refinement_evaluation_receipt, std::string> {
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned) {
+        return std::unexpected(std::string{"receipt journal is poisoned"});
+    }
+    auto observed_size = validate_file(state_->descriptor.get());
+    if (!observed_size || *observed_size != state_->durable_size) {
+        state_->poisoned = true;
+        return std::unexpected(
+            observed_size ? std::string{"receipt journal size changed unexpectedly"}
+                          : observed_size.error()
+        );
+    }
+    const auto previous_sequence = state_->chain->sequence_;
+    auto previous_hmac = state_->chain->head_hmac_;
+    auto envelope =
+        state_->chain->append_refinement(session_id, controller_plan_digest, receipt);
+    if (!envelope) {
+        return std::unexpected(envelope.error());
+    }
+    state_->chain->sequence_ = previous_sequence;
+    state_->chain->head_hmac_.swap(previous_hmac);
+    receipt_journal_record journal_record{
+        .kind = "refinement_evaluation_v1",
+        .resource = std::nullopt,
+        .refinement = *envelope,
+    };
+    auto payload = encode_record(journal_record);
+    if (!payload) {
+        return std::unexpected(payload.error());
+    }
+    const auto record = make_record(*payload);
+    if (record.size() > state_->max_size - state_->durable_size) {
+        return std::unexpected(std::string{"receipt journal capacity exhausted"});
+    }
+    auto next_head = envelope->this_hmac;
+    state_->records.push_back(std::move(journal_record));
+    const auto rollback = [&]() -> std::expected<void, std::string> {
+        if (state_->durable_size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+            ::ftruncate(state_->descriptor.get(), static_cast<off_t>(state_->durable_size)) != 0) {
+            state_->poisoned = true;
+            return std::unexpected(system_error("receipt journal rollback truncate"));
+        }
+        auto synced = sync_descriptor(state_->descriptor.get(), "receipt journal rollback sync");
+        if (!synced) {
+            state_->poisoned = true;
+            return std::unexpected(synced.error());
+        }
+        return {};
+    };
     auto written = write_at(state_->descriptor.get(), record, state_->durable_size);
     if (!written) {
         state_->records.pop_back();
@@ -662,6 +779,7 @@ auto receipt_audit_journal::page_after(
     const auto count = std::min(limit, remaining);
     receipt_journal_page page{
         .envelopes = {},
+        .refinement_envelopes = {},
         .has_more = count < remaining,
         .local_anchor = {
             .key_id = std::string{state_->chain->key_id()},
@@ -670,11 +788,14 @@ auto receipt_audit_journal::page_after(
         },
     };
     page.envelopes.reserve(count);
-    page.envelopes.insert(
-        page.envelopes.end(),
-        state_->records.begin() + static_cast<std::ptrdiff_t>(begin),
-        state_->records.begin() + static_cast<std::ptrdiff_t>(begin + count)
-    );
+    page.refinement_envelopes.reserve(count);
+    for (std::size_t index = begin; index < begin + count; ++index) {
+        if (state_->records[index].resource) {
+            page.envelopes.push_back(*state_->records[index].resource);
+        } else {
+            page.refinement_envelopes.push_back(*state_->records[index].refinement);
+        }
+    }
     return page;
 }
 
@@ -697,7 +818,31 @@ auto receipt_audit_journal::contains_exact(
         return false;
     }
     const auto index = static_cast<std::size_t>(envelope.sequence - 1U);
-    return state_->records[index] == envelope;
+    return state_->records[index].resource &&
+           *state_->records[index].resource == envelope;
+}
+
+auto receipt_audit_journal::contains_exact(
+    const authenticated_refinement_evaluation_receipt& envelope
+) const -> std::expected<bool, std::string> {
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned) {
+        return std::unexpected(std::string{"receipt journal is poisoned"});
+    }
+    auto observed_size = validate_file(state_->descriptor.get());
+    if (!observed_size || *observed_size != state_->durable_size) {
+        state_->poisoned = true;
+        return std::unexpected(
+            observed_size ? std::string{"receipt journal size changed unexpectedly"}
+                          : observed_size.error()
+        );
+    }
+    if (envelope.sequence == 0 || envelope.sequence > state_->records.size()) {
+        return false;
+    }
+    const auto index = static_cast<std::size_t>(envelope.sequence - 1U);
+    return state_->records[index].refinement &&
+           *state_->records[index].refinement == envelope;
 }
 
 auto receipt_audit_journal::terminal_for_execution(
@@ -722,7 +867,11 @@ auto receipt_audit_journal::terminal_for_execution(
         );
     }
     std::optional<authenticated_resource_enforcement_receipt> match;
-    for (const auto& envelope : state_->records) {
+    for (const auto& record : state_->records) {
+        if (!record.resource) {
+            continue;
+        }
+        const auto& envelope = *record.resource;
         if (envelope.session_id != session_id ||
             envelope.controller_plan_digest != controller_plan_digest ||
             envelope.receipt.profile_digest != profile_digest) {
@@ -731,6 +880,49 @@ auto receipt_audit_journal::terminal_for_execution(
         if (match) {
             return std::unexpected(
                 std::string{"multiple terminal receipts exist for one execution"}
+            );
+        }
+        match = envelope;
+    }
+    return match;
+}
+
+auto receipt_audit_journal::refinement_terminal_for_execution(
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    std::string_view profile_digest
+) const
+    -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string> {
+    if (!valid_identifier(session_id) || !valid_digest(controller_plan_digest) ||
+        !valid_digest(profile_digest)) {
+        return std::unexpected(std::string{"receipt execution lookup binding is invalid"});
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned) {
+        return std::unexpected(std::string{"receipt journal is poisoned"});
+    }
+    auto observed_size = validate_file(state_->descriptor.get());
+    if (!observed_size || *observed_size != state_->durable_size) {
+        state_->poisoned = true;
+        return std::unexpected(
+            observed_size ? std::string{"receipt journal size changed unexpectedly"}
+                          : observed_size.error()
+        );
+    }
+    std::optional<authenticated_refinement_evaluation_receipt> match;
+    for (const auto& record : state_->records) {
+        if (!record.refinement) {
+            continue;
+        }
+        const auto& envelope = *record.refinement;
+        if (envelope.session_id != session_id ||
+            envelope.controller_plan_digest != controller_plan_digest ||
+            envelope.receipt.resource_receipt.profile_digest != profile_digest) {
+            continue;
+        }
+        if (match) {
+            return std::unexpected(
+                std::string{"multiple refinement receipts exist for one execution"}
             );
         }
         match = envelope;

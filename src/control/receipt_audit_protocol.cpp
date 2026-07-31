@@ -66,6 +66,7 @@ struct page_request {
 struct page_result {
     std::uint8_t schema_version = 1;
     std::vector<container::authenticated_resource_enforcement_receipt> envelopes;
+    std::vector<container::authenticated_refinement_evaluation_receipt> refinement_envelopes;
     bool has_more = false;
     container::receipt_audit_anchor local_anchor;
 };
@@ -716,7 +717,10 @@ auto handle_capabilities(
             .change_manifest_schema_version = retained_write_schema_version,
             .change_apply_authorization_schema_version = 0,
             .refinement_evaluation_protocol_schema_version =
-                container::refinement_evaluation_capability_schema_version,
+                state.session_runtime
+                    ? state.session_runtime
+                          ->refinement_evaluation_protocol_schema_version()
+                    : std::uint8_t{0},
             .backends = {
                 backend_capabilities{
                     .backend = "linux_production",
@@ -1699,6 +1703,7 @@ auto handle_page(
     auto result = encode_json(
         page_result{
             .envelopes = std::move(page->envelopes),
+            .refinement_envelopes = std::move(page->refinement_envelopes),
             .has_more = page->has_more,
             .local_anchor = std::move(page->local_anchor),
         }

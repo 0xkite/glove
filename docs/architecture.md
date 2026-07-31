@@ -140,13 +140,28 @@ lifecycle:
 6. Start and recover the child through the executor and reconciler.
 7. Append an authenticated terminal receipt before projecting terminal state.
 
-The `refinement-eval-v1` result protocol is currently foundation-only. Glove
-defines a bounded canonical result frame, an online raw-PTY transcript
-commitment, and a distinct authenticated refinement receipt, but it does not
-yet have a Glove-owned runtime wrapper or a result descriptor that is excluded
-from model-child inheritance. Capability discovery therefore reports
-`refinement_evaluation_protocol_schema_version = 0`, and plan validation rejects
-that runtime template rather than falling back to the resource receipt V1.
+`refinement-eval-v1` is a Glove-owned declarative evaluator on the shipping
+Linux managed-session backend. The model and harness receive no evidence writer.
+Before launch, Glove reads the exact fixture projection through its pinned
+read-only bundle descriptor, strictly decodes a non-executable fixture DSL, and
+removes that supervisor-only projection from the child mount set. The selected
+base or candidate skill projection remains an ordinary immutable read-only
+projection.
+
+The PTY drain worker feeds every raw byte to the evaluator before circular
+transcript eviction. After clean drain and resource finalization, Glove checks
+the trusted termination, exit code, wall latency, UTF-8 stream state, and
+required/forbidden transcript literals, then synthesizes the canonical outcome.
+PTY JSON is only text and cannot become evidence. An incomplete stream or
+invalid UTF-8 produces authenticated invalid evidence; resource termination
+overrides otherwise satisfied transcript assertions.
+
+The distinct refinement envelope shares the receipt journal's global sequence
+and HMAC head but uses its own receipt and envelope domains. Recovery and audit
+paging preserve the receipt kind, and the session registry refuses a resource
+V1 envelope for a refinement plan. Capability discovery reports schema version
+`1` only when the Linux runtime and protected library projection store were
+both constructed.
 
 The local protocol exposes attach, input, resize, signal, detach, stop, and
 cleanup only when the runtime is constructed. Sage now wires that lifecycle and

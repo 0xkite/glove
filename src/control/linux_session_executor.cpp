@@ -96,19 +96,44 @@ struct linux_pty_session::implementation {
                 return;
             }
             const std::lock_guard transition_lock{transition_mutex};
-            auto terminal = producer->commit_terminal(
-                std::move(reservation),
-                failure_commitment.session_id,
-                failure_commitment.controller_plan_digest,
-                *receipt
-            );
-            if (!terminal) {
+            auto refinement = managed->wait_refinement();
+            if (!refinement) {
                 close_failed_locked(
-                    std::string{"commit Linux PTY terminal receipt: "} + terminal.error()
+                    std::string{"read Linux PTY refinement result: "} + refinement.error()
                 );
                 return;
             }
-            auto exited = registry->mark_exited(*terminal, *producer, exited_key);
+            session_registry_result<session_exited_record> exited =
+                std::unexpected(session_registry_error{});
+            if (*refinement) {
+                auto terminal = producer->commit_refinement_terminal(
+                    std::move(reservation),
+                    failure_commitment.session_id,
+                    failure_commitment.controller_plan_digest,
+                    **refinement
+                );
+                if (!terminal) {
+                    close_failed_locked(
+                        std::string{"commit Linux PTY refinement receipt: "} + terminal.error()
+                    );
+                    return;
+                }
+                exited = registry->mark_refinement_exited(*terminal, *producer, exited_key);
+            } else {
+                auto terminal = producer->commit_terminal(
+                    std::move(reservation),
+                    failure_commitment.session_id,
+                    failure_commitment.controller_plan_digest,
+                    *receipt
+                );
+                if (!terminal) {
+                    close_failed_locked(
+                        std::string{"commit Linux PTY terminal receipt: "} + terminal.error()
+                    );
+                    return;
+                }
+                exited = registry->mark_exited(*terminal, *producer, exited_key);
+            }
             if (!exited) {
                 publish_error(registry_error("project durable Linux PTY receipt", exited.error()));
                 return;
@@ -195,13 +220,15 @@ struct linux_session_runtime::implementation {
         : registry{&session_registry},
           preparer{&session_preparer},
           options{pty_options},
-          sessions{std::move(live_sessions)} {}
+          sessions{std::move(live_sessions)},
+          refinement_available{session_registry.library_projections_available()} {}
 
     session_registry* registry = nullptr;
     linux_session_preparer* preparer = nullptr;
     container::linux_detail::managed_pty_session_options options;
     std::unique_ptr<linux_pty_session_index> sessions;
     std::optional<session_reconciliation_report> reconciliation;
+    bool refinement_available = false;
     std::mutex start_mutex;
 };
 
@@ -541,6 +568,13 @@ auto linux_session_runtime::resource_capabilities() const noexcept
     return container::linux_detail::managed_session_capabilities();
 }
 
+auto linux_session_runtime::refinement_evaluation_protocol_schema_version() const noexcept
+    -> std::uint8_t {
+    return state_ && state_->refinement_available
+               ? container::refinement_evaluation_capability_schema_version
+               : std::uint8_t{0};
+}
+
 auto linux_session_runtime::start(
     container::receipt_audit_producer& receipt_producer,
     const session_start_authorization& authorization,
@@ -856,7 +890,10 @@ auto start_linux_pty_session(
         prepared->argv,
         prepared->binding,
         std::move(prepared->lifecycle),
-        options,
+        [&] {
+            options.refinement_evaluator = prepared->refinement_evaluator;
+            return options;
+        }(),
         before_child_release
     );
     if (!managed) {

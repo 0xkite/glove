@@ -84,6 +84,10 @@ public:
     // Exact runtime identifiers the configured managed closure can launch.
     // An adapter schema without this bounded set is not runtime-specific proof.
     [[nodiscard]] virtual auto managed_runtime_ids() const -> std::vector<std::string> = 0;
+    [[nodiscard]] virtual auto refinement_evaluation_protocol_schema_version() const noexcept
+        -> std::uint8_t {
+        return 0;
+    }
     [[nodiscard]] virtual auto resource_capabilities() const noexcept
         -> container::resource_enforcement_capabilities = 0;
     [[nodiscard]] virtual auto start(
