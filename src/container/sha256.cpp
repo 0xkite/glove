@@ -30,118 +30,6 @@ constexpr std::array<std::uint32_t, 64> round_constants = {
 
 // SHA-256's fixed schedule is indexed only by the explicit loop bounds below.
 // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
-class sha256_state {
-public:
-    void update(std::span<const unsigned char> input) noexcept {
-        for (const unsigned char byte : input) {
-            block_[block_size_++] = byte;
-            if (block_size_ == block_.size()) {
-                transform();
-                block_size_ = 0;
-            }
-        }
-        total_bytes_ += static_cast<std::uint64_t>(input.size());
-    }
-
-    [[nodiscard]] auto finish() noexcept -> std::array<unsigned char, 32> {
-        block_[block_size_++] = 0x80U;
-        if (block_size_ > 56U) {
-            while (block_size_ < block_.size()) {
-                block_[block_size_++] = 0;
-            }
-            transform();
-            block_size_ = 0;
-        }
-        while (block_size_ < 56U) {
-            block_[block_size_++] = 0;
-        }
-        const std::uint64_t bit_length = total_bytes_ * 8U;
-        for (std::size_t index = 0; index < 8U; ++index) {
-            const auto shift = static_cast<unsigned int>((7U - index) * 8U);
-            block_[56U + index] = static_cast<unsigned char>(bit_length >> shift);
-        }
-        transform();
-
-        std::array<unsigned char, 32> digest{};
-        for (std::size_t word = 0; word < state_.size(); ++word) {
-            for (std::size_t byte = 0; byte < 4U; ++byte) {
-                const auto shift = static_cast<unsigned int>((3U - byte) * 8U);
-                digest[word * 4U + byte] = static_cast<unsigned char>(state_[word] >> shift);
-            }
-        }
-        return digest;
-    }
-
-private:
-    void transform() noexcept {
-        std::array<std::uint32_t, 64> schedule{};
-        for (std::size_t index = 0; index < 16U; ++index) {
-            const std::size_t offset = index * 4U;
-            schedule[index] = static_cast<std::uint32_t>(block_[offset]) << 24U |
-                              static_cast<std::uint32_t>(block_[offset + 1U]) << 16U |
-                              static_cast<std::uint32_t>(block_[offset + 2U]) << 8U |
-                              static_cast<std::uint32_t>(block_[offset + 3U]);
-        }
-        for (std::size_t index = 16U; index < schedule.size(); ++index) {
-            const std::uint32_t first = std::rotr(schedule[index - 15U], 7) ^
-                                        std::rotr(schedule[index - 15U], 18) ^
-                                        (schedule[index - 15U] >> 3U);
-            const std::uint32_t second = std::rotr(schedule[index - 2U], 17) ^
-                                         std::rotr(schedule[index - 2U], 19) ^
-                                         (schedule[index - 2U] >> 10U);
-            schedule[index] = schedule[index - 16U] + first + schedule[index - 7U] + second;
-        }
-
-        std::uint32_t a = state_[0];
-        std::uint32_t b = state_[1];
-        std::uint32_t c = state_[2];
-        std::uint32_t d = state_[3];
-        std::uint32_t e = state_[4];
-        std::uint32_t f = state_[5];
-        std::uint32_t g = state_[6];
-        std::uint32_t h = state_[7];
-        for (std::size_t index = 0; index < schedule.size(); ++index) {
-            const std::uint32_t choose = (e & f) ^ (~e & g);
-            const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
-            const std::uint32_t upper_a = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
-            const std::uint32_t upper_e = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
-            const std::uint32_t first =
-                h + upper_e + choose + round_constants[index] + schedule[index];
-            const std::uint32_t second = upper_a + majority;
-            h = g;
-            g = f;
-            f = e;
-            e = d + first;
-            d = c;
-            c = b;
-            b = a;
-            a = first + second;
-        }
-        state_[0] += a;
-        state_[1] += b;
-        state_[2] += c;
-        state_[3] += d;
-        state_[4] += e;
-        state_[5] += f;
-        state_[6] += g;
-        state_[7] += h;
-    }
-
-    std::array<std::uint32_t, 8> state_ = {
-        0x6a09e667U,
-        0xbb67ae85U,
-        0x3c6ef372U,
-        0xa54ff53aU,
-        0x510e527fU,
-        0x9b05688cU,
-        0x1f83d9abU,
-        0x5be0cd19U,
-    };
-    std::array<unsigned char, 64> block_{};
-    std::size_t block_size_ = 0;
-    std::uint64_t total_bytes_ = 0;
-};
-
 auto encode_digest(const std::array<unsigned char, 32>& digest) -> std::string {
     constexpr std::array digits = {
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
@@ -155,17 +43,120 @@ auto encode_digest(const std::array<unsigned char, 32>& digest) -> std::string {
     return encoded;
 }
 
-// NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
-
 } // namespace
 
-auto sha256_hex(std::span<const unsigned char> input) -> std::expected<std::string, std::string> {
-    if (input.size() > std::numeric_limits<std::uint64_t>::max() / 8U) {
+auto sha256_stream::update(std::span<const unsigned char> input)
+    -> std::expected<void, std::string> {
+    constexpr auto max_input_bytes = std::numeric_limits<std::uint64_t>::max() / 8U;
+    if (input.size() > max_input_bytes - total_bytes_) {
         return std::unexpected(std::string{"SHA-256 input exceeds its length encoding"});
     }
-    sha256_state state;
-    state.update(input);
-    return encode_digest(state.finish());
+    for (const unsigned char byte : input) {
+        block_[block_size_++] = byte;
+        if (block_size_ == block_.size()) {
+            transform();
+            block_size_ = 0;
+        }
+    }
+    total_bytes_ += static_cast<std::uint64_t>(input.size());
+    return {};
+}
+
+auto sha256_stream::digest_hex() const -> std::expected<std::string, std::string> {
+    auto copy = *this;
+    return encode_digest(copy.finish());
+}
+
+auto sha256_stream::finish() noexcept -> std::array<unsigned char, 32> {
+    block_[block_size_++] = 0x80U;
+    if (block_size_ > 56U) {
+        while (block_size_ < block_.size()) {
+            block_[block_size_++] = 0;
+        }
+        transform();
+        block_size_ = 0;
+    }
+    while (block_size_ < 56U) {
+        block_[block_size_++] = 0;
+    }
+    const std::uint64_t bit_length = total_bytes_ * 8U;
+    for (std::size_t index = 0; index < 8U; ++index) {
+        const auto shift = static_cast<unsigned int>((7U - index) * 8U);
+        block_[56U + index] = static_cast<unsigned char>(bit_length >> shift);
+    }
+    transform();
+
+    std::array<unsigned char, 32> digest{};
+    for (std::size_t word = 0; word < state_.size(); ++word) {
+        for (std::size_t byte = 0; byte < 4U; ++byte) {
+            const auto shift = static_cast<unsigned int>((3U - byte) * 8U);
+            digest[word * 4U + byte] = static_cast<unsigned char>(state_[word] >> shift);
+        }
+    }
+    return digest;
+}
+
+void sha256_stream::transform() noexcept {
+    std::array<std::uint32_t, 64> schedule{};
+    for (std::size_t index = 0; index < 16U; ++index) {
+        const std::size_t offset = index * 4U;
+        schedule[index] = static_cast<std::uint32_t>(block_[offset]) << 24U |
+                          static_cast<std::uint32_t>(block_[offset + 1U]) << 16U |
+                          static_cast<std::uint32_t>(block_[offset + 2U]) << 8U |
+                          static_cast<std::uint32_t>(block_[offset + 3U]);
+    }
+    for (std::size_t index = 16U; index < schedule.size(); ++index) {
+        const std::uint32_t first = std::rotr(schedule[index - 15U], 7) ^
+                                    std::rotr(schedule[index - 15U], 18) ^
+                                    (schedule[index - 15U] >> 3U);
+        const std::uint32_t second = std::rotr(schedule[index - 2U], 17) ^
+                                     std::rotr(schedule[index - 2U], 19) ^
+                                     (schedule[index - 2U] >> 10U);
+        schedule[index] = schedule[index - 16U] + first + schedule[index - 7U] + second;
+    }
+
+    std::uint32_t a = state_[0];
+    std::uint32_t b = state_[1];
+    std::uint32_t c = state_[2];
+    std::uint32_t d = state_[3];
+    std::uint32_t e = state_[4];
+    std::uint32_t f = state_[5];
+    std::uint32_t g = state_[6];
+    std::uint32_t h = state_[7];
+    for (std::size_t index = 0; index < schedule.size(); ++index) {
+        const std::uint32_t choose = (e & f) ^ (~e & g);
+        const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        const std::uint32_t upper_a = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
+        const std::uint32_t upper_e = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
+        const std::uint32_t first = h + upper_e + choose + round_constants[index] + schedule[index];
+        const std::uint32_t second = upper_a + majority;
+        h = g;
+        g = f;
+        f = e;
+        e = d + first;
+        d = c;
+        c = b;
+        b = a;
+        a = first + second;
+    }
+    state_[0] += a;
+    state_[1] += b;
+    state_[2] += c;
+    state_[3] += d;
+    state_[4] += e;
+    state_[5] += f;
+    state_[6] += g;
+    state_[7] += h;
+}
+
+// NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
+
+auto sha256_hex(std::span<const unsigned char> input) -> std::expected<std::string, std::string> {
+    sha256_stream stream;
+    if (auto updated = stream.update(input); !updated) {
+        return std::unexpected(updated.error());
+    }
+    return stream.digest_hex();
 }
 
 auto sha256_fd_hex(int descriptor, std::uint64_t max_bytes)
@@ -176,7 +167,7 @@ auto sha256_fd_hex(int descriptor, std::uint64_t max_bytes)
     }
     std::array<unsigned char, std::size_t{64} * 1024U> buffer{};
     std::uint64_t offset = 0;
-    sha256_state state;
+    sha256_stream stream;
     while (true) {
         const std::uint64_t remaining = max_bytes - offset;
         if (remaining == 0) {
@@ -214,10 +205,13 @@ auto sha256_fd_hex(int descriptor, std::uint64_t max_bytes)
             break;
         }
         const auto count = static_cast<std::size_t>(read);
-        state.update(std::span<const unsigned char>{buffer.data(), count});
+        if (auto updated = stream.update(std::span<const unsigned char>{buffer.data(), count});
+            !updated) {
+            return std::unexpected(updated.error());
+        }
         offset += static_cast<std::uint64_t>(count);
     }
-    return encode_digest(state.finish());
+    return stream.digest_hex();
 }
 
 } // namespace glove::container::detail

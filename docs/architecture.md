@@ -140,6 +140,14 @@ lifecycle:
 6. Start and recover the child through the executor and reconciler.
 7. Append an authenticated terminal receipt before projecting terminal state.
 
+The `refinement-eval-v1` result protocol is currently foundation-only. Glove
+defines a bounded canonical result frame, an online raw-PTY transcript
+commitment, and a distinct authenticated refinement receipt, but it does not
+yet have a Glove-owned runtime wrapper or a result descriptor that is excluded
+from model-child inheritance. Capability discovery therefore reports
+`refinement_evaluation_protocol_schema_version = 0`, and plan validation rejects
+that runtime template rather than falling back to the resource receipt V1.
+
 The local protocol exposes attach, input, resize, signal, detach, stop, and
 cleanup only when the runtime is constructed. Sage now wires that lifecycle and
 receipt reconciliation. Exposure create/revoke remains owner-local; peers may

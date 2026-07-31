@@ -114,6 +114,15 @@ auto run() -> int {
     REQUIRE(eof.has_value());
     REQUIRE(eof->bytes.empty());
     REQUIRE(eof->eof);
+    REQUIRE((*channel)->finish_draining().has_value());
+    auto transcript = (*channel)->transcript_commitment();
+    REQUIRE(transcript.has_value());
+    REQUIRE(transcript->schema == glove::container::raw_pty_transcript_schema);
+    REQUIRE(transcript->byte_count == 12);
+    REQUIRE(transcript->complete);
+    REQUIRE(
+        transcript->digest == "d682ed4ca4d989c134ec94f1551e1ec580dd6d5a6ecde9f3d35e6e4a717fbde4"
+    );
     REQUIRE(termination_calls.load() == 0);
 
     auto quota_pair = glove::container::linux_detail::open_pty_pair();
@@ -136,6 +145,15 @@ auto run() -> int {
     REQUIRE(write_all(quota_pair->slave_fd(), "12345"));
     auto limited = (*quota_channel)->wait_read(0, 8, 1'000);
     REQUIRE(!limited.has_value());
+    REQUIRE((*quota_channel)->finish_draining().has_value());
+    auto limited_transcript = (*quota_channel)->transcript_commitment();
+    REQUIRE(limited_transcript.has_value());
+    REQUIRE(limited_transcript->byte_count == 5);
+    REQUIRE(!limited_transcript->complete);
+    REQUIRE(
+        limited_transcript->digest ==
+        "5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5"
+    );
     REQUIRE(termination_calls.load() == 1);
     return 0;
 }

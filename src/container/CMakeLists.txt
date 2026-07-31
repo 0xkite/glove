@@ -4,6 +4,7 @@ add_library(glove_container STATIC
     receipt_chain.cpp
     receipt_journal.cpp
     receipt_producer.cpp
+    refinement_protocol.cpp
     resource_monitor.cpp
 )
 add_library(glove::container ALIAS glove_container)

@@ -187,6 +187,7 @@ struct supervisor_capabilities {
     std::uint8_t retained_write_schema_version = 0;
     std::uint8_t change_manifest_schema_version = 0;
     std::uint8_t change_apply_authorization_schema_version = 0;
+    std::uint8_t refinement_evaluation_protocol_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
@@ -454,6 +455,7 @@ auto run() -> int {
     REQUIRE(capabilities.retained_write_schema_version == 0);
     REQUIRE(capabilities.change_manifest_schema_version == 0);
     REQUIRE(capabilities.change_apply_authorization_schema_version == 0);
+    REQUIRE(capabilities.refinement_evaluation_protocol_schema_version == 0);
     REQUIRE(capabilities.backends.size() == 2);
     for (const auto& backend : capabilities.backends) {
         REQUIRE(backend.resource_enforcement.cpu_time == "unavailable");
@@ -556,6 +558,7 @@ auto run() -> int {
     REQUIRE(exposure_capability_set.retained_write_schema_version == 0);
     REQUIRE(exposure_capability_set.change_manifest_schema_version == 0);
     REQUIRE(exposure_capability_set.change_apply_authorization_schema_version == 0);
+    REQUIRE(exposure_capability_set.refinement_evaluation_protocol_schema_version == 0);
 
     const auto exposure_payload =
         std::string{

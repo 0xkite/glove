@@ -1,6 +1,7 @@
 #include "glove/supervisor/session_plan.hpp"
 
 #include "glove/container/digest.hpp"
+#include "glove/container/refinement_protocol.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include <fcntl.h>
@@ -1353,6 +1354,13 @@ auto session_plan_validator::validate_json(std::string_view plan_json, std::uint
         !valid_identifier(plan.tool_policy_id) || !complete_limits(plan.limits)) {
         return std::unexpected(std::string{"session plan contains invalid authority identifiers"});
     }
+    if (plan.runtime_template_id == container::refinement_runtime_template_id &&
+        container::refinement_evaluation_capability_schema_version !=
+            container::refinement_evaluation_receipt_schema_version) {
+        return std::unexpected(
+            std::string{"refinement-eval-v1 requires unavailable dedicated result evidence"}
+        );
+    }
     if (plan.path_grants.size() > max_path_grants ||
         plan.library_projections.size() > max_library_projections ||
         plan.secret_handles.size() > max_secret_handles) {
@@ -1472,9 +1480,7 @@ auto session_plan_validator::resolve_runtime_launch_json(
             std::string{"runtime launch conflicts with managed adapter arguments"}
         );
     }
-    argv.reserve(
-        launch.arguments.size() + 1U + (adapter ? adapter->managed_arguments.size() : 0U)
-    );
+    argv.reserve(launch.arguments.size() + 1U + (adapter ? adapter->managed_arguments.size() : 0U));
     argv.push_back(std::move(*executable));
     argv.insert(argv.end(), launch.arguments.begin(), launch.arguments.end());
     if (adapter) {

@@ -324,6 +324,26 @@ auto envelope_material(
     return encoder;
 }
 
+auto refinement_envelope_material(
+    std::uint64_t sequence,
+    std::string_view key_id,
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    std::string_view receipt_digest,
+    std::string_view previous_hmac
+) -> canonical_encoder {
+    canonical_encoder encoder;
+    encoder.append_string("glove.refinement-receipt-audit-envelope");
+    encoder.append_u8(1);
+    encoder.append_u64(sequence);
+    encoder.append_string(key_id);
+    encoder.append_string(session_id);
+    encoder.append_string(controller_plan_digest);
+    encoder.append_string(receipt_digest);
+    encoder.append_string(previous_hmac);
+    return encoder;
+}
+
 auto constant_time_digest_equal(std::string_view left, std::string_view right) -> bool {
     auto left_bytes = decode_digest(left);
     auto right_bytes = decode_digest(right);
@@ -437,6 +457,53 @@ auto resource_enforcement_receipt_digest(const resource_enforcement_receipt& rec
     return detail::sha256_hex(encoded->bytes());
 }
 
+auto make_authenticated_refinement_evaluation_receipt(
+    std::string_view key_hex,
+    std::uint64_t sequence,
+    std::string_view previous_hmac,
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    const refinement_evaluation_receipt& receipt
+) -> std::expected<authenticated_refinement_evaluation_receipt, std::string> {
+    if (sequence == 0 || !valid_digest(previous_hmac) || !valid_identifier(session_id) ||
+        !valid_digest(controller_plan_digest)) {
+        return std::unexpected(std::string{"invalid refinement receipt envelope identity"});
+    }
+    auto key = decode_digest(key_hex);
+    if (!key) {
+        return std::unexpected(key.error());
+    }
+    auto key_id = derive_key_id(*key);
+    if (!key_id) {
+        std::ranges::fill(*key, 0U);
+        return std::unexpected(key_id.error());
+    }
+    auto receipt_digest = refinement_evaluation_receipt_digest(receipt);
+    if (!receipt_digest) {
+        std::ranges::fill(*key, 0U);
+        return std::unexpected(receipt_digest.error());
+    }
+    const auto material = refinement_envelope_material(
+        sequence, *key_id, session_id, controller_plan_digest, *receipt_digest, previous_hmac
+    );
+    auto this_hmac = hmac_sha256_hex(*key, material.bytes());
+    std::ranges::fill(*key, 0U);
+    if (!this_hmac) {
+        return std::unexpected(this_hmac.error());
+    }
+    return authenticated_refinement_evaluation_receipt{
+        .schema_version = 1,
+        .sequence = sequence,
+        .key_id = std::move(*key_id),
+        .session_id = std::string{session_id},
+        .controller_plan_digest = std::string{controller_plan_digest},
+        .receipt = receipt,
+        .receipt_digest = std::move(*receipt_digest),
+        .previous_hmac = std::string{previous_hmac},
+        .this_hmac = std::move(*this_hmac),
+    };
+}
+
 auto verify_receipt_audit_envelope(
     const authenticated_resource_enforcement_receipt& envelope,
     std::string_view key_hex,
@@ -493,6 +560,68 @@ auto verify_receipt_audit_envelope(
     std::ranges::fill(*key, 0U);
     if (!expected_hmac || !constant_time_digest_equal(envelope.this_hmac, *expected_hmac)) {
         return std::unexpected(std::string{"receipt audit HMAC mismatch"});
+    }
+    anchor.sequence = envelope.sequence;
+    anchor.head_hmac = envelope.this_hmac;
+    return {};
+}
+
+auto verify_refinement_receipt_audit_envelope(
+    const authenticated_refinement_evaluation_receipt& envelope,
+    std::string_view key_hex,
+    std::string_view expected_session_id,
+    std::string_view expected_controller_plan_digest,
+    receipt_audit_anchor& anchor
+) -> std::expected<void, std::string> {
+    auto key = decode_digest(key_hex);
+    if (!key) {
+        return std::unexpected(key.error());
+    }
+    auto key_id = derive_key_id(*key);
+    if (!key_id) {
+        std::ranges::fill(*key, 0U);
+        return std::unexpected(key_id.error());
+    }
+    auto fail = [&](std::string message) -> std::expected<void, std::string> {
+        std::ranges::fill(*key, 0U);
+        return std::unexpected(std::move(message));
+    };
+    if (envelope.schema_version != 1) {
+        return fail("unsupported refinement receipt audit envelope schema");
+    }
+    if (!valid_identifier(expected_session_id) || envelope.session_id != expected_session_id) {
+        return fail("refinement receipt audit session identity mismatch");
+    }
+    if (!valid_digest(expected_controller_plan_digest) ||
+        envelope.controller_plan_digest != expected_controller_plan_digest) {
+        return fail("refinement receipt audit controller plan digest mismatch");
+    }
+    if (anchor.key_id != *key_id || envelope.key_id != *key_id) {
+        return fail("refinement receipt audit key identity mismatch");
+    }
+    if (anchor.sequence == std::numeric_limits<std::uint64_t>::max() ||
+        envelope.sequence != anchor.sequence + 1U) {
+        return fail("refinement receipt audit sequence mismatch");
+    }
+    if (!constant_time_digest_equal(envelope.previous_hmac, anchor.head_hmac)) {
+        return fail("refinement receipt audit previous HMAC mismatch");
+    }
+    auto receipt_digest = refinement_evaluation_receipt_digest(envelope.receipt);
+    if (!receipt_digest || !constant_time_digest_equal(envelope.receipt_digest, *receipt_digest)) {
+        return fail("refinement receipt audit receipt digest mismatch");
+    }
+    const auto material = refinement_envelope_material(
+        envelope.sequence,
+        envelope.key_id,
+        envelope.session_id,
+        envelope.controller_plan_digest,
+        envelope.receipt_digest,
+        envelope.previous_hmac
+    );
+    auto expected_hmac = hmac_sha256_hex(*key, material.bytes());
+    std::ranges::fill(*key, 0U);
+    if (!expected_hmac || !constant_time_digest_equal(envelope.this_hmac, *expected_hmac)) {
+        return std::unexpected(std::string{"refinement receipt audit HMAC mismatch"});
     }
     anchor.sequence = envelope.sequence;
     anchor.head_hmac = envelope.this_hmac;

@@ -18,6 +18,14 @@ variables, or raw secrets.
 Capabilities are derived from successfully constructed components. macOS does
 not advertise managed-session resource enforcement.
 
+`refinement_evaluation_protocol_schema_version` is `0` until the trusted Glove
+runtime wrapper owns a dedicated bounded result pipe, closes its write
+descriptor before launching the model child, and durably journals the distinct
+authenticated refinement receipt. The typed frame and commitment primitives
+exist at schema version `1`, but `refinement-eval-v1` plans are rejected while
+the constructed capability remains `0`; they never fall back to the resource
+receipt V1.
+
 `max_plan_ttl_ms` must exceed every resource profile's `wall_time_ms` by at
 least one second. That headroom is reserved for approval and launch; Glove and
 Sage reject a policy that cannot launch its own resource profiles. The guided

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "glove/container/profile.hpp"
+#include "glove/container/refinement_protocol.hpp"
 
 #include <array>
 #include <cstdint>
@@ -27,6 +28,22 @@ struct authenticated_resource_enforcement_receipt {
     std::string this_hmac;
 
     auto operator==(const authenticated_resource_enforcement_receipt&) const -> bool = default;
+};
+
+// Separate authenticated envelope for refinement evidence. It cannot be
+// decoded as or substituted for the resource-enforcement V1 envelope.
+struct authenticated_refinement_evaluation_receipt {
+    std::uint8_t schema_version = 0;
+    std::uint64_t sequence = 0;
+    std::string key_id;
+    std::string session_id;
+    std::string controller_plan_digest;
+    refinement_evaluation_receipt receipt;
+    std::string receipt_digest;
+    std::string previous_hmac;
+    std::string this_hmac;
+
+    auto operator==(const authenticated_refinement_evaluation_receipt&) const -> bool = default;
 };
 
 // Trusted verifier state. Persisting this anchor makes replay, reordering,
@@ -88,10 +105,31 @@ private:
 [[nodiscard]] auto resource_enforcement_receipt_digest(const resource_enforcement_receipt& receipt)
     -> std::expected<std::string, std::string>;
 
+// Low-level authenticated commitment for the dedicated refinement receipt.
+// Persistence and sequence ownership remain the responsibility of the future
+// refinement-aware journal; capability version stays zero until that wiring is
+// constructed.
+[[nodiscard]] auto make_authenticated_refinement_evaluation_receipt(
+    std::string_view key_hex,
+    std::uint64_t sequence,
+    std::string_view previous_hmac,
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    const refinement_evaluation_receipt& receipt
+) -> std::expected<authenticated_refinement_evaluation_receipt, std::string>;
+
 // Verify without advancing on failure. `anchor` must be durable trusted state,
 // not a value supplied by the envelope or its remote controller.
 [[nodiscard]] auto verify_receipt_audit_envelope(
     const authenticated_resource_enforcement_receipt& envelope,
+    std::string_view key_hex,
+    std::string_view expected_session_id,
+    std::string_view expected_controller_plan_digest,
+    receipt_audit_anchor& anchor
+) -> std::expected<void, std::string>;
+
+[[nodiscard]] auto verify_refinement_receipt_audit_envelope(
+    const authenticated_refinement_evaluation_receipt& envelope,
     std::string_view key_hex,
     std::string_view expected_session_id,
     std::string_view expected_controller_plan_digest,

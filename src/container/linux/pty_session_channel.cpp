@@ -405,6 +405,21 @@ auto pty_session_channel::finish_draining() -> std::expected<void, std::string> 
     return std::unexpected(error_message_locked());
 }
 
+auto pty_session_channel::transcript_commitment() const
+    -> std::expected<raw_pty_transcript_commitment, std::string> {
+    const std::lock_guard lock{state_mutex_};
+    auto digest = transcript_hash_.digest_hex();
+    if (!digest) {
+        return std::unexpected(digest.error());
+    }
+    return raw_pty_transcript_commitment{
+        .schema = std::string{raw_pty_transcript_schema},
+        .digest = std::move(*digest),
+        .byte_count = transcript_hash_.byte_count(),
+        .complete = eof_ && worker_done_ && error_ == error_code::none,
+    };
+}
+
 void pty_session_channel::stop() noexcept {
     const std::lock_guard finish_lock{finish_mutex_};
     {
@@ -505,12 +520,22 @@ void pty_session_channel::drain_loop() {
 }
 
 void pty_session_channel::append_output(std::string_view bytes) {
-    if (!monitor_->account_terminal_output(bytes.size())) {
-        const std::lock_guard lock{state_mutex_};
+    const bool within_output_limit = monitor_->account_terminal_output(bytes.size());
+    const std::lock_guard lock{state_mutex_};
+    const auto raw_bytes = std::span<const unsigned char>{
+        reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()
+    };
+    if (auto hashed = transcript_hash_.update(raw_bytes); !hashed) {
+        static_cast<void>(
+            monitor_->request_termination(resource_termination_cause::supervisor_error)
+        );
+        set_error_locked(error_code::transcript_digest);
+        return;
+    }
+    if (!within_output_limit) {
         set_error_locked(error_code::output_limit);
         return;
     }
-    const std::lock_guard lock{state_mutex_};
     if (bytes.size() > std::numeric_limits<std::uint64_t>::max() - next_cursor_) {
         static_cast<void>(
             monitor_->request_termination(resource_termination_cause::supervisor_error)
@@ -554,6 +579,8 @@ auto pty_session_channel::error_message_locked() const -> std::string {
         return std::string{"terminal output limit exceeded"};
     case error_code::cursor_overflow:
         return std::string{"PTY transcript cursor exhausted"};
+    case error_code::transcript_digest:
+        return std::string{"PTY transcript digest exhausted"};
     case error_code::worker_failure:
         return std::string{"PTY session worker failed"};
     }

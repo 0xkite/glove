@@ -1,6 +1,7 @@
 #include "glove/control/receipt_audit_protocol.hpp"
 
 #include "glove/container/digest.hpp"
+#include "glove/container/refinement_protocol.hpp"
 #include "glove/supervisor/change_manifest.hpp"
 
 #include "receipt_audit_wire.hpp"
@@ -292,6 +293,7 @@ struct supervisor_capabilities {
     std::uint8_t retained_write_schema_version = 0;
     std::uint8_t change_manifest_schema_version = 0;
     std::uint8_t change_apply_authorization_schema_version = 0;
+    std::uint8_t refinement_evaluation_protocol_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
@@ -703,9 +705,9 @@ auto handle_capabilities(
                 state.session_runtime
                     ? state.session_runtime->agent_runtime_adapter_schema_version()
                     : std::uint8_t{0},
-            .managed_runtime_ids =
-                state.session_runtime ? state.session_runtime->managed_runtime_ids()
-                                      : std::vector<std::string>{},
+            .managed_runtime_ids = state.session_runtime
+                                       ? state.session_runtime->managed_runtime_ids()
+                                       : std::vector<std::string>{},
             .path_exposure_admin_schema_version =
                 state.path_exposures ? std::uint8_t{1} : std::uint8_t{0},
             .path_exposure_catalog_schema_version =
@@ -713,6 +715,8 @@ auto handle_capabilities(
             .retained_write_schema_version = retained_write_schema_version,
             .change_manifest_schema_version = retained_write_schema_version,
             .change_apply_authorization_schema_version = 0,
+            .refinement_evaluation_protocol_schema_version =
+                container::refinement_evaluation_capability_schema_version,
             .backends = {
                 backend_capabilities{
                     .backend = "linux_production",
@@ -757,9 +761,9 @@ auto session_profile_digest(const session_registry& sessions, const session_reco
             return status->profile_digest;
         }
         auto managed = sessions.managed_lifecycle_status(record.session_id);
-        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
-                             managed->profile_digest
-                         }
+        return managed ? std::expected<
+                             std::optional<std::string>,
+                             session_registry_error>{managed->profile_digest}
                        : std::unexpected(managed.error());
     }
     case session_state::running: {
@@ -768,9 +772,9 @@ auto session_profile_digest(const session_registry& sessions, const session_reco
             return status->profile_digest;
         }
         auto managed = sessions.managed_lifecycle_status(record.session_id);
-        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
-                             managed->profile_digest
-                         }
+        return managed ? std::expected<
+                             std::optional<std::string>,
+                             session_registry_error>{managed->profile_digest}
                        : std::unexpected(managed.error());
     }
     case session_state::stopping: {
@@ -779,9 +783,9 @@ auto session_profile_digest(const session_registry& sessions, const session_reco
             return status->profile_digest;
         }
         auto managed = sessions.managed_lifecycle_status(record.session_id);
-        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
-                             managed->profile_digest
-                         }
+        return managed ? std::expected<
+                             std::optional<std::string>,
+                             session_registry_error>{managed->profile_digest}
                        : std::unexpected(managed.error());
     }
     case session_state::exited: {
@@ -790,9 +794,9 @@ auto session_profile_digest(const session_registry& sessions, const session_reco
             return status->profile_digest;
         }
         auto managed = sessions.managed_lifecycle_status(record.session_id);
-        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
-                             managed->profile_digest
-                         }
+        return managed ? std::expected<
+                             std::optional<std::string>,
+                             session_registry_error>{managed->profile_digest}
                        : std::unexpected(managed.error());
     }
     case session_state::failed: {
@@ -801,9 +805,9 @@ auto session_profile_digest(const session_registry& sessions, const session_reco
             return status->profile_digest;
         }
         auto managed = sessions.managed_lifecycle_status(record.session_id);
-        return managed ? std::expected<std::optional<std::string>, session_registry_error>{
-                             managed->profile_digest
-                         }
+        return managed ? std::expected<
+                             std::optional<std::string>,
+                             session_registry_error>{managed->profile_digest}
                        : std::unexpected(managed.error());
     }
     }

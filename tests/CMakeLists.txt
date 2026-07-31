@@ -114,6 +114,10 @@ add_executable(container_receipt_producer_test container/receipt_producer_test.c
 target_link_libraries(container_receipt_producer_test PRIVATE glove_container)
 add_test(NAME container_receipt_producer COMMAND container_receipt_producer_test)
 
+add_executable(container_refinement_protocol_test container/refinement_protocol_test.cpp)
+target_link_libraries(container_refinement_protocol_test PRIVATE glove_container)
+add_test(NAME container_refinement_protocol COMMAND container_refinement_protocol_test)
+
 add_executable(control_receipt_audit_protocol_test control/receipt_audit_protocol_test.cpp)
 target_link_libraries(control_receipt_audit_protocol_test PRIVATE glove_control glaze::glaze)
 target_include_directories(control_receipt_audit_protocol_test PRIVATE
@@ -185,6 +189,16 @@ add_test(NAME supervisor_path_exposure_journal COMMAND supervisor_path_exposure_
 add_executable(supervisor_session_plan_test supervisor/session_plan_test.cpp)
 target_link_libraries(supervisor_session_plan_test PRIVATE glove_supervisor)
 add_test(NAME supervisor_session_plan COMMAND supervisor_session_plan_test)
+
+add_executable(
+    supervisor_refinement_session_plan_test
+    supervisor/refinement_session_plan_test.cpp
+)
+target_link_libraries(supervisor_refinement_session_plan_test PRIVATE glove_supervisor)
+add_test(
+    NAME supervisor_refinement_session_plan
+    COMMAND supervisor_refinement_session_plan_test
+)
 
 add_executable(supervisor_library_bundle_test supervisor/library_bundle_test.cpp)
 target_link_libraries(supervisor_library_bundle_test PRIVATE glove_supervisor)
@@ -271,6 +285,23 @@ if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_dependencies(glove_exec_perimeter_test glove)
     add_test(NAME glove_exec_perimeter COMMAND glove_exec_perimeter_test)
     set_tests_properties(glove_exec_perimeter PROPERTIES TIMEOUT 30)
+endif()
+
+if(APPLE)
+    add_executable(
+        container_linux_pty_session_channel_test
+        container/linux_pty_session_channel_test.cpp
+    )
+    target_link_libraries(container_linux_pty_session_channel_test PRIVATE glove_container)
+    target_include_directories(container_linux_pty_session_channel_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container/linux>
+    )
+    add_test(
+        NAME container_linux_pty_session_channel
+        COMMAND container_linux_pty_session_channel_test
+    )
+    set_tests_properties(container_linux_pty_session_channel PROPERTIES TIMEOUT 10)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

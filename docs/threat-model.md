@@ -55,6 +55,7 @@ the operation rather than silently reducing enforcement.
 | Host egress broker compromise | A defect in the host relay or authenticated proxy could mishandle an approved connection. | Keep the relay target fixed to the per-run proxy, use exact host/port grants, cap concurrent relays, and retain proxy audit evidence. |
 | Retained-change apply disabled | The local atomic/recovery primitive is not a production authorization boundary by itself. | Keep capability `0` until the independent Ed25519 helper/verifier, local RPC/audit path, startup sweep, host-space policy, and Sage-to-parent isolation are configured and tested. |
 | Bundle expansion absent | A verified bundle file is not yet converted into harness-native prompt context. | Add bounded, format-aware extraction and receipt-bound launch inputs. |
+| Refinement result channel absent | PTY/model output cannot serve as trustworthy evaluation evidence, and the model process must not inherit a result writer. | Keep refinement capability at version `0` and reject `refinement-eval-v1` until a Glove-owned wrapper, non-inherited bounded result pipe, and durable distinct receipt path are constructed. |
 | Dependency or compiler compromise | Build-time code or toolchain compromise can alter enforcement. | Pin dependencies by immutable digest, verify releases, and use reproducible builds. |
 | Protocol parser defects | Malformed input may expose untested parser behavior. | Add fuzz targets and a maintained adversarial corpus. |
 

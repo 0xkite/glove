@@ -1,6 +1,9 @@
 #pragma once
 
+#include "glove/container/refinement_protocol.hpp"
+
 #include "../resource_monitor.hpp"
+#include "../sha256.hpp"
 
 #include <condition_variable>
 #include <cstddef>
@@ -83,6 +86,7 @@ class pty_session_channel {
         read_failed,
         output_limit,
         cursor_overflow,
+        transcript_digest,
         worker_failure,
     };
 
@@ -106,6 +110,8 @@ public:
         -> std::expected<void, std::string>;
     [[nodiscard]] auto signal(pty_session_signal requested) -> std::expected<void, std::string>;
     [[nodiscard]] auto finish_draining() -> std::expected<void, std::string>;
+    [[nodiscard]] auto transcript_commitment() const
+        -> std::expected<raw_pty_transcript_commitment, std::string>;
     void stop() noexcept;
 
 private:
@@ -143,6 +149,7 @@ private:
     std::size_t transcript_size_ = 0;
     std::uint64_t oldest_cursor_ = 0;
     std::uint64_t next_cursor_ = 0;
+    detail::sha256_stream transcript_hash_;
     error_code error_ = error_code::none;
     int system_error_ = 0;
     bool eof_ = false;
