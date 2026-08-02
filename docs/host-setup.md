@@ -36,7 +36,30 @@ glove setup policy \
 The dry run performs the same detection, selected-runtime closure derivation,
 template digest, and complete-policy encoding without changing files. Apply is explicit,
 creates the policy as owner-only mode `0600`, refuses changed existing files,
-and validates the result through the production loader. Missing clients remain
+and validates the result through the production loader.
+
+Pi enrollment requires a separate, explicit adoption binding in the same setup
+transaction. The settings file is discovery input containing only approved
+`npm:` extension identifiers; the package store is copied into an immutable
+Glove-owned snapshot. It is never a host-home projection:
+
+```sh
+glove setup policy \
+  --search-path /absolute/reviewed/pi-bin --runtime pi \
+  --harness-root "$HOME/.local/share/glove/harnesses" \
+  --pi-settings /absolute/reviewed/pi-adoption-settings.json \
+  --pi-package-store /absolute/reviewed/pi-packages \
+  --pi-adoption-root "$HOME/.local/share/glove/harness-adoptions/pi" \
+  --path-root /absolute/project-root \
+  --output "$HOME/.config/glove/session-policy.json" --yes
+```
+
+All three `--pi-*` arguments are required together, and they are rejected
+unless Pi is selected. The resulting policy carries only the Glove-owned
+manifest root plus manifest and snapshot digests. At launch, Glove generates
+private `.pi/agent/settings.json` and extension projections; it never imports
+host Pi authentication, sessions, provider/model settings, or package-manager
+credentials. Missing clients remain
 visible in the report and are not errors when at least one supported harness is
 ready. Repeat `--runtime` only when the policy should authorize more than one
 detected client; omitting it selects all detected clients. The generated
@@ -239,11 +262,11 @@ retained.
 
 By default Glove uses:
 
-| Purpose | Path |
-|---|---|
-| Configuration | `${XDG_CONFIG_HOME:-~/.config}/glove/config.json` |
-| Persistent state | `${XDG_STATE_HOME:-~/.local/state}/glove` |
-| Bundles | `${XDG_DATA_HOME:-~/.local/share}/glove` |
+| Purpose                   | Path                                                         |
+| ------------------------- | ------------------------------------------------------------ |
+| Configuration             | `${XDG_CONFIG_HOME:-~/.config}/glove/config.json`            |
+| Persistent state          | `${XDG_STATE_HOME:-~/.local/state}/glove`                    |
+| Bundles                   | `${XDG_DATA_HOME:-~/.local/share}/glove`                     |
 | Runtime socket and secret | `$XDG_RUNTIME_DIR/glove`, or owner-only local state fallback |
 
 Override the configuration file with `--config /absolute/file`. Runtime and
@@ -276,7 +299,15 @@ definition fixes the resolved local `gloved` binary and protected config path;
 no remote request can alter them. On Linux the fixed service enters an
 unprivileged user and private mount namespace before starting `gloved`, while
 systemd delegates the `cpu`, `memory`, and `pids` cgroup controllers. Both are
-required for quota-backed session filesystems and managed resource limits.
+required for quota-backed session filesystems and managed resource limits. Do
+not replace this service with a bare `gloved` launch from a normal login cgroup.
+
+A systemd restart is a host-supervisor recovery boundary, not an interactive
+terminal continuity guarantee: systemd may terminate remaining service-cgroup
+processes before restarting `gloved`. Glove can reconcile authenticated durable
+state and receipts after restart, but operators must explicitly create or resume
+a managed session; do not promise that an interrupted Pi TUI survives a daemon
+crash.
 
 Use `--config <absolute-file>` for a non-default machine configuration and
 `--gloved <absolute-file>` only when the daemon binary is not installed beside
@@ -293,11 +324,11 @@ glove init /absolute/project
 The default purpose is `inspect`, which is read-only. Choose a human-readable
 purpose instead of assembling access, quota, and cleanup options:
 
-| Purpose | Access | Writable scope | Cleanup | Default TTL |
-|---|---|---|---|---|
-| `inspect` | Read-only | None | No copy | 1 hour |
-| `experiment` | Ephemeral write | Isolated copy, up to 1 GiB | Removed | 1 hour |
-| `retain` | Retained write | Isolated copy, up to 1 GiB | Kept for review/apply | 24 hours |
+| Purpose      | Access          | Writable scope             | Cleanup               | Default TTL |
+| ------------ | --------------- | -------------------------- | --------------------- | ----------- |
+| `inspect`    | Read-only       | None                       | No copy               | 1 hour      |
+| `experiment` | Ephemeral write | Isolated copy, up to 1 GiB | Removed               | 1 hour      |
+| `retain`     | Retained write  | Isolated copy, up to 1 GiB | Kept for review/apply | 24 hours    |
 
 ```sh
 glove init /absolute/project --purpose experiment

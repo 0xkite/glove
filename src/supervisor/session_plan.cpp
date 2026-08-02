@@ -118,6 +118,8 @@ struct runtime_template_policy {
     std::string sandbox_backend;
     std::vector<std::string> allowed_path_aliases;
     std::vector<std::string> allowed_projection_destinations;
+    // Owner-local only: a remote session plan cannot select or override it.
+    std::optional<native_harness_adoption_policy> adoption;
     std::optional<runtime_launch_template> launch;
 };
 
@@ -711,6 +713,11 @@ auto validate_runtime_policy(const runtime_template_policy& runtime)
             std::string{"allowed_projection_destinations must be canonical unique identifiers"}
         );
     }
+    if (runtime.adoption) {
+        if (auto valid = validate_native_harness_adoption_policy(*runtime.adoption); !valid) {
+            return std::unexpected(valid.error());
+        }
+    }
     if (!runtime.launch) {
         return {};
     }
@@ -849,11 +856,9 @@ auto common_v1_plan(const wire::session_plan_v2& plan) -> wire::session_plan {
     };
 }
 
-auto valid_refinement_projection(
-    const container::refinement_projection_binding& projection
-) -> bool {
-    return valid_identifier(projection.projection_id) &&
-           valid_digest(projection.content_digest) &&
+auto valid_refinement_projection(const container::refinement_projection_binding& projection)
+    -> bool {
+    return valid_identifier(projection.projection_id) && valid_digest(projection.content_digest) &&
            valid_identifier(projection.destination_alias);
 }
 
@@ -864,9 +869,7 @@ auto validate_refinement_plan(
         plan.runtime_template_id == container::refinement_runtime_template_id;
     if (!refinement_runtime) {
         if (plan.refinement) {
-            return std::unexpected(
-                std::string{"refinement binding requires refinement-eval-v1"}
-            );
+            return std::unexpected(std::string{"refinement binding requires refinement-eval-v1"});
         }
         return {};
     }
@@ -881,10 +884,9 @@ auto validate_refinement_plan(
         plan.refinement->base.projection_id == plan.refinement->candidate.projection_id) {
         return std::unexpected(std::string{"invalid refinement evaluation binding"});
     }
-    const auto& selected =
-        plan.refinement->variant == container::refinement_variant::base
-            ? plan.refinement->base
-            : plan.refinement->candidate;
+    const auto& selected = plan.refinement->variant == container::refinement_variant::base
+                               ? plan.refinement->base
+                               : plan.refinement->candidate;
     if (plan.library_projections.size() != 2U) {
         return std::unexpected(
             std::string{"refinement evaluation requires fixture and selected skill projections"}
@@ -1222,7 +1224,8 @@ auto session_plan_validator::load(
                 .allowed_path_aliases = std::move(runtime.allowed_path_aliases),
                 .allowed_projection_destinations =
                     std::move(runtime.allowed_projection_destinations),
-                .launch = std::move(runtime.launch),
+                .launch = std::exchange(runtime.launch, std::nullopt),
+                .adoption = runtime.adoption,
             }
         );
     }
@@ -1604,6 +1607,14 @@ auto session_plan_validator::resolve_runtime_launch_json(
         }
         secret_mounts.push_back(*secret);
     }
+    std::optional<native_harness_adoption_identity> adoption;
+    if (runtime->adoption) {
+        auto resolved = resolve_native_harness_adoption(*runtime->adoption, runtime->runtime_id);
+        if (!resolved) {
+            return std::unexpected("resolve runtime adoption: " + resolved.error());
+        }
+        adoption = resolved->identity();
+    }
     std::optional<container::refinement_execution_binding> refinement;
     if (plan.refinement) {
         auto plan_context = refinement_plan_context_digest(plan);
@@ -1640,8 +1651,45 @@ auto session_plan_validator::resolve_runtime_launch_json(
         .egress_policy_id = plan.egress_policy_id,
         .egress_targets = std::move(egress_targets),
         .secret_mounts = std::move(secret_mounts),
+        .adoption = std::move(adoption),
         .refinement = std::move(refinement),
     };
+}
+
+auto session_plan_validator::resolve_native_harness_adoption_json(
+    std::string_view plan_json, std::uint64_t now_ms
+) const -> result<std::optional<resolved_native_harness_adoption>> {
+    auto validation = validate_json(plan_json, now_ms);
+    if (!validation) {
+        return std::unexpected(validation.error());
+    }
+    wire::session_plan plan;
+    if (validation->schema_version == 2) {
+        wire::session_plan_v2 v2;
+        if (const auto error = read_untrusted_json<strict_read_options>(v2, plan_json); error) {
+            return std::unexpected(std::string{"invalid session plan v2 schema"});
+        }
+        plan = common_v1_plan(v2);
+    } else if (
+        const auto error = read_untrusted_json<strict_read_options>(plan, plan_json); error
+    ) {
+        return std::unexpected(std::string{"invalid session plan schema"});
+    }
+    const auto runtime =
+        std::ranges::find_if(policy_.runtime_templates, [&](const auto& candidate) {
+            return candidate.runtime_template_id == plan.runtime_template_id;
+        });
+    if (runtime == policy_.runtime_templates.end()) {
+        return std::unexpected(std::string{"runtime template is unavailable"});
+    }
+    if (!runtime->adoption) {
+        return std::optional<resolved_native_harness_adoption>{};
+    }
+    auto adoption = resolve_native_harness_adoption(*runtime->adoption, runtime->runtime_id);
+    if (!adoption) {
+        return std::unexpected("resolve runtime adoption: " + adoption.error());
+    }
+    return std::optional<resolved_native_harness_adoption>{std::move(*adoption)};
 }
 
 auto session_plan_validator::resolve_path_grants_json(

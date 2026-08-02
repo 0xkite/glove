@@ -7,6 +7,10 @@
 
 namespace glove::term {
 
+// Internal factory hook consumed by factory.cpp; keep it out of the public
+// terminal API while satisfying toolchains that require a prior declaration.
+auto make_null_terminal() -> std::unique_ptr<terminal>;
+
 namespace {
 
 // Stdout-backed terminal. Used as the fallback when no frontend is enabled,

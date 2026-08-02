@@ -428,6 +428,11 @@ auto main(int argc, char** argv) -> int {
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }
+    if (sub == "workspace") {
+        return glove::host::workspace_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
     if (sub == "init") {
         return glove::host::init_command(
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
@@ -442,6 +447,7 @@ auto main(int argc, char** argv) -> int {
             "  exec    contain a real self-driving agent (e.g. pi); stdio + egress\n"
             "  setup   create trusted machine-local configuration and state\n"
             "  daemon  install and manage the fixed gloved user service\n"
+            "  workspace discover, register, and list explicit workspace exposures\n"
             "  doctor  verify configuration and local service readiness\n"
             "  config  inspect trusted machine-local configuration\n"
             "  policy  detect harnesses and generate or validate runtime policy\n"

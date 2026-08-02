@@ -15,8 +15,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <chrono>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -279,6 +279,7 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
                                 .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
                                 .read_only_paths = {},
                             },
+                        .adoption = std::nullopt,
                     },
                     runtime_template_policy{
                         .runtime_template_id = "codex-interactive",
@@ -296,6 +297,7 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
                                 .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
                                 .read_only_paths = {},
                             },
+                        .adoption = std::nullopt,
                     },
                     runtime_template_policy{
                         .runtime_template_id = "refinement-eval-v1",
@@ -313,6 +315,7 @@ auto validator_for(const std::filesystem::path& source, std::uint64_t page)
                                 .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
                                 .read_only_paths = {},
                             },
+                        .adoption = std::nullopt,
                     },
                 },
             .library_projection_destinations =
@@ -471,6 +474,9 @@ auto run() -> int {
             .idempotency_namespace = "execute-session-executor",
         }
     );
+    if (!exited) {
+        std::fprintf(stderr, "execute Linux session: %s\n", exited.error().c_str());
+    }
     REQUIRE(exited.has_value());
     REQUIRE(exited->session.state == glove::control::session_state::exited);
     REQUIRE(exited->session.session_id == created->session_id);
@@ -1053,8 +1059,7 @@ auto run() -> int {
     const auto capability_bundle_root = tree.root() / "capability-bundles";
     REQUIRE(std::filesystem::create_directory(capability_bundle_root));
     REQUIRE(::chmod(capability_bundle_root.c_str(), 0700) == 0);
-    auto capability_store =
-        glove::supervisor::library_bundle_store::open(capability_bundle_root);
+    auto capability_store = glove::supervisor::library_bundle_store::open(capability_bundle_root);
     REQUIRE(capability_store.has_value());
     auto capability_registry = glove::control::session_registry::open_or_create(
         tree.root() / "capability-sessions.journal",
@@ -1074,9 +1079,7 @@ auto run() -> int {
         std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
             std::move(*capability_runtime)
         };
-    REQUIRE(
-        capability_runtime_shared->refinement_evaluation_protocol_schema_version() == 1
-    );
+    REQUIRE(capability_runtime_shared->refinement_evaluation_protocol_schema_version() == 1);
     auto capability_protocol = glove::control::receipt_audit_protocol::create(
         bootstrap_secret,
         shared_producer,
@@ -1087,16 +1090,17 @@ auto run() -> int {
         materializations.string()
     );
     REQUIRE(capability_protocol.has_value());
-    auto refinement_capability_frame = (*capability_protocol)->handle_frame(
-        make_request(
-            "refinement-runtime-capabilities",
-            "capabilities",
-            "null",
-            std::nullopt,
-            interactive_now_ms + 20'000U
-        ),
-        interactive_now_ms + 12U
-    );
+    auto refinement_capability_frame = (*capability_protocol)
+                                           ->handle_frame(
+                                               make_request(
+                                                   "refinement-runtime-capabilities",
+                                                   "capabilities",
+                                                   "null",
+                                                   std::nullopt,
+                                                   interactive_now_ms + 20'000U
+                                               ),
+                                               interactive_now_ms + 12U
+                                           );
     REQUIRE(refinement_capability_frame.has_value());
     auto refinement_capability_response = decode_response(*refinement_capability_frame);
     REQUIRE(refinement_capability_response.has_value());
@@ -1110,21 +1114,15 @@ auto run() -> int {
     const std::string candidate_bytes = R"({"candidate":"exact"})";
     const auto candidate_digest = glove::container::sha256_hex(
         std::span<const unsigned char>{
-            reinterpret_cast<const unsigned char*>(candidate_bytes.data()),
-            candidate_bytes.size()
+            reinterpret_cast<const unsigned char*>(candidate_bytes.data()), candidate_bytes.size()
         }
     );
     REQUIRE(candidate_digest.has_value());
     const auto placeholder_plan = refinement_plan(
-        interactive_now_ms,
-        page,
-        std::string(64, 'f'),
-        *candidate_digest,
-        std::string(64, '0')
+        interactive_now_ms, page, std::string(64, 'f'), *candidate_digest, std::string(64, '0')
     );
-    auto plan_context = shared_validator->refinement_plan_context_digest_json(
-        placeholder_plan, interactive_now_ms
-    );
+    auto plan_context =
+        shared_validator->refinement_plan_context_digest_json(placeholder_plan, interactive_now_ms);
     REQUIRE(plan_context.has_value());
     glove::container::refinement_fixture_manifest fixture{
         .schema = std::string{glove::container::refinement_fixture_schema},
@@ -1154,25 +1152,21 @@ auto run() -> int {
         .skill_projection_id = "candidate",
         .skill_projection_digest = *candidate_digest,
         .matched_context_digest = std::string(64, '0'),
-        .assertions =
-            {
-                .expected_termination =
-                    glove::container::resource_termination_cause::exited,
-                .expected_exit_code = 0,
-                .required_transcript_literals = {"alpha beta", "done"},
-                .forbidden_transcript_literals = {"forbidden"},
-                .max_latency_ms = 2'000,
-            },
+        .assertions = {
+            .expected_termination = glove::container::resource_termination_cause::exited,
+            .expected_exit_code = 0,
+            .required_transcript_literals = {"alpha beta", "done"},
+            .forbidden_transcript_literals = {"forbidden"},
+            .max_latency_ms = 2'000,
+        },
     };
     fixture.matched_context_digest =
         glove::container::refinement_fixture_context_digest(fixture, *plan_context).value();
-    const auto fixture_bytes =
-        glove::container::canonical_refinement_fixture_bytes(fixture);
+    const auto fixture_bytes = glove::container::canonical_refinement_fixture_bytes(fixture);
     REQUIRE(fixture_bytes.has_value());
     const auto fixture_digest = glove::container::sha256_hex(
         std::span<const unsigned char>{
-            reinterpret_cast<const unsigned char*>(fixture_bytes->data()),
-            fixture_bytes->size()
+            reinterpret_cast<const unsigned char*>(fixture_bytes->data()), fixture_bytes->size()
         }
     );
     REQUIRE(fixture_digest.has_value());
@@ -1189,23 +1183,23 @@ auto run() -> int {
         REQUIRE(::chmod((capability_bundle_root / (digest + ".json")).c_str(), 0600) == 0);
     }
     const auto final_refinement_plan = refinement_plan(
-        interactive_now_ms,
-        page,
-        *fixture_digest,
-        *candidate_digest,
-        fixture.matched_context_digest
+        interactive_now_ms, page, *fixture_digest, *candidate_digest, fixture.matched_context_digest
     );
-    auto refinement_created = (*capability_protocol)->handle_frame(
-        make_request(
-            "create-refinement",
-            "create_session",
-            std::string{"{\"session_id\":\"session-refinement\",\"controller_plan_digest\":\""} +
-                std::string{controller_digest} + "\",\"plan\":" + final_refinement_plan + "}",
-            "create-session-refinement",
-            interactive_now_ms + 20'000U
-        ),
-        interactive_now_ms
-    );
+    auto refinement_created =
+        (*capability_protocol)
+            ->handle_frame(
+                make_request(
+                    "create-refinement",
+                    "create_session",
+                    std::string{
+                        "{\"session_id\":\"session-refinement\",\"controller_plan_digest\":\""
+                    } + std::string{controller_digest} +
+                        "\",\"plan\":" + final_refinement_plan + "}",
+                    "create-session-refinement",
+                    interactive_now_ms + 20'000U
+                ),
+                interactive_now_ms
+            );
     REQUIRE(refinement_created.has_value());
     auto refinement_created_response = decode_response(*refinement_created);
     REQUIRE(refinement_created_response.has_value());
@@ -1215,8 +1209,7 @@ auto run() -> int {
         refinement_record, refinement_created_response->result->str
     ));
     REQUIRE(
-        capability_runtime_shared->reconcile(*shared_producer, interactive_now_ms + 1U)
-            .has_value()
+        capability_runtime_shared->reconcile(*shared_producer, interactive_now_ms + 1U).has_value()
     );
     const glove::control::session_start_authorization refinement_authorization{
         .schema_version = 1,
@@ -1236,8 +1229,7 @@ auto run() -> int {
     REQUIRE(refinement_started.has_value());
     auto refinement_exited = capability_runtime_shared->wait("session-refinement");
     REQUIRE(refinement_exited.has_value());
-    auto durable_refinement =
-        capability_registry_shared->exited_status("session-refinement");
+    auto durable_refinement = capability_registry_shared->exited_status("session-refinement");
     REQUIRE(durable_refinement.has_value());
     REQUIRE(durable_refinement->refinement_receipt);
     REQUIRE(shared_producer->anchor().sequence == 3);

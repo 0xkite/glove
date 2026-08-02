@@ -149,10 +149,12 @@ auto make_inputs(
                 .egress_policy_id = "",
                 .egress_targets = {},
                 .secret_mounts = {},
+                .adoption = std::nullopt,
                 .refinement = std::nullopt,
             },
         .path_grants = std::move(grants),
         .library_projections = {},
+        .adoption = std::nullopt,
         .authorization_id = "approval-session-preparation",
         .authorization_expires_at_ms = now_ms + 30'000,
     };

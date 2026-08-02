@@ -167,7 +167,7 @@ result<unique_fd> open_owner_only_root(std::string_view raw) {
                 std::string{"resolve materialization root: "} + errno_message(errno)
             );
         }
-        current = std::move(next);
+        current = unique_fd{next.release()};
     }
     unique_fd root{::openat(current.get(), ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
     struct stat status{};
@@ -231,7 +231,7 @@ auto parse_partition_name(std::string_view name) -> std::optional<materializatio
     if (!alias || !name.empty()) {
         return std::nullopt;
     }
-    return materialization_identity{std::move(*session_id), std::move(*alias)};
+    return materialization_identity{*session_id, *alias};
 }
 
 auto parse_scratch_name(std::string_view name) -> std::optional<materialization_identity> {
@@ -244,7 +244,7 @@ auto parse_scratch_name(std::string_view name) -> std::optional<materialization_
     if (!session_id || !name.empty()) {
         return std::nullopt;
     }
-    return materialization_identity{std::move(*session_id), "__scratch"};
+    return materialization_identity{*session_id, "__scratch"};
 }
 
 auto parse_metadata_name(std::string_view name) -> std::optional<materialization_identity> {
@@ -267,7 +267,7 @@ auto parse_metadata_name(std::string_view name) -> std::optional<materialization
     if (!alias || !name.empty()) {
         return std::nullopt;
     }
-    return materialization_identity{std::move(*session_id), std::move(*alias)};
+    return materialization_identity{*session_id, *alias};
 }
 
 auto list_root_entries(int root_fd) -> result<std::vector<std::string>> {
@@ -402,8 +402,8 @@ auto scratch_mount(int source_fd, std::string target, std::string alias, std::ui
     }
     return session_mount{
         .descriptor_fd = *descriptor,
-        .target_path = std::move(target),
-        .alias = std::move(alias),
+        .target_path = target,
+        .alias = alias,
         .quota_partition = "__scratch",
         .quota_bytes = quota,
         .source_identity = std::nullopt,
@@ -412,6 +412,8 @@ auto scratch_mount(int source_fd, std::string target, std::string alias, std::ui
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .runtime_adoption_manifest_digest = std::nullopt,
+        .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
         .writable = true,
@@ -428,13 +430,13 @@ auto create_scratch_mounts(
     if (!tmp) {
         return std::unexpected(tmp.error());
     }
-    mounts.push_back(std::move(*tmp));
+    mounts.push_back(std::exchange(*tmp, session_mount{}));
     auto var_tmp = scratch_mount(var_tmp_fd, "/var/tmp", "__scratch_var_tmp", quota);
     if (!var_tmp) {
         close_mount_records(mounts);
         return std::unexpected(var_tmp.error());
     }
-    mounts.push_back(std::move(*var_tmp));
+    mounts.push_back(std::exchange(*var_tmp, session_mount{}));
     return mounts;
 }
 
@@ -443,13 +445,23 @@ auto append_native_skill_runtime_home(
     int scratch_fd,
     std::uint64_t scratch_quota,
     const std::vector<resolved_library_projection>& library_projections,
+    const resolved_native_harness_adoption* adoption,
     std::vector<session_mount>& mounts
 ) -> result<void> {
+    if (adapter.adoption_manifest && adapter.adoption_manifest->require_snapshot && !adoption) {
+        return std::unexpected(std::string{"native harness adoption is required for runtime"});
+    }
     auto projection = resolve_native_skill_runtime_projection(adapter, library_projections);
     if (!projection) {
         return std::unexpected(projection.error());
     }
-    auto context_digest = native_skill_runtime_projection_digest(adapter, *projection);
+    std::optional<native_harness_adoption_identity> adoption_identity;
+    if (adoption) {
+        adoption_identity = adoption->identity();
+    }
+    auto context_digest = native_skill_runtime_projection_digest(
+        adapter, *projection, adoption_identity ? &*adoption_identity : nullptr
+    );
     if (!context_digest) {
         return std::unexpected(context_digest.error());
     }
@@ -466,8 +478,9 @@ auto append_native_skill_runtime_home(
             std::string{"open native skill private home: "} + errno_message(errno)
         );
     }
-    if (auto materialized =
-            materialize_native_skill_runtime_projection(home_fd.get(), adapter, *projection);
+    if (auto materialized = materialize_native_skill_runtime_projection(
+            home_fd.get(), adapter, *projection, adoption
+        );
         !materialized) {
         return std::unexpected(materialized.error());
     }
@@ -478,6 +491,10 @@ auto append_native_skill_runtime_home(
     }
     mount->runtime_adapter_id = adapter.runtime_id;
     mount->runtime_context_digest = std::move(*context_digest);
+    if (adoption_identity) {
+        mount->runtime_adoption_manifest_digest = std::move(adoption_identity->manifest_digest);
+        mount->runtime_adoption_snapshot_digest = std::move(adoption_identity->snapshot_digest);
+    }
     mounts.push_back(std::move(*mount));
     return {};
 }
@@ -500,6 +517,8 @@ auto append_read_mount(const resolved_path_grant& grant, std::vector<session_mou
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .runtime_adoption_manifest_digest = std::nullopt,
+        .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
         .writable = false,
@@ -541,6 +560,8 @@ auto append_ephemeral_mount(
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .runtime_adoption_manifest_digest = std::nullopt,
+        .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
         .writable = true,
@@ -580,6 +601,8 @@ auto append_library_mounts(
             .projection_destination_alias = projection.destination_alias,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .runtime_adoption_manifest_digest = std::nullopt,
+            .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
             .writable = false,
@@ -656,10 +679,12 @@ result<linux_session_filesystem> linux_session_filesystem::create(
     std::uint64_t disk_limit_bytes,
     std::vector<resolved_path_grant>&& grants,
     std::vector<resolved_library_projection>&& library_projections,
-    std::string_view runtime_id
+    std::string_view runtime_id,
+    std::optional<resolved_native_harness_adoption>&& adoption
 ) {
     auto owned_grants = std::move(grants);
     auto owned_library_projections = std::move(library_projections);
+    auto owned_adoption = std::move(adoption);
     const long page_size = ::sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         return std::unexpected(std::string{"cannot determine session filesystem granularity"});
@@ -714,7 +739,12 @@ result<linux_session_filesystem> linux_session_filesystem::create(
     }
     if (const auto adapter = native_skill_runtime_adapter_for(runtime_id)) {
         if (auto appended = append_native_skill_runtime_home(
-                *adapter, scratch->content_fd(), scratch_quota, owned_library_projections, *mounts
+                *adapter,
+                scratch->content_fd(),
+                scratch_quota,
+                owned_library_projections,
+                owned_adoption ? &*owned_adoption : nullptr,
+                *mounts
             );
             !appended) {
             close_mount_records(*mounts);

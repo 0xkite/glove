@@ -61,8 +61,19 @@ struct stage_report {
     std::vector<std::string> launch_arguments;
     std::vector<std::string> read_only_paths;
     std::string snapshot_digest;
+    std::string adoption_manifest_digest;
     std::uint64_t snapshot_logical_bytes = 0;
     std::uint64_t snapshot_entries = 0;
+    bool changed = false;
+    bool dry_run = false;
+};
+
+struct pi_adoption_report {
+    std::uint8_t schema_version = 1;
+    std::string runtime_id;
+    std::string manifest_digest;
+    std::string snapshot_digest;
+    std::vector<std::string> package_ids;
     bool changed = false;
     bool dry_run = false;
 };
@@ -160,7 +171,9 @@ void print_setup_usage() {
         "  glove setup policy --search-path <absolute-directory>...\n"
         "      --harness-root <absolute-directory> --path-root <absolute-directory>\n"
         "      --output <absolute-file> [--backend <linux_production|apple_container>]\n"
-        "      [--runtime <adapter-id>]...\n"
+        "      [--runtime <adapter-id>]... [--hostile-content]\n"
+        "      [--pi-settings <absolute-file> --pi-package-store <absolute-directory>\n"
+        "       --pi-adoption-root <absolute-directory>]\n"
         "      [--egress <policy-id> <host> <port>]...\n"
         "      [--secret <runtime-id> <handle> <absolute-source> <sandbox-target>]...\n"
         "      [--dry-run | --yes] [--json]\n"
@@ -226,6 +239,8 @@ void print_policy_usage() {
         "  glove policy detect --search-path <absolute-directory>... [--json]\n"
         "  glove policy stage --runtime <id> --source <absolute-file>\n"
         "      --directory <absolute-directory> [--dry-run | --yes] [--json]\n"
+        "  glove policy adopt-pi --settings <absolute-file> --package-store <absolute-directory>\n"
+        "      --directory <absolute-directory> [--dry-run | --yes] [--json]\n"
         "  glove policy generate --runtime <id>\n"
         "      (--executable <absolute-file> | --search-path <absolute-directory>...)\n"
         "      [--template-id <id>] [--backend <linux_production|apple_container>]\n"
@@ -249,6 +264,9 @@ auto setup_policy_command(std::span<char* const> arguments) -> int {
 #endif
     bool yes = false;
     bool json = false;
+    std::optional<std::filesystem::path> pi_settings;
+    std::optional<std::filesystem::path> pi_package_store;
+    std::optional<std::filesystem::path> pi_adoption_root;
     for (std::size_t index = 0; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
         if (argument == "--dry-run") {
@@ -259,6 +277,9 @@ auto setup_policy_command(std::span<char* const> arguments) -> int {
             ++index;
         } else if (argument == "--json") {
             json = true;
+            ++index;
+        } else if (argument == "--hostile-content") {
+            options.hostile_content_analysis = true;
             ++index;
         } else if (argument == "--egress" && index + 3U < arguments.size()) {
             const std::string policy_id{arguments[index + 1U]};
@@ -307,6 +328,12 @@ auto setup_policy_command(std::span<char* const> arguments) -> int {
                 options.selected_runtime_ids.push_back(value);
             } else if (argument == "--harness-root") {
                 options.protected_harness_root = value;
+            } else if (argument == "--pi-settings") {
+                pi_settings = value;
+            } else if (argument == "--pi-package-store") {
+                pi_package_store = value;
+            } else if (argument == "--pi-adoption-root") {
+                pi_adoption_root = value;
             } else if (argument == "--path-root") {
                 options.workspace_root = value;
             } else if (argument == "--output") {
@@ -332,6 +359,25 @@ auto setup_policy_command(std::span<char* const> arguments) -> int {
             print_setup_usage();
             return 2;
         }
+    }
+    if (const auto pi_adoption_argument_count =
+            static_cast<unsigned>(pi_settings.has_value()) +
+            static_cast<unsigned>(pi_package_store.has_value()) +
+            static_cast<unsigned>(pi_adoption_root.has_value());
+        pi_adoption_argument_count != 0U) {
+        if (pi_adoption_argument_count != 3U) {
+            return print_error(
+                "setup_policy_pi_adoption_incomplete",
+                "Pi adoption requires --pi-settings, --pi-package-store, and --pi-adoption-root "
+                "together.",
+                "glove setup policy --help"
+            );
+        }
+        options.pi_adoption = pi_adoption_manifest_options{
+            .settings_path = *pi_settings,
+            .package_store_root = *pi_package_store,
+            .protected_directory = *pi_adoption_root,
+        };
     }
     if (options.dry_run && yes) {
         return print_error(
@@ -377,6 +423,7 @@ auto setup_policy_command(std::span<char* const> arguments) -> int {
             .launch_arguments = runtime.launch_arguments,
             .read_only_paths = {},
             .snapshot_digest = runtime.snapshot_digest,
+            .adoption_manifest_digest = runtime.adoption_manifest_digest,
             .snapshot_logical_bytes = runtime.snapshot_logical_bytes,
             .snapshot_entries = runtime.snapshot_entries,
             .changed = runtime.changed,
@@ -1208,6 +1255,7 @@ auto policy_command(std::span<char* const> arguments) -> int {
             .launch_arguments = staged->launch_arguments,
             .read_only_paths = {},
             .snapshot_digest = staged->snapshot_digest,
+            .adoption_manifest_digest = staged->adoption_manifest_digest,
             .snapshot_logical_bytes = staged->snapshot_logical_bytes,
             .snapshot_entries = staged->snapshot_entries,
             .changed = staged->changed,
@@ -1246,6 +1294,11 @@ auto policy_command(std::span<char* const> arguments) -> int {
         for (const auto& path : staged->read_only_paths) {
             std::printf("Read-only dependency root:  %s\n", path.c_str());
         }
+        if (!staged->adoption_manifest_digest.empty()) {
+            std::printf(
+                "Harness adoption manifest: %s\n", staged->adoption_manifest_digest.c_str()
+            );
+        }
         if (!staged->snapshot_digest.empty()) {
             std::printf(
                 "Protected snapshot digest:  %s\n"
@@ -1261,6 +1314,98 @@ auto policy_command(std::span<char* const> arguments) -> int {
             "  glove policy detect --search-path %s --json\n",
             staged->protected_entry_point.parent_path().c_str()
         );
+        return 0;
+    }
+    if (action == "adopt-pi") {
+        pi_adoption_manifest_options options;
+        bool yes = false;
+        bool json = false;
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (argument == "--yes") {
+                yes = true;
+                ++index;
+            } else if (argument == "--dry-run") {
+                options.dry_run = true;
+                ++index;
+            } else if (argument == "--json") {
+                json = true;
+                ++index;
+            } else if (index + 1U < arguments.size()) {
+                const std::filesystem::path value{arguments[index + 1U]};
+                if (argument == "--settings") {
+                    options.settings_path = value;
+                } else if (argument == "--package-store") {
+                    options.package_store_root = value;
+                } else if (argument == "--directory") {
+                    options.protected_directory = value;
+                } else {
+                    print_policy_usage();
+                    return 2;
+                }
+                index += 2U;
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+        }
+        if (yes && options.dry_run) {
+            return print_error(
+                "policy_conflicting_flags",
+                "--dry-run and --yes cannot be combined.",
+                "glove policy adopt-pi --help"
+            );
+        }
+        if (options.settings_path.empty() || options.package_store_root.empty() ||
+            options.protected_directory.empty()) {
+            print_policy_usage();
+            return 2;
+        }
+        if (!yes && !options.dry_run) {
+            return print_error(
+                "policy_confirmation_required",
+                "Pi adoption snapshots selected package closures on this machine.",
+                "glove policy adopt-pi --settings <absolute-file> --package-store "
+                "<absolute-directory> --directory <absolute-directory> --dry-run\n"
+                "  glove policy adopt-pi --settings <absolute-file> --package-store "
+                "<absolute-directory> --directory <absolute-directory> --yes"
+            );
+        }
+        auto adopted = generate_pi_adoption_manifest(options);
+        if (!adopted) {
+            return print_error(
+                "policy_pi_adoption_failed", adopted.error(), "glove policy adopt-pi --help"
+            );
+        }
+        policy_wire::pi_adoption_report report{
+            .runtime_id = "pi",
+            .manifest_digest = adopted->manifest_digest,
+            .snapshot_digest = adopted->snapshot_digest,
+            .package_ids = adopted->package_ids,
+            .changed = adopted->changed,
+            .dry_run = options.dry_run,
+        };
+        if (json) {
+            auto encoded = glz::write_json(report);
+            if (!encoded) {
+                return print_error(
+                    "policy_encode_failed",
+                    "Could not encode Pi adoption report.",
+                    "glove policy adopt-pi --help"
+                );
+            }
+            std::printf("%s\n", encoded->c_str());
+            return 0;
+        }
+        std::printf(
+            "%s Pi adoption manifest: %s\nSnapshot digest: %s\n",
+            options.dry_run ? "Planned" : (adopted->changed ? "Created" : "Verified"),
+            adopted->manifest_digest.c_str(),
+            adopted->snapshot_digest.c_str()
+        );
+        for (const auto& package_id : adopted->package_ids) {
+            std::printf("Package closure member: %s\n", package_id.c_str());
+        }
         return 0;
     }
     if (action == "generate") {
@@ -1404,6 +1549,233 @@ auto policy_command(std::span<char* const> arguments) -> int {
     }
     print_policy_usage();
     return 2;
+}
+
+auto workspace_command(std::span<char* const> arguments) -> int {
+    if (arguments.empty() || std::string_view{arguments.front()} == "--help" ||
+        std::string_view{arguments.front()} == "-h") {
+        std::fprintf(
+            stderr,
+            "usage:\n"
+            "  glove workspace discover <path> --root <id> [--config <absolute-file>]\n"
+            "  glove workspace register <path> [glove init options]\n"
+            "  glove workspace list [--config <absolute-file>] [--json]\n"
+            "  glove workspace start --session <id> --controller-digest <sha256>\n"
+            "      --plan-json <canonical-json> --request-id <id> [--config <absolute-file>]\n"
+            "  glove workspace resume --session <id> [--config <absolute-file>]\n"
+        );
+        return arguments.empty() ? 2 : 0;
+    }
+    const std::string_view action{arguments.front()};
+    if (action == "register") {
+        return init_command(arguments.subspan(1));
+    }
+    if (action == "discover") {
+        if (arguments.size() < 4U || std::string_view{arguments[2]} != "--root") {
+            return print_error(
+                "workspace_discover_usage",
+                "Discovery requires one explicit path and a protected-root identifier.",
+                "glove workspace discover <path> --root <id>"
+            );
+        }
+        std::error_code error;
+        const auto path = std::filesystem::canonical(arguments[1], error);
+        if (error || !std::filesystem::is_directory(path, error)) {
+            return print_error(
+                "workspace_discover_path_invalid",
+                "Workspace path must resolve to an existing directory.",
+                "glove workspace discover <existing-directory> --root <id>"
+            );
+        }
+        const std::string root_id{arguments[3]};
+        if (root_id.empty() || root_id.size() > 128U || root_id.front() == '-' ||
+            root_id.front() == '.') {
+            return print_error(
+                "workspace_discover_root_invalid",
+                "Protected-root identifier is invalid.",
+                "glove workspace discover <path> --root <configured-root-id>"
+            );
+        }
+        // Discovery deliberately scans only the caller's one explicit path.
+        // Containment and durable registration remain enforced by `register`.
+        std::printf(
+            "Workspace candidate: %s\nProtected root:      %s\nNext:\n"
+            "  glove workspace register %s --root %s\n",
+            path.c_str(),
+            root_id.c_str(),
+            path.c_str(),
+            root_id.c_str()
+        );
+        return 0;
+    }
+    if (action == "start") {
+        workspace_session_create_request request;
+        std::optional<std::filesystem::path> config_path;
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (index + 1U >= arguments.size()) {
+                return print_error(
+                    "workspace_start_usage",
+                    "Workspace start arguments are invalid.",
+                    "glove workspace start --help"
+                );
+            }
+            const std::string value{arguments[index + 1U]};
+            if (argument == "--session") {
+                request.session_id = value;
+            } else if (argument == "--controller-digest") {
+                request.controller_plan_digest = value;
+            } else if (argument == "--plan-json") {
+                request.canonical_plan_json = value;
+            } else if (argument == "--request-id") {
+                request.idempotency_key = value;
+            } else if (argument == "--config") {
+                config_path = value;
+            } else {
+                return print_error(
+                    "workspace_start_usage",
+                    "Workspace start arguments are invalid.",
+                    "glove workspace start --help"
+                );
+            }
+            index += 2U;
+        }
+        if (!config_path) {
+            auto resolved = default_path();
+            if (!resolved) {
+                return print_error(
+                    "workspace_environment_invalid", resolved.error(), "glove setup --dry-run"
+                );
+            }
+            config_path = *resolved;
+        }
+        auto configured = load_config(*config_path);
+        if (!configured) {
+            return print_error("workspace_config_invalid", configured.error(), "glove doctor");
+        }
+        auto created = create_workspace_session(*configured, request);
+        if (!created) {
+            return print_error("workspace_start_failed", created.error(), "glove daemon status");
+        }
+        std::printf(
+            "Session recorded: %s\nState:            %s\nPlan digest:      %s\n"
+            "Launch remains controller-authorized; this command cannot start a process.\n",
+            created->session_id.c_str(),
+            created->state.c_str(),
+            created->plan_content_digest.c_str()
+        );
+        return 0;
+    }
+    if (action == "resume") {
+        if ((arguments.size() != 3U && arguments.size() != 5U) ||
+            std::string_view{arguments[1]} != "--session" ||
+            (arguments.size() == 5U && std::string_view{arguments[3]} != "--config")) {
+            return print_error(
+                "workspace_resume_usage",
+                "Resume requires an exact session identifier.",
+                "glove workspace resume --session <id> [--config <absolute-file>]"
+            );
+        }
+        std::optional<std::filesystem::path> config_path;
+        if (arguments.size() == 5U) {
+            config_path = arguments[4];
+        } else {
+            auto resolved = default_path();
+            if (!resolved) {
+                return print_error(
+                    "workspace_environment_invalid", resolved.error(), "glove setup --dry-run"
+                );
+            }
+            config_path = *resolved;
+        }
+        auto configured = load_config(*config_path);
+        if (!configured) {
+            return print_error("workspace_config_invalid", configured.error(), "glove doctor");
+        }
+        auto status = workspace_session_status_for(*configured, arguments[2]);
+        if (!status) {
+            return print_error("workspace_resume_failed", status.error(), "glove daemon status");
+        }
+        if (status->state != "starting" && status->state != "running" &&
+            status->state != "stopping") {
+            return print_error(
+                "workspace_resume_ineligible",
+                "Only an existing starting, running, or stopping managed session is resumable.",
+                "glove workspace start --help"
+            );
+        }
+        std::printf(
+            "Session recovery candidate: %s\nState:                      %s\n"
+            "The daemon owns reconciliation; no new launch authorization was minted.\n",
+            status->session_id.c_str(),
+            status->state.c_str()
+        );
+        return 0;
+    }
+    if (action != "list") {
+        return print_error(
+            "workspace_action_invalid", "Unknown workspace action.", "glove workspace --help"
+        );
+    }
+    std::optional<std::filesystem::path> config_path;
+    bool json = false;
+    for (std::size_t index = 1; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--json") {
+            json = true;
+            ++index;
+        } else if (argument == "--config" && index + 1U < arguments.size()) {
+            config_path = arguments[index + 1U];
+            index += 2U;
+        } else {
+            return print_error(
+                "workspace_list_usage",
+                "Workspace list arguments are invalid.",
+                "glove workspace list [--config <absolute-file>] [--json]"
+            );
+        }
+    }
+    if (!config_path) {
+        auto resolved = default_path();
+        if (!resolved) {
+            return print_error(
+                "workspace_environment_invalid", resolved.error(), "glove setup --dry-run"
+            );
+        }
+        config_path = *resolved;
+    }
+    auto configured = load_config(*config_path);
+    if (!configured) {
+        return print_error("workspace_config_invalid", configured.error(), "glove doctor");
+    }
+    auto workspaces = list_workspace_exposures(*configured);
+    if (!workspaces) {
+        return print_error("workspace_list_failed", workspaces.error(), "glove daemon status");
+    }
+    if (json) {
+        auto encoded = glz::write_json(*workspaces);
+        if (!encoded) {
+            return print_error(
+                "workspace_list_encode_failed",
+                "Could not encode workspace inventory.",
+                "glove workspace list"
+            );
+        }
+        std::printf("%s\n", encoded->c_str());
+        return 0;
+    }
+    for (const auto& workspace : *workspaces) {
+        std::printf(
+            "%s generation=%llu state=%s label=%s expires_at_ms=%llu scope_digest=%s\n",
+            workspace.exposure_id.c_str(),
+            static_cast<unsigned long long>(workspace.generation),
+            workspace.state.c_str(),
+            workspace.display_label.c_str(),
+            static_cast<unsigned long long>(workspace.expires_at_ms),
+            workspace.scope_digest.c_str()
+        );
+    }
+    return 0;
 }
 
 auto init_command(std::span<char* const> arguments) -> int {

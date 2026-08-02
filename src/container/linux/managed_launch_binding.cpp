@@ -146,6 +146,8 @@ struct mount_projection_state {
     std::optional<std::string> runtime_home_path;
     std::optional<std::string> runtime_adapter_id;
     std::optional<std::string> runtime_context_digest;
+    std::optional<std::string> runtime_adoption_manifest_digest;
+    std::optional<std::string> runtime_adoption_snapshot_digest;
 };
 
 auto valid_mount_source_identity(const supervisor::linux_detail::session_mount& mount) -> bool {
@@ -200,8 +202,9 @@ auto validate_secret_mount(const supervisor::linux_detail::session_mount& mount)
         target == managed_home || !path_within(target, managed_home) ||
         !valid_mount_source_identity(mount) || mount.source_content_digest || mount.projection_id ||
         mount.projection_destination_alias || mount.runtime_adapter_id ||
-        mount.runtime_context_digest || !mount.quota_partition.empty() || mount.quota_bytes != 0 ||
-        mount.directory) {
+        mount.runtime_context_digest || mount.runtime_adoption_manifest_digest ||
+        mount.runtime_adoption_snapshot_digest || !mount.quota_partition.empty() ||
+        mount.quota_bytes != 0 || mount.directory) {
         return std::unexpected(std::string{"invalid managed launch secret projection"});
     }
     return {};
@@ -211,7 +214,8 @@ auto validate_read_only_mount(const supervisor::linux_detail::session_mount& mou
     -> std::expected<void, std::string> {
     if (!mount.quota_partition.empty() || mount.quota_bytes != 0 ||
         !valid_mount_source_identity(mount) || mount.runtime_adapter_id ||
-        mount.runtime_context_digest) {
+        mount.runtime_context_digest || mount.runtime_adoption_manifest_digest ||
+        mount.runtime_adoption_snapshot_digest) {
         return std::unexpected(std::string{"invalid managed launch read-only projection"});
     }
     const bool has_secret = mount.secret_handle.has_value() || mount.secret_runtime_id.has_value();
@@ -254,27 +258,40 @@ auto validate_writable_mount(
     }
     const bool has_runtime_context =
         mount.runtime_adapter_id.has_value() || mount.runtime_context_digest.has_value();
+    const bool has_adoption_identity = mount.runtime_adoption_manifest_digest.has_value() ||
+                                       mount.runtime_adoption_snapshot_digest.has_value();
     if (has_runtime_context) {
         const auto adapter =
             mount.runtime_adapter_id
                 ? supervisor::native_skill_runtime_adapter_for(*mount.runtime_adapter_id)
                 : std::nullopt;
         if (!mount.runtime_adapter_id || !mount.runtime_context_digest || !adapter ||
-            !valid_digest(*mount.runtime_context_digest) || mount.quota_partition != "__scratch" ||
-            mount.alias != adapter->home_mount_alias || mount.target_path != "/home/agent" ||
-            mount.source_identity || !mount.directory || state.runtime_home_mounts != 0U) {
+            !valid_digest(*mount.runtime_context_digest) ||
+            (has_adoption_identity &&
+             (!mount.runtime_adoption_manifest_digest || !mount.runtime_adoption_snapshot_digest ||
+              adapter->runtime_id != "pi" ||
+              !valid_digest(*mount.runtime_adoption_manifest_digest) ||
+              !valid_digest(*mount.runtime_adoption_snapshot_digest))) ||
+            mount.quota_partition != "__scratch" || mount.alias != adapter->home_mount_alias ||
+            mount.target_path != "/home/agent" || mount.source_identity || !mount.directory ||
+            state.runtime_home_mounts != 0U) {
             return std::unexpected(std::string{"invalid managed runtime home projection"});
         }
         ++state.runtime_home_mounts;
         state.runtime_home_path = mount.target_path;
         state.runtime_adapter_id = *mount.runtime_adapter_id;
         state.runtime_context_digest = *mount.runtime_context_digest;
+        state.runtime_adoption_manifest_digest = mount.runtime_adoption_manifest_digest;
+        state.runtime_adoption_snapshot_digest = mount.runtime_adoption_snapshot_digest;
         const auto [partition, inserted] =
             state.quota_partitions.emplace(mount.quota_partition, mount.quota_bytes);
         if (!inserted && partition->second != mount.quota_bytes) {
             return std::unexpected(std::string{"managed launch quota partition is inconsistent"});
         }
         return {};
+    }
+    if (has_adoption_identity) {
+        return std::unexpected(std::string{"adoption identity requires a managed runtime home"});
     }
     const auto [partition, inserted] =
         state.quota_partitions.emplace(mount.quota_partition, mount.quota_bytes);
@@ -548,6 +565,11 @@ auto bind_managed_launch_projection_from_fd(
         if (mount.runtime_adapter_id) {
             encoder.append_string(*mount.runtime_adapter_id);
             encoder.append_string(*mount.runtime_context_digest);
+        }
+        encoder.append_bool(mount.runtime_adoption_manifest_digest.has_value());
+        if (mount.runtime_adoption_manifest_digest) {
+            encoder.append_string(*mount.runtime_adoption_manifest_digest);
+            encoder.append_string(*mount.runtime_adoption_snapshot_digest);
         }
         if (mount.secret_handle) {
             encoder.append_string("glove.managed-launch-secret");

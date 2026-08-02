@@ -320,12 +320,11 @@ auto run() -> int {
         discovery_validator->resolve_runtime_launch_json(discovery_plan, 1'000);
     REQUIRE(discovered_launch.has_value());
     REQUIRE(
-        discovered_launch->argv ==
-        std::vector<std::string>({
-            std::filesystem::canonical(codex).string(),
-            "--version",
-            "--dangerously-bypass-approvals-and-sandbox",
-        })
+        discovered_launch->argv == std::vector<std::string>({
+                                       std::filesystem::canonical(codex).string(),
+                                       "--version",
+                                       "--dangerously-bypass-approvals-and-sandbox",
+                                   })
     );
     REQUIRE(::chmod(harness_bin.c_str(), 0777) == 0);
     REQUIRE(!discovery_validator->resolve_runtime_launch_json(discovery_plan, 1'000).has_value());
@@ -363,12 +362,11 @@ auto run() -> int {
     REQUIRE(launch->runtime_template_id == "codex-safe");
     REQUIRE(launch->adapter_command_digest == launch_digest());
     REQUIRE(
-        launch->argv ==
-        std::vector<std::string>({
-            "/usr/bin/true",
-            "--version",
-            "--dangerously-bypass-approvals-and-sandbox",
-        })
+        launch->argv == std::vector<std::string>({
+                            "/usr/bin/true",
+                            "--version",
+                            "--dangerously-bypass-approvals-and-sandbox",
+                        })
     );
     REQUIRE(launch->environment == launch_template().environment);
     REQUIRE(launch->limits.cpu_time_ms == 1'000);
@@ -616,6 +614,23 @@ auto run() -> int {
     REQUIRE(loaded.has_value());
     REQUIRE(loaded->validate_json(valid_plan(), 1'000).has_value());
     REQUIRE(loaded->resolve_runtime_launch_json(valid_plan(), 1'000).has_value());
+    auto no_adoption = loaded->resolve_native_harness_adoption_json(valid_plan(), 1'000);
+    REQUIRE(no_adoption.has_value());
+    REQUIRE(!no_adoption->has_value());
+
+    const auto invalid_adoption_policy_path = temp.root() / "invalid-adoption-policy.json";
+    {
+        std::ofstream output{invalid_adoption_policy_path};
+        output << replace_once(
+            policy_json(source),
+            R"("launch":{"executable_path":"/usr/bin/true")",
+            R"("adoption":{"manifest_root":"relative","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","snapshot_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"launch":{"executable_path":"/usr/bin/true")"
+        );
+    }
+    REQUIRE(::chmod(invalid_adoption_policy_path.c_str(), 0600) == 0);
+    REQUIRE(
+        !glove::supervisor::session_plan_validator::load(invalid_adoption_policy_path).has_value()
+    );
 
     const auto unbound_destination_policy_path = temp.root() / "unbound-destination-policy.json";
     {

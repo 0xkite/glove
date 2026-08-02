@@ -31,13 +31,10 @@ residual risks.
 
 ## Build and test
 
-Requirements:
-
-- CMake 3.28 or newer
-- Ninja
-- Clang 18 or newer
-- Linux: libseccomp development headers
-- macOS integration tests: `yams`
+Build requirements include CMake 3.28+, Ninja, Git, and a C++23-capable
+compiler/toolchain. Linux also requires `pkg-config` and the `libseccomp`
+development package. See [build prerequisites](docs/build.md) for distro
+commands, offline Glaze staging, and Linux managed-session host requirements.
 
 Build, test, and install Release to `${GLOVE_INSTALL_PREFIX:-$HOME/.local}`:
 
@@ -106,8 +103,10 @@ the local service is running: `glove init /absolute/project`. See
 ## Documentation
 
 - [Architecture](docs/architecture.md): process boundaries and request flow
+- [Build prerequisites](docs/build.md): dependencies, offline builds, and Linux launch-host requirements
 - [Session policy](docs/session-policy.md): canonical plan and local policy contract
 - [Threat model](docs/threat-model.md): guarantees, assumptions, and residual risk
+- [Hostile-content analysis](docs/hostile-content-analysis.md): offline analysis profile, quarantine rules, and VM escalation boundary
 - [Quickstart](docs/quickstart.md): build and invocation examples
 - [Host setup](docs/host-setup.md): XDG state, service registration, and project enrollment
 - [Future work](docs/future-work.md): prioritized launch and hardening gates

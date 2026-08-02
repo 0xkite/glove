@@ -50,6 +50,27 @@ struct runtime_harness_stage_options {
     bool dry_run = false;
 };
 
+struct pi_adoption_manifest_options {
+    // Explicit loose discovery inputs. They are never launch authority and
+    // their bytes never leave Glove's local manifest generator.
+    std::filesystem::path settings_path;
+    std::filesystem::path package_store_root;
+    std::filesystem::path protected_directory;
+    bool dry_run = false;
+};
+
+struct generated_pi_adoption_manifest {
+    std::string manifest_digest;
+    std::string snapshot_digest;
+    std::vector<std::string> package_ids;
+    // Written beneath the managed Pi home by the runtime projector, not copied
+    // from the host settings file. Entries are private-home relative paths.
+    std::string generated_settings_json;
+    std::filesystem::path snapshot_root;
+    std::filesystem::path manifest_path;
+    bool changed = false;
+};
+
 struct staged_runtime_harness {
     std::string runtime_id;
     std::string executable_name;
@@ -65,6 +86,9 @@ struct staged_runtime_harness {
     // Set when setup copied an otherwise untrusted package/interpreter tree
     // into a content-addressed owner-protected snapshot.
     std::string snapshot_digest;
+    // Present for adapter-defined adoption flows. It commits logical selectors
+    // and exclusions, never host paths, config bytes, or credentials.
+    std::string adoption_manifest_digest;
     std::uint64_t snapshot_logical_bytes = 0;
     std::uint64_t snapshot_entries = 0;
     bool changed = false;
@@ -83,6 +107,12 @@ struct session_policy_prepare_options {
     // Empty preserves the all-detected behavior. Otherwise only the explicit
     // adapter IDs are staged and emitted.
     std::vector<std::string> selected_runtime_ids;
+    // Required for Pi enrollment. These explicit discovery inputs produce the
+    // owner-local digest-pinned adoption binding embedded in the policy.
+    std::optional<pi_adoption_manifest_options> pi_adoption;
+    // A dedicated offline, credential-free policy for treating downloaded
+    // content as adversarial data. It is Linux managed-session only.
+    bool hostile_content_analysis = false;
     bool dry_run = false;
 };
 
@@ -107,6 +137,12 @@ detect_runtime_harnesses(const std::vector<std::filesystem::path>& executable_se
 // read-only snapshot and revalidated. Existing entries are never overwritten.
 [[nodiscard]] auto stage_runtime_harness(const runtime_harness_stage_options& options)
     -> result<staged_runtime_harness>;
+
+// Generate a closed Pi extension manifest from explicitly named host settings
+// and package-store inputs. The result commits only selected logical package
+// IDs, immutable snapshot content, and generated private-home settings.
+[[nodiscard]] auto generate_pi_adoption_manifest(const pi_adoption_manifest_options& options)
+    -> result<generated_pi_adoption_manifest>;
 
 // Emit one strict session-policy runtime_templates[] entry. The generator
 // canonicalizes local paths, resolves the adapter executable through the same

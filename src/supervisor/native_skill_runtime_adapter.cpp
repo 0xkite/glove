@@ -39,7 +39,10 @@ auto write_all(int descriptor, std::string_view bytes) -> std::expected<void, st
 
 auto make_directory_at(int parent_fd, std::string_view name) -> std::expected<int, std::string> {
     if (name.empty() || name.size() > 128U || name.find('/') != std::string_view::npos ||
-        name == "." || name == ".." || ::mkdirat(parent_fd, std::string{name}.c_str(), 0700) != 0) {
+        name == "." || name == "..") {
+        return std::unexpected(std::string{"native runtime directory component is invalid"});
+    }
+    if (::mkdirat(parent_fd, std::string{name}.c_str(), 0700) != 0 && errno != EEXIST) {
         return std::unexpected(errno_message("create native runtime directory"));
     }
     const int descriptor = ::openat(
@@ -47,6 +50,17 @@ auto make_directory_at(int parent_fd, std::string_view name) -> std::expected<in
     );
     if (descriptor < 0) {
         return std::unexpected(errno_message("open native runtime directory"));
+    }
+    struct stat metadata{};
+    if (::fstat(descriptor, &metadata) != 0) {
+        const auto error = errno_message("inspect native runtime directory");
+        ::close(descriptor);
+        return std::unexpected(error);
+    }
+    if (!S_ISDIR(metadata.st_mode) || metadata.st_uid != ::geteuid() ||
+        (metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        ::close(descriptor);
+        return std::unexpected(std::string{"native runtime directory is not owner-only"});
     }
     return descriptor;
 }
@@ -89,13 +103,13 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .skill_root_components = {".codex", "skills"},
             .managed_environment = {"CODEX_HOME=/home/agent/.codex"},
             .managed_arguments = {"--dangerously-bypass-approvals-and-sandbox"},
-            .managed_configuration =
-                native_skill_runtime_configuration{
-                    .filename = "config.toml",
-                    .contents =
-                        "[projects.\"/home/agent\"]\n"
-                        "trust_level = \"trusted\"\n",
-                },
+            .adoption_manifest = std::nullopt,
+            .managed_configuration = native_skill_runtime_configuration{
+                .directory_components = {".codex"},
+                .filename = "config.toml",
+                .contents = "[projects.\"/home/agent\"]\n"
+                            "trust_level = \"trusted\"\n",
+            },
         };
     }
     if (runtime_id == "claude-code") {
@@ -106,6 +120,7 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .skill_root_components = {".claude", "skills"},
             .managed_environment = {},
             .managed_arguments = {},
+            .adoption_manifest = std::nullopt,
             .managed_configuration = std::nullopt,
         };
     }
@@ -117,7 +132,24 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .skill_root_components = {".pi", "agent", "skills"},
             .managed_environment = {},
             .managed_arguments = {},
-            .managed_configuration = std::nullopt,
+            .adoption_manifest =
+                native_harness_adoption_manifest{
+                    .source_artifact_ids = {"runtime-executable", "runtime-dependency-closure"},
+                    .excluded_host_state_ids =
+                        {
+                            "host-auth",
+                            "host-sessions",
+                            "host-settings",
+                            "host-model-state",
+                            "host-package-credentials",
+                        },
+                    .require_snapshot = true,
+                },
+            .managed_configuration = native_skill_runtime_configuration{
+                .directory_components = {".pi", "agent"},
+                .filename = "settings.json",
+                .contents = "{\"packages\":[],\"enableSkillCommands\":true}\n",
+            },
         };
     }
     if (runtime_id == "copilot") {
@@ -128,6 +160,7 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .skill_root_components = {".copilot", "skills"},
             .managed_environment = {"COPILOT_HOME=/home/agent/.copilot"},
             .managed_arguments = {},
+            .adoption_manifest = std::nullopt,
             .managed_configuration = std::nullopt,
         };
     }
@@ -139,6 +172,7 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .skill_root_components = {".config", "opencode", "skills"},
             .managed_environment = {"XDG_CONFIG_HOME=/home/agent/.config"},
             .managed_arguments = {},
+            .adoption_manifest = std::nullopt,
             .managed_configuration = std::nullopt,
         };
     }
@@ -153,10 +187,51 @@ auto native_skill_runtime_adapters() -> std::vector<native_skill_runtime_adapter
     adapters.reserve(runtime_ids.size());
     for (const auto runtime_id : runtime_ids) {
         if (auto adapter = native_skill_runtime_adapter_for(runtime_id)) {
-            adapters.push_back(std::move(*adapter));
+            adapters.emplace_back(*adapter);
         }
     }
     return adapters;
+}
+
+auto native_harness_adoption_manifest_digest(const native_skill_runtime_adapter& adapter)
+    -> std::expected<std::string, std::string> {
+    const auto builtin = native_skill_runtime_adapter_for(adapter.runtime_id);
+    if (!builtin || *builtin != adapter || !adapter.adoption_manifest) {
+        return std::unexpected(std::string{"runtime adoption manifest is unavailable"});
+    }
+    const auto& manifest = *adapter.adoption_manifest;
+    canonical_encoder encoder;
+    if (auto appended = encoder.append_string("glove.native-harness-adoption-manifest-v1");
+        !appended) {
+        return std::unexpected(appended.error());
+    }
+    if (auto appended = encoder.append_string(adapter.runtime_id); !appended) {
+        return std::unexpected(appended.error());
+    }
+    if (auto appended = encoder.append_size(manifest.schema_version); !appended) {
+        return std::unexpected(appended.error());
+    }
+    for (const auto& values : {
+             std::span<const std::string>{manifest.source_artifact_ids},
+             std::span<const std::string>{manifest.excluded_host_state_ids},
+         }) {
+        if (auto appended = encoder.append_size(values.size()); !appended) {
+            return std::unexpected(appended.error());
+        }
+        for (const auto& value : values) {
+            if (auto appended = encoder.append_string(value); !appended) {
+                return std::unexpected(appended.error());
+            }
+        }
+    }
+    if (auto appended = encoder.append_size(manifest.require_snapshot ? 1U : 0U); !appended) {
+        return std::unexpected(appended.error());
+    }
+    auto digest = container::sha256_hex(encoder.bytes());
+    if (!digest) {
+        return std::unexpected(digest.error());
+    }
+    return digest;
 }
 
 auto is_builtin_adapter(const native_skill_runtime_adapter& adapter) -> bool {
@@ -190,10 +265,16 @@ auto resolve_native_skill_runtime_projection(
 }
 
 auto native_skill_runtime_projection_digest(
-    const native_skill_runtime_adapter& adapter, const native_skill_runtime_projection& projection
+    const native_skill_runtime_adapter& adapter,
+    const native_skill_runtime_projection& projection,
+    const native_harness_adoption_identity* adoption
 ) -> std::expected<std::string, std::string> {
     if (!is_builtin_adapter(adapter)) {
         return std::unexpected(std::string{"native skill runtime adapter is unsupported"});
+    }
+    if (adoption && (!adapter.adoption_manifest || adoption->manifest_digest.empty() ||
+                     adoption->snapshot_digest.empty())) {
+        return std::unexpected(std::string{"native harness adoption is unavailable for runtime"});
     }
     codex_runtime_projection canonical;
     canonical.skills.reserve(projection.skills.size());
@@ -240,9 +321,32 @@ auto native_skill_runtime_projection_digest(
         return std::unexpected(appended.error());
     }
     if (adapter.managed_configuration) {
+        if (auto appended =
+                encoder.append_size(adapter.managed_configuration->directory_components.size());
+            !appended) {
+            return std::unexpected(appended.error());
+        }
+        for (const auto& component : adapter.managed_configuration->directory_components) {
+            if (auto appended = encoder.append_string(component); !appended) {
+                return std::unexpected(appended.error());
+            }
+        }
         for (const std::string_view value : {
                  std::string_view{adapter.managed_configuration->filename},
                  std::string_view{adapter.managed_configuration->contents},
+             }) {
+            if (auto appended = encoder.append_string(value); !appended) {
+                return std::unexpected(appended.error());
+            }
+        }
+    }
+    if (auto appended = encoder.append_size(adoption ? 1U : 0U); !appended) {
+        return std::unexpected(appended.error());
+    }
+    if (adoption) {
+        for (const std::string_view value : {
+                 std::string_view{adoption->manifest_digest},
+                 std::string_view{adoption->snapshot_digest},
              }) {
             if (auto appended = encoder.append_string(value); !appended) {
                 return std::unexpected(appended.error());
@@ -259,12 +363,28 @@ auto native_skill_runtime_projection_digest(
 auto materialize_native_skill_runtime_projection(
     int private_home_fd,
     const native_skill_runtime_adapter& adapter,
-    const native_skill_runtime_projection& projection
+    const native_skill_runtime_projection& projection,
+    const resolved_native_harness_adoption* adoption
 ) -> std::expected<void, std::string> {
     if (private_home_fd < 0 || !is_builtin_adapter(adapter)) {
         return std::unexpected(std::string{"native skill runtime home is unavailable"});
     }
-    if (auto valid = native_skill_runtime_projection_digest(adapter, projection); !valid) {
+    std::optional<native_harness_adoption_identity> adoption_identity;
+    if (adoption) {
+        if (!adapter.adoption_manifest || adoption->runtime_id() != adapter.runtime_id) {
+            return std::unexpected(
+                std::string{"native harness adoption is unavailable for runtime"}
+            );
+        }
+        if (auto verified = adoption->verify_identity(); !verified) {
+            return std::unexpected(verified.error());
+        }
+        adoption_identity = adoption->identity();
+    }
+    if (auto valid = native_skill_runtime_projection_digest(
+            adapter, projection, adoption_identity ? &*adoption_identity : nullptr
+        );
+        !valid) {
         return std::unexpected(valid.error());
     }
     int parent_fd = private_home_fd;
@@ -281,22 +401,46 @@ auto materialize_native_skill_runtime_projection(
         parent_fd = *directory;
     }
     if (adapter.managed_configuration) {
-        const int configuration_root_fd = opened_directories.front();
+        int configuration_parent_fd = private_home_fd;
+        std::vector<int> configuration_directories;
+        for (const auto& component : adapter.managed_configuration->directory_components) {
+            auto directory = make_directory_at(configuration_parent_fd, component);
+            if (!directory) {
+                for (const int descriptor : configuration_directories) {
+                    ::close(descriptor);
+                }
+                for (const int descriptor : opened_directories) {
+                    ::close(descriptor);
+                }
+                return std::unexpected(directory.error());
+            }
+            configuration_directories.push_back(*directory);
+            configuration_parent_fd = *directory;
+        }
         const int configuration_fd = ::openat(
-            configuration_root_fd,
+            configuration_parent_fd,
             adapter.managed_configuration->filename.c_str(),
             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
             0600
         );
         if (configuration_fd < 0) {
+            for (const int descriptor : configuration_directories) {
+                ::close(descriptor);
+            }
             for (const int descriptor : opened_directories) {
                 ::close(descriptor);
             }
             return std::unexpected(errno_message("create native runtime configuration"));
         }
-        auto wrote = write_all(configuration_fd, adapter.managed_configuration->contents);
+        const std::string_view configuration_contents =
+            adoption ? adoption->generated_settings_json()
+                     : std::string_view{adapter.managed_configuration->contents};
+        auto wrote = write_all(configuration_fd, configuration_contents);
         const int sync_status = ::fsync(configuration_fd);
         ::close(configuration_fd);
+        for (const int descriptor : configuration_directories) {
+            ::close(descriptor);
+        }
         if (!wrote || sync_status != 0) {
             for (const int descriptor : opened_directories) {
                 ::close(descriptor);
@@ -304,6 +448,17 @@ auto materialize_native_skill_runtime_projection(
             return std::unexpected(
                 wrote ? errno_message("sync native runtime configuration") : wrote.error()
             );
+        }
+    }
+    if (adoption) {
+        if (auto materialized = materialize_native_harness_adoption_projection(
+                private_home_fd, adapter.runtime_id, *adoption
+            );
+            !materialized) {
+            for (const int descriptor : opened_directories) {
+                ::close(descriptor);
+            }
+            return std::unexpected(materialized.error());
         }
     }
     for (const auto& skill : projection.skills) {

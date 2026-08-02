@@ -44,6 +44,16 @@ struct create_exposure {
     std::vector<std::string> allowed_runtime_template_ids;
 };
 
+struct create_session {
+    std::string session_id;
+    std::string controller_plan_digest;
+    glz::raw_json plan;
+};
+
+struct session_status_request {
+    std::string session_id;
+};
+
 struct params {
     std::uint8_t schema_version = 1;
     std::string bootstrap_secret;
@@ -86,6 +96,23 @@ struct exposure {
 struct exposure_result {
     std::uint8_t schema_version = 0;
     exposure exposure;
+};
+
+struct exposure_list_result {
+    std::uint8_t schema_version = 0;
+    std::vector<exposure> exposures;
+};
+
+struct session_result {
+    std::uint8_t schema_version = 0;
+    std::string session_id;
+    std::string controller_plan_digest;
+    std::string plan_content_digest;
+    std::string state;
+    std::uint64_t policy_revision = 0;
+    std::uint64_t expires_at_ms = 0;
+    std::uint64_t created_at_ms = 0;
+    std::optional<std::string> profile_digest;
 };
 
 } // namespace control_wire
@@ -474,6 +501,104 @@ auto enroll_project(const config& service, const project_enrollment& request)
         .scope_digest = std::move(decoded.exposure.scope_digest),
         .expires_at_ms = decoded.exposure.expires_at_ms,
     };
+}
+
+auto list_workspace_exposures(const config& service) -> result<std::vector<workspace_exposure>> {
+    auto response = call(service, "list_path_exposures", glz::raw_json{"null"}, std::nullopt);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    control_wire::exposure_list_result decoded;
+    if (const auto parse = glz::read<strict_read_options>(decoded, response->str);
+        parse || decoded.schema_version != 1 || decoded.exposures.size() > 4'096U) {
+        return std::unexpected(std::string{"workspace inventory response is invalid"});
+    }
+    std::vector<workspace_exposure> exposures;
+    exposures.reserve(decoded.exposures.size());
+    for (auto& exposure : decoded.exposures) {
+        if (exposure.schema_version != 1 || !valid_identifier(exposure.exposure_id) ||
+            exposure.generation == 0 || exposure.scope_digest.size() != 64U ||
+            exposure.display_label.empty() || exposure.display_label.size() > 256U ||
+            (exposure.state != "active" && exposure.state != "revoked" &&
+             exposure.state != "expired")) {
+            return std::unexpected(std::string{"workspace inventory entry is invalid"});
+        }
+        exposures.push_back({
+            .exposure_id = std::move(exposure.exposure_id),
+            .generation = exposure.generation,
+            .scope_digest = std::move(exposure.scope_digest),
+            .display_label = std::move(exposure.display_label),
+            .expires_at_ms = exposure.expires_at_ms,
+            .state = std::move(exposure.state),
+        });
+    }
+    return exposures;
+}
+
+auto workspace_session_status_from_response(std::string_view response)
+    -> result<workspace_session_status> {
+    control_wire::session_result decoded;
+    if (const auto parse = glz::read<strict_read_options>(decoded, response);
+        parse || decoded.schema_version != 1 || !valid_identifier(decoded.session_id) ||
+        decoded.controller_plan_digest.size() != 64U || decoded.plan_content_digest.size() != 64U ||
+        (decoded.state != "created" && decoded.state != "preparing" &&
+         decoded.state != "starting" && decoded.state != "running" && decoded.state != "stopping" &&
+         decoded.state != "exited" && decoded.state != "failed")) {
+        return std::unexpected(std::string{"workspace session response is invalid"});
+    }
+    return workspace_session_status{
+        .session_id = std::move(decoded.session_id),
+        .controller_plan_digest = std::move(decoded.controller_plan_digest),
+        .plan_content_digest = std::move(decoded.plan_content_digest),
+        .state = std::move(decoded.state),
+        .expires_at_ms = decoded.expires_at_ms,
+    };
+}
+
+auto create_workspace_session(
+    const config& service, const workspace_session_create_request& request
+) -> result<workspace_session_status> {
+    if (!valid_identifier(request.session_id) || !valid_identifier(request.idempotency_key) ||
+        request.controller_plan_digest.size() != 64U || request.canonical_plan_json.empty() ||
+        request.canonical_plan_json.size() > max_frame_bytes) {
+        return std::unexpected(std::string{"workspace session create request is invalid"});
+    }
+    auto payload = glz::write_json(
+        control_wire::create_session{
+            .session_id = request.session_id,
+            .controller_plan_digest = request.controller_plan_digest,
+            .plan = glz::raw_json{request.canonical_plan_json},
+        }
+    );
+    if (!payload) {
+        return std::unexpected(std::string{"workspace session request encoding failed"});
+    }
+    auto response = call(
+        service, "create_session", glz::raw_json{std::move(*payload)}, request.idempotency_key
+    );
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    return workspace_session_status_from_response(response->str);
+}
+
+auto workspace_session_status_for(const config& service, std::string_view session_id)
+    -> result<workspace_session_status> {
+    if (!valid_identifier(session_id)) {
+        return std::unexpected(std::string{"workspace session identifier is invalid"});
+    }
+    auto payload = glz::write_json(
+        control_wire::session_status_request{.session_id = std::string{session_id}}
+    );
+    if (!payload) {
+        return std::unexpected(std::string{"workspace session status encoding failed"});
+    }
+    auto response =
+        call(service, "session_status", glz::raw_json{std::move(*payload)}, std::nullopt);
+    if (!response) {
+        return std::unexpected(response.error());
+    }
+    return workspace_session_status_from_response(response->str);
 }
 
 } // namespace glove::host

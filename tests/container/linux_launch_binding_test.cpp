@@ -68,6 +68,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .runtime_adoption_manifest_digest = std::nullopt,
+            .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
             .writable = true,
@@ -85,6 +87,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .runtime_adoption_manifest_digest = std::nullopt,
+            .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
             .writable = true,
@@ -107,6 +111,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .runtime_adoption_manifest_digest = std::nullopt,
+            .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
             .writable = true,
@@ -129,6 +135,8 @@ auto mounts() -> std::vector<session_mount> {
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .runtime_adoption_manifest_digest = std::nullopt,
+            .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
             .writable = false,
@@ -241,6 +249,8 @@ auto run() -> int {
         .projection_destination_alias = "libraries",
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .runtime_adoption_manifest_digest = std::nullopt,
+        .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
         .writable = false,
@@ -301,6 +311,8 @@ auto run() -> int {
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = "codex",
         .runtime_context_digest = std::string(64U, 'c'),
+        .runtime_adoption_manifest_digest = std::nullopt,
+        .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
         .writable = true,
@@ -323,6 +335,8 @@ auto run() -> int {
         .projection_destination_alias = std::nullopt,
         .runtime_adapter_id = std::nullopt,
         .runtime_context_digest = std::nullopt,
+        .runtime_adoption_manifest_digest = std::nullopt,
+        .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = "codex-auth",
         .secret_runtime_id = "codex",
         .writable = true,
@@ -335,6 +349,38 @@ auto run() -> int {
     auto private_home_binding = make_binding(credentialed_profile, argv, credentialed_mounts);
     REQUIRE(private_home_binding.has_value());
     REQUIRE(private_home_binding->profile_digest != credentialed_binding->profile_digest);
+
+    auto adopted_profile = first_profile;
+    adopted_profile.managed_home_dir = "/home/agent";
+    auto adopted_mounts = first_mounts;
+    adopted_mounts.push_back({
+        .descriptor_fd = 18,
+        .target_path = "/home/agent",
+        .alias = "__runtime_home_pi",
+        .quota_partition = "__scratch",
+        .quota_bytes = limits().disk_bytes * 3U / 4U,
+        .source_identity = std::nullopt,
+        .source_content_digest = std::nullopt,
+        .projection_id = std::nullopt,
+        .projection_destination_alias = std::nullopt,
+        .runtime_adapter_id = "pi",
+        .runtime_context_digest = std::string(64U, 'c'),
+        .runtime_adoption_manifest_digest = std::string(64U, 'a'),
+        .runtime_adoption_snapshot_digest = std::string(64U, 'b'),
+        .secret_handle = std::nullopt,
+        .secret_runtime_id = std::nullopt,
+        .writable = true,
+        .directory = true,
+    });
+    auto adopted_binding = make_binding(adopted_profile, argv, adopted_mounts);
+    REQUIRE(adopted_binding.has_value());
+    adopted_mounts.back().runtime_adoption_snapshot_digest = std::string(64U, 'd');
+    auto changed_adoption = make_binding(adopted_profile, argv, adopted_mounts);
+    REQUIRE(changed_adoption.has_value());
+    REQUIRE(changed_adoption->profile_digest != adopted_binding->profile_digest);
+    adopted_mounts.back().runtime_adoption_snapshot_digest = std::nullopt;
+    REQUIRE(!make_binding(adopted_profile, argv, adopted_mounts).has_value());
+
     credentialed_profile.work_dir = "/tmp";
     REQUIRE(!make_binding(credentialed_profile, argv, credentialed_mounts).has_value());
 

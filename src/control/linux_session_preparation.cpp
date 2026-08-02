@@ -93,6 +93,12 @@ auto validate_inputs(const session_start_inputs& inputs, std::uint64_t started_a
     if (inputs.launch.backend != supervisor::sandbox_backend::linux_production) {
         return std::unexpected(std::string{"Linux preparation requires the production backend"});
     }
+    if (inputs.launch.adoption.has_value() != inputs.adoption.has_value() ||
+        (inputs.launch.adoption && inputs.adoption->identity() != *inputs.launch.adoption)) {
+        return std::unexpected(
+            std::string{"Linux preparation adoption binding differs from launch projection"}
+        );
+    }
     if (inputs.launch.requires_direct_write_approval) {
         return std::unexpected(
             std::string{"direct-write preparation requires an independent local-consent verifier"}
@@ -380,6 +386,8 @@ auto resolve_secret_mounts(
             .projection_destination_alias = std::nullopt,
             .runtime_adapter_id = std::nullopt,
             .runtime_context_digest = std::nullopt,
+            .runtime_adoption_manifest_digest = std::nullopt,
+            .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = policy.handle,
             .secret_runtime_id = policy.runtime_id,
             .writable = true,
@@ -524,33 +532,26 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
 
     std::shared_ptr<container::refinement_transcript_evaluator> refinement_evaluator;
     if (owned_inputs.launch.refinement) {
-        const auto fixture = std::ranges::find_if(
-            owned_inputs.library_projections,
-            [&](const auto& projection) {
+        const auto fixture =
+            std::ranges::find_if(owned_inputs.library_projections, [&](const auto& projection) {
                 return projection.projection_id ==
                            owned_inputs.launch.refinement->fixture.projection_id &&
                        projection.destination_alias ==
                            owned_inputs.launch.refinement->fixture.destination_alias &&
                        projection.bundle.content_digest() ==
                            owned_inputs.launch.refinement->fixture.content_digest;
-            }
-        );
+            });
         if (fixture == owned_inputs.library_projections.end()) {
-            return std::unexpected(
-                std::string{"refinement fixture projection is unavailable"}
-            );
+            return std::unexpected(std::string{"refinement fixture projection is unavailable"});
         }
-        auto fixture_bytes =
-            fixture->bundle.read_bytes(container::max_refinement_fixture_bytes);
+        auto fixture_bytes = fixture->bundle.read_bytes(container::max_refinement_fixture_bytes);
         if (!fixture_bytes) {
             return std::unexpected(
                 std::string{"read refinement fixture projection: "} + fixture_bytes.error()
             );
         }
         auto evaluator = container::refinement_transcript_evaluator::create(
-            *fixture_bytes,
-            owned_inputs.session.session_id,
-            *owned_inputs.launch.refinement
+            *fixture_bytes, owned_inputs.session.session_id, *owned_inputs.launch.refinement
         );
         if (!evaluator) {
             return std::unexpected(
@@ -561,8 +562,7 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         std::vector<supervisor::resolved_library_projection> selected_projections;
         selected_projections.reserve(1);
         for (auto& projection : owned_inputs.library_projections) {
-            if (projection.projection_id !=
-                owned_inputs.launch.refinement->fixture.projection_id) {
+            if (projection.projection_id != owned_inputs.launch.refinement->fixture.projection_id) {
                 selected_projections.push_back(std::move(projection));
             }
         }
@@ -575,9 +575,7 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
     } else if (
         owned_inputs.launch.runtime_template_id == container::refinement_runtime_template_id
     ) {
-        return std::unexpected(
-            std::string{"refinement runtime is missing its evaluator binding"}
-        );
+        return std::unexpected(std::string{"refinement runtime is missing its evaluator binding"});
     }
 
     auto filesystem = supervisor::linux_detail::linux_session_filesystem::create(
@@ -586,7 +584,8 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         limits.disk_bytes,
         std::move(owned_inputs.path_grants),
         std::move(owned_inputs.library_projections),
-        owned_inputs.launch.runtime_id
+        owned_inputs.launch.runtime_id,
+        std::move(owned_inputs.adoption)
     );
     if (!filesystem) {
         return std::unexpected(filesystem.error());

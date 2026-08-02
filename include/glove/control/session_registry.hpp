@@ -69,6 +69,9 @@ struct session_start_inputs {
     supervisor::runtime_launch_projection launch;
     std::vector<supervisor::resolved_path_grant> path_grants;
     std::vector<supervisor::resolved_library_projection> library_projections;
+    // Descriptor-pinned adoption state is local launch material, not remote
+    // plan content. It must exactly match launch.adoption when present.
+    std::optional<supervisor::resolved_native_harness_adoption> adoption;
     std::string authorization_id;
     std::uint64_t authorization_expires_at_ms = 0;
 };

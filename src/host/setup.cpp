@@ -108,32 +108,26 @@ auto installed_apple_container_runtime() -> result<std::optional<apple_container
         return std::unexpected(std::string{"resolve installed Glove executable"});
     }
     std::error_code filesystem_error;
-    const auto executable =
-        std::filesystem::canonical(executable_bytes.data(), filesystem_error);
+    const auto executable = std::filesystem::canonical(executable_bytes.data(), filesystem_error);
     if (filesystem_error) {
         return std::unexpected(
             std::string{"canonicalize installed Glove executable: "} + filesystem_error.message()
         );
     }
-    const auto release_root =
-        executable.parent_path().parent_path().parent_path();
+    const auto release_root = executable.parent_path().parent_path().parent_path();
     const auto manifest_path = release_root / "runtime-pair.json";
     if (!std::filesystem::exists(manifest_path, filesystem_error)) {
         return std::optional<apple_container_config>{};
     }
-    struct stat metadata {};
+    struct stat metadata{};
     if (::lstat(manifest_path.c_str(), &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
-        metadata.st_nlink != 1 ||
-        (metadata.st_uid != ::geteuid() && metadata.st_uid != 0) ||
-        (static_cast<unsigned int>(metadata.st_mode) & 0022U) != 0U ||
-        metadata.st_size <= 0 ||
+        metadata.st_nlink != 1 || (metadata.st_uid != ::geteuid() && metadata.st_uid != 0) ||
+        (static_cast<unsigned int>(metadata.st_mode) & 0022U) != 0U || metadata.st_size <= 0 ||
         static_cast<std::uint64_t>(metadata.st_size) > max_setup_ledger_bytes) {
         return std::unexpected(std::string{"installed runtime pair manifest is unsafe"});
     }
     std::ifstream input{manifest_path, std::ios::binary};
-    std::string contents(
-        std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}
-    );
+    std::string contents(std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
     setup_wire::runtime_pair pair;
     constexpr glz::opts strict{.error_on_unknown_keys = false};
     if (const auto error = glz::read<strict>(pair, contents); error) {
@@ -161,7 +155,7 @@ auto installed_apple_container_runtime() -> result<std::optional<apple_container
 auto run_apple_container_command(
     const std::filesystem::path& cli, std::initializer_list<std::string> arguments
 ) -> result<void> {
-    struct stat metadata {};
+    struct stat metadata{};
     if (::lstat(cli.c_str(), &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
         metadata.st_uid != 0 || (static_cast<unsigned int>(metadata.st_mode) & 0022U) != 0U ||
         (static_cast<unsigned int>(metadata.st_mode) & 0111U) == 0U) {
@@ -180,8 +174,7 @@ auto run_apple_container_command(
     }
     argv.push_back(nullptr);
     ::pid_t child = -1;
-    const int spawned =
-        ::posix_spawn(&child, cli.c_str(), nullptr, nullptr, argv.data(), environ);
+    const int spawned = ::posix_spawn(&child, cli.c_str(), nullptr, nullptr, argv.data(), environ);
     if (spawned != 0) {
         return std::unexpected(system_error("start Apple Container command", spawned));
     }
@@ -272,7 +265,7 @@ auto create_owner_file(const std::filesystem::path& path, std::string_view conte
         if (errno == EEXIST) {
             return std::unexpected("refusing to overwrite existing file: " + path.string());
         }
-        return std::unexpected(system_error("create protected file"));
+        return std::unexpected(system_error("create protected file: " + path.string()));
     }
     auto written = write_exact(descriptor, contents);
     const int close_result = ::close(descriptor);
@@ -462,6 +455,9 @@ auto make_setup_ledger(
         }
     };
     add_directory("config_directory", plan.config_path.parent_path());
+    if (plan.service.path_exposure_policy) {
+        add_directory("config_directory", plan.service.path_exposure_policy->parent_path());
+    }
     add_directory("state_directory", plan.service.audit_key.parent_path());
     add_directory("runtime_directory", plan.service.runtime_directory);
     if (plan.service.materialization_root) {
@@ -678,8 +674,7 @@ auto plan_setup(const setup_options& options, const environment& values) -> resu
         if (!options.persistent_service) {
             service.persistent_service = existing->persistent_service;
         }
-        const bool runtime_differs =
-            existing->runtime_directory != service.runtime_directory;
+        const bool runtime_differs = existing->runtime_directory != service.runtime_directory;
         const bool paired_apple_addition =
             !existing->apple_container && service.apple_container.has_value();
         auto known_existing = service;
@@ -856,6 +851,12 @@ auto execute_setup(const setup_plan& plan) -> result<void> {
                 return std::unexpected("session policy is invalid: " + valid.error());
             }
         }
+        if (plan.service.path_exposure_policy) {
+            if (auto created = ensure_directory(plan.service.path_exposure_policy->parent_path());
+                !created) {
+                return created;
+            }
+        }
         for (const auto& directory : {
                  std::optional{plan.service.runtime_directory},
                  plan.service.materialization_root,
@@ -887,6 +888,12 @@ auto execute_setup(const setup_plan& plan) -> result<void> {
             if (auto created = ensure_directory(*directory); !created) {
                 return created;
             }
+        }
+    }
+    if (plan.service.path_exposure_policy) {
+        if (auto created = ensure_directory(plan.service.path_exposure_policy->parent_path());
+            !created) {
+            return created;
         }
     }
     if (plan.service.session_policy) {

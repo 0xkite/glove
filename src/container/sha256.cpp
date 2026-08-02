@@ -58,7 +58,7 @@ auto sha256_stream::update(std::span<const unsigned char> input)
             block_size_ = 0;
         }
     }
-    total_bytes_ += static_cast<std::uint64_t>(input.size());
+    total_bytes_ += input.size();
     return {};
 }
 
@@ -187,9 +187,10 @@ auto sha256_fd_hex(int descriptor, std::uint64_t max_bytes)
             }
             break;
         }
-        const auto requested = static_cast<std::size_t>(
-            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size()))
-        );
+        std::size_t requested = buffer.size();
+        if (remaining < requested) {
+            requested = remaining;
+        }
         const ::ssize_t read =
             ::pread(descriptor, buffer.data(), requested, static_cast<off_t>(offset));
         if (read < 0) {

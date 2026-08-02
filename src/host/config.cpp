@@ -40,8 +40,8 @@ struct config_wire {
 
 namespace {
 
-using config_wire_types::config_wire;
 using config_wire_types::apple_container_wire;
+using config_wire_types::config_wire;
 
 constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 constexpr std::uint64_t max_config_bytes = std::uint64_t{1024} * 1024U;
@@ -118,8 +118,7 @@ auto read_owner_only_file(const std::filesystem::path& path) -> result<std::stri
     if (!S_ISREG(metadata.st_mode) || metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
         permissions != 0600U || metadata.st_size <= 0 ||
         static_cast<std::uint64_t>(metadata.st_size) > max_config_bytes ||
-        static_cast<std::uint64_t>(metadata.st_size) >
-            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        static_cast<std::uint64_t>(metadata.st_size) > std::numeric_limits<std::size_t>::max()) {
         return std::unexpected(
             std::string{"configuration must be a bounded owner-only single-link file"}
         );
@@ -264,11 +263,13 @@ auto validate(const config& value) -> result<void> {
                  }
              ));
         if (!value.session_store || !value.materialization_root || apple.image.empty() ||
-            apple.image.size() > 256U || apple.image.find_first_of(" \t\r\n") != std::string::npos ||
-            !valid_digest || !valid_closure_digest) {
-            return std::unexpected(std::string{
-                "Apple Container runtime requires managed-session roots and an exact image digest"
-            });
+            apple.image.size() > 256U ||
+            apple.image.find_first_of(" \t\r\n") != std::string::npos || !valid_digest ||
+            !valid_closure_digest) {
+            return std::unexpected(
+                std::string{"Apple Container runtime requires managed-session roots and an exact "
+                            "image digest"}
+            );
         }
     }
     if (value.path_exposure_policy.has_value() != value.path_exposure_journal.has_value()) {
@@ -308,8 +309,7 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
                       .cli = encoded.apple_container->cli,
                       .image = encoded.apple_container->image,
                       .image_digest = encoded.apple_container->image_digest,
-                      .harness_closure_digest =
-                          encoded.apple_container->harness_closure_digest,
+                      .harness_closure_digest = encoded.apple_container->harness_closure_digest,
                   }}
                 : std::nullopt,
     };
@@ -342,8 +342,7 @@ auto encode_config(const config& value) -> result<std::string> {
                           .cli = value.apple_container->cli.string(),
                           .image = value.apple_container->image,
                           .image_digest = value.apple_container->image_digest,
-                          .harness_closure_digest =
-                              value.apple_container->harness_closure_digest,
+                          .harness_closure_digest = value.apple_container->harness_closure_digest,
                       }}
                     : std::nullopt,
         }

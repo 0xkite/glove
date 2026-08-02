@@ -93,6 +93,41 @@ auto run() -> int {
     );
     REQUIRE(registry.has_value());
     REQUIRE(execute_setup(*plan).has_value());
+
+    // An explicit config path must not assume the separate XDG config child
+    // used for path-exposure policy already exists.
+    const auto isolated_config_home = temporary.root() / "isolated-config";
+    const auto isolated_state_home = temporary.root() / "isolated-state";
+    const auto isolated_data_home = temporary.root() / "isolated-data";
+    const auto isolated_runtime_home = temporary.root() / "isolated-runtime";
+    const auto explicit_config_parent = temporary.root() / "explicit-config";
+    for (const auto& directory : {
+             isolated_config_home,
+             isolated_state_home,
+             isolated_data_home,
+             isolated_runtime_home,
+             explicit_config_parent,
+         }) {
+        REQUIRE(std::filesystem::create_directory(directory));
+        REQUIRE(::chmod(directory.c_str(), 0700) == 0);
+    }
+    auto isolated_values = values;
+    isolated_values.xdg_config_home = isolated_config_home.string();
+    isolated_values.xdg_state_home = isolated_state_home.string();
+    isolated_values.xdg_data_home = isolated_data_home.string();
+    isolated_values.xdg_runtime_dir = isolated_runtime_home.string();
+    setup_options explicit_config_options{};
+    explicit_config_options.protected_root = project_root;
+    explicit_config_options.config_path = explicit_config_parent / "glove.json";
+    auto explicit_config_plan = plan_setup(explicit_config_options, isolated_values);
+    REQUIRE(explicit_config_plan.has_value());
+    REQUIRE(execute_setup(*explicit_config_plan).has_value());
+    REQUIRE(
+        std::filesystem::is_regular_file(
+            isolated_config_home / "glove" / "path-exposure-policy.json"
+        )
+    );
+
     const auto legacy_runtime = temporary.root() / "run/user/501/glove";
     REQUIRE(std::filesystem::create_directories(legacy_runtime));
     REQUIRE(::chmod(legacy_runtime.c_str(), 0700) == 0);

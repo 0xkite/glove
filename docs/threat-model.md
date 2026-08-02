@@ -12,52 +12,53 @@ host security boundary.
 
 ## Trust boundaries
 
-| Component | Trust assumption |
-|---|---|
-| Agent process and model output | Untrusted |
-| Agent-supplied JSON-RPC and terminal input | Untrusted |
-| Glove control, policy, and sandbox code | Trusted |
-| Local policy, launch templates, and approval records | Trusted operator input |
-| Project files, repository configuration, and agent instructions | Untrusted; never machine-setup authority |
-| MCP upstream servers | Trusted host processes; not sandboxed by Glove |
-| Sage controller | Authenticated peer, but not authority for raw paths, exposure administration, or host mutation |
-| Operating-system kernel and platform sandbox | Trusted and patched |
-| Other processes under the same host user | Outside the strong integrity boundary |
+| Component                                                       | Trust assumption                                                                               |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Agent process and model output                                  | Untrusted                                                                                      |
+| Agent-supplied JSON-RPC and terminal input                      | Untrusted                                                                                      |
+| Glove control, policy, and sandbox code                         | Trusted                                                                                        |
+| Local policy, launch templates, and approval records            | Trusted operator input                                                                         |
+| Project files, repository configuration, and agent instructions | Untrusted; never machine-setup authority                                                       |
+| MCP upstream servers                                            | Trusted host processes; not sandboxed by Glove                                                 |
+| Sage controller                                                 | Authenticated peer, but not authority for raw paths, exposure administration, or host mutation |
+| Operating-system kernel and platform sandbox                    | Trusted and patched                                                                            |
+| Other processes under the same host user                        | Outside the strong integrity boundary                                                          |
 
 ## Enforced properties
 
-| Area | Enforcement |
-|---|---|
-| Filesystem | Deny-default sandbox; explicit read/write grants; descriptor-based path resolution; link, ownership, identity, and overlap checks |
-| Network | Linux private network namespace with no external route; offline agents cannot create Internet sockets, while online agents reach only an authenticated audited host proxy through a private-loopback listener and inherited Unix descriptor channel; exact macOS egress rules |
-| Process surface | Linux PID/user/IPC/UTS namespaces; macOS deny-default SBPL |
-| Environment | Minimal environment plus named grants |
-| Tool access | Qualified allow-list and configured argument rules before upstream dispatch |
-| Protocol | Bounded JSON-RPC frames, strict decoding, initialization checks, and timeouts |
-| Resources | Linux cgroup CPU/memory/PID limits, watchdog wall time, filesystem quotas, and aggregate terminal-output accounting |
-| Audit | Agent-inaccessible JSONL destination; HMAC-chained managed-session terminal receipts |
-| Remote plans | Identifier-only canonical plan matched against owner-local policy and dual digests |
-| Daemon lifecycle | Fixed local user-service name, protected config and executable paths, shell-free service-manager invocation, and authenticated readiness checks |
-| Recovery | Append-only state, exact replay, process identity beyond PID, and fail-closed reconciliation |
+| Area             | Enforcement                                                                                                                                                                                                                                                                   |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Filesystem       | Deny-default sandbox; explicit read/write grants; descriptor-based path resolution; link, ownership, identity, and overlap checks                                                                                                                                             |
+| Network          | Linux private network namespace with no external route; offline agents cannot create Internet sockets, while online agents reach only an authenticated audited host proxy through a private-loopback listener and inherited Unix descriptor channel; exact macOS egress rules |
+| Process surface  | Linux PID/user/IPC/UTS namespaces; macOS deny-default SBPL                                                                                                                                                                                                                    |
+| Environment      | Minimal environment plus named grants                                                                                                                                                                                                                                         |
+| Tool access      | Qualified allow-list and configured argument rules before upstream dispatch                                                                                                                                                                                                   |
+| Protocol         | Bounded JSON-RPC frames, strict decoding, initialization checks, and timeouts                                                                                                                                                                                                 |
+| Resources        | Linux cgroup CPU/memory/PID limits, watchdog wall time, filesystem quotas, and aggregate terminal-output accounting                                                                                                                                                           |
+| Audit            | Agent-inaccessible JSONL destination; HMAC-chained managed-session terminal receipts                                                                                                                                                                                          |
+| Remote plans     | Identifier-only canonical plan matched against owner-local policy and dual digests                                                                                                                                                                                            |
+| Daemon lifecycle | Fixed local user-service name, protected config and executable paths, shell-free service-manager invocation, and authenticated readiness checks                                                                                                                               |
+| Recovery         | Append-only state, exact replay, process identity beyond PID, and fail-closed reconciliation                                                                                                                                                                                  |
 
 Security-relevant append, policy, setup, and receipt failures terminate or reject
 the operation rather than silently reducing enforcement.
 
 ## Residual risks
 
-| Risk | Consequence | Required mitigation |
-|---|---|---|
-| Allowed-tool abuse or prompt injection | An agent can perform malicious operations that remain within an allowed tool's semantics. | Narrow tool and argument policy; upstream semantic authorization. |
-| Unsandboxed upstream compromise | A vulnerable MCP server can act with its host-user authority. | Run upstreams in separate sandboxes or move them behind a hardened service boundary. |
-| Same-user host tampering | A peer process can rewrite the general JSONL log or unkeyed session state and may read shared local secrets. | Isolate the service identity; use asymmetric signing or protected key storage; authenticate general logs. |
-| Linux kernel escape | A kernel vulnerability can cross namespace or seccomp boundaries. | Patch hosts and add an outer VM/container boundary where required. |
-| macOS resource exhaustion | The Sage six-limit resource contract is not implemented on macOS. | Add enforceable CPU, memory, PID, wall-time, disk, and output controls with receipts. |
-| Host egress broker compromise | A defect in the host relay or authenticated proxy could mishandle an approved connection. | Keep the relay target fixed to the per-run proxy, use exact host/port grants, cap concurrent relays, and retain proxy audit evidence. |
-| Retained-change apply disabled | The local atomic/recovery primitive is not a production authorization boundary by itself. | Keep capability `0` until the independent Ed25519 helper/verifier, local RPC/audit path, startup sweep, host-space policy, and Sage-to-parent isolation are configured and tested. |
-| Bundle expansion absent | A verified bundle file is not yet converted into harness-native prompt context. | Add bounded, format-aware extraction and receipt-bound launch inputs. |
-| Refinement evidence scope | Glove does not currently own harness token accounting or a session-indexed durable tool/security/egress event stream suitable for fixture assertions. | V1 omits token and audited-event assertions. Never accept model-reported counts or event identifiers; add them only after those observations have a Glove-owned exact-session source. |
-| Dependency or compiler compromise | Build-time code or toolchain compromise can alter enforcement. | Pin dependencies by immutable digest, verify releases, and use reproducible builds. |
-| Protocol parser defects | Malformed input may expose untested parser behavior. | Add fuzz targets and a maintained adversarial corpus. |
+| Risk                                   | Consequence                                                                                                                                           | Required mitigation                                                                                                                                                                   |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Allowed-tool abuse or prompt injection | An agent can perform malicious operations that remain within an allowed tool's semantics.                                                             | Narrow tool and argument policy; upstream semantic authorization.                                                                                                                     |
+| Unsandboxed upstream compromise        | A vulnerable MCP server can act with its host-user authority.                                                                                         | Run upstreams in separate sandboxes or move them behind a hardened service boundary.                                                                                                  |
+| Same-user host tampering               | A peer process can rewrite the general JSONL log or unkeyed session state and may read shared local secrets.                                          | Isolate the service identity; use asymmetric signing or protected key storage; authenticate general logs.                                                                             |
+| Linux kernel escape                    | A kernel vulnerability can cross namespace or seccomp boundaries.                                                                                     | Patch hosts and add an outer VM/container boundary where required.                                                                                                                    |
+| Hostile active content                 | Documents, archives, installers, and malware can exploit a process that parses or executes them.                                                      | Use the [hostile-content analysis profile](hostile-content-analysis.md) for offline data inspection; require a disposable VM-grade boundary for active-content execution.             |
+| macOS resource exhaustion              | The Sage six-limit resource contract is not implemented on macOS.                                                                                     | Add enforceable CPU, memory, PID, wall-time, disk, and output controls with receipts.                                                                                                 |
+| Host egress broker compromise          | A defect in the host relay or authenticated proxy could mishandle an approved connection.                                                             | Keep the relay target fixed to the per-run proxy, use exact host/port grants, cap concurrent relays, and retain proxy audit evidence.                                                 |
+| Retained-change apply disabled         | The local atomic/recovery primitive is not a production authorization boundary by itself.                                                             | Keep capability `0` until the independent Ed25519 helper/verifier, local RPC/audit path, startup sweep, host-space policy, and Sage-to-parent isolation are configured and tested.    |
+| Bundle expansion absent                | A verified bundle file is not yet converted into harness-native prompt context.                                                                       | Add bounded, format-aware extraction and receipt-bound launch inputs.                                                                                                                 |
+| Refinement evidence scope              | Glove does not currently own harness token accounting or a session-indexed durable tool/security/egress event stream suitable for fixture assertions. | V1 omits token and audited-event assertions. Never accept model-reported counts or event identifiers; add them only after those observations have a Glove-owned exact-session source. |
+| Dependency or compiler compromise      | Build-time code or toolchain compromise can alter enforcement.                                                                                        | Pin dependencies by immutable digest, verify releases, and use reproducible builds.                                                                                                   |
+| Protocol parser defects                | Malformed input may expose untested parser behavior.                                                                                                  | Add fuzz targets and a maintained adversarial corpus.                                                                                                                                 |
 
 ## Assumptions
 

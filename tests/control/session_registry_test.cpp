@@ -202,8 +202,7 @@ auto validator_for(
     const std::filesystem::path& source,
     glove::supervisor::sandbox_backend backend =
         glove::supervisor::sandbox_backend::linux_production
-)
-    -> glove::supervisor::result<glove::supervisor::session_plan_validator> {
+) -> glove::supervisor::result<glove::supervisor::session_plan_validator> {
     using namespace glove::supervisor;
     auto paths = path_alias_registry::build({
         path_alias_policy{
@@ -246,6 +245,7 @@ auto validator_for(
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {"libraries"},
                         .launch = launch_template(),
+                        .adoption = std::nullopt,
                     },
                 },
             .library_projection_destinations =
@@ -400,12 +400,11 @@ auto run() -> int {
     REQUIRE(reserved->authorization_expires_at_ms == authorization.expires_at_ms);
     REQUIRE(reserved->launch.runtime_template_id == "codex-safe");
     REQUIRE(
-        reserved->launch.argv ==
-        std::vector<std::string>({
-            "/usr/bin/true",
-            "--version",
-            "--dangerously-bypass-approvals-and-sandbox",
-        })
+        reserved->launch.argv == std::vector<std::string>({
+                                     "/usr/bin/true",
+                                     "--version",
+                                     "--dangerously-bypass-approvals-and-sandbox",
+                                 })
     );
     REQUIRE((*registry)->record_count() == 2);
     REQUIRE(
@@ -1132,14 +1131,12 @@ auto run_managed_runtime_registry() -> int {
     REQUIRE(!temp.root().empty());
     const auto source = temp.root() / "source";
     REQUIRE(std::filesystem::create_directory(source));
-    auto validator =
-        validator_for(source, glove::supervisor::sandbox_backend::apple_container);
+    auto validator = validator_for(source, glove::supervisor::sandbox_backend::apple_container);
     REQUIRE(validator.has_value());
     auto shared_validator =
         std::make_shared<const glove::supervisor::session_plan_validator>(std::move(*validator));
     const auto store_path = temp.root() / "managed-sessions.journal";
-    auto registry =
-        glove::control::session_registry::open_or_create(store_path, shared_validator);
+    auto registry = glove::control::session_registry::open_or_create(store_path, shared_validator);
     REQUIRE(registry.has_value());
     auto created = (*registry)->create(
         "managed-session", controller_digest, managed_plan(), "managed-create", 1'000
@@ -1244,8 +1241,7 @@ auto run_managed_runtime_registry() -> int {
         std::move(receipt)
     );
     REQUIRE(terminal.has_value());
-    auto exited =
-        (*registry)->mark_managed_exited(*terminal, **producer, "managed-exited");
+    auto exited = (*registry)->mark_managed_exited(*terminal, **producer, "managed-exited");
     REQUIRE(exited.has_value());
     REQUIRE(exited->lifecycle.runtime_identity == runtime_identity);
     REQUIRE(exited->termination_cause == glove::container::resource_termination_cause::exited);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "glove/supervisor/change_manifest.hpp"
+#include "glove/supervisor/harness_adoption.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/linux_ephemeral_copy.hpp"
 #include "glove/supervisor/path_alias.hpp"
@@ -28,6 +29,11 @@ struct session_mount {
     // are not controller input and are committed by managed_launch_binding.
     std::optional<std::string> runtime_adapter_id;
     std::optional<std::string> runtime_context_digest;
+    // Redacted adoption evidence for an adapter-owned private home. Both
+    // values are required together and are committed into the managed launch
+    // profile and terminal receipt; protected source paths remain absent.
+    std::optional<std::string> runtime_adoption_manifest_digest;
+    std::optional<std::string> runtime_adoption_snapshot_digest;
     // Present only for a local secret-handle projection. The handle and
     // runtime identity are committed; source paths and secret bytes are not.
     std::optional<std::string> secret_handle;
@@ -76,7 +82,8 @@ public:
         std::uint64_t disk_limit_bytes,
         std::vector<resolved_path_grant>&& grants,
         std::vector<resolved_library_projection>&& library_projections = {},
-        std::string_view runtime_id = {}
+        std::string_view runtime_id = {},
+        std::optional<resolved_native_harness_adoption>&& adoption = {}
     );
 
     // Removes only the deterministic tmpfs partitions whose complete quota

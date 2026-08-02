@@ -212,7 +212,28 @@ auto run() -> int {
             REQUIRE(adapter->managed_configuration->filename == "config.toml");
         } else {
             REQUIRE(adapter->managed_arguments.empty());
-            REQUIRE(!adapter->managed_configuration);
+            if (runtime_id != "pi") {
+                REQUIRE(!adapter->managed_configuration);
+                REQUIRE(!adapter->adoption_manifest);
+            } else {
+                REQUIRE(adapter->adoption_manifest.has_value());
+                REQUIRE(adapter->adoption_manifest->require_snapshot);
+                const std::vector<std::string> expected_source_artifacts{
+                    "runtime-executable", "runtime-dependency-closure"
+                };
+                REQUIRE(
+                    adapter->adoption_manifest->source_artifact_ids == expected_source_artifacts
+                );
+                REQUIRE(
+                    std::ranges::find(
+                        adapter->adoption_manifest->excluded_host_state_ids, "host-auth"
+                    ) != adapter->adoption_manifest->excluded_host_state_ids.end()
+                );
+                auto manifest_digest =
+                    glove::supervisor::native_harness_adoption_manifest_digest(*adapter);
+                REQUIRE(manifest_digest.has_value());
+                REQUIRE(manifest_digest->size() == 64U);
+            }
         }
         auto native = glove::supervisor::resolve_native_skill_runtime_projection(
             *adapter, *codex_projections
@@ -254,6 +275,15 @@ auto run() -> int {
             };
             REQUIRE(config_contents.find("[projects.\"/home/agent\"]") != std::string::npos);
             REQUIRE(config_contents.find("trust_level = \"trusted\"") != std::string::npos);
+        }
+        if (runtime_id == "pi") {
+            std::ifstream managed_config{home / ".pi/agent/settings.json", std::ios::binary};
+            REQUIRE(static_cast<bool>(managed_config));
+            const std::string config_contents{
+                std::istreambuf_iterator<char>{managed_config},
+                std::istreambuf_iterator<char>{},
+            };
+            REQUIRE(config_contents == "{\"packages\":[],\"enableSkillCommands\":true}\n");
         }
     }
     REQUIRE(!glove::supervisor::native_skill_runtime_adapter_for("untrusted-runtime"));

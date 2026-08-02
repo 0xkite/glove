@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -30,6 +31,15 @@ extern char** environ;
 namespace glove::host {
 namespace runtime_policy_wire {
 
+struct pi_settings_discovery {
+    std::vector<std::string> packages;
+};
+
+struct pi_package_metadata {
+    std::string name;
+    std::map<std::string, std::string> dependencies;
+};
+
 struct runtime_template {
     std::string runtime_template_id;
     std::string runtime_id;
@@ -38,6 +48,7 @@ struct runtime_template {
     std::vector<std::string> allowed_path_aliases;
     std::vector<std::string> allowed_projection_destinations;
     supervisor::runtime_launch_template launch;
+    std::optional<supervisor::native_harness_adoption_policy> adoption;
 };
 
 struct path_access {
@@ -1242,6 +1253,12 @@ auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> resul
         remove_temporary();
         return std::unexpected(protected_tree.error());
     }
+    // The published snapshot root is also an adoption trust boundary. Do not
+    // leave its creation mode subject to the operator's umask.
+    if (::chmod(temporary.c_str(), 0500) != 0) {
+        remove_temporary();
+        return std::unexpected(system_error("protect runtime snapshot root"));
+    }
     if (::rename(temporary.c_str(), plan.snapshot_root.c_str()) != 0) {
         const int rename_error = errno;
         remove_temporary();
@@ -1306,6 +1323,14 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
     if (!adapter) {
         return std::unexpected("unsupported runtime adapter: " + options.runtime_id);
     }
+    std::string adoption_manifest_digest;
+    if (adapter->adoption_manifest) {
+        auto manifest = supervisor::native_harness_adoption_manifest_digest(*adapter);
+        if (!manifest) {
+            return std::unexpected(manifest.error());
+        }
+        adoption_manifest_digest = std::move(*manifest);
+    }
     if (!options.source_executable.is_absolute()) {
         return std::unexpected(std::string{"source executable path must be absolute"});
     }
@@ -1337,7 +1362,8 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
         return std::unexpected(dependency_closure.error());
     }
     std::optional<planned_runtime_snapshot> snapshot;
-    if (!closure_launch_is_trusted(*dependency_closure)) {
+    if ((adapter->adoption_manifest && adapter->adoption_manifest->require_snapshot) ||
+        !closure_launch_is_trusted(*dependency_closure)) {
         auto planned = plan_runtime_snapshot(directory, source, *dependency_closure);
         if (!planned) {
             return std::unexpected("derive protected runtime snapshot: " + planned.error());
@@ -1434,8 +1460,225 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
         .launch_arguments = launch_closure.arguments,
         .read_only_paths = launch_closure.read_only_paths,
         .snapshot_digest = snapshot ? snapshot->digest : std::string{},
+        .adoption_manifest_digest = std::move(adoption_manifest_digest),
         .snapshot_logical_bytes = snapshot ? snapshot->logical_bytes : 0,
         .snapshot_entries = snapshot ? snapshot->entries : 0,
+        .changed = changed,
+    };
+}
+
+namespace {
+
+auto valid_pi_package_id(std::string_view value) -> bool {
+    if (value.empty() || value.size() > 214U || value.starts_with('.') || value.contains("..") ||
+        std::ranges::any_of(value, [](unsigned char byte) {
+            return !(
+                std::isalnum(byte) || byte == '@' || byte == '/' || byte == '-' || byte == '_' ||
+                byte == '.'
+            );
+        })) {
+        return false;
+    }
+    const auto slash = value.find('/');
+    if (value.starts_with('@')) {
+        return slash != std::string_view::npos && slash > 1U && slash + 1U < value.size() &&
+               value.find('/', slash + 1U) == std::string_view::npos;
+    }
+    return slash == std::string_view::npos;
+}
+
+auto read_pi_settings_discovery(const std::filesystem::path& path)
+    -> result<runtime_policy_wire::pi_settings_discovery> {
+    std::error_code error;
+    const auto canonical = std::filesystem::canonical(path, error);
+    if (error || !std::filesystem::is_regular_file(canonical, error)) {
+        return std::unexpected(std::string{"Pi settings discovery file must be a regular file"});
+    }
+    const auto size = std::filesystem::file_size(canonical, error);
+    if (error || size > 1024U * 1024U) {
+        return std::unexpected(std::string{"Pi settings discovery file exceeds 1 MiB"});
+    }
+    std::ifstream input{canonical, std::ios::binary};
+    std::string contents{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    runtime_policy_wire::pi_settings_discovery settings;
+    if (const auto decoded =
+            glz::read<glz::opts{.error_on_unknown_keys = false}>(settings, contents)) {
+        return std::unexpected(
+            "decode Pi settings discovery: " + glz::format_error(decoded, contents)
+        );
+    }
+    return settings;
+}
+
+auto read_pi_package_metadata(const std::filesystem::path& package)
+    -> result<runtime_policy_wire::pi_package_metadata> {
+    const auto metadata_path = package / "package.json";
+    std::error_code error;
+    const auto size = std::filesystem::file_size(metadata_path, error);
+    if (error || size == 0U || size > 1024U * 1024U) {
+        return std::unexpected(std::string{"Pi package metadata is missing or exceeds 1 MiB"});
+    }
+    std::ifstream input{metadata_path, std::ios::binary};
+    std::string contents{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    runtime_policy_wire::pi_package_metadata metadata;
+    if (const auto decoded =
+            glz::read<glz::opts{.error_on_unknown_keys = false}>(metadata, contents)) {
+        return std::unexpected(
+            "decode Pi package metadata: " + glz::format_error(decoded, contents)
+        );
+    }
+    return metadata;
+}
+
+} // namespace
+
+auto generate_pi_adoption_manifest(const pi_adoption_manifest_options& options)
+    -> result<generated_pi_adoption_manifest> {
+    if (!options.settings_path.is_absolute() || !options.package_store_root.is_absolute() ||
+        !options.protected_directory.is_absolute()) {
+        return std::unexpected(std::string{"Pi adoption paths must be absolute"});
+    }
+    auto settings = read_pi_settings_discovery(options.settings_path);
+    if (!settings) {
+        return std::unexpected(settings.error());
+    }
+    std::error_code error;
+    const auto store = std::filesystem::canonical(options.package_store_root, error);
+    if (error || !std::filesystem::is_directory(store, error)) {
+        return std::unexpected(std::string{"Pi package store must be an existing directory"});
+    }
+    const auto protected_directory =
+        std::filesystem::weakly_canonical(options.protected_directory, error);
+    if (error || protected_directory == protected_directory.root_path()) {
+        return std::unexpected(std::string{"Pi protected manifest directory is invalid"});
+    }
+    std::set<std::string> selected;
+    for (const auto& source : settings->packages) {
+        if (!source.starts_with("npm:")) {
+            return std::unexpected(std::string{"Pi package source must use npm: discovery syntax"});
+        }
+        const std::string id = source.substr(4U);
+        if (!valid_pi_package_id(id) || !selected.insert(id).second) {
+            return std::unexpected(std::string{"Pi package source is invalid or duplicated"});
+        }
+    }
+    if (selected.empty()) {
+        return std::unexpected(std::string{"Pi settings selected no package sources"});
+    }
+    // Resolve a flattened npm-style dependency closure from the explicitly
+    // selected extensions. Versions remain package-manager discovery data;
+    // the snapshot digest commits the actual package bytes.
+    std::set<std::string> closure_ids = selected;
+    std::vector<std::string> pending{selected.begin(), selected.end()};
+    std::vector<std::filesystem::path> roots;
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        const auto& id = pending[index];
+        const auto package = std::filesystem::canonical(store / id, error);
+        if (error || !std::filesystem::is_directory(package, error) ||
+            !path_within(package, store) ||
+            !std::filesystem::is_regular_file(package / "package.json", error)) {
+            return std::unexpected("Pi package discovery path is unavailable: " + id);
+        }
+        auto metadata = read_pi_package_metadata(package);
+        if (!metadata) {
+            return std::unexpected("read Pi package metadata for " + id + ": " + metadata.error());
+        }
+        roots.push_back(package);
+        for (const auto& [dependency, version] : metadata->dependencies) {
+            if (!valid_pi_package_id(dependency) || version.empty()) {
+                return std::unexpected("Pi package dependency is invalid: " + dependency);
+            }
+            if (closure_ids.insert(dependency).second) {
+                pending.push_back(dependency);
+            }
+        }
+    }
+    const std::vector<std::string> package_ids{closure_ids.begin(), closure_ids.end()};
+    std::ranges::sort(roots);
+    runtime_dependency_closure closure{
+        .executable = roots.front() / "package.json",
+        .arguments = {},
+        .read_only_paths = roots,
+    };
+    auto planned = plan_runtime_snapshot(protected_directory, closure.executable, closure);
+    if (!planned) {
+        return std::unexpected("plan Pi package snapshot: " + planned.error());
+    }
+    std::string generated_settings{"{\"packages\":["};
+    for (std::size_t index = 0; index < package_ids.size(); ++index) {
+        if (index != 0U) {
+            generated_settings.push_back(',');
+        }
+        generated_settings += "\"./extensions/" + std::to_string(index) + "\"";
+    }
+    generated_settings += "],\"enableSkillCommands\":true}\n";
+    std::string material{"glove.pi-adoption-manifest-v1"};
+    material.push_back('\0');
+    material += planned->digest;
+    material.push_back('\0');
+    for (const auto& id : package_ids) {
+        material += id;
+        material.push_back('\0');
+    }
+    material += generated_settings;
+    const auto bytes =
+        std::span{reinterpret_cast<const unsigned char*>(material.data()), material.size()};
+    auto manifest_digest = container::sha256_hex(bytes);
+    if (!manifest_digest) {
+        return std::unexpected(manifest_digest.error());
+    }
+    const auto manifest_path =
+        protected_directory / "manifests" / (*manifest_digest + std::string{".json"});
+    std::string persisted_manifest{
+        "{\"schema_version\":1,\"runtime_id\":\"pi\",\"manifest_digest\":\"" + *manifest_digest +
+        "\",\"snapshot_digest\":\"" + planned->digest + "\",\"packages\":["
+    };
+    for (std::size_t index = 0; index < package_ids.size(); ++index) {
+        if (index != 0U) {
+            persisted_manifest.push_back(',');
+        }
+        persisted_manifest += "\"" + package_ids[index] + "\"";
+    }
+    // The generated settings are a standalone JSON file and deliberately end
+    // with a newline. Embed its JSON value without that transport newline so
+    // the protected manifest remains canonical JSON.
+    const auto settings_value = generated_settings.ends_with('\n')
+                                    ? generated_settings.substr(0, generated_settings.size() - 1U)
+                                    : generated_settings;
+    persisted_manifest += "],\"generated_settings\":" + settings_value + "}";
+    bool changed = false;
+    if (!options.dry_run) {
+        auto materialized = materialize_runtime_snapshot(*planned);
+        if (!materialized) {
+            return std::unexpected("materialize Pi package snapshot: " + materialized.error());
+        }
+        changed = *materialized;
+        if (auto prepared = ensure_protected_directory(manifest_path.parent_path()); !prepared) {
+            return std::unexpected(prepared.error());
+        }
+        auto existing = read_policy_contents(manifest_path);
+        if (!existing) {
+            return std::unexpected("read existing Pi adoption manifest: " + existing.error());
+        }
+        if (!*existing) {
+            if (auto written = write_owner_file_exclusive(manifest_path, persisted_manifest);
+                !written) {
+                return std::unexpected("write Pi adoption manifest: " + written.error());
+            }
+            changed = true;
+        } else if (**existing != persisted_manifest) {
+            return std::unexpected(
+                std::string{"existing Pi adoption manifest does not match its digest"}
+            );
+        }
+    }
+    return generated_pi_adoption_manifest{
+        .manifest_digest = std::move(*manifest_digest),
+        .snapshot_digest = planned->digest,
+        .package_ids = std::move(package_ids),
+        .generated_settings_json = std::move(generated_settings),
+        .snapshot_root = planned->snapshot_root,
+        .manifest_path = manifest_path,
         .changed = changed,
     };
 }
@@ -1565,6 +1808,18 @@ auto prepare_session_policy(const session_policy_prepare_options& options)
             std::string{"at least one explicit harness search path is required"}
         );
     }
+    if (options.hostile_content_analysis &&
+        options.backend != supervisor::sandbox_backend::linux_production) {
+        return std::unexpected(
+            std::string{"hostile-content analysis requires the Linux managed-session backend"}
+        );
+    }
+    if (options.hostile_content_analysis &&
+        (!options.egress_policies.empty() || !options.secret_mounts.empty())) {
+        return std::unexpected(
+            std::string{"hostile-content analysis forbids egress policies and secret mounts"}
+        );
+    }
     if (!options.protected_harness_root.is_absolute() || !options.workspace_root.is_absolute() ||
         !options.policy_path.is_absolute()) {
         return std::unexpected(
@@ -1619,7 +1874,9 @@ auto prepare_session_policy(const session_policy_prepare_options& options)
         }
         auto generated = generate_runtime_policy({
             .runtime_id = detected.runtime_id,
-            .runtime_template_id = detected.runtime_id + "-safe",
+            .runtime_template_id =
+                detected.runtime_id +
+                (options.hostile_content_analysis ? "-hostile-analysis" : "-safe"),
             .backend = options.backend,
             .executable_path = staged->launch_executable,
             .executable_search_paths = {},
@@ -1662,6 +1919,36 @@ auto prepare_session_policy(const session_policy_prepare_options& options)
                 "selected runtime is not available in the explicit search paths: " + selected
             );
         }
+    }
+
+    const bool pi_selected = std::ranges::any_of(planned_runtimes, [](const auto& runtime) {
+        return runtime.runtime_id == "pi";
+    });
+    if (pi_selected != options.pi_adoption.has_value()) {
+        return std::unexpected(
+            pi_selected ? std::string{"Pi enrollment requires --pi-settings, --pi-package-store, "
+                                      "and --pi-adoption-root"}
+                        : std::string{"Pi adoption inputs require the Pi runtime to be selected"}
+        );
+    }
+    if (options.pi_adoption) {
+        auto adoption_options = *options.pi_adoption;
+        adoption_options.dry_run = options.dry_run;
+        auto adoption = generate_pi_adoption_manifest(adoption_options);
+        if (!adoption) {
+            return std::unexpected("generate Pi adoption manifest: " + adoption.error());
+        }
+        const auto pi_template = std::ranges::find(templates, "pi", [](const auto& template_) {
+            return template_.runtime_id;
+        });
+        if (pi_template == templates.end()) {
+            return std::unexpected(std::string{"Pi runtime template is missing"});
+        }
+        pi_template->adoption = supervisor::native_harness_adoption_policy{
+            .manifest_root = adoption->snapshot_root.parent_path().parent_path().string(),
+            .manifest_digest = adoption->manifest_digest,
+            .snapshot_digest = adoption->snapshot_digest,
+        };
     }
 
     constexpr std::uint64_t mebibyte = std::uint64_t{1024} * 1024U;
@@ -1733,6 +2020,67 @@ auto prepare_session_policy(const session_policy_prepare_options& options)
             .target_path = secret.target_path,
         });
     }
+    const std::uint64_t workspace_limit =
+        options.hostile_content_analysis ? 64U * mebibyte : 1024U * mebibyte;
+    std::vector<runtime_policy_wire::path_access> workspace_access;
+    if (!options.hostile_content_analysis) {
+        workspace_access.push_back({
+            .access = "read",
+            .materialization = "bind",
+            .create_policy = "never",
+            .cleanup_policy = "retain",
+            .max_bytes = 0,
+        });
+    }
+    workspace_access.push_back({
+        .access = "ephemeral_write",
+        .materialization = "copy",
+        .create_policy = "empty_directory",
+        .cleanup_policy = "remove",
+        .max_bytes = workspace_limit,
+    });
+    if (!options.hostile_content_analysis) {
+        workspace_access.push_back({
+            .access = "retained_write",
+            .materialization = "copy",
+            .create_policy = "empty_directory",
+            .cleanup_policy = "retain",
+            .max_bytes = workspace_limit,
+        });
+    }
+    std::vector<runtime_policy_wire::resource_profile> resource_profiles;
+    if (options.hostile_content_analysis) {
+        resource_profiles.push_back({
+            .profile_id = "hostile-analysis",
+            .cpu_time_ms = 30'000,
+            .memory_bytes = 512U * mebibyte,
+            .pids = 64,
+            .wall_time_ms = 60'000,
+            .disk_bytes = 128U * mebibyte,
+            .terminal_output_bytes = mebibyte,
+        });
+    } else {
+        resource_profiles = {
+            {
+                .profile_id = "small",
+                .cpu_time_ms = 60'000,
+                .memory_bytes = 1024U * mebibyte,
+                .pids = 256,
+                .wall_time_ms = 120'000,
+                .disk_bytes = 2048U * mebibyte,
+                .terminal_output_bytes = 16U * mebibyte,
+            },
+            {
+                .profile_id = "interactive",
+                .cpu_time_ms = 120'000,
+                .memory_bytes = 1024U * mebibyte,
+                .pids = 256,
+                .wall_time_ms = 300'000,
+                .disk_bytes = 2048U * mebibyte,
+                .terminal_output_bytes = 16U * mebibyte,
+            },
+        };
+    }
     runtime_policy_wire::session_policy policy{
         .runtime_templates = std::move(templates),
         .path_aliases = {{
@@ -1740,62 +2088,13 @@ auto prepare_session_policy(const session_policy_prepare_options& options)
             .host_path = workspace.string(),
             .target_path = "/workspace",
             .max_ttl_secs = 86'400,
-            .access =
-                {
-                    {
-                        .access = "read",
-                        .materialization = "bind",
-                        .create_policy = "never",
-                        .cleanup_policy = "retain",
-                        .max_bytes = 0,
-                    },
-                    {
-                        .access = "ephemeral_write",
-                        .materialization = "copy",
-                        .create_policy = "empty_directory",
-                        .cleanup_policy = "remove",
-                        .max_bytes = 1024U * mebibyte,
-                    },
-                    {
-                        .access = "retained_write",
-                        .materialization = "copy",
-                        .create_policy = "empty_directory",
-                        .cleanup_policy = "retain",
-                        .max_bytes = 1024U * mebibyte,
-                    },
-                },
+            .access = std::move(workspace_access),
         }},
         .library_projection_destinations = {{
             .alias = "libraries",
             .target_path = "/opt/sage/library-bundles",
         }},
-        .resource_profiles =
-            {
-                {
-                    .profile_id = "small",
-                    .cpu_time_ms = 60'000,
-                    .memory_bytes = 1024U * mebibyte,
-                    // Node-based harnesses account runtime worker threads against the
-                    // cgroup pids controller. Keep the profile bounded while leaving
-                    // enough headroom for deterministic and short agent turns.
-                    .pids = 256,
-                    .wall_time_ms = 120'000,
-                    .disk_bytes = 2048U * mebibyte,
-                    .terminal_output_bytes = 16U * mebibyte,
-                },
-                {
-                    // Model-backed interactive turns may spend most of their
-                    // lifetime waiting on audited egress. Keep that use explicit
-                    // instead of silently weakening the small probe profile.
-                    .profile_id = "interactive",
-                    .cpu_time_ms = 120'000,
-                    .memory_bytes = 1024U * mebibyte,
-                    .pids = 256,
-                    .wall_time_ms = 300'000,
-                    .disk_bytes = 2048U * mebibyte,
-                    .terminal_output_bytes = 16U * mebibyte,
-                },
-            },
+        .resource_profiles = std::move(resource_profiles),
         .egress_policy_ids = std::move(egress_policy_ids),
         .tool_policy_ids = {"sage-readonly"},
         .secret_handles = std::move(secret_handles),

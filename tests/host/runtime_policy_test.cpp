@@ -114,6 +114,18 @@ auto run() -> int {
     const auto managed_package = managed_runtime / "lib" / "node_modules" / "vendor" / "bin";
     REQUIRE(std::filesystem::create_directories(managed_bin));
     REQUIRE(std::filesystem::create_directories(managed_package));
+    // Launch-trust tests must not inherit the operator's umask. These
+    // directories model an owner-only managed runtime closure.
+    for (const auto& directory : {
+             managed_runtime,
+             managed_bin,
+             managed_runtime / "lib",
+             managed_runtime / "lib" / "node_modules",
+             managed_runtime / "lib" / "node_modules" / "vendor",
+             managed_package,
+         }) {
+        REQUIRE(::chmod(directory.c_str(), 0700) == 0);
+    }
     const auto managed_node = managed_bin / "node";
     const auto managed_script = managed_package / "codex.js";
     REQUIRE(write_owner_file(managed_node, "#!/bin/sh\nexit 0\n", 0700));
@@ -127,6 +139,14 @@ auto run() -> int {
     managed_stage_options.dry_run = true;
     auto managed_stage = stage_runtime_harness(managed_stage_options);
     REQUIRE(managed_stage.has_value());
+    if (managed_stage->launch_executable != std::filesystem::canonical(managed_node)) {
+        std::fprintf(
+            stderr,
+            "managed interpreter mismatch: got=%s expected=%s\n",
+            managed_stage->launch_executable.c_str(),
+            std::filesystem::canonical(managed_node).c_str()
+        );
+    }
     REQUIRE(managed_stage->launch_executable == std::filesystem::canonical(managed_node));
     REQUIRE(
         managed_stage->launch_arguments ==
@@ -169,6 +189,13 @@ auto run() -> int {
     struct stat snapshot_metadata{};
     REQUIRE(::stat(snapshot_stage->read_only_paths.front().c_str(), &snapshot_metadata) == 0);
     REQUIRE((snapshot_metadata.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0);
+    struct stat snapshot_root_metadata{};
+    REQUIRE(
+        ::stat(
+            snapshot_stage->read_only_paths.front().parent_path().c_str(), &snapshot_root_metadata
+        ) == 0
+    );
+    REQUIRE((snapshot_root_metadata.st_mode & 0777U) == 0500U);
     auto repeated_snapshot = stage_runtime_harness(snapshot_stage_options);
     REQUIRE(repeated_snapshot.has_value());
     REQUIRE(!repeated_snapshot->changed);
@@ -222,6 +249,119 @@ auto run() -> int {
     REQUIRE(split_stage->launch_arguments.front().starts_with(
         split_stage->read_only_paths.front().string()
     ));
+
+    // Pi adoption must treat the explicitly selected package-manager closure
+    // as discovery input only: even an otherwise owner-trusted source is
+    // snapshotted, and a nearby host Pi home never becomes launch authority.
+    const auto pi_runtime = temporary.root() / "pi-runtime";
+    const auto pi_package = pi_runtime / "lib" / "node_modules" / "@pi" / "agent";
+    const auto host_pi_home = temporary.root() / "host-pi-home";
+    REQUIRE(std::filesystem::create_directories(pi_package / "bin"));
+    REQUIRE(std::filesystem::create_directories(host_pi_home / "agent" / "sessions"));
+    REQUIRE(write_owner_file(pi_package / "bin" / "node", "#!/bin/sh\nexit 0\n", 0700));
+    REQUIRE(write_owner_file(pi_package / "package.json", "{}\n", 0600));
+    REQUIRE(write_owner_file(pi_package / "bin" / "pi", "#!/usr/bin/env node\n", 0700));
+    REQUIRE(
+        write_owner_file(host_pi_home / "agent" / "auth.json", R"({\"token\":\"host-only\"})", 0600)
+    );
+    REQUIRE(write_owner_file(
+        host_pi_home / "agent" / "settings.json", R"({\"packages\":[\"host-extension\"]})", 0600
+    ));
+    REQUIRE(write_owner_file(host_pi_home / "agent" / "sessions" / "active.json", "{}\n", 0600));
+    const auto pi_entry = pi_package / "bin" / "pi";
+    auto pi_stage_options = stage_options;
+    pi_stage_options.runtime_id = "pi";
+    pi_stage_options.source_executable = pi_entry;
+    pi_stage_options.protected_directory = temporary.root() / "protected" / "pi";
+    pi_stage_options.dry_run = true;
+    auto pi_dry_stage = stage_runtime_harness(pi_stage_options);
+    if (!pi_dry_stage) {
+        std::fprintf(stderr, "Pi dry staging failed: %s\n", pi_dry_stage.error().c_str());
+    }
+    REQUIRE(pi_dry_stage.has_value());
+    REQUIRE(pi_dry_stage->snapshot_digest.size() == 64U);
+    REQUIRE(pi_dry_stage->adoption_manifest_digest.size() == 64U);
+    REQUIRE(pi_dry_stage->launch_executable.string().find("snapshots/") != std::string::npos);
+    REQUIRE(pi_dry_stage->read_only_paths.size() == 1U);
+    REQUIRE(
+        pi_dry_stage->read_only_paths.front().string().find(host_pi_home.string()) ==
+        std::string::npos
+    );
+    REQUIRE(!std::filesystem::exists(pi_stage_options.protected_directory));
+    pi_stage_options.dry_run = false;
+    auto pi_stage = stage_runtime_harness(pi_stage_options);
+    REQUIRE(pi_stage.has_value());
+    REQUIRE(pi_stage->snapshot_digest == pi_dry_stage->snapshot_digest);
+    REQUIRE(pi_stage->adoption_manifest_digest == pi_dry_stage->adoption_manifest_digest);
+    REQUIRE(
+        std::filesystem::canonical(pi_stage->protected_entry_point) !=
+        std::filesystem::canonical(pi_package / "bin" / "pi")
+    );
+    REQUIRE(
+        !std::filesystem::exists(pi_stage->read_only_paths.front() / "host-pi-home/agent/auth.json")
+    );
+
+    // Explicit Pi configuration is discovery input only. The generated
+    // sandbox settings retain only selected package closures at private-home
+    // relative paths; host auth/settings/sessions never enter the manifest.
+    const auto pi_settings = host_pi_home / "agent" / "adoption-settings.json";
+    const auto pi_store = temporary.root() / "pi-package-store";
+    const auto pi_extension = pi_store / "example-extension";
+    const auto pi_dependency = pi_store / "dependency-extension";
+    REQUIRE(std::filesystem::create_directories(pi_extension));
+    REQUIRE(std::filesystem::create_directories(pi_dependency));
+    REQUIRE(write_owner_file(pi_settings, R"({"packages":["npm:example-extension"]})", 0600));
+    REQUIRE(write_owner_file(
+        pi_extension / "package.json",
+        R"({"name":"example-extension","dependencies":{"dependency-extension":"1.0.0"}})",
+        0600
+    ));
+    REQUIRE(write_owner_file(pi_extension / "index.js", "export default {};\n", 0600));
+    REQUIRE(
+        write_owner_file(pi_dependency / "package.json", R"({"name":"dependency-extension"})", 0600)
+    );
+    REQUIRE(write_owner_file(pi_dependency / "index.js", "export default {};\n", 0600));
+    pi_adoption_manifest_options pi_manifest_options{
+        .settings_path = pi_settings,
+        .package_store_root = pi_store,
+        .protected_directory = temporary.root() / "protected" / "pi-manifest",
+        .dry_run = true,
+    };
+    auto pi_manifest = generate_pi_adoption_manifest(pi_manifest_options);
+    if (!pi_manifest) {
+        std::fprintf(stderr, "Pi manifest generation failed: %s\n", pi_manifest.error().c_str());
+    }
+    REQUIRE(pi_manifest.has_value());
+    REQUIRE(pi_manifest->manifest_digest.size() == 64U);
+    REQUIRE(pi_manifest->snapshot_digest.size() == 64U);
+    const std::vector<std::string> expected_pi_packages{
+        "dependency-extension", "example-extension"
+    };
+    REQUIRE(pi_manifest->package_ids == expected_pi_packages);
+    REQUIRE(pi_manifest->generated_settings_json.find("./extensions/0") != std::string::npos);
+    REQUIRE(pi_manifest->generated_settings_json.find("host-only") == std::string::npos);
+    REQUIRE(!std::filesystem::exists(pi_manifest_options.protected_directory));
+    pi_manifest_options.dry_run = false;
+    auto applied_pi_manifest = generate_pi_adoption_manifest(pi_manifest_options);
+    if (!applied_pi_manifest) {
+        std::fprintf(stderr, "Apply Pi manifest failed: %s\n", applied_pi_manifest.error().c_str());
+    }
+    REQUIRE(applied_pi_manifest.has_value());
+    REQUIRE(applied_pi_manifest->changed);
+    REQUIRE(applied_pi_manifest->manifest_digest == pi_manifest->manifest_digest);
+    REQUIRE(std::filesystem::is_directory(applied_pi_manifest->snapshot_root / "payload"));
+    REQUIRE(std::filesystem::is_regular_file(applied_pi_manifest->manifest_path));
+    struct stat pi_manifest_metadata{};
+    REQUIRE(::lstat(applied_pi_manifest->manifest_path.c_str(), &pi_manifest_metadata) == 0);
+    REQUIRE((static_cast<unsigned int>(pi_manifest_metadata.st_mode) & 0777U) == 0600U);
+    struct stat pi_snapshot_metadata{};
+    REQUIRE(
+        ::stat((applied_pi_manifest->snapshot_root / "payload").c_str(), &pi_snapshot_metadata) == 0
+    );
+    REQUIRE((pi_snapshot_metadata.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0);
+    auto repeated_pi_manifest = generate_pi_adoption_manifest(pi_manifest_options);
+    REQUIRE(repeated_pi_manifest.has_value());
+    REQUIRE(!repeated_pi_manifest->changed);
 
     const auto missing_interpreter = managed_package / "missing.js";
     REQUIRE(write_owner_file(missing_interpreter, "#!/usr/bin/env missing-runtime\n", 0700));
@@ -332,6 +472,7 @@ auto run() -> int {
         .egress_policies = {},
         .secret_mounts = {},
         .selected_runtime_ids = {},
+        .hostile_content_analysis = false,
         .dry_run = true,
     };
     auto prepared_dry_run = prepare_session_policy(prepare_options);
@@ -353,6 +494,79 @@ auto run() -> int {
     REQUIRE(!std::filesystem::exists(prepared_harness_root));
     REQUIRE(!std::filesystem::exists(prepared_policy_path));
 
+    auto hostile_options = prepare_options;
+    hostile_options.hostile_content_analysis = true;
+    auto prepared_hostile = prepare_session_policy(hostile_options);
+    REQUIRE(prepared_hostile.has_value());
+    REQUIRE(
+        prepared_hostile->policy_json.find("\"runtime_template_id\":\"codex-hostile-analysis\"") !=
+        std::string::npos
+    );
+    REQUIRE(
+        prepared_hostile->policy_json.find("\"egress_policy_ids\":[\"no-network\"]") !=
+        std::string::npos
+    );
+    REQUIRE(prepared_hostile->policy_json.find("\"access\":\"read\"") == std::string::npos);
+    REQUIRE(
+        prepared_hostile->policy_json.find("\"access\":\"retained_write\"") == std::string::npos
+    );
+    REQUIRE(
+        prepared_hostile->policy_json.find(
+            R"("profile_id":"hostile-analysis","cpu_time_ms":30000,"memory_bytes":536870912,"pids":64,"wall_time_ms":60000,"disk_bytes":134217728,"terminal_output_bytes":1048576)"
+        ) != std::string::npos
+    );
+    auto hostile_apple = hostile_options;
+    hostile_apple.backend = glove::supervisor::sandbox_backend::apple_container;
+    REQUIRE(!prepare_session_policy(hostile_apple).has_value());
+
+    const auto pi_harness_bin = temporary.root() / "pi-harness-bin";
+    REQUIRE(std::filesystem::create_directory(pi_harness_bin));
+    REQUIRE(::chmod(pi_harness_bin.c_str(), 0700) == 0);
+    std::error_code pi_harness_error;
+    std::filesystem::create_symlink(pi_entry, pi_harness_bin / "pi", pi_harness_error);
+    REQUIRE(!pi_harness_error);
+    std::filesystem::create_symlink(
+        pi_package / "bin" / "node", pi_harness_bin / "node", pi_harness_error
+    );
+    REQUIRE(!pi_harness_error);
+    auto pi_prepare_options = prepare_options;
+    pi_prepare_options.executable_search_paths = {pi_harness_bin};
+    pi_prepare_options.protected_harness_root = temporary.root() / "prepared-pi-harnesses";
+    pi_prepare_options.policy_path = temporary.root() / "policy" / "pi-session-policy.json";
+    pi_prepare_options.selected_runtime_ids = {"pi"};
+    pi_prepare_options.pi_adoption = pi_manifest_options;
+    pi_prepare_options.dry_run = true;
+    auto prepared_pi = prepare_session_policy(pi_prepare_options);
+    if (!prepared_pi) {
+        std::fprintf(stderr, "Pi policy preparation failed: %s\n", prepared_pi.error().c_str());
+    }
+    REQUIRE(prepared_pi.has_value());
+    REQUIRE(
+        prepared_pi->policy_json.find(
+            "\"manifest_digest\":\"" + pi_manifest->manifest_digest + "\""
+        ) != std::string::npos
+    );
+    REQUIRE(
+        prepared_pi->policy_json.find(
+            "\"snapshot_digest\":\"" + pi_manifest->snapshot_digest + "\""
+        ) != std::string::npos
+    );
+    REQUIRE(prepared_pi->policy_json.find(host_pi_home.string()) == std::string::npos);
+    REQUIRE(prepared_pi->policy_json.find("host-only") == std::string::npos);
+    pi_prepare_options.dry_run = false;
+    auto applied_pi_policy = prepare_session_policy(pi_prepare_options);
+    REQUIRE(applied_pi_policy.has_value());
+    REQUIRE(std::filesystem::is_regular_file(pi_prepare_options.policy_path));
+    REQUIRE(
+        validate_session_policy_file(std::filesystem::canonical(pi_prepare_options.policy_path))
+    );
+    auto missing_pi_adoption = pi_prepare_options;
+    missing_pi_adoption.pi_adoption.reset();
+    REQUIRE(!prepare_session_policy(missing_pi_adoption).has_value());
+    auto unused_pi_adoption = prepare_options;
+    unused_pi_adoption.pi_adoption = pi_manifest_options;
+    REQUIRE(!prepare_session_policy(unused_pi_adoption).has_value());
+
     const auto codex_auth = temporary.root() / "codex-auth.json";
     REQUIRE(write_owner_file(codex_auth, R"({"token":"test-only"})", 0600));
     auto online_options = prepare_options;
@@ -373,6 +587,9 @@ auto run() -> int {
     }};
     auto prepared_online = prepare_session_policy(online_options);
     REQUIRE(prepared_online.has_value());
+    auto hostile_online = online_options;
+    hostile_online.hostile_content_analysis = true;
+    REQUIRE(!prepare_session_policy(hostile_online).has_value());
     REQUIRE(
         prepared_online->policy_json.find(
             "\"egress_policy_ids\":[\"no-network\",\"openai-online\"]"

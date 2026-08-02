@@ -1,6 +1,7 @@
 #pragma once
 
 #include "glove/container/refinement_protocol.hpp"
+#include "glove/supervisor/harness_adoption.hpp"
 #include "glove/supervisor/path_alias.hpp"
 #include "glove/supervisor/path_exposure.hpp"
 
@@ -81,6 +82,10 @@ struct runtime_template_policy {
     // Absent policies remain eligible for plan-only validation, never launch
     // resolution. A present template must match adapter_command_digest.
     std::optional<runtime_launch_template> launch;
+    // Owner-local adoption authority. The protected root never crosses the
+    // controller boundary; launch projections retain only the redacted pair
+    // of content digests.
+    std::optional<native_harness_adoption_policy> adoption;
 };
 
 // Host-owned sandbox destination for exact Sage bundle objects. The alias may
@@ -160,6 +165,10 @@ struct runtime_launch_projection {
     std::string egress_policy_id;
     std::vector<egress_target_policy> egress_targets;
     std::vector<secret_mount_policy> secret_mounts;
+    // Present only when the local runtime template has bound a verified
+    // adoption manifest. No protected root, host path, or selector reaches
+    // this session-visible projection.
+    std::optional<native_harness_adoption_identity> adoption;
     std::optional<container::refinement_execution_binding> refinement;
 
     auto operator==(const runtime_launch_projection&) const -> bool = default;
@@ -223,6 +232,12 @@ public:
     resolve_runtime_launch_json(std::string_view plan_json, std::uint64_t now_ms) const
         -> result<runtime_launch_projection>;
 
+    // Resolve the descriptor-owned adoption state selected solely by the
+    // owner-local runtime template. Remote plans do not name it.
+    [[nodiscard]] auto
+    resolve_native_harness_adoption_json(std::string_view plan_json, std::uint64_t now_ms) const
+        -> result<std::optional<resolved_native_harness_adoption>>;
+
     // Resolve host-owned aliases to identity-pinned descriptors after complete
     // plan validation. Callers must first establish their own durable start
     // authorization. Direct-write remains unavailable through this generic
@@ -248,9 +263,9 @@ public:
     // supplied matched-context field is intentionally not an input to this
     // digest, allowing a controller to construct the fixture and then submit
     // the final exact digest.
-    [[nodiscard]] auto refinement_plan_context_digest_json(
-        std::string_view plan_json, std::uint64_t now_ms
-    ) const -> result<std::string>;
+    [[nodiscard]] auto
+    refinement_plan_context_digest_json(std::string_view plan_json, std::uint64_t now_ms) const
+        -> result<std::string>;
 
 private:
     session_plan_policy policy_;
