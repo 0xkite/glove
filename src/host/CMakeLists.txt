@@ -1,10 +1,12 @@
 add_library(glove_host STATIC
+    ../../include/glove/host/onboarding_plan.hpp
     cli.cpp
     config.cpp
     control_client.cpp
     daemon.cpp
     doctor.cpp
     operator_experience.cpp
+    onboarding_plan.cpp
     runtime_policy.cpp
     setup.cpp
 )

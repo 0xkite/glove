@@ -4,6 +4,7 @@
 #include "glove/host/control_client.hpp"
 #include "glove/host/daemon.hpp"
 #include "glove/host/doctor.hpp"
+#include "glove/host/onboarding_plan.hpp"
 #include "glove/host/operator_experience.hpp"
 #include "glove/host/runtime_policy.hpp"
 #include "glove/host/setup.hpp"
@@ -96,6 +97,27 @@ struct prepared_policy_report {
     bool changed = false;
     bool dry_run = false;
 };
+
+struct onboarding_plan_report {
+    std::uint8_t schema_version = 1;
+    std::string mode = "read_only";
+    std::string platform;
+    std::string recommended_path;
+    std::string config_path;
+    std::string policy_path;
+    std::string protected_harness_root;
+    std::string protected_project_root;
+    std::vector<std::string> runtime_template_ids;
+    std::vector<harness> detections;
+    std::string sandbox_backend;
+    bool network_denied = true;
+    bool credentials_configured = false;
+    bool hostile_content = false;
+    std::optional<std::string> session_policy_json;
+    std::vector<std::string> next_actions;
+    bool writes_performed = false;
+    bool inherited_host_state = false;
+};
 } // namespace policy_wire
 
 namespace {
@@ -168,6 +190,12 @@ void print_setup_usage() {
         "  glove setup adopt [--config <absolute-file>] [--dry-run | --yes]\n"
         "  glove setup cleanup [--config <absolute-file>]\n"
         "      [--dry-run | --yes --confirm-ledger <sha256>]\n"
+        "  glove setup plan --path-root <absolute-directory>\n"
+        "      --search-path <absolute-directory>... [--config <absolute-file>]\n"
+        "      [--runtime <adapter-id>]... [--backend <linux_production|apple_container>]\n"
+        "      [--hostile-content] [--pi-settings <absolute-file>\n"
+        "       --pi-package-store <absolute-directory> --pi-adoption-root <absolute-directory>]\n"
+        "      [--show-policy] [--json]\n"
         "  glove setup policy --search-path <absolute-directory>...\n"
         "      --harness-root <absolute-directory> --path-root <absolute-directory>\n"
         "      --output <absolute-file> [--backend <linux_production|apple_container>]\n"
@@ -475,6 +503,175 @@ auto setup_policy_command(std::span<char* const> arguments) -> int {
     return 0;
 }
 
+auto setup_plan_command(std::span<char* const> arguments) -> int {
+    if (arguments.size() == 1U && (std::string_view{arguments.front()} == "-h" ||
+                                   std::string_view{arguments.front()} == "--help")) {
+        print_setup_usage();
+        return 0;
+    }
+    onboarding_plan_options options;
+#if defined(__linux__)
+    options.backend = supervisor::sandbox_backend::linux_production;
+#endif
+    bool json = false;
+    bool show_policy = false;
+    std::optional<std::filesystem::path> pi_settings;
+    std::optional<std::filesystem::path> pi_package_store;
+    std::optional<std::filesystem::path> pi_adoption_root;
+    for (std::size_t index = 0; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--json") {
+            json = true;
+            ++index;
+        } else if (argument == "--show-policy") {
+            show_policy = true;
+            ++index;
+        } else if (argument == "--hostile-content") {
+            options.hostile_content_analysis = true;
+            ++index;
+        } else if (index + 1U < arguments.size()) {
+            const std::filesystem::path value{arguments[index + 1U]};
+            if (argument == "--config") {
+                options.config_path = value;
+            } else if (argument == "--path-root") {
+                options.protected_root = value;
+            } else if (argument == "--search-path") {
+                options.executable_search_paths.push_back(value);
+            } else if (argument == "--runtime") {
+                options.selected_runtime_ids.push_back(value.string());
+            } else if (argument == "--pi-settings") {
+                pi_settings = value;
+            } else if (argument == "--pi-package-store") {
+                pi_package_store = value;
+            } else if (argument == "--pi-adoption-root") {
+                pi_adoption_root = value;
+            } else if (argument == "--backend") {
+                if (value == "linux_production") {
+                    options.backend = supervisor::sandbox_backend::linux_production;
+                } else if (value == "apple_container") {
+                    options.backend = supervisor::sandbox_backend::apple_container;
+                } else {
+                    return print_error(
+                        "setup_plan_backend_invalid",
+                        "Unknown sandbox backend.",
+                        "glove setup plan --help"
+                    );
+                }
+            } else {
+                print_setup_usage();
+                return 2;
+            }
+            index += 2U;
+        } else {
+            print_setup_usage();
+            return 2;
+        }
+    }
+    if (const auto pi_adoption_argument_count =
+            static_cast<unsigned>(pi_settings.has_value()) +
+            static_cast<unsigned>(pi_package_store.has_value()) +
+            static_cast<unsigned>(pi_adoption_root.has_value());
+        pi_adoption_argument_count != 0U) {
+        if (pi_adoption_argument_count != 3U) {
+            return print_error(
+                "setup_plan_pi_adoption_incomplete",
+                "Pi adoption requires --pi-settings, --pi-package-store, and --pi-adoption-root "
+                "together.",
+                "glove setup plan --help"
+            );
+        }
+        options.pi_adoption = pi_adoption_manifest_options{
+            .settings_path = *pi_settings,
+            .package_store_root = *pi_package_store,
+            .protected_directory = *pi_adoption_root,
+            .dry_run = true,
+        };
+    }
+    auto planned = plan_onboarding(options, current_environment());
+    if (!planned) {
+        return print_error("setup_plan_failed", planned.error(), "glove setup plan --help");
+    }
+
+    const auto guidance = operator_setup_guidance();
+    policy_wire::onboarding_plan_report report{
+        .platform = guidance.platform,
+        .recommended_path = guidance.recommended_path,
+        .config_path = planned->setup.config_path.string(),
+        .policy_path = planned->session_policy.policy_path.string(),
+        .protected_harness_root = planned->protected_harness_root.string(),
+        .protected_project_root = planned->setup.canonical_protected_root->string(),
+        .runtime_template_ids = planned->setup.runtime_template_ids,
+        .detections = {},
+        .sandbox_backend = options.backend == supervisor::sandbox_backend::linux_production
+                               ? "linux_production"
+                               : "apple_container",
+        .network_denied = true,
+        .credentials_configured = false,
+        .hostile_content = options.hostile_content_analysis,
+        .session_policy_json =
+            show_policy ? std::optional{planned->session_policy.policy_json} : std::nullopt,
+        .next_actions = {
+            "Review the policy preview and detected closures before any write.",
+            "Use the explicit `glove setup policy ... --yes` workflow to stage the reviewed "
+            "closures and create the policy.",
+            "Use the explicit `glove setup ... --yes` workflow to create machine-local "
+            "configuration and enable the reviewed policy.",
+        },
+    };
+    for (const auto& detection : planned->session_policy.detections) {
+        report.detections.push_back({
+            .runtime_id = detection.runtime_id,
+            .executable_name = detection.executable_name,
+            .available = detection.available,
+            .resolved_executable = detection.resolved_executable.string(),
+            .diagnostic = detection.diagnostic,
+        });
+    }
+    if (json) {
+        auto encoded = glz::write_json(report);
+        if (!encoded) {
+            return print_error(
+                "setup_plan_encode_failed",
+                "Could not encode read-only setup plan.",
+                "glove setup plan --help"
+            );
+        }
+        std::printf("%s\n", encoded->c_str());
+        return 0;
+    }
+
+    std::printf(
+        "Read-only managed-session plan (no files were changed)\n"
+        "Platform shipping lane: %s\n"
+        "Configuration:          %s\n"
+        "Session policy:         %s\n"
+        "Protected harness root: %s\n"
+        "Protected project root: %s\n",
+        report.recommended_path.empty() ? "unsupported" : report.recommended_path.c_str(),
+        report.config_path.c_str(),
+        report.policy_path.c_str(),
+        report.protected_harness_root.c_str(),
+        report.protected_project_root.c_str()
+    );
+    for (const auto& template_id : report.runtime_template_ids) {
+        std::printf("Runtime template:      %s\n", template_id.c_str());
+    }
+    for (const auto& detection : report.detections) {
+        std::printf(
+            "%c %-12s %s\n",
+            detection.available ? '+' : '-',
+            detection.runtime_id.c_str(),
+            detection.available ? detection.resolved_executable.c_str()
+                                : detection.diagnostic.c_str()
+        );
+    }
+    std::printf("\nNext:\n");
+    for (const auto& next : report.next_actions) {
+        std::printf("  %s\n", next.c_str());
+    }
+    return 0;
+}
+
 auto setup_cleanup_command(std::span<char* const> arguments) -> int {
     std::optional<std::filesystem::path> config_path;
     std::string confirmation;
@@ -681,6 +878,9 @@ auto setup_command(std::span<char* const> arguments) -> int {
         }
         print_setup_usage();
         return 2;
+    }
+    if (!arguments.empty() && std::string_view{arguments.front()} == "plan") {
+        return setup_plan_command(arguments.subspan(1));
     }
     if (!arguments.empty() && std::string_view{arguments.front()} == "policy") {
         return setup_policy_command(arguments.subspan(1));

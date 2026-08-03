@@ -18,6 +18,19 @@ add_executable(host_operator_experience_test host/operator_experience_test.cpp)
 target_link_libraries(host_operator_experience_test PRIVATE glove_host)
 add_test(NAME host_operator_experience COMMAND host_operator_experience_test)
 
+add_executable(host_onboarding_plan_test host/onboarding_plan_test.cpp)
+target_link_libraries(host_onboarding_plan_test PRIVATE glove_host)
+add_test(NAME host_onboarding_plan COMMAND host_onboarding_plan_test)
+
+add_executable(host_onboarding_cli_test host/onboarding_cli_test.cpp)
+target_link_libraries(host_onboarding_cli_test PRIVATE glove_host)
+add_dependencies(host_onboarding_cli_test glove)
+add_test(NAME host_onboarding_cli COMMAND host_onboarding_cli_test)
+set_tests_properties(
+    host_onboarding_cli
+    PROPERTIES ENVIRONMENT "GLOVE_BIN=$<TARGET_FILE:glove>"
+)
+
 add_executable(thread_smoke_test thread_smoke_test.cpp)
 target_link_libraries(thread_smoke_test PRIVATE glove_kernel)
 add_test(NAME thread_smoke COMMAND thread_smoke_test)

@@ -1,54 +1,18 @@
 # Glove
 
-Glove runs an LLM agent inside an OS-enforced sandbox and mediates its tool
-access. Files and inherited environment variables are denied unless the operator
-grants them explicitly.
+Glove contains an LLM agent in an OS-enforced sandbox. It denies files,
+environment, network, and tool access unless an operator grants them explicitly.
 
-> Status: research prototype. Remote Sage launch remains disabled until the
-> public lifecycle, approval, and resource-enforcement contracts are complete.
+> **Status:** research prototype. Remote Sage launch remains disabled until its
+> lifecycle, approval, and resource-enforcement contracts are complete.
 
-## Security model
-
-Glove contains the agent process rather than operating only as a network proxy.
-
-```text
-host
-├── Glove control, policy, and audit
-├── sandbox
-│   └── agent
-└── approved MCP upstreams
-```
-
-On Linux, the sandbox combines user, PID, network, mount, IPC, and UTS
-namespaces with `pivot_root`, bind mounts, and seccomp. On macOS, Glove applies
-a deny-default Sandbox Profile Language policy before launch. The contained
-process receives a minimal environment and only configured filesystem grants.
-
-Glove does not prevent prompt injection, misuse of an allowed tool, compromise
-of an unsandboxed upstream tool server, same-user host tampering, or kernel
-exploitation. See [the threat model](docs/threat-model.md) for assumptions and
-residual risks.
-
-## Build and test
-
-Build requirements include CMake 3.28+, Ninja, Git, and a C++23-capable
-compiler/toolchain. Linux also requires `pkg-config` and the `libseccomp`
-development package. See [build prerequisites](docs/build.md) for distro
-commands, offline Glaze staging, and Linux managed-session host requirements.
-
-Build, test, and install Release to `${GLOVE_INSTALL_PREFIX:-$HOME/.local}`:
+## Start here
 
 ```sh
 ./setup.sh
 ```
 
-Use `./setup.sh Debug` for a development build. Run the complete local gate:
-
-```sh
-./scripts/preflight.sh
-```
-
-For faster development:
+For development:
 
 ```sh
 cmake --preset dev
@@ -56,64 +20,30 @@ cmake --build --preset dev
 ctest --preset dev
 ```
 
-Linux isolation tests can run in the provided container:
+Use [`docs/build.md`](docs/build.md) for prerequisites, controlled/offline
+builds, and Linux runtime requirements. Use
+[`docs/host-setup.md`](docs/host-setup.md) to plan and apply owner-local managed
+session setup.
 
-```sh
-docker build -f dockerfiles/Dockerfile.linux -t glove-linux .
-docker run --rm --privileged --security-opt seccomp=unconfined glove-linux
-```
+## Why Glove
 
-## Run modes
-
-`glove run` contains an agent and exposes only allow-listed MCP tools:
-
-```sh
-./build/dev/src/glove run \
-  --upstream yams=yams,serve,--quiet \
-  --allow yams.mcp.echo \
-  -- ./build/dev/src/container/glove_synthetic_agent --mode=client
-```
-
-`glove exec` contains a direct agent process without attaching the MCP kernel:
-
-```sh
-mkdir -p /tmp/glove-work
-./build/dev/src/glove exec \
-  --workspace /tmp/glove-work \
-  -- /absolute/path/to/agent --version
-```
-
-`gloved` is an owner-local control service for plan validation, durable session
-state, authenticated receipt delivery, and a Linux managed-session lifecycle.
-Live host writes are unsupported. Dynamic path exposure is owner-local;
-write-capable sessions use isolated, quota-backed materializations.
-
-```sh
-./build/dev/src/glove setup --path-root "$HOME/work" --dry-run
-./build/dev/src/glove setup --path-root "$HOME/work" --yes
-./build/dev/src/glove daemon start
-./build/dev/src/glove daemon status
-```
-
-Add `--session-policy /absolute/owner-only/session-policy.json` during setup to
-enable managed-session configuration. Enroll individual projects only while
-the local service is running: `glove init /absolute/project`. See
-[host setup](docs/host-setup.md).
+Glove is a containment boundary, not a prompt-injection detector or a complete
+host-security boundary. The motivation, trust boundaries, and residual risks
+are in [`docs/architecture.md`](docs/architecture.md) and
+[`docs/threat-model.md`](docs/threat-model.md).
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): process boundaries and request flow
-- [Build prerequisites](docs/build.md): dependencies, offline builds, and Linux launch-host requirements
-- [Session policy](docs/session-policy.md): canonical plan and local policy contract
-- [Threat model](docs/threat-model.md): guarantees, assumptions, and residual risk
-- [Hostile-content analysis](docs/hostile-content-analysis.md): offline analysis profile, quarantine rules, and VM escalation boundary
-- [Quickstart](docs/quickstart.md): build and invocation examples
-- [Host setup](docs/host-setup.md): XDG state, service registration, and project enrollment
-- [Future work](docs/future-work.md): prioritized launch and hardening gates
-- [Validation surface](docs/validation-surface.md): style findings and research evidence map
-- [Credits](CREDITS.md): dependencies and research references
+- [`docs/build.md`](docs/build.md) — build and validation
+- [`docs/host-setup.md`](docs/host-setup.md) — owner-local machine setup
+- [`docs/session-policy.md`](docs/session-policy.md) — managed-session policy
+  contract
+- [`docs/hostile-content-analysis.md`](docs/hostile-content-analysis.md) —
+  offline hostile-content profile
+- [`docs/quickstart.md`](docs/quickstart.md) — local containment commands
+- [`docs/future-work.md`](docs/future-work.md) — unsupported and planned work
 
 ## License
 
-Glove is licensed under [GPL-3.0-only](LICENSE). Dependency licenses are listed
-in [CREDITS.md](CREDITS.md).
+Glove is licensed under [GPL-3.0-only](LICENSE). See [CREDITS.md](CREDITS.md)
+for dependency licenses and research references.
