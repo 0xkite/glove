@@ -151,13 +151,16 @@ public:
     [[nodiscard]] auto backend_id() const noexcept -> std::string_view override {
         return "linux_production";
     }
+
     [[nodiscard]] auto agent_runtime_adapter_schema_version() const noexcept
         -> std::uint8_t override {
         return 1;
     }
+
     [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override {
         return {"codex", "claude-code", "pi", "copilot", "opencode"};
     }
+
     [[nodiscard]] auto refinement_evaluation_protocol_schema_version() const noexcept
         -> std::uint8_t override;
 

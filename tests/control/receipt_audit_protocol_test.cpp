@@ -6,6 +6,7 @@
 #include "glove/supervisor/session_plan.hpp"
 
 #include "receipt_audit_wire.hpp"
+#include "remote_session_runtime.hpp"
 
 #include <glaze/glaze.hpp>
 #include <sys/stat.h>
@@ -122,9 +123,11 @@ auto refinement_receipt() -> glove::container::refinement_evaluation_receipt {
         .metrics = {{"failed_assertions", 0}, {"latency_us", 750'000}, {"passed", 1}},
     };
     const auto outcome_bytes = canonical_refinement_outcome_bytes(outcome).value();
-    const auto outcome_digest = sha256_hex(std::span<const unsigned char>{
-        reinterpret_cast<const unsigned char*>(outcome_bytes.data()), outcome_bytes.size()
-    });
+    const auto outcome_digest = sha256_hex(
+        std::span<const unsigned char>{
+            reinterpret_cast<const unsigned char*>(outcome_bytes.data()), outcome_bytes.size()
+        }
+    );
     return {
         .schema_version = refinement_evaluation_receipt_schema_version,
         .runtime_template_id = std::string{refinement_runtime_template_id},
@@ -150,14 +153,13 @@ auto refinement_receipt() -> glove::container::refinement_evaluation_receipt {
                 .byte_count = 1'024,
                 .complete = true,
             },
-        .evaluator =
-            {
-                .schema = std::string{refinement_evaluator_schema},
-                .fixture_complete = true,
-                .transcript_utf8 = true,
-                .required_literals = 1,
-                .forbidden_literals = 1,
-            },
+        .evaluator = {
+            .schema = std::string{refinement_evaluator_schema},
+            .fixture_complete = true,
+            .transcript_utf8 = true,
+            .required_literals = 1,
+            .forbidden_literals = 1,
+        },
     };
 }
 
@@ -180,8 +182,7 @@ struct rpc_response {
 struct page_result {
     std::uint8_t schema_version = 0;
     std::vector<glove::container::authenticated_resource_enforcement_receipt> envelopes;
-    std::vector<glove::container::authenticated_refinement_evaluation_receipt>
-        refinement_envelopes;
+    std::vector<glove::container::authenticated_refinement_evaluation_receipt> refinement_envelopes;
     bool has_more = false;
     glove::container::receipt_audit_anchor local_anchor;
 };
@@ -429,10 +430,7 @@ auto run() -> int {
     auto refinement_reservation = (*producer)->reserve_terminal();
     REQUIRE(refinement_reservation.has_value());
     auto refinement_terminal = (*producer)->commit_refinement_terminal(
-        std::move(*refinement_reservation),
-        "session-refinement",
-        plan_digest,
-        refinement_receipt()
+        std::move(*refinement_reservation), "session-refinement", plan_digest, refinement_receipt()
     );
     REQUIRE(refinement_terminal.has_value());
     const auto terminal_anchor = (*producer)->anchor();
@@ -757,6 +755,81 @@ auto run() -> int {
     REQUIRE(planned_capability_set.session_control.create_session);
     REQUIRE(planned_capability_set.session_control.session_status);
     REQUIRE(!planned_capability_set.session_control.start_session);
+
+    auto remote_runtime = glove::control::remote_session_runtime::create({
+        .ssh_argv = {"/usr/bin/ssh", "-F", "/tmp/glove-remote/config", "glove-remote"},
+        .executor_digest = "sha256:" + std::string(64U, 'a'),
+        .container_image = "registry.example.test/glove/runtime@sha256:" + std::string(64U, 'b'),
+        .container_image_digest = "sha256:" + std::string(64U, 'b'),
+        .channel_timeout_ms = 5'000,
+        .max_clock_skew_ms = 250,
+        .max_sessions = 4,
+        .staging_root = "/var/lib/glove-remote/staging",
+    });
+    REQUIRE(remote_runtime.has_value());
+    auto remote_control = glove::control::receipt_audit_protocol::create(
+        bootstrap_secret, *recovered, shared_validator, shared_sessions, *remote_runtime
+    );
+    REQUIRE(remote_control.has_value());
+    auto remote_capabilities =
+        (*remote_control)
+            ->handle_frame(
+                make_request("remote-capabilities", "capabilities", bootstrap_secret, "null"), 1'000
+            );
+    REQUIRE(remote_capabilities.has_value());
+    auto remote_capabilities_response = decode_response(*remote_capabilities);
+    REQUIRE(remote_capabilities_response.has_value());
+    REQUIRE(remote_capabilities_response->result.has_value());
+    supervisor_capabilities remote_capability_set;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        remote_capability_set, remote_capabilities_response->result->str
+    ));
+    REQUIRE(remote_capability_set.session_control.create_session);
+    REQUIRE(remote_capability_set.session_control.session_status);
+    REQUIRE(!remote_capability_set.session_control.start_session);
+    REQUIRE(!remote_capability_set.session_control.attach);
+    REQUIRE(!remote_capability_set.session_control.resize);
+    REQUIRE(!remote_capability_set.session_control.write_stdin);
+    REQUIRE(!remote_capability_set.session_control.signal);
+    REQUIRE(!remote_capability_set.session_control.detach);
+    REQUIRE(!remote_capability_set.session_control.stop_session);
+    REQUIRE(!remote_capability_set.session_control.cleanup_session);
+    REQUIRE(remote_capability_set.agent_runtime_adapter_schema_version == 0);
+    REQUIRE(remote_capability_set.managed_runtime_ids.empty());
+    REQUIRE(remote_capability_set.refinement_evaluation_protocol_schema_version == 0);
+    REQUIRE(remote_capability_set.backends.size() == 2);
+    for (const auto& backend : remote_capability_set.backends) {
+        REQUIRE(backend.resource_enforcement.cpu_time == "unavailable");
+        REQUIRE(backend.resource_enforcement.receipt_schema_version == 0);
+    }
+    constexpr std::array<std::string_view, 8> remote_unavailable_methods{
+        "start_session",
+        "attach",
+        "resize",
+        "write_stdin",
+        "signal",
+        "detach",
+        "stop_session",
+        "cleanup_session",
+    };
+    for (const auto method : remote_unavailable_methods) {
+        auto unavailable = (*remote_control)
+                               ->handle_frame(
+                                   make_request(
+                                       std::string{"remote-unavailable-"} + std::string{method},
+                                       method,
+                                       bootstrap_secret,
+                                       "null",
+                                       "remote-unavailable"
+                                   ),
+                                   1'000
+                               );
+        REQUIRE(unavailable.has_value());
+        auto response = decode_response(*unavailable);
+        REQUIRE(response.has_value());
+        REQUIRE(response->error.has_value());
+        REQUIRE(response->error->code == "method_not_found");
+    }
 
     auto validated =
         (*planned_protocol)

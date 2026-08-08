@@ -1,0 +1,11 @@
+**
+!tools/
+!tools/.cache/
+!tools/.cache/remote-workerd/
+!tools/.cache/remote-workerd/workerd
+!tests/
+!tests/fixtures/
+!tests/fixtures/remote-workerd/
+!tests/fixtures/remote-workerd/workerd.capnp
+!tests/fixtures/remote-workerd/hello.mjs
+!tests/fixtures/remote-workerd/validate.sh

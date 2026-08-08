@@ -133,8 +133,11 @@ detect_runtime_harnesses(const std::vector<std::filesystem::path>& executable_se
 
 // Create an adapter-named entry inside an owner-controlled directory. A source
 // that already passes launch trust is linked directly. Otherwise, a supported
-// single-root interpreter/package closure is copied into a content-addressed,
-// read-only snapshot and revalidated. Existing entries are never overwritten.
+// interpreter/package closure is copied into a content-addressed, read-only
+// snapshot and revalidated. Dry runs inspect filesystem metadata only and fail
+// closed when closure derivation requires a dependency command; applied staging
+// may execute the locally derived dependency tool. Existing entries are never
+// overwritten.
 [[nodiscard]] auto stage_runtime_harness(const runtime_harness_stage_options& options)
     -> result<staged_runtime_harness>;
 
@@ -152,8 +155,10 @@ detect_runtime_harnesses(const std::vector<std::filesystem::path>& executable_se
 
 // Detect all supported harnesses through explicit directories, derive each
 // immutable launch closure, and emit one complete deny-network session policy.
-// Applying the plan requires an explicit caller confirmation; existing policy
-// files are accepted only when their protected contents match exactly.
+// Dry-run preparation never executes dependency commands and fails closed when
+// metadata alone cannot produce the closure. Applying the plan requires an
+// explicit caller confirmation; existing policy files are accepted only when
+// their protected contents match exactly.
 [[nodiscard]] auto prepare_session_policy(const session_policy_prepare_options& options)
     -> result<prepared_session_policy>;
 

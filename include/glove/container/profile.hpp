@@ -80,8 +80,17 @@ enum class resource_termination_cause : std::uint8_t {
 
 enum class sandbox_backend : std::uint8_t {
     linux_production,
+    remote_linux_container,
     apple_container,
     macos_experimental,
+};
+
+// Names the authority behind receipt observations. A trusted remote claim is
+// structurally checked and locally authenticated, but is not local proof of
+// kernel or container enforcement.
+enum class receipt_observation_authority : std::uint8_t {
+    local_enforcement,
+    trusted_remote_claim,
 };
 
 // High-water/aggregate observations captured by the enforcing backend. These
@@ -139,6 +148,9 @@ struct resource_enforcement_receipt {
     std::string profile_digest;
     sandbox_backend backend = sandbox_backend::macos_experimental;
     std::string backend_id;
+    receipt_observation_authority observation_authority =
+        receipt_observation_authority::local_enforcement;
+    bool independently_verified = true;
     resource_limits configured_limits;
     resource_enforcement_capabilities mechanisms;
     resource_usage observed;
@@ -202,6 +214,14 @@ auto validate_resource_enforcement_receipt(
     const resource_limits& expected_limits,
     const resource_enforcement_capabilities& expected_capabilities,
     sandbox_backend expected_backend,
+    std::string_view expected_profile_digest
+) -> std::expected<void, std::string>;
+
+// Remote claims use the same bounded shape for audit transport, but never pass
+// through the local enforcement validator above.
+auto validate_trusted_remote_resource_claim(
+    const resource_enforcement_receipt& receipt,
+    const resource_limits& expected_limits,
     std::string_view expected_profile_digest
 ) -> std::expected<void, std::string>;
 

@@ -153,6 +153,46 @@ auto run() -> int {
                      profile_digest
         )
                      .has_value());
+
+        auto remote_claim = receipt;
+        remote_claim.backend = glove::container::sandbox_backend::remote_linux_container;
+        remote_claim.backend_id = "remote-linux-container:trusted-operator-v1";
+        remote_claim.observation_authority =
+            glove::container::receipt_observation_authority::trusted_remote_claim;
+        remote_claim.independently_verified = false;
+        REQUIRE(!glove::container::validate_resource_enforcement_receipt(
+                     remote_claim,
+                     *out->required_limits,
+                     complete,
+                     glove::container::sandbox_backend::remote_linux_container,
+                     profile_digest
+        )
+                     .has_value());
+        REQUIRE(
+            glove::container::validate_trusted_remote_resource_claim(
+                remote_claim, *out->required_limits, profile_digest
+            )
+                .has_value()
+        );
+        auto lying_authority = remote_claim;
+        lying_authority.observation_authority =
+            glove::container::receipt_observation_authority::local_enforcement;
+        REQUIRE(!glove::container::validate_trusted_remote_resource_claim(
+                     lying_authority, *out->required_limits, profile_digest
+        )
+                     .has_value());
+        auto lying_verification = remote_claim;
+        lying_verification.independently_verified = true;
+        REQUIRE(!glove::container::validate_trusted_remote_resource_claim(
+                     lying_verification, *out->required_limits, profile_digest
+        )
+                     .has_value());
+        auto retained_remote = remote_claim;
+        retained_remote.retained_changes.push_back({});
+        REQUIRE(!glove::container::validate_trusted_remote_resource_claim(
+                     retained_remote, *out->required_limits, profile_digest
+        )
+                     .has_value());
     }
 
     {

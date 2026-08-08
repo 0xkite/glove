@@ -10,6 +10,10 @@ add_executable(host_daemon_test host/daemon_test.cpp)
 target_link_libraries(host_daemon_test PRIVATE glove_host)
 add_test(NAME host_daemon COMMAND host_daemon_test)
 
+add_executable(host_remote_backend_test host/remote_backend_test.cpp)
+target_link_libraries(host_remote_backend_test PRIVATE glove_host)
+add_test(NAME host_remote_backend COMMAND host_remote_backend_test)
+
 add_executable(host_runtime_policy_test host/runtime_policy_test.cpp)
 target_link_libraries(host_runtime_policy_test PRIVATE glove_host glove_supervisor)
 add_test(NAME host_runtime_policy COMMAND host_runtime_policy_test)
@@ -138,6 +142,39 @@ target_include_directories(control_receipt_audit_protocol_test PRIVATE
 )
 add_test(NAME control_receipt_audit_protocol COMMAND control_receipt_audit_protocol_test)
 
+add_executable(control_remote_protocol_test control/remote_protocol_test.cpp)
+target_link_libraries(control_remote_protocol_test PRIVATE glove_control)
+add_test(NAME control_remote_protocol COMMAND control_remote_protocol_test)
+
+add_executable(control_remote_validation_test control/remote_validation_test.cpp)
+target_link_libraries(control_remote_validation_test PRIVATE glove_control)
+add_test(NAME control_remote_validation COMMAND control_remote_validation_test)
+
+add_executable(control_remote_exec_test control/remote_exec_test.cpp)
+target_compile_definitions(control_remote_exec_test PRIVATE
+    GLOVE_REMOTE_EXEC_BIN="$<TARGET_FILE:glove-remote-exec>"
+)
+add_dependencies(control_remote_exec_test glove-remote-exec)
+add_test(NAME control_remote_exec COMMAND control_remote_exec_test)
+
+add_executable(
+    control_remote_validation_executor_test
+    control/remote_validation_executor_test.cpp
+)
+target_link_libraries(control_remote_validation_executor_test PRIVATE glove_control)
+target_include_directories(control_remote_validation_executor_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+)
+add_test(NAME control_remote_validation_executor COMMAND control_remote_validation_executor_test)
+set_tests_properties(control_remote_validation_executor PROPERTIES TIMEOUT 15)
+
+add_executable(control_remote_session_runtime_test control/remote_session_runtime_test.cpp)
+target_link_libraries(control_remote_session_runtime_test PRIVATE glove_control)
+target_include_directories(control_remote_session_runtime_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+)
+add_test(NAME control_remote_session_runtime COMMAND control_remote_session_runtime_test)
+
 add_executable(control_session_registry_test control/session_registry_test.cpp)
 target_link_libraries(control_session_registry_test PRIVATE glove_control)
 target_include_directories(control_session_registry_test PRIVATE
@@ -202,6 +239,16 @@ add_test(NAME supervisor_path_exposure_journal COMMAND supervisor_path_exposure_
 add_executable(supervisor_session_plan_test supervisor/session_plan_test.cpp)
 target_link_libraries(supervisor_session_plan_test PRIVATE glove_supervisor)
 add_test(NAME supervisor_session_plan COMMAND supervisor_session_plan_test)
+
+add_executable(
+    supervisor_cloudflare_os_policy_test
+    supervisor/cloudflare_os_policy_test.cpp
+)
+target_link_libraries(supervisor_cloudflare_os_policy_test PRIVATE glove_supervisor)
+target_compile_definitions(supervisor_cloudflare_os_policy_test PRIVATE
+    CLOUDFLARE_OS_POLICY_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/cloudflare-os-session-policy.json"
+)
+add_test(NAME supervisor_cloudflare_os_policy COMMAND supervisor_cloudflare_os_policy_test)
 
 add_executable(
     supervisor_refinement_session_plan_test

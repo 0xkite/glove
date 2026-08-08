@@ -9,6 +9,7 @@ add_subdirectory(host)
 # container receipts without joining their higher-level dependency graph.
 add_library(glove_digest STATIC
     container/digest.cpp
+    container/image_identity.cpp
     container/sha256.cpp
 )
 add_library(glove::digest ALIAS glove_digest)
@@ -48,6 +49,9 @@ target_link_libraries(glove_kernel
 
 add_executable(glove main.cpp)
 target_link_libraries(glove PRIVATE glove_kernel)
+
+add_executable(glove-remote-exec remote_exec_main.cpp)
+target_link_libraries(glove-remote-exec PRIVATE glove_control)
 
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(gloved gloved_main.cpp)

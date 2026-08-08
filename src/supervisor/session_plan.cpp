@@ -561,6 +561,9 @@ auto parse_backend(std::string_view value) -> std::expected<sandbox_backend, std
     if (value == "linux_production") {
         return sandbox_backend::linux_production;
     }
+    if (value == "remote_linux_container") {
+        return sandbox_backend::remote_linux_container;
+    }
     if (value == "apple_container") {
         return sandbox_backend::apple_container;
     }
@@ -584,6 +587,25 @@ auto parse_access(std::string_view value) -> std::expected<path_access, std::str
         return path_access::direct_write;
     }
     return std::unexpected(std::string{"unknown path access"});
+}
+
+template<typename Plan>
+auto validate_remote_constraints(const Plan& plan, sandbox_backend backend)
+    -> std::expected<void, std::string> {
+    if (backend != sandbox_backend::remote_linux_container) {
+        return {};
+    }
+    if (!plan.secret_handles.empty()) {
+        return std::unexpected(std::string{"remote runtimes do not accept secret handles"});
+    }
+    if (std::ranges::any_of(plan.path_grants, [](const auto& grant) {
+            return grant.access == "direct_write" || grant.access == "retained_write";
+        })) {
+        return std::unexpected(
+            std::string{"remote runtimes do not accept direct or retained writes"}
+        );
+    }
+    return {};
 }
 
 auto parse_materialization(std::string_view value)
@@ -1432,6 +1454,9 @@ auto session_plan_validator::validate_json(std::string_view plan_json, std::uint
         if (runtime == policy_.runtime_templates.end()) {
             return std::unexpected(std::string{"session plan runtime projection is unavailable"});
         }
+        if (auto remote = validate_remote_constraints(plan, runtime->backend); !remote) {
+            return std::unexpected(remote.error());
+        }
         if (auto paths = validate_path_projection(plan, *runtime, exposures_.get(), now_ms);
             !paths) {
             return std::unexpected(paths.error());
@@ -1473,6 +1498,9 @@ auto session_plan_validator::validate_json(std::string_view plan_json, std::uint
         runtime_entry->adapter_command_digest != plan.adapter_command_digest ||
         runtime_entry->backend != *backend) {
         return std::unexpected(std::string{"session plan runtime projection is not authorized"});
+    }
+    if (auto remote = validate_remote_constraints(plan, *backend); !remote) {
+        return std::unexpected(remote.error());
     }
     if (!contains(policy_.egress_policy_ids, plan.egress_policy_id) ||
         !contains(policy_.tool_policy_ids, plan.tool_policy_id) ||

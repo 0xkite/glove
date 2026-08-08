@@ -79,15 +79,23 @@ public:
     virtual ~session_runtime() = default;
 
     [[nodiscard]] virtual auto backend_id() const noexcept -> std::string_view = 0;
+
+    // Constructed diagnostic backends may remain deliberately non-operational.
+    // Protocol discovery and dispatch must not infer lifecycle support from a
+    // non-null runtime object alone.
+    [[nodiscard]] virtual auto lifecycle_operational() const noexcept -> bool { return true; }
+
     [[nodiscard]] virtual auto agent_runtime_adapter_schema_version() const noexcept
         -> std::uint8_t = 0;
     // Exact runtime identifiers the configured managed closure can launch.
     // An adapter schema without this bounded set is not runtime-specific proof.
     [[nodiscard]] virtual auto managed_runtime_ids() const -> std::vector<std::string> = 0;
+
     [[nodiscard]] virtual auto refinement_evaluation_protocol_schema_version() const noexcept
         -> std::uint8_t {
         return 0;
     }
+
     [[nodiscard]] virtual auto resource_capabilities() const noexcept
         -> container::resource_enforcement_capabilities = 0;
     [[nodiscard]] virtual auto start(

@@ -146,11 +146,27 @@ auto run() -> int {
                  .has_value());
     REQUIRE((**fresh_anchor).sequence == 0);
 
+    auto remote_claim = receipt();
+    remote_claim.backend = glove::container::sandbox_backend::remote_linux_container;
+    remote_claim.backend_id = "remote-linux-container:trusted-operator-v1";
+    remote_claim.observation_authority =
+        glove::container::receipt_observation_authority::trusted_remote_claim;
+    remote_claim.independently_verified = false;
+    auto remote = (*chain)->append("session-remote", controller_plan_digest, remote_claim);
+    REQUIRE(remote.has_value());
+    REQUIRE(
+        remote->receipt.observation_authority ==
+        glove::container::receipt_observation_authority::trusted_remote_claim
+    );
+    auto changed_authority = remote_claim;
+    changed_authority.independently_verified = true;
+    REQUIRE(!glove::container::resource_enforcement_receipt_digest(changed_authority).has_value());
+
     auto invalid_receipt = receipt();
     invalid_receipt.backend_id.clear();
     REQUIRE(!(*chain)->append("session-3", controller_plan_digest, invalid_receipt).has_value());
-    REQUIRE((*chain)->sequence() == 2);
-    REQUIRE((*chain)->head_hmac() == second->this_hmac);
+    REQUIRE((*chain)->sequence() == 3);
+    REQUIRE((*chain)->head_hmac() == remote->this_hmac);
 
     REQUIRE(!glove::container::receipt_audit_chain::create("not-a-key").has_value());
     return 0;

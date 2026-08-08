@@ -176,6 +176,8 @@ auto backend_name(supervisor::sandbox_backend backend) -> std::string {
     switch (backend) {
     case supervisor::sandbox_backend::linux_production:
         return "linux_production";
+    case supervisor::sandbox_backend::remote_linux_container:
+        return "remote_linux_container";
     case supervisor::sandbox_backend::apple_container:
         return "apple_container";
     case supervisor::sandbox_backend::macos_experimental:
@@ -660,8 +662,16 @@ auto homebrew_keg_for(const std::filesystem::path& path) -> std::optional<homebr
 }
 
 auto append_homebrew_runtime_closure(
-    const homebrew_keg& interpreter, std::vector<std::filesystem::path>& paths
+    const homebrew_keg& interpreter,
+    std::vector<std::filesystem::path>& paths,
+    bool allow_dependency_commands
 ) -> result<void> {
+    if (!allow_dependency_commands) {
+        return std::unexpected(
+            std::string{"Homebrew dependency closure requires executing brew; dry-run planning "
+                        "does not execute dependency commands"}
+        );
+    }
     const auto brew = interpreter.prefix / "bin" / "brew";
     std::error_code error;
     const auto canonical_brew = std::filesystem::canonical(brew, error);
@@ -886,7 +896,9 @@ auto package_root_for(const std::filesystem::path& source) -> std::filesystem::p
 }
 
 auto derive_runtime_dependency_closure(
-    const std::filesystem::path& source_entry, const std::filesystem::path& source
+    const std::filesystem::path& source_entry,
+    const std::filesystem::path& source,
+    bool allow_dependency_commands
 ) -> result<runtime_dependency_closure> {
     std::ifstream input{source, std::ios::binary};
     std::string first_line;
@@ -936,7 +948,8 @@ auto derive_runtime_dependency_closure(
 
     std::vector<std::filesystem::path> roots{package_root_for(source)};
     if (const auto keg = homebrew_keg_for(interpreter)) {
-        if (auto appended = append_homebrew_runtime_closure(*keg, roots); !appended) {
+        if (auto appended = append_homebrew_runtime_closure(*keg, roots, allow_dependency_commands);
+            !appended) {
             return std::unexpected(appended.error());
         }
     } else if (fields.front() == "/usr/bin/env") {
@@ -1317,8 +1330,11 @@ auto detect_runtime_harnesses(const std::vector<std::filesystem::path>& executab
     return detected;
 }
 
-auto stage_runtime_harness(const runtime_harness_stage_options& options)
-    -> result<staged_runtime_harness> {
+namespace {
+
+auto stage_runtime_harness_impl(
+    const runtime_harness_stage_options& options, bool allow_dependency_commands
+) -> result<staged_runtime_harness> {
     const auto adapter = supervisor::native_skill_runtime_adapter_for(options.runtime_id);
     if (!adapter) {
         return std::unexpected("unsupported runtime adapter: " + options.runtime_id);
@@ -1357,7 +1373,9 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
         return std::unexpected("canonicalize protected harness directory: " + error.message());
     }
     const auto entry_point = directory / adapter->executable_name;
-    auto dependency_closure = derive_runtime_dependency_closure(options.source_executable, source);
+    auto dependency_closure = derive_runtime_dependency_closure(
+        options.source_executable, source, allow_dependency_commands
+    );
     if (!dependency_closure) {
         return std::unexpected(dependency_closure.error());
     }
@@ -1465,6 +1483,13 @@ auto stage_runtime_harness(const runtime_harness_stage_options& options)
         .snapshot_entries = snapshot ? snapshot->entries : 0,
         .changed = changed,
     };
+}
+
+} // namespace
+
+auto stage_runtime_harness(const runtime_harness_stage_options& options)
+    -> result<staged_runtime_harness> {
+    return stage_runtime_harness_impl(options, !options.dry_run);
 }
 
 namespace {
@@ -1861,12 +1886,15 @@ auto prepare_session_policy(const session_policy_prepare_options& options)
              !std::ranges::binary_search(*selected_runtimes, detected.runtime_id))) {
             continue;
         }
-        auto staged = stage_runtime_harness({
-            .runtime_id = detected.runtime_id,
-            .source_executable = detected.resolved_executable,
-            .protected_directory = harness_root / detected.runtime_id,
-            .dry_run = true,
-        });
+        auto staged = stage_runtime_harness_impl(
+            {
+                .runtime_id = detected.runtime_id,
+                .source_executable = detected.resolved_executable,
+                .protected_directory = harness_root / detected.runtime_id,
+                .dry_run = true,
+            },
+            !options.dry_run
+        );
         if (!staged) {
             return std::unexpected(
                 "derive " + detected.runtime_id + " launch closure: " + staged.error()

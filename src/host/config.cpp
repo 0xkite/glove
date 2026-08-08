@@ -1,14 +1,18 @@
 #include "glove/host/config.hpp"
 
+#include "glove/container/image_identity.hpp"
+#include "glove/host/remote_backend.hpp"
+
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <limits>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -20,6 +24,22 @@ struct apple_container_wire {
     std::string image;
     std::string image_digest;
     std::optional<std::string> harness_closure_digest;
+};
+
+struct remote_backend_wire {
+    std::string host;
+    std::string user;
+    std::uint16_t port = 0;
+    std::string host_public_key;
+    std::string host_key_fingerprint;
+    std::string identity_file;
+    std::string executor_digest;
+    std::string container_image;
+    std::string container_image_digest;
+    std::uint64_t channel_timeout_ms = 0;
+    std::uint64_t max_clock_skew_ms = 0;
+    std::uint32_t max_sessions = 0;
+    std::string staging_root;
 };
 
 struct config_wire {
@@ -35,6 +55,7 @@ struct config_wire {
     std::optional<std::string> path_exposure_policy;
     std::optional<std::string> path_exposure_journal;
     std::optional<apple_container_wire> apple_container;
+    std::optional<remote_backend_wire> remote_backend;
 };
 } // namespace config_wire_types
 
@@ -42,6 +63,7 @@ namespace {
 
 using config_wire_types::apple_container_wire;
 using config_wire_types::config_wire;
+using config_wire_types::remote_backend_wire;
 
 constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 constexpr std::uint64_t max_config_bytes = std::uint64_t{1024} * 1024U;
@@ -142,6 +164,30 @@ auto read_owner_only_file(const std::filesystem::path& path) -> result<std::stri
     return contents;
 }
 
+auto valid_sha256_digest(std::string_view value) -> bool {
+    return value.size() == 71U && value.starts_with("sha256:") &&
+           std::ranges::all_of(value.substr(7), [](char byte) {
+               return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+           });
+}
+
+auto valid_host_token(std::string_view value) -> bool {
+    return !value.empty() && value.size() <= 253U && value.front() != '-' &&
+           std::ranges::all_of(value, [](char byte) {
+               return (byte >= '0' && byte <= '9') || (byte >= 'A' && byte <= 'Z') ||
+                      (byte >= 'a' && byte <= 'z') || byte == '.' || byte == '-' || byte == ':';
+           });
+}
+
+auto valid_user_token(std::string_view value) -> bool {
+    return !value.empty() && value.size() <= 32U &&
+           ((value.front() >= 'a' && value.front() <= 'z') || value.front() == '_') &&
+           std::ranges::all_of(value, [](char byte) {
+               return (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') || byte == '_' ||
+                      byte == '-';
+           });
+}
+
 auto all_configured_paths(const config& value) -> std::vector<std::filesystem::path> {
     std::vector<std::filesystem::path> paths{
         value.runtime_directory,
@@ -162,6 +208,9 @@ auto all_configured_paths(const config& value) -> std::vector<std::filesystem::p
     }
     if (value.apple_container) {
         paths.push_back(value.apple_container->cli);
+    }
+    if (value.remote_backend) {
+        paths.push_back(value.remote_backend->identity_file);
     }
     return paths;
 }
@@ -220,6 +269,30 @@ auto default_config_path(const directories& values) -> std::filesystem::path {
     return values.config / "config.json";
 }
 
+auto validate(const remote_backend_config& value) -> result<void> {
+    const auto staging = value.staging_root.lexically_normal();
+    const bool valid_staging = value.staging_root.is_absolute() &&
+                               value.staging_root != value.staging_root.root_path() &&
+                               staging == value.staging_root;
+    const bool valid_identity = value.identity_file.is_absolute() &&
+                                value.identity_file != value.identity_file.root_path() &&
+                                value.identity_file.lexically_normal() == value.identity_file;
+    if (!valid_host_token(value.host) || !valid_user_token(value.user) || value.port == 0 ||
+        !valid_identity || !valid_staging || !valid_sha256_digest(value.executor_digest) ||
+        !container::valid_immutable_container_image(
+            value.container_image, value.container_image_digest
+        ) ||
+        value.channel_timeout_ms < 100U || value.channel_timeout_ms > 60'000U ||
+        value.max_clock_skew_ms > 5'000U || value.max_sessions == 0 || value.max_sessions > 64U) {
+        return std::unexpected(std::string{"remote backend configuration is invalid"});
+    }
+    auto fingerprint = openssh_host_key_fingerprint(value.host_public_key);
+    if (!fingerprint || *fingerprint != value.host_key_fingerprint) {
+        return std::unexpected(std::string{"remote backend host key fingerprint mismatch"});
+    }
+    return {};
+}
+
 auto validate(const config& value) -> result<void> {
     if (value.schema_version != 1) {
         return std::unexpected(std::string{"unsupported configuration schema"});
@@ -247,29 +320,27 @@ auto validate(const config& value) -> result<void> {
     }
     if (value.apple_container) {
         const auto& apple = *value.apple_container;
-        const auto digest = std::string_view{apple.image_digest};
-        const bool valid_digest =
-            digest.size() == 71U && digest.starts_with("sha256:") &&
-            std::ranges::all_of(digest.substr(7), [](char byte) {
-                return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-            });
         const bool valid_closure_digest =
-            !apple.harness_closure_digest ||
-            (apple.harness_closure_digest->size() == 71U &&
-             apple.harness_closure_digest->starts_with("sha256:") &&
-             std::ranges::all_of(
-                 std::string_view{*apple.harness_closure_digest}.substr(7), [](char byte) {
-                     return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-                 }
-             ));
+            !apple.harness_closure_digest || valid_sha256_digest(*apple.harness_closure_digest);
         if (!value.session_store || !value.materialization_root || apple.image.empty() ||
             apple.image.size() > 256U ||
-            apple.image.find_first_of(" \t\r\n") != std::string::npos || !valid_digest ||
-            !valid_closure_digest) {
+            apple.image.find_first_of(" \t\r\n") != std::string::npos ||
+            !valid_sha256_digest(apple.image_digest) || !valid_closure_digest) {
             return std::unexpected(
                 std::string{"Apple Container runtime requires managed-session roots and an exact "
                             "image digest"}
             );
+        }
+    }
+    if (value.remote_backend) {
+        if (!value.session_policy || !value.session_store || value.materialization_root ||
+            value.apple_container) {
+            return std::unexpected(
+                std::string{"remote backend requires session storage and excludes local runtimes"}
+            );
+        }
+        if (auto valid = validate(*value.remote_backend); !valid) {
+            return std::unexpected(valid.error());
         }
     }
     if (value.path_exposure_policy.has_value() != value.path_exposure_journal.has_value()) {
@@ -312,6 +383,24 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
                       .harness_closure_digest = encoded.apple_container->harness_closure_digest,
                   }}
                 : std::nullopt,
+        .remote_backend =
+            encoded.remote_backend
+                ? std::optional<remote_backend_config>{remote_backend_config{
+                      .host = encoded.remote_backend->host,
+                      .user = encoded.remote_backend->user,
+                      .port = encoded.remote_backend->port,
+                      .host_public_key = encoded.remote_backend->host_public_key,
+                      .host_key_fingerprint = encoded.remote_backend->host_key_fingerprint,
+                      .identity_file = encoded.remote_backend->identity_file,
+                      .executor_digest = encoded.remote_backend->executor_digest,
+                      .container_image = encoded.remote_backend->container_image,
+                      .container_image_digest = encoded.remote_backend->container_image_digest,
+                      .channel_timeout_ms = encoded.remote_backend->channel_timeout_ms,
+                      .max_clock_skew_ms = encoded.remote_backend->max_clock_skew_ms,
+                      .max_sessions = encoded.remote_backend->max_sessions,
+                      .staging_root = encoded.remote_backend->staging_root,
+                  }}
+                : std::nullopt,
     };
     if (auto valid = validate(decoded); !valid) {
         return std::unexpected(valid.error());
@@ -343,6 +432,24 @@ auto encode_config(const config& value) -> result<std::string> {
                           .image = value.apple_container->image,
                           .image_digest = value.apple_container->image_digest,
                           .harness_closure_digest = value.apple_container->harness_closure_digest,
+                      }}
+                    : std::nullopt,
+            .remote_backend =
+                value.remote_backend
+                    ? std::optional<remote_backend_wire>{remote_backend_wire{
+                          .host = value.remote_backend->host,
+                          .user = value.remote_backend->user,
+                          .port = value.remote_backend->port,
+                          .host_public_key = value.remote_backend->host_public_key,
+                          .host_key_fingerprint = value.remote_backend->host_key_fingerprint,
+                          .identity_file = value.remote_backend->identity_file.string(),
+                          .executor_digest = value.remote_backend->executor_digest,
+                          .container_image = value.remote_backend->container_image,
+                          .container_image_digest = value.remote_backend->container_image_digest,
+                          .channel_timeout_ms = value.remote_backend->channel_timeout_ms,
+                          .max_clock_skew_ms = value.remote_backend->max_clock_skew_ms,
+                          .max_sessions = value.remote_backend->max_sessions,
+                          .staging_root = value.remote_backend->staging_root.string(),
                       }}
                     : std::nullopt,
         }

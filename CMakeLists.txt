@@ -57,6 +57,9 @@ install(TARGETS glove RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET gloved)
     install(TARGETS gloved RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
+if(TARGET glove-remote-exec)
+    install(TARGETS glove-remote-exec RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
+endif()
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(
     FILES packaging/systemd/sage-gloved.service.in

@@ -18,6 +18,7 @@ namespace glove::supervisor {
 
 enum class sandbox_backend : std::uint8_t {
     linux_production,
+    remote_linux_container,
     apple_container,
     // Decode-only compatibility for policies emitted before Apple Container
     // became the default macOS shipping backend.

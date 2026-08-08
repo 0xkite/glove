@@ -2,10 +2,13 @@
 #include "glove/control/receipt_audit_unix_server.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/host/config.hpp"
+#include "glove/host/remote_backend.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/path_exposure_journal.hpp"
 #include "glove/supervisor/session_plan.hpp"
 #include "glove/version.hpp"
+
+#include "control/remote_session_runtime.hpp"
 
 #if defined(__linux__)
 #    include "linux_session_executor.hpp"
@@ -104,6 +107,7 @@ struct options {
     std::optional<std::filesystem::path> path_exposure_policy;
     std::optional<std::filesystem::path> path_exposure_journal;
     std::optional<glove::host::apple_container_config> apple_container;
+    std::optional<glove::host::remote_backend_config> remote_backend;
 };
 
 auto parse_options(int argc, char** argv) -> std::expected<options, std::string> {
@@ -123,6 +127,7 @@ auto parse_options(int argc, char** argv) -> std::expected<options, std::string>
             .path_exposure_policy = configured->path_exposure_policy,
             .path_exposure_journal = configured->path_exposure_journal,
             .apple_container = configured->apple_container,
+            .remote_backend = configured->remote_backend,
         };
     }
     if (argc < 7 || argc > 19 || argc % 2 == 0) {
@@ -241,6 +246,7 @@ auto parse_options(int argc, char** argv) -> std::expected<options, std::string>
     parsed.path_exposure_policy = std::move(path_exposure_policy);
     parsed.path_exposure_journal = std::move(path_exposure_journal);
     parsed.apple_container = std::nullopt;
+    parsed.remote_backend = std::nullopt;
     return parsed;
 }
 
@@ -533,9 +539,38 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         sessions = std::shared_ptr<glove::control::session_registry>{std::move(*opened)};
     }
     std::shared_ptr<glove::control::session_runtime> session_runtime;
+    if (configured.remote_backend) {
+        if (!sessions) {
+            return std::unexpected(std::string{"remote runtime requires managed-session storage"});
+        }
+        auto artifacts = glove::host::prepare_remote_ssh_artifacts(
+            *configured.remote_backend, configured.runtime_directory
+        );
+        if (!artifacts) {
+            return std::unexpected(
+                std::string{"prepare remote SSH artifacts: "} + artifacts.error()
+            );
+        }
+        auto runtime = glove::control::remote_session_runtime::create({
+            .ssh_argv = std::move(artifacts->argv),
+            .executor_digest = configured.remote_backend->executor_digest,
+            .container_image = configured.remote_backend->container_image,
+            .container_image_digest = configured.remote_backend->container_image_digest,
+            .channel_timeout_ms = configured.remote_backend->channel_timeout_ms,
+            .max_clock_skew_ms = configured.remote_backend->max_clock_skew_ms,
+            .max_sessions = configured.remote_backend->max_sessions,
+            .staging_root = configured.remote_backend->staging_root,
+        });
+        if (!runtime) {
+            return std::unexpected(
+                std::string{"create remote session runtime: "} + runtime.error()
+            );
+        }
+        session_runtime = std::move(*runtime);
+    }
 #if defined(__linux__)
     std::optional<glove::control::linux_detail::linux_session_preparer> session_preparer;
-    if (configured.materialization_root) {
+    if (configured.materialization_root && !configured.remote_backend) {
         if (auto valid = validate_materialization_root(*configured.materialization_root); !valid) {
             return std::unexpected(valid.error());
         }
@@ -575,19 +610,17 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         if (!audit) {
             return std::unexpected(std::string{"open egress audit journal: "} + audit.error());
         }
-        auto runtime =
-            glove::control::apple_detail::apple_container_session_runtime::create(
-                *sessions,
-                {
-                    .container_cli = configured.apple_container->cli,
-                    .image_reference = configured.apple_container->image,
-                    .image_digest = configured.apple_container->image_digest,
-                    .harness_closure_digest =
-                        configured.apple_container->harness_closure_digest,
-                    .egress_audit = std::move(*audit),
-                    .session_root = *configured.materialization_root,
-                }
-            );
+        auto runtime = glove::control::apple_detail::apple_container_session_runtime::create(
+            *sessions,
+            {
+                .container_cli = configured.apple_container->cli,
+                .image_reference = configured.apple_container->image,
+                .image_digest = configured.apple_container->image_digest,
+                .harness_closure_digest = configured.apple_container->harness_closure_digest,
+                .egress_audit = std::move(*audit),
+                .session_root = *configured.materialization_root,
+            }
+        );
         if (!runtime) {
             return std::unexpected(
                 std::string{"create Apple Container session runtime: "} + runtime.error()

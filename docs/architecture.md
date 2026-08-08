@@ -4,14 +4,17 @@
 
 Glove provides three execution surfaces:
 
-| Surface | Purpose | Current boundary |
-|---|---|---|
-| `glove run` | Contain an agent and mediate MCP tool calls | Public CLI |
-| `glove exec` | Contain a direct agent process | Public CLI |
-| `gloved` | Validate Sage plans, persist sessions, and deliver receipts | Owner-local control service |
+| Surface      | Purpose                                                     | Current boundary            |
+| ------------ | ----------------------------------------------------------- | --------------------------- |
+| `glove run`  | Contain an agent and mediate MCP tool calls                 | Public CLI                  |
+| `glove exec` | Contain a direct agent process                              | Public CLI                  |
+| `gloved`     | Validate Sage plans, persist sessions, and deliver receipts | Owner-local control service |
 
 The public CLI is usable for local containment. The distributed Sage session
-surface is incomplete and must not advertise remote-launch readiness.
+surface is incomplete and must not advertise remote-launch readiness. A
+`remote_linux_container` runtime can be constructed from validated operator
+configuration, but it is deliberately non-operational and advertises no
+lifecycle, runtime-adapter, resource-enforcement, or receipt capability.
 
 ## Process model
 
@@ -39,14 +42,14 @@ does not sandbox the upstream processes themselves.
 
 ## Platform isolation
 
-| Property | Linux | macOS |
-|---|---|---|
-| Process visibility | PID namespace | SBPL process policy |
-| Filesystem | mount namespace, `pivot_root`, read-only binds, private writable mounts | deny-default SBPL path rules |
-| Network | route-less network namespace; offline socket denial or private-loopback access to the authenticated audited proxy through an inherited Unix descriptor channel | deny-default SBPL network rules |
-| Identity | user namespace and UID/GID mapping | invoking user |
-| IPC and hostname | IPC and UTS namespaces | SBPL policy |
-| Resource limits | private cgroup/quota/watchdog implementation | incomplete for the Sage six-limit contract |
+| Property           | Linux                                                                                                                                                          | macOS                                      |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| Process visibility | PID namespace                                                                                                                                                  | SBPL process policy                        |
+| Filesystem         | mount namespace, `pivot_root`, read-only binds, private writable mounts                                                                                        | deny-default SBPL path rules               |
+| Network            | route-less network namespace; offline socket denial or private-loopback access to the authenticated audited proxy through an inherited Unix descriptor channel | deny-default SBPL network rules            |
+| Identity           | user namespace and UID/GID mapping                                                                                                                             | invoking user                              |
+| IPC and hostname   | IPC and UTS namespaces                                                                                                                                         | SBPL policy                                |
+| Resource limits    | private cgroup/quota/watchdog implementation                                                                                                                   | incomplete for the Sage six-limit contract |
 
 Linux launches the child through `clone3`, configures the namespace and mount
 perimeter, applies seccomp, then releases the child to execute. Writable
@@ -63,18 +66,18 @@ the child.
 
 ## Components
 
-| Namespace | Responsibility |
-|---|---|
-| `container` | sandbox creation, mounts, limits, output accounting, terminal receipts |
-| `control` | Unix control protocol, authentication, session registry, receipt delivery |
-| `supervisor` | canonical plan validation, local alias resolution, bundle resolution |
-| `mcp` | bounded JSON-RPC framing and upstream clients |
-| `policy` | tool and argument authorization |
-| `kernel` | extension registration and dispatch |
-| `audit` | structured local activity records |
-| `run` | CLI orchestration for `run` and `exec` |
-| `host` | strict XDG configuration, machine setup, diagnostics, and local project enrollment |
-| `reflect` | compile-time extension metadata experiments |
+| Namespace    | Responsibility                                                                     |
+| ------------ | ---------------------------------------------------------------------------------- |
+| `container`  | sandbox creation, mounts, limits, output accounting, terminal receipts             |
+| `control`    | Unix control protocol, authentication, session registry, receipt delivery          |
+| `supervisor` | canonical plan validation, local alias resolution, bundle resolution               |
+| `mcp`        | bounded JSON-RPC framing and upstream clients                                      |
+| `policy`     | tool and argument authorization                                                    |
+| `kernel`     | extension registration and dispatch                                                |
+| `audit`      | structured local activity records                                                  |
+| `run`        | CLI orchestration for `run` and `exec`                                             |
+| `host`       | strict XDG configuration, machine setup, diagnostics, and local project enrollment |
+| `reflect`    | compile-time extension metadata experiments                                        |
 
 Public headers live under `include/glove/`. Implementations mirror that layout in
 `src/`. Tests are separated by concern under `tests/`.
@@ -164,10 +167,42 @@ V1 envelope for a refinement plan. Capability discovery reports schema version
 both constructed.
 
 The local protocol exposes attach, input, resize, signal, detach, stop, and
-cleanup only when the runtime is constructed. Sage now wires that lifecycle and
-receipt reconciliation. Exposure create/revoke remains owner-local; peers may
+cleanup only when the constructed runtime reports `lifecycle_operational()`.
+Pointer presence is not capability evidence. The remote runtime currently
+reports false, schema version `0`, an empty managed-runtime set, and unavailable
+resource mechanisms; every lifecycle dispatch returns `method_not_found`
+without starting SSH. Sage wires only operational lifecycle and receipt
+reconciliation. Exposure create/revoke remains owner-local; peers may
 receive only the redacted catalog. Retained-change inspection and independently
 authorized apply remain separate launch gates.
+
+## Construction-only remote backend
+
+When `remote_backend` is present, `gloved` validates it as mutually exclusive
+with local materialization and Apple Container configuration. It requires the
+container identity as an untagged canonical `name@sha256:<64 lowercase hex>`
+reference whose suffix exactly equals `container_image_digest`, retains both
+values in the runtime composition, and rejects tags or mismatches. It writes an
+isolated OpenSSH config and pinned `known_hosts` beneath the already verified
+owner-only runtime directory, then constructs the non-operational runtime. This
+step performs no DNS lookup, network probe, authentication, SSH process launch,
+or Docker operation.
+
+The generated SSH configuration ignores global known-hosts files, accepts only
+`ssh-ed25519` host keys, disables host-key learning, and disables connection
+sharing with `GlobalKnownHostsFile none`, `HostKeyAlgorithms ssh-ed25519`,
+`UpdateHostKeys no`, `ControlMaster no`, `ControlPath none`, and
+`ControlPersist no`. The forced remote executable accepts exactly `--stdio`,
+sets umask `077`, and reads its expected executable and image SHA-256 digests
+only from the administrator-owned `/etc/glove/remote-executor.identity` source.
+It measures its opened executable and fails closed on missing, empty, malformed,
+writable, or mismatched identity. Before each frame read, it captures the
+monotonic receive start and channel deadline. Request-TTL conversion subtracts
+all frame-receive time and rejects a frame that consumed its TTL; response writes
+use only the resulting request deadline. Only `remote_health` is available and
+it always reports `not_operational`;
+lifecycle methods return `method_not_found`. This is construction evidence, not
+remote-launch readiness.
 
 ## Library projection
 

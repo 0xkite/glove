@@ -618,6 +618,36 @@ auto run() -> int {
     REQUIRE(no_adoption.has_value());
     REQUIRE(!no_adoption->has_value());
 
+    const auto remote_policy_path = temp.root() / "remote-session-policy.json";
+    {
+        std::ofstream output{remote_policy_path};
+        output << replace_once(
+            policy_json(source),
+            "\"sandbox_backend\":\"linux_production\"",
+            "\"sandbox_backend\":\"remote_linux_container\""
+        );
+    }
+    REQUIRE(::chmod(remote_policy_path.c_str(), 0600) == 0);
+    auto remote_validator = session_plan_validator::load(remote_policy_path);
+    REQUIRE(remote_validator.has_value());
+    const auto remote_plan = replace_once(
+        valid_plan(),
+        "\"sandbox_backend\":\"linux_production\"",
+        "\"sandbox_backend\":\"remote_linux_container\""
+    );
+    REQUIRE(!remote_validator->validate_json(remote_plan, 1'000).has_value());
+    const auto remote_without_secrets =
+        replace_once(remote_plan, "\"secret_handles\":[\"codex-token\"]", "\"secret_handles\":[]");
+    REQUIRE(remote_validator->validate_json(remote_without_secrets, 1'000).has_value());
+    const auto remote_direct = replace_once(
+        remote_without_secrets, "\"access\":\"ephemeral_write\"", "\"access\":\"direct_write\""
+    );
+    REQUIRE(!remote_validator->validate_json(remote_direct, 1'000).has_value());
+    const auto remote_retained = replace_once(
+        remote_without_secrets, "\"access\":\"ephemeral_write\"", "\"access\":\"retained_write\""
+    );
+    REQUIRE(!remote_validator->validate_json(remote_retained, 1'000).has_value());
+
     const auto invalid_adoption_policy_path = temp.root() / "invalid-adoption-policy.json";
     {
         std::ofstream output{invalid_adoption_policy_path};

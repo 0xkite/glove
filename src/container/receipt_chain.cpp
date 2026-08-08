@@ -105,10 +105,22 @@ auto backend_name(sandbox_backend backend) noexcept -> std::string_view {
     switch (backend) {
     case sandbox_backend::linux_production:
         return "linux_production";
+    case sandbox_backend::remote_linux_container:
+        return "remote_linux_container";
     case sandbox_backend::apple_container:
         return "apple_container";
     case sandbox_backend::macos_experimental:
         return "macos_experimental";
+    }
+    return {};
+}
+
+auto authority_name(receipt_observation_authority authority) noexcept -> std::string_view {
+    switch (authority) {
+    case receipt_observation_authority::local_enforcement:
+        return "local_enforcement";
+    case receipt_observation_authority::trusted_remote_claim:
+        return "trusted_remote_claim";
     }
     return {};
 }
@@ -178,13 +190,17 @@ void append_capabilities(
 
 auto encode_receipt(const resource_enforcement_receipt& receipt)
     -> std::expected<canonical_encoder, std::string> {
-    auto valid = validate_resource_enforcement_receipt(
-        receipt,
-        receipt.configured_limits,
-        receipt.mechanisms,
-        receipt.backend,
-        receipt.profile_digest
-    );
+    auto valid = receipt.backend == sandbox_backend::remote_linux_container
+                     ? validate_trusted_remote_resource_claim(
+                           receipt, receipt.configured_limits, receipt.profile_digest
+                       )
+                     : validate_resource_enforcement_receipt(
+                           receipt,
+                           receipt.configured_limits,
+                           receipt.mechanisms,
+                           receipt.backend,
+                           receipt.profile_digest
+                       );
     if (!valid) {
         return std::unexpected(std::string{"invalid receipt for audit: "} + valid.error());
     }
@@ -200,6 +216,16 @@ auto encode_receipt(const resource_enforcement_receipt& receipt)
     encoder.append_string(receipt.profile_digest);
     encoder.append_string(backend);
     encoder.append_string(receipt.backend_id);
+    if (receipt.backend == sandbox_backend::remote_linux_container) {
+        const auto authority = authority_name(receipt.observation_authority);
+        if (authority.empty()) {
+            return std::unexpected(std::string{"receipt contains an unknown authority"});
+        }
+        encoder.append_string("glove.remote-observation-authority");
+        encoder.append_u8(1);
+        encoder.append_string(authority);
+        encoder.append_u8(receipt.independently_verified ? 1U : 0U);
+    }
     append_limits(encoder, receipt.configured_limits);
     append_capabilities(encoder, receipt.mechanisms);
     encoder.append_u64(receipt.observed.cpu_time_ms);

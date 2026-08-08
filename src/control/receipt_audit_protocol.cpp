@@ -651,7 +651,9 @@ auto handle_capabilities(
     }
     wire::resource_enforcement_capabilities linux_enforcement;
     wire::resource_enforcement_capabilities apple_enforcement;
-    if (state.session_runtime) {
+    const bool lifecycle_operational =
+        state.session_runtime && state.session_runtime->lifecycle_operational();
+    if (lifecycle_operational) {
         const auto capabilities = state.session_runtime->resource_capabilities();
         wire::resource_enforcement_capabilities advertised{
             .cpu_time = capabilities.cpu_time,
@@ -670,7 +672,7 @@ auto handle_capabilities(
     }
 #if defined(__linux__)
     const auto retained_write_schema_version =
-        state.session_runtime && state.session_runtime->backend_id() == "linux_production" &&
+        lifecycle_operational && state.session_runtime->backend_id() == "linux_production" &&
                 state.path_exposures
             ? std::uint8_t{1}
             : std::uint8_t{0};
@@ -690,23 +692,23 @@ auto handle_capabilities(
                 wire::session_control_capabilities{
                     .validate_plan = state.plan_validator != nullptr,
                     .create_session = state.sessions != nullptr,
-                    .start_session = state.session_runtime != nullptr,
+                    .start_session = lifecycle_operational,
                     .session_status = state.sessions != nullptr,
-                    .attach = state.session_runtime != nullptr,
-                    .resize = state.session_runtime != nullptr,
-                    .write_stdin = state.session_runtime != nullptr,
-                    .signal = state.session_runtime != nullptr,
-                    .detach = state.session_runtime != nullptr,
-                    .stop_session = state.session_runtime != nullptr,
-                    .cleanup_session = state.session_runtime != nullptr,
+                    .attach = lifecycle_operational,
+                    .resize = lifecycle_operational,
+                    .write_stdin = lifecycle_operational,
+                    .signal = lifecycle_operational,
+                    .detach = lifecycle_operational,
+                    .stop_session = lifecycle_operational,
+                    .cleanup_session = lifecycle_operational,
                 },
             // Managed sessions own a fresh private harness home and
             // derive its native skills from verified Sage library bundles.
             .agent_runtime_adapter_schema_version =
-                state.session_runtime
+                lifecycle_operational
                     ? state.session_runtime->agent_runtime_adapter_schema_version()
                     : std::uint8_t{0},
-            .managed_runtime_ids = state.session_runtime
+            .managed_runtime_ids = lifecycle_operational
                                        ? state.session_runtime->managed_runtime_ids()
                                        : std::vector<std::string>{},
             .path_exposure_admin_schema_version =
@@ -717,9 +719,8 @@ auto handle_capabilities(
             .change_manifest_schema_version = retained_write_schema_version,
             .change_apply_authorization_schema_version = 0,
             .refinement_evaluation_protocol_schema_version =
-                state.session_runtime
-                    ? state.session_runtime
-                          ->refinement_evaluation_protocol_schema_version()
+                lifecycle_operational
+                    ? state.session_runtime->refinement_evaluation_protocol_schema_version()
                     : std::uint8_t{0},
             .backends = {
                 backend_capabilities{
@@ -971,7 +972,7 @@ auto handle_start_session(
     const rpc_params& params,
     std::uint64_t now_ms
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -1037,7 +1038,7 @@ auto handle_stop_session(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -1076,7 +1077,7 @@ auto handle_attach(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     if (params.idempotency_key.has_value()) {
@@ -1178,7 +1179,7 @@ auto handle_write_stdin(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -1216,7 +1217,7 @@ auto handle_resize(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -1256,7 +1257,7 @@ auto handle_signal(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -1303,7 +1304,7 @@ auto handle_detach(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -1370,7 +1371,7 @@ auto handle_cleanup_session(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime) {
+    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -1682,7 +1683,8 @@ auto handle_page(
         );
     }
 #if defined(__linux__)
-    if (state.session_runtime && (*producer)->bootstrap_reconciled()) {
+    if (state.session_runtime && state.session_runtime->lifecycle_operational() &&
+        (*producer)->bootstrap_reconciled()) {
         if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
             return error_response(
                 request_id,
@@ -1759,7 +1761,7 @@ auto handle_acknowledgement(
         );
     }
 #if defined(__linux__)
-    if (state.session_runtime) {
+    if (state.session_runtime && state.session_runtime->lifecycle_operational()) {
         if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
             return error_response(
                 request_id,
@@ -1804,7 +1806,9 @@ auto receipt_audit_protocol::create(
     std::string materialization_root
 ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string> {
     if (!valid_hex_secret(bootstrap_secret_hex) || !producer || (sessions && !plan_validator) ||
-        (session_runtime && (!sessions || !plan_validator || materialization_root.empty()))) {
+        (session_runtime &&
+         (!sessions || !plan_validator ||
+          (session_runtime->lifecycle_operational() && materialization_root.empty())))) {
         return std::unexpected(std::string{"receipt audit protocol configuration is invalid"});
     }
     auto state = std::make_unique<implementation>();
@@ -1830,7 +1834,9 @@ auto receipt_audit_protocol::create(
 ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string> {
     if (!valid_hex_secret(bootstrap_secret_hex) || producer_config.key_path.empty() ||
         producer_config.journal_path.empty() || (sessions && !plan_validator) ||
-        (session_runtime && (!sessions || !plan_validator || materialization_root.empty()))) {
+        (session_runtime &&
+         (!sessions || !plan_validator ||
+          (session_runtime->lifecycle_operational() && materialization_root.empty())))) {
         return std::unexpected(std::string{"receipt audit protocol configuration is invalid"});
     }
     auto audit_key_id = container::receipt_audit_producer::audit_key_id(producer_config);

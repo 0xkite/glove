@@ -37,6 +37,28 @@ struct apple_container_config {
     auto operator==(const apple_container_config&) const -> bool = default;
 };
 
+// Operator-authored literal endpoint and immutable remote execution identity.
+// No field is sourced from a session plan or inherited SSH configuration.
+struct remote_backend_config {
+    std::string host;
+    std::string user;
+    std::uint16_t port = 22;
+    std::string host_public_key;
+    std::string host_key_fingerprint;
+    std::filesystem::path identity_file;
+    std::string executor_digest;
+    // Exact untagged name@sha256:<64 lowercase hex> identity. The suffix must
+    // equal container_image_digest; neither field is accepted independently.
+    std::string container_image;
+    std::string container_image_digest;
+    std::uint64_t channel_timeout_ms = 0;
+    std::uint64_t max_clock_skew_ms = 0;
+    std::uint32_t max_sessions = 0;
+    std::filesystem::path staging_root;
+
+    auto operator==(const remote_backend_config&) const -> bool = default;
+};
+
 struct config {
     std::uint8_t schema_version = 1;
     bool persistent_service = false;
@@ -50,6 +72,7 @@ struct config {
     std::optional<std::filesystem::path> path_exposure_policy;
     std::optional<std::filesystem::path> path_exposure_journal;
     std::optional<apple_container_config> apple_container;
+    std::optional<remote_backend_config> remote_backend;
 
     auto operator==(const config&) const -> bool = default;
 };
@@ -57,6 +80,7 @@ struct config {
 [[nodiscard]] auto current_environment() -> environment;
 [[nodiscard]] auto resolve_directories(const environment& values) -> result<directories>;
 [[nodiscard]] auto default_config_path(const directories& values) -> std::filesystem::path;
+[[nodiscard]] auto validate(const remote_backend_config& value) -> result<void>;
 [[nodiscard]] auto validate(const config& value) -> result<void>;
 [[nodiscard]] auto load_config(const std::filesystem::path& path) -> result<config>;
 [[nodiscard]] auto encode_config(const config& value) -> result<std::string>;

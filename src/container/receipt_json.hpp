@@ -10,10 +10,19 @@ template<> struct glz::meta<glove::container::sandbox_backend> {
     static constexpr auto value = enumerate(
         "linux_production",
         linux_production,
+        "remote_linux_container",
+        remote_linux_container,
         "apple_container",
         apple_container,
         "macos_experimental",
         macos_experimental
+    );
+};
+
+template<> struct glz::meta<glove::container::receipt_observation_authority> {
+    using enum glove::container::receipt_observation_authority;
+    static constexpr auto value = enumerate(
+        "local_enforcement", local_enforcement, "trusted_remote_claim", trusted_remote_claim
     );
 };
 

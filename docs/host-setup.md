@@ -20,8 +20,13 @@ glove setup plan \
 
 The default JSON is read-only and summarizes a deny-network, credential-free
 policy. It derives Glove-owned config, policy, and harness locations and emits
-`runtime_template_ids` for the next step. Use `--show-policy` only when the
-local operator needs the complete policy preview.
+`runtime_template_ids` for the next step. Planning may read and hash closure
+files, but it performs no writes and never executes a harness, interpreter,
+package manager, or dependency tool.
+If an exact closure requires a command (for example, Homebrew dependency
+resolution), planning fails closed instead of advertising an incomplete policy;
+the explicit applied policy workflow may run that locally derived tool. Use
+`--show-policy` only when the local operator needs the complete policy preview.
 
 ## 2. Apply reviewed policy and machine setup
 

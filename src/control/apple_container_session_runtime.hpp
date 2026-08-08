@@ -1,7 +1,7 @@
 #pragma once
 
-#include "glove/control/session_runtime.hpp"
 #include "glove/audit/sink.hpp"
+#include "glove/control/session_runtime.hpp"
 
 #include <cstddef>
 #include <expected>
@@ -47,8 +47,7 @@ public:
     auto operator=(const apple_container_session_runtime&)
         -> apple_container_session_runtime& = delete;
     apple_container_session_runtime(apple_container_session_runtime&&) = delete;
-    auto operator=(apple_container_session_runtime&&)
-        -> apple_container_session_runtime& = delete;
+    auto operator=(apple_container_session_runtime&&) -> apple_container_session_runtime& = delete;
     ~apple_container_session_runtime();
 
     [[nodiscard]] static auto
@@ -58,6 +57,7 @@ public:
     [[nodiscard]] auto backend_id() const noexcept -> std::string_view override {
         return "apple_container";
     }
+
     [[nodiscard]] auto agent_runtime_adapter_schema_version() const noexcept
         -> std::uint8_t override;
     [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override;

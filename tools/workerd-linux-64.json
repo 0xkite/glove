@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "artifact": {
+    "package_name": "@cloudflare/workerd-linux-64",
+    "version": "1.20260807.2",
+    "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20260807.2.tgz",
+    "npm_sri": "sha512-7gr33+oKGTAUArVh4Mzuo0W2bl9DZrxrkoHCinUNymtauhCACY3woVtm4V6JdkPWsniCXkIdViWu+8d8XdbleQ==",
+    "archive_sha256": "e71b8e0cdb3557c021c9b2c837dfcf160ee544b6b0e04ce15f27968ac407d5e5",
+    "archive_size_bytes_max": 67108864,
+    "unpacked_size_bytes": 150982613,
+    "entry_count_max": 3,
+    "entry_size_bytes_max": 150982613,
+    "expected_entries": [
+      "package/bin/workerd",
+      "package/package.json",
+      "package/README.md"
+    ],
+    "binary": {
+      "path": "package/bin/workerd",
+      "sha256": "65f9d58baa1eb9ea04614ae6b93826fa7fd72626778e6d236d4fec4e9e8cbfa6",
+      "mode": "0555"
+    }
+  },
+  "container": {
+    "base_image": "docker.io/library/debian:bookworm-slim",
+    "oci_index_digest": "sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241",
+    "linux_amd64_manifest_digest": "sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143",
+    "uid": 65532,
+    "gid": 65532,
+    "port": 8787
+  }
+}

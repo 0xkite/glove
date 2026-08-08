@@ -6,17 +6,23 @@ variables, or raw secrets.
 
 ## Capability activation
 
-| Configuration | Advertised session methods |
-|---|---|
-| Base service | authenticated receipt paging and acknowledgement |
-| `--session-policy` | `validate_plan` |
-| plus `--session-store` | `create_session`, `session_status` |
-| Linux plus `--materialization-root` | `start_session`, `attach`, `write_stdin`, `resize`, `signal`, `detach`, `stop_session`, `cleanup_session` |
-| plus `--library-bundle-root` | digest-bound read-only bundle projection |
-| `--path-exposure-policy` plus `--path-exposure-journal` | local exposure administration and redacted catalog |
+| Configuration                                           | Advertised session methods                                                                                |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Base service                                            | authenticated receipt paging and acknowledgement                                                          |
+| `--session-policy`                                      | `validate_plan`                                                                                           |
+| plus `--session-store`                                  | `create_session`, `session_status`                                                                        |
+| Linux plus `--materialization-root`                     | `start_session`, `attach`, `write_stdin`, `resize`, `signal`, `detach`, `stop_session`, `cleanup_session` |
+| validated `remote_backend`                              | construction diagnostic only; no lifecycle methods                                                        |
+| plus `--library-bundle-root`                            | digest-bound read-only bundle projection                                                                  |
+| `--path-exposure-policy` plus `--path-exposure-journal` | local exposure administration and redacted catalog                                                        |
 
-Capabilities are derived from successfully constructed components. macOS does
-not advertise managed-session resource enforcement.
+Capabilities are derived from successfully constructed and operational
+components, not pointer presence. macOS does not advertise managed-session
+resource enforcement. The construction-only remote runtime reports
+`lifecycle_operational() == false`, adapter schema `0`, no managed runtime IDs,
+and no resource or verified-receipt capability. Its local lifecycle methods are
+unavailable through the protocol even though validated SSH artifacts and a
+runtime object exist.
 
 `refinement_evaluation_protocol_schema_version` is `1` only when the Linux
 managed runtime and protected library-bundle store are both constructed.
@@ -42,6 +48,55 @@ fail before child release. The fixture binds:
 - the selected skill projection;
 - expected termination and exit code, optional maximum wall latency, and
   canonical sorted required/forbidden UTF-8 transcript literals.
+
+Remote configuration is mutually exclusive with local materialization and
+Apple Container configuration. Startup prepares only mode-0600 SSH config and
+known-host artifacts beneath the verified mode-0700 runtime directory. It does
+not contact the configured host. Remote policy acceptance therefore remains
+separate from launch authority.
+
+## Cloudflare OS development template
+
+`tests/fixtures/cloudflare-os-session-policy.json` is the checked-in,
+owner-authored policy template for `runtime_id: "cloudflare-os"` and
+`runtime_template_id: "cloudflare-os-dev"`. It uses
+`remote_linux_container`; it is not a native Agent Skills adapter and does not
+extend the closed native-adapter table. The plan selects the template ID and
+its `adapter_command_digest`. The executable path, argument, environment, and
+immutable closure remain operator-local policy fields.
+
+The template commits `/opt/glove/runtime/cloudflare-os/node-v25/bin/node`, the
+single fixed absolute argument
+`/opt/glove/runtime/cloudflare-os/closure/scripts/run-local.mjs`, an empty
+environment, and the read-only `/opt/glove/runtime/cloudflare-os/closure`. The
+script is therefore selected from the immutable closure even when the writable
+workspace contains a shadow `scripts/run-local.mjs`. The checked digest is valid
+only for those exact fields. An operator changing any path or launch field must
+recalculate it with the existing canonical `runtime_launch_template_digest`
+implementation and revalidate the owner-only policy; a plan cannot override any
+launch field. Before use, the owner must provision or replace the fixed
+workspace and `/opt/glove` paths, protect the policy as mode `0600`, and
+revalidate it. Provisioning the pinned Node, pnpm, workerd, or source closure is
+outside this artifact and must not be performed by a session plan.
+
+The only workspace mode is a quota-bounded 4 GiB `ephemeral_write` copy at
+`/workspace`, removed after the session. Read binds, `direct_write`, and
+`retained_write` are not authorized. `cfos-small` fixes 120 seconds of CPU,
+2 GiB memory, 256 PIDs, five minutes wall time, 6 GiB disk, and 16 MiB terminal
+output. `max_plan_ttl_ms` preserves the required one-second launch headroom.
+No library projection or secret handle is authorized.
+
+The named `cloudflare-os-loopback` egress policy contains exactly
+`127.0.0.1:8787` with `allow_private: true`. No wildcard, non-loopback address,
+or extra inspector port is present. This policy records the intended target;
+network-namespace routing to the authenticated per-run proxy remains part of a
+future operational remote lifecycle.
+
+Loading or accepting this template does not make remote lifecycle operational.
+The remote runtime still reports `lifecycle_operational() == false`, so
+`start_session` and every other lifecycle method remain unadvertised and return
+`method_not_found`. Policy and plan acceptance are construction-only until a
+separate implementation supplies and tests the remote enforcement lifecycle.
 
 Glove derives a plan-context digest from runtime, adapter, backend, network/tool
 policy IDs, secrets, six resource limits, policy revision, and both skill
@@ -100,13 +155,13 @@ For a supported native-skill runtime on Linux, an operator can replace a
 pinned `executable_path` with a matching `runtime_discovery` value and an empty
 executable path. Supported values and their Glove-owned private locations are:
 
-| Runtime | Executable | Skill directory | Managed environment |
-|---|---|---|---|
-| `codex` | `codex` | `/home/agent/.codex/skills` | `CODEX_HOME=/home/agent/.codex` |
-| `claude-code` | `claude` | `/home/agent/.claude/skills` | — |
-| `pi` | `pi` | `/home/agent/.pi/agent/skills` | — |
-| `copilot` | `copilot` | `/home/agent/.copilot/skills` | `COPILOT_HOME=/home/agent/.copilot` |
-| `opencode` | `opencode` | `/home/agent/.config/opencode/skills` | `XDG_CONFIG_HOME=/home/agent/.config` |
+| Runtime       | Executable | Skill directory                       | Managed environment                   |
+| ------------- | ---------- | ------------------------------------- | ------------------------------------- |
+| `codex`       | `codex`    | `/home/agent/.codex/skills`           | `CODEX_HOME=/home/agent/.codex`       |
+| `claude-code` | `claude`   | `/home/agent/.claude/skills`          | —                                     |
+| `pi`          | `pi`       | `/home/agent/.pi/agent/skills`        | —                                     |
+| `copilot`     | `copilot`  | `/home/agent/.copilot/skills`         | `COPILOT_HOME=/home/agent/.copilot`   |
+| `opencode`    | `opencode` | `/home/agent/.config/opencode/skills` | `XDG_CONFIG_HOME=/home/agent/.config` |
 
 Discovery requires a non-empty ordered `executable_search_paths` list. Each
 directory is an explicit, digest-bound local policy value; Glove rejects any
@@ -167,13 +222,13 @@ Retained images require a root-owned, non-writable `/usr/sbin/mkfs.ext4` or
 
 ## Protected files
 
-| Object | Required properties | Bound |
-|---|---|---|
-| Runtime and materialization directories | absolute, current-user owned, mode `0700` | dedicated paths |
-| Policy | regular file, current-user owned, mode `0600`, one hard link, no final symlink | 1 MiB |
-| Session store | parent mode `0700`; regular file mode `0600`; one hard link; exclusive writer | 64 MiB and 10,000 records |
-| Bundle root | directory mode `0700`, identity-pinned | digest filenames only |
-| Bundle | regular file mode `0600`, one hard link, no symlink | 16 MiB |
+| Object                                  | Required properties                                                            | Bound                     |
+| --------------------------------------- | ------------------------------------------------------------------------------ | ------------------------- |
+| Runtime and materialization directories | absolute, current-user owned, mode `0700`                                      | dedicated paths           |
+| Policy                                  | regular file, current-user owned, mode `0600`, one hard link, no final symlink | 1 MiB                     |
+| Session store                           | parent mode `0700`; regular file mode `0600`; one hard link; exclusive writer  | 64 MiB and 10,000 records |
+| Bundle root                             | directory mode `0700`, identity-pinned                                         | digest filenames only     |
+| Bundle                                  | regular file mode `0600`, one hard link, no symlink                            | 16 MiB                    |
 
 Policy and bundle reads use one descriptor and reject metadata or identity
 changes during validation. Policy is frozen for the process lifetime; replace

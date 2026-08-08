@@ -7,6 +7,7 @@ add_library(glove_host STATIC
     doctor.cpp
     operator_experience.cpp
     onboarding_plan.cpp
+    remote_backend.cpp
     runtime_policy.cpp
     setup.cpp
 )
@@ -14,7 +15,7 @@ add_library(glove::host ALIAS glove_host)
 
 target_link_libraries(glove_host
     PUBLIC glove_options
-    PRIVATE glaze::glaze glove_supervisor
+    PRIVATE glaze::glaze glove_supervisor glove_digest
 )
 target_include_directories(glove_host
     PUBLIC

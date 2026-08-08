@@ -1,0 +1,21 @@
+# Prepare the only binary build input without npm or lifecycle hooks:
+#   python3 tools/fetch_workerd.py \
+#     --destination tools/.cache/remote-workerd/workerd
+# Then build from the repository root with this Dockerfile. Its companion
+# Dockerfile-specific ignore file admits only the verified binary and fixtures.
+#
+# The multi-platform bookworm-slim index is pinned in tools/workerd-linux-64.json as
+# sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241.
+# This image intentionally selects its amd64 child manifest because the verified
+# @cloudflare/workerd-linux-64 artifact is architecture-specific.
+FROM docker.io/library/debian:bookworm-slim@sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143
+
+WORKDIR /opt/remote-workerd
+COPY --chown=65532:65532 --chmod=0555 tools/.cache/remote-workerd/workerd /usr/local/bin/workerd
+COPY --chown=65532:65532 --chmod=0444 tests/fixtures/remote-workerd/workerd.capnp ./workerd.capnp
+COPY --chown=65532:65532 --chmod=0444 tests/fixtures/remote-workerd/hello.mjs ./hello.mjs
+COPY --chown=65532:65532 --chmod=0555 tests/fixtures/remote-workerd/validate.sh ./validate.sh
+
+USER 65532:65532
+EXPOSE 8787
+ENTRYPOINT ["/opt/remote-workerd/validate.sh"]

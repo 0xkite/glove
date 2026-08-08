@@ -361,6 +361,14 @@ auto validate_resource_enforcement_receipt(
     sandbox_backend expected_backend,
     std::string_view expected_profile_digest
 ) -> std::expected<void, std::string> {
+    if (receipt.backend == sandbox_backend::remote_linux_container ||
+        expected_backend == sandbox_backend::remote_linux_container ||
+        receipt.observation_authority != receipt_observation_authority::local_enforcement ||
+        !receipt.independently_verified) {
+        return std::unexpected(
+            std::string{"trusted remote claims are not local enforcement receipts"}
+        );
+    }
     if (receipt.schema_version != 1) {
         return std::unexpected(std::string{"unsupported resource receipt schema"});
     }
@@ -401,6 +409,31 @@ auto validate_resource_enforcement_receipt(
         );
     }
     return {};
+}
+
+auto validate_trusted_remote_resource_claim(
+    const resource_enforcement_receipt& receipt,
+    const resource_limits& expected_limits,
+    std::string_view expected_profile_digest
+) -> std::expected<void, std::string> {
+    if (receipt.backend != sandbox_backend::remote_linux_container ||
+        receipt.observation_authority != receipt_observation_authority::trusted_remote_claim ||
+        receipt.independently_verified || !receipt.retained_changes.empty()) {
+        return std::unexpected(
+            std::string{"resource receipt is not a bounded trusted remote claim"}
+        );
+    }
+    auto structurally_local = receipt;
+    structurally_local.backend = sandbox_backend::linux_production;
+    structurally_local.observation_authority = receipt_observation_authority::local_enforcement;
+    structurally_local.independently_verified = true;
+    return validate_resource_enforcement_receipt(
+        structurally_local,
+        expected_limits,
+        receipt.mechanisms,
+        sandbox_backend::linux_production,
+        expected_profile_digest
+    );
 }
 
 } // namespace glove::container

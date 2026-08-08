@@ -2,6 +2,7 @@
 #include "glove/control/receipt_audit_protocol.hpp"
 #include "glove/host/config.hpp"
 #include "glove/host/control_client.hpp"
+#include "glove/host/remote_backend.hpp"
 
 #include "receipt_audit_wire.hpp"
 
@@ -47,8 +48,7 @@ struct rpc_response {
 struct page_result {
     std::uint8_t schema_version = 0;
     std::vector<glove::container::authenticated_resource_enforcement_receipt> envelopes;
-    std::vector<glove::container::authenticated_refinement_evaluation_receipt>
-        refinement_envelopes;
+    std::vector<glove::container::authenticated_refinement_evaluation_receipt> refinement_envelopes;
     bool has_more = false;
     glove::container::receipt_audit_anchor local_anchor;
 };
@@ -909,6 +909,85 @@ auto run() -> int {
     REQUIRE(recovered_secret.has_value());
     REQUIRE(create_or_read_session(socket_path, *recovered_secret, false));
     REQUIRE(session_recovered.stop());
+    REQUIRE(!std::filesystem::exists(socket_path));
+
+    constexpr std::string_view remote_public_key =
+        "ssh-ed25519 "
+        "AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    auto remote_fingerprint = glove::host::openssh_host_key_fingerprint(remote_public_key);
+    REQUIRE(remote_fingerprint.has_value());
+    const auto remote_identity = temp.root() / "remote-identity";
+    REQUIRE(write_owner_only(remote_identity, "test-private-key"));
+    auto remote_host_config = host_config;
+    remote_host_config.session_policy = policy_path;
+    remote_host_config.session_store = session_store;
+    remote_host_config.path_exposure_policy.reset();
+    remote_host_config.path_exposure_journal.reset();
+    remote_host_config.remote_backend = glove::host::remote_backend_config{
+        .host = "research.example.test",
+        .user = "glove_remote",
+        .port = 2222,
+        .host_public_key = std::string{remote_public_key},
+        .host_key_fingerprint = *remote_fingerprint,
+        .identity_file = remote_identity,
+        .executor_digest = "sha256:" + std::string(64U, 'a'),
+        .container_image = "registry.example.test/glove/runtime@sha256:" + std::string(64U, 'b'),
+        .container_image_digest = "sha256:" + std::string(64U, 'b'),
+        .channel_timeout_ms = 5'000,
+        .max_clock_skew_ms = 250,
+        .max_sessions = 4,
+        .staging_root = "/var/lib/glove-remote/staging",
+    };
+    REQUIRE(std::filesystem::remove(config_path));
+    auto remote_config_json = glove::host::encode_config(remote_host_config);
+    REQUIRE(remote_config_json.has_value());
+    REQUIRE(write_owner_only(config_path, *remote_config_json));
+    auto remote_configured = start_gloved_config(config_path);
+    REQUIRE(
+        wait_until_secret_changes(remote_configured, socket_path, secret_path, *recovered_secret)
+    );
+    const auto remote_secret = read_secret(secret_path);
+    REQUIRE(remote_secret.has_value());
+    auto remote_capabilities = transact(
+        socket_path, make_request("remote-capabilities", "capabilities", *remote_secret, "null")
+    );
+    REQUIRE(remote_capabilities.has_value());
+    auto remote_capabilities_response = decode_response(*remote_capabilities);
+    REQUIRE(remote_capabilities_response.has_value());
+    REQUIRE(remote_capabilities_response->result.has_value());
+    REQUIRE(
+        remote_capabilities_response->result->str.find("\"start_session\":false") !=
+        std::string::npos
+    );
+    REQUIRE(
+        remote_capabilities_response->result->str.find(
+            "\"agent_runtime_adapter_schema_version\":0"
+        ) != std::string::npos
+    );
+    REQUIRE(
+        remote_capabilities_response->result->str.find("\"managed_runtime_ids\":[]") !=
+        std::string::npos
+    );
+    auto unavailable_start = transact(
+        socket_path,
+        make_request("remote-start", "start_session", *remote_secret, "null", "remote-start-1")
+    );
+    REQUIRE(unavailable_start.has_value());
+    auto unavailable_start_response = decode_response(*unavailable_start);
+    REQUIRE(unavailable_start_response.has_value());
+    REQUIRE(unavailable_start_response->error.has_value());
+    REQUIRE(unavailable_start_response->error->code == "method_not_found");
+    std::ifstream ssh_config{temp.root() / "remote-ssh/config"};
+    const std::string ssh_contents{
+        std::istreambuf_iterator<char>{ssh_config}, std::istreambuf_iterator<char>{}
+    };
+    REQUIRE(ssh_contents.find("  GlobalKnownHostsFile none\n") != std::string::npos);
+    REQUIRE(ssh_contents.find("  HostKeyAlgorithms ssh-ed25519\n") != std::string::npos);
+    REQUIRE(ssh_contents.find("  UpdateHostKeys no\n") != std::string::npos);
+    REQUIRE(ssh_contents.find("  ControlPath none\n") != std::string::npos);
+    REQUIRE(ssh_contents.find("  ControlPersist no\n") != std::string::npos);
+    REQUIRE(remote_configured.running());
+    REQUIRE(remote_configured.stop());
     REQUIRE(!std::filesystem::exists(socket_path));
     return 0;
 }
