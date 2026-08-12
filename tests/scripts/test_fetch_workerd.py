@@ -543,6 +543,13 @@ class FixtureAndDockerfileTests(unittest.TestCase):
             / "remote-workerd"
             / "hello.mjs"
         ).read_text(encoding="utf-8")
+        validator = (
+            REPOSITORY_ROOT
+            / "tests"
+            / "fixtures"
+            / "remote-workerd"
+            / "validate.sh"
+        ).read_text(encoding="utf-8")
 
         self.assertIn(PRODUCTION_MANIFEST.container.linux_amd64_manifest_digest, dockerfile)
         self.assertIn(PRODUCTION_MANIFEST.container.oci_index_digest, dockerfile)
@@ -551,6 +558,10 @@ class FixtureAndDockerfileTests(unittest.TestCase):
         self.assertIn('address = "*:8787"', config)
         self.assertIn('embed "hello.mjs"', config)
         self.assertIn('Response("Hello, World!\\n"', module)
+        self.assertIn(":2253[[:space:]]", validator)
+        self.assertNotIn(":2243[[:space:]]", validator)
+        self.assertIn('trap cleanup EXIT', validator)
+        self.assertIn('kill -KILL "$workerd_pid"', validator)
 
     def test_dockerfile_has_no_network_or_package_manager_step(self) -> None:
         dockerfile = (

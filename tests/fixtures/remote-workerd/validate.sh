@@ -18,14 +18,23 @@ fi
 workerd_pid=$!
 cleanup() {
   kill -TERM "$workerd_pid" 2>/dev/null || true
+  cleanup_attempt=0
+  while kill -0 "$workerd_pid" 2>/dev/null && [ "$cleanup_attempt" -lt 100 ]; do
+    sleep 0.05
+    cleanup_attempt=$((cleanup_attempt + 1))
+  done
+  if kill -0 "$workerd_pid" 2>/dev/null; then
+    kill -KILL "$workerd_pid" 2>/dev/null || true
+  fi
   wait "$workerd_pid" 2>/dev/null || true
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
 
 attempt=0
 while [ "$attempt" -lt 100 ]; do
-  if grep -Eq ':2243[[:space:]].*[[:space:]]0A[[:space:]]' "/proc/$workerd_pid/net/tcp" 2>/dev/null ||
-     grep -Eq ':2243[[:space:]].*[[:space:]]0A[[:space:]]' "/proc/$workerd_pid/net/tcp6" 2>/dev/null; then
+  if grep -Eq ':2253[[:space:]].*[[:space:]]0A[[:space:]]' "/proc/$workerd_pid/net/tcp" 2>/dev/null ||
+     grep -Eq ':2253[[:space:]].*[[:space:]]0A[[:space:]]' "/proc/$workerd_pid/net/tcp6" 2>/dev/null; then
     printf '{"status":"passed","http_status":200,"body":"Hello, World!\\n","socket":"127.0.0.1:8787","workerd_sha256":"%s"}\n' "$actual_workerd_sha256"
     exit 0
   fi
