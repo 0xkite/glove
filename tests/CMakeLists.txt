@@ -670,3 +670,14 @@ if(GLOVE_YAMS_BIN)
 else()
     message(STATUS "  yams smoke test       : disabled (yams not on PATH)")
 endif()
+
+# Pinned-supply-chain tool tests (network-free; exercises tools/fetch_workerd.py).
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME workerd_supply_chain
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_workerd.py)
+    set_tests_properties(workerd_supply_chain PROPERTIES TIMEOUT 120)
+    message(STATUS "  workerd supply-chain test: enabled")
+else()
+    message(STATUS "  workerd supply-chain test: disabled (python3 not found)")
+endif()
