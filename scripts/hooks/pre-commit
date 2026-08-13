@@ -1,0 +1,7 @@
+#!/bin/bash
+# Pre-commit hook for glove repo: monolith + slop detection.
+# (clang-format is intentionally not gated here yet: 19 pre-existing files
+#  still fail formatting; the monolith/slop check is staged-file-scoped so it
+#  only evaluates what you are committing.)
+set -e
+exec "$(dirname "$0")/monolith-slop.sh"
