@@ -10,7 +10,12 @@
 #include <string_view>
 #include <vector>
 
+#include <glaze/glaze.hpp>
+
 namespace glove::control::wire {
+
+inline constexpr std::uint64_t max_record_payload_bytes = std::uint64_t{1024} * 1024U;
+inline constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 
 // Wire representation of a persisted session registry record. This must stay
 // byte-for-byte stable with the on-disk registry format.
@@ -131,5 +136,10 @@ auto failure_code_from_wire(std::string_view value) -> std::optional<session_fai
 auto hash_failure_commitment(const session_failure_commitment& failure)
     -> std::expected<std::string, std::string>;
 auto state_from_wire(std::string_view state) -> std::optional<session_state>;
+
+auto encode_record(const persisted_session& record)
+    -> std::expected<std::vector<unsigned char>, std::string>;
+auto decode_record(std::string_view payload)
+    -> std::expected<persisted_session, std::string>;
 
 } // namespace glove::control::wire
