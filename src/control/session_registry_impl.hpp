@@ -3,7 +3,10 @@
 #include "glove/control/session_registry.hpp"
 #include "glove/control/session_registry_wire.hpp"
 
+#include <fcntl.h>
 #include <glaze/glaze.hpp>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -23,10 +26,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace glove::control {
 
@@ -118,7 +117,6 @@ struct session_registry::implementation {
     mutable std::mutex mutex;
 };
 
-
 using namespace wire;
 
 inline auto valid_identifier(std::string_view value) noexcept -> bool {
@@ -195,8 +193,8 @@ inline auto valid_cgroup_identity(const linux_cgroup_recovery_identity& identity
     return identity.schema_version == 1 && identity.device != 0 && identity.inode != 0;
 }
 
-inline auto valid_managed_runtime_identity(const managed_runtime_recovery_identity& identity) noexcept
-    -> bool {
+inline auto
+valid_managed_runtime_identity(const managed_runtime_recovery_identity& identity) noexcept -> bool {
     return identity.schema_version == 1 && identity.backend == "apple_container" &&
            valid_identifier(identity.instance_id) && valid_digest(identity.launch_identity_digest);
 }
@@ -433,7 +431,8 @@ inline auto public_record(const wire::persisted_session& record) -> session_reco
     };
 }
 
-inline auto valid_record_shape(const wire::persisted_session& record, std::uint64_t sequence) -> bool {
+inline auto valid_record_shape(const wire::persisted_session& record, std::uint64_t sequence)
+    -> bool {
     const bool common =
         record.schema_version == 1 && record.sequence == sequence &&
         valid_identifier(record.operation) && valid_identifier(record.idempotency_key) &&
@@ -577,6 +576,5 @@ inline auto valid_record_shape(const wire::persisted_session& record, std::uint6
                (stopping ? record.stopping_at_ms
                          : (running ? record.running_at_ms : record.starting_at_ms));
 }
-
 
 } // namespace glove::control
