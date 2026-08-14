@@ -7,6 +7,7 @@
 #    include <pwd.h>
 #    include <sched.h>
 #endif
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -16,7 +17,6 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <spawn.h>
 #include <string_view>
 #include <utility>
 
@@ -192,11 +192,9 @@ auto apple_host_checks(const std::optional<apple_container_config>& runtime)
         }};
     }
     const bool cli_safe = root_owned_executable(runtime->cli);
-    const bool system_ready =
-        cli_safe && apple_command_ok(runtime->cli, {"system", "status"});
+    const bool system_ready = cli_safe && apple_command_ok(runtime->cli, {"system", "status"});
     const bool image_ready =
-        system_ready &&
-        apple_command_ok(runtime->cli, {"image", "inspect", runtime->image});
+        system_ready && apple_command_ok(runtime->cli, {"image", "inspect", runtime->image});
     return {
         {
             .code = "apple_container_cli",

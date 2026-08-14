@@ -1930,8 +1930,7 @@ struct linux_detail::managed_pty_session::implementation {
                     publish_error_locked(transcript_commitment.error());
                     return;
                 }
-                auto evaluated =
-                    refinement_evaluator->finish(*produced, *transcript_commitment);
+                auto evaluated = refinement_evaluator->finish(*produced, *transcript_commitment);
                 if (!evaluated) {
                     publish_error_locked(evaluated.error());
                     return;

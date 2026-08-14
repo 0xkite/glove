@@ -575,8 +575,7 @@ auto start_egress_proxy_on_unix_socket(
         rule.host = std::move(*host);
         if (!seen.emplace(rule.host, rule.port).second) {
             return std::unexpected(
-                std::string{"duplicate egress rule: "} + rule.host + ":" +
-                std::to_string(rule.port)
+                std::string{"duplicate egress rule: "} + rule.host + ":" + std::to_string(rule.port)
             );
         }
     }
@@ -601,11 +600,7 @@ auto start_egress_proxy_on_unix_socket(
         );
     }
     std::unique_ptr<egress_proxy> proxy = std::make_unique<proxy_impl>(
-        listener,
-        advertised_guest_port,
-        std::move(opts),
-        std::move(*token),
-        socket_path
+        listener, advertised_guest_port, std::move(opts), std::move(*token), socket_path
     );
     return proxy;
 }

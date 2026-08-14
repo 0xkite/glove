@@ -17,8 +17,7 @@
 namespace glove::container {
 
 inline constexpr std::string_view refinement_runtime_template_id = "refinement-eval-v1";
-inline constexpr std::string_view refinement_fixture_schema =
-    "glove.refinement-eval-fixture-v1";
+inline constexpr std::string_view refinement_fixture_schema = "glove.refinement-eval-fixture-v1";
 inline constexpr std::string_view refinement_outcome_schema = "sage.refinement-eval-outcome-v1";
 inline constexpr std::string_view refinement_outcome_encoding = "canonical-json-utf8";
 inline constexpr std::string_view raw_pty_transcript_schema = "glove.raw-pty-transcript-v1";

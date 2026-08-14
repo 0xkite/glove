@@ -134,9 +134,8 @@ auto valid_utf8_literal(std::string_view value) noexcept -> bool {
         }
         code_point = (code_point << 6U) | (byte & 0x3fU);
         --remaining;
-        if (remaining == 0 &&
-            (code_point < minimum || code_point > 0x10ffffU ||
-             (code_point >= 0xd800U && code_point <= 0xdfffU))) {
+        if (remaining == 0 && (code_point < minimum || code_point > 0x10ffffU ||
+                               (code_point >= 0xd800U && code_point <= 0xdfffU))) {
             return false;
         }
     }
@@ -205,10 +204,9 @@ auto valid_fixture(const refinement_fixture_manifest& fixture) -> bool {
         fixture.assertions.expected_termination == resource_termination_cause::exited
             ? fixture.assertions.expected_exit_code.has_value()
             : !fixture.assertions.expected_exit_code.has_value();
-    return fixture.schema == refinement_fixture_schema &&
-           valid_token(fixture.evaluation_run_id) && valid_token(fixture.pair_id) &&
-           valid_token(fixture.session_id, 128U) && valid_digest(fixture.proposal_digest) &&
-           valid_digest(fixture.base_projection_digest) &&
+    return fixture.schema == refinement_fixture_schema && valid_token(fixture.evaluation_run_id) &&
+           valid_token(fixture.pair_id) && valid_token(fixture.session_id, 128U) &&
+           valid_digest(fixture.proposal_digest) && valid_digest(fixture.base_projection_digest) &&
            valid_digest(fixture.candidate_projection_digest) && valid_token(fixture.fixture_id) &&
            valid_digest(fixture.fixture_digest) && valid_token(fixture.dataset_ref) &&
            valid_digest(fixture.dataset_fingerprint) && valid_token(fixture.model.model_id) &&
@@ -216,16 +214,14 @@ auto valid_fixture(const refinement_fixture_manifest& fixture) -> bool {
            (!fixture.model.model_family || valid_token(*fixture.model.model_family)) &&
            (!fixture.model.model_revision || valid_token(*fixture.model.model_revision)) &&
            valid_token(fixture.model.tier) && fixture.model.normalizer_version != 0 &&
-           valid_token(fixture.harness) &&
-           (!fixture.module || valid_module(*fixture.module)) &&
+           valid_token(fixture.harness) && (!fixture.module || valid_module(*fixture.module)) &&
            valid_token(fixture.skill_projection_id, 128U) &&
            valid_digest(fixture.skill_projection_digest) &&
            valid_digest(fixture.matched_context_digest) && expected_exit_valid &&
            fixture.assertions.expected_exit_code.value_or(0) >= 0 &&
            valid_literal_set(fixture.assertions.required_transcript_literals, literal_bytes) &&
            valid_literal_set(fixture.assertions.forbidden_transcript_literals, literal_bytes) &&
-           (!fixture.assertions.max_latency_ms ||
-            *fixture.assertions.max_latency_ms != 0);
+           (!fixture.assertions.max_latency_ms || *fixture.assertions.max_latency_ms != 0);
 }
 
 auto append_integer(std::string& output, std::int64_t value) -> bool {
@@ -257,9 +253,11 @@ auto outcome_commitment(const refinement_outcome& outcome)
     if (!bytes) {
         return std::unexpected(bytes.error());
     }
-    auto digest = detail::sha256_hex(std::span<const unsigned char>{
-        reinterpret_cast<const unsigned char*>(bytes->data()), bytes->size()
-    });
+    auto digest = detail::sha256_hex(
+        std::span<const unsigned char>{
+            reinterpret_cast<const unsigned char*>(bytes->data()), bytes->size()
+        }
+    );
     if (!digest) {
         return std::unexpected(digest.error());
     }
@@ -335,8 +333,8 @@ auto valid_receipt_evidence(const refinement_evaluation_receipt& receipt) -> boo
         !valid_digest(receipt.transcript.digest) ||
         receipt.transcript.byte_count != receipt.resource_receipt.observed.terminal_output_bytes ||
         receipt.evaluator.schema != refinement_evaluator_schema ||
-        evidence_status_name(receipt.evidence_status).empty() || variant_name(receipt.variant).empty()
-    ) {
+        evidence_status_name(receipt.evidence_status).empty() ||
+        variant_name(receipt.variant).empty()) {
         return false;
     }
     if (receipt.evidence_status == refinement_evidence_status::valid_outcome) {
@@ -359,7 +357,8 @@ struct literal_matcher {
     std::size_t matched = 0;
     bool found = false;
 
-    explicit literal_matcher(std::string value) : literal{std::move(value)}, prefix(literal.size()) {
+    explicit literal_matcher(std::string value)
+        : literal{std::move(value)}, prefix(literal.size()) {
         for (std::size_t index = 1, length = 0; index < literal.size();) {
             if (literal[index] == literal[length]) {
                 prefix[index++] = ++length;
@@ -664,37 +663,30 @@ auto refinement_transcript_evaluator::finish(
         .outcome = std::move(*empty),
         .evaluated_outcome = std::nullopt,
         .transcript = transcript,
-        .evaluator =
-            {
-                .schema = std::string{refinement_evaluator_schema},
-                .fixture_complete = true,
-                .transcript_utf8 = utf8_complete,
-                .required_literals = static_cast<std::uint32_t>(state_->required.size()),
-                .forbidden_literals = static_cast<std::uint32_t>(state_->forbidden.size()),
-            },
+        .evaluator = {
+            .schema = std::string{refinement_evaluator_schema},
+            .fixture_complete = true,
+            .transcript_utf8 = utf8_complete,
+            .required_literals = static_cast<std::uint32_t>(state_->required.size()),
+            .forbidden_literals = static_cast<std::uint32_t>(state_->forbidden.size()),
+        },
     };
     if (stream_complete) {
         std::uint64_t failed_assertions = 0;
-        failed_assertions += static_cast<std::uint64_t>(
-            std::ranges::count_if(state_->required, [](const auto& matcher) {
-                return !matcher.found;
-            })
-        );
-        failed_assertions += static_cast<std::uint64_t>(
-            std::ranges::count_if(state_->forbidden, [](const auto& matcher) {
-                return matcher.found;
-            })
-        );
+        failed_assertions += static_cast<std::uint64_t>(std::ranges::count_if(
+            state_->required, [](const auto& matcher) { return !matcher.found; }
+        ));
+        failed_assertions += static_cast<std::uint64_t>(std::ranges::count_if(
+            state_->forbidden, [](const auto& matcher) { return matcher.found; }
+        ));
         const bool termination_matches =
-            resource_receipt.termination_cause ==
-            state_->fixture.assertions.expected_termination;
+            resource_receipt.termination_cause == state_->fixture.assertions.expected_termination;
         const bool exit_matches =
             !state_->fixture.assertions.expected_exit_code ||
             resource_receipt.exit_code == state_->fixture.assertions.expected_exit_code;
         const bool latency_matches =
             !state_->fixture.assertions.max_latency_ms ||
-            resource_receipt.observed.wall_time_ms <=
-                *state_->fixture.assertions.max_latency_ms;
+            resource_receipt.observed.wall_time_ms <= *state_->fixture.assertions.max_latency_ms;
         failed_assertions += termination_matches ? 0U : 1U;
         failed_assertions += exit_matches ? 0U : 1U;
         failed_assertions += latency_matches ? 0U : 1U;
@@ -706,14 +698,13 @@ auto refinement_transcript_evaluator::finish(
         refinement_outcome outcome{
             .schema = std::string{refinement_outcome_schema},
             .encoding = std::string{refinement_outcome_encoding},
-            .metrics =
-                {
-                    {"failed_assertions", static_cast<std::int64_t>(failed_assertions)},
-                    {"forbidden_literals", static_cast<std::int64_t>(state_->forbidden.size())},
-                    {"latency_us", latency_us},
-                    {"passed", failed_assertions == 0 ? 1 : 0},
-                    {"required_literals", static_cast<std::int64_t>(state_->required.size())},
-                },
+            .metrics = {
+                {"failed_assertions", static_cast<std::int64_t>(failed_assertions)},
+                {"forbidden_literals", static_cast<std::int64_t>(state_->forbidden.size())},
+                {"latency_us", latency_us},
+                {"passed", failed_assertions == 0 ? 1 : 0},
+                {"required_literals", static_cast<std::int64_t>(state_->required.size())},
+            },
         };
         auto commitment = outcome_commitment(outcome);
         if (!commitment) {

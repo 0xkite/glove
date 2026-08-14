@@ -38,14 +38,13 @@ auto run() -> int {
             .host_path = std::filesystem::canonical(std::filesystem::current_path()).string(),
             .target_path = "/workspace",
             .max_ttl_secs = 120,
-            .access =
-                {{
-                    .access = path_access::read,
-                    .materialization = path_materialization::bind,
-                    .create_policy = path_create_policy::never,
-                    .cleanup_policy = path_cleanup_policy::retain,
-                    .max_bytes = 0,
-                }},
+            .access = {{
+                .access = path_access::read,
+                .materialization = path_materialization::bind,
+                .create_policy = path_create_policy::never,
+                .cleanup_policy = path_cleanup_policy::retain,
+                .max_bytes = 0,
+            }},
         },
     });
     REQUIRE(paths.has_value());
@@ -79,15 +78,14 @@ auto run() -> int {
                     {.alias = "fixtures", .target_path = "/opt/glove/fixtures"},
                     {.alias = "skills", .target_path = "/opt/sage/library-bundles"},
                 },
-            .resource_profiles =
-                {{
-                    .cpu_time_ms = 1'000,
-                    .memory_bytes = 67'108'864,
-                    .pids = 16,
-                    .wall_time_ms = 2'000,
-                    .disk_bytes = 2'097'152,
-                    .terminal_output_bytes = 1'048'576,
-                }},
+            .resource_profiles = {{
+                .cpu_time_ms = 1'000,
+                .memory_bytes = 67'108'864,
+                .pids = 16,
+                .wall_time_ms = 2'000,
+                .disk_bytes = 2'097'152,
+                .terminal_output_bytes = 1'048'576,
+            }},
             .egress_policy_ids = {"no-network"},
             .tool_policy_ids = {"sage-readonly"},
             .secret_handles = {},
