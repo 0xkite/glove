@@ -48,11 +48,20 @@ prepare_linux_userns_tests() {
 find_fuzzer_compiler() {
     local candidate=""
     if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null; then
-        candidate="$(brew --prefix llvm 2>/dev/null)/bin/clang++"
-        if [[ -x "${candidate}" ]]; then
-            printf '%s\n' "${candidate}"
-            return
-        fi
+        local formula=""
+        local prefix=""
+        # LLVM 19+ can emit libFuzzer Mach-O relocations rejected by Apple's
+        # linker. Prefer the CI-pinned compatible toolchain when available.
+        for formula in llvm@18 llvm; do
+            if ! prefix="$(brew --prefix "${formula}" 2>/dev/null)"; then
+                continue
+            fi
+            candidate="${prefix}/bin/clang++"
+            if [[ -x "${candidate}" ]]; then
+                printf '%s\n' "${candidate}"
+                return
+            fi
+        done
     fi
     for candidate in clang++-22 clang++-21 clang++-20 clang++-19 clang++-18 clang++; do
         if command -v "${candidate}" >/dev/null; then

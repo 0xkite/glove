@@ -44,8 +44,8 @@ jobs:
       - name: Install macOS toolchain
         if: runner.os == 'macOS'
         run: |
-          brew install go llvm ninja
-          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          brew install go llvm@18 ninja
+          echo "$(brew --prefix llvm@18)/bin" >> "$GITHUB_PATH"
           echo "CC=/usr/bin/clang" >> "$GITHUB_ENV"
           echo "CXX=/usr/bin/clang++" >> "$GITHUB_ENV"
 
