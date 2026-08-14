@@ -163,6 +163,11 @@ auto run() -> int {
         .receipt_journal = temporary.root() / "receipts.journal",
         .session_policy = temporary.root() / "policy.json",
         .session_store = temporary.root() / "sessions.journal",
+        .materialization_root = std::nullopt,
+        .library_bundle_root = std::nullopt,
+        .path_exposure_policy = std::nullopt,
+        .path_exposure_journal = std::nullopt,
+        .apple_container = std::nullopt,
         .remote_backend = remote,
     };
     REQUIRE(glove::host::validate(configured).has_value());

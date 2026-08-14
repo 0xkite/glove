@@ -62,6 +62,7 @@ auto run() -> int {
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {},
                         .launch = std::nullopt,
+                        .adoption = std::nullopt,
                     },
                     runtime_template_policy{
                         .runtime_template_id = "refinement-eval-v1",
@@ -71,6 +72,7 @@ auto run() -> int {
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {"fixtures", "skills"},
                         .launch = std::nullopt,
+                        .adoption = std::nullopt,
                     },
                 },
             .library_projection_destinations =

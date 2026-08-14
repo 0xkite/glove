@@ -135,6 +135,7 @@ binding(std::string session_id, std::string epoch, std::string key, std::string 
         .session_epoch = std::move(epoch),
         .descriptor_digest = std::move(descriptor),
         .idempotency_key = std::move(key),
+        .payload_digest = {},
     };
 }
 

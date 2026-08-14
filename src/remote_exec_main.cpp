@@ -128,8 +128,11 @@ private:
                 {
                     .executor_digest = std::move(*executor_digest),
                     .container_image_digest = std::move(*image_digest),
+                    .workerd_digest = {},
+                    .descriptor_digest = {},
                 },
             .validation_available = false,
+            .validation = {},
         };
     }
 

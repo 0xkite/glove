@@ -478,6 +478,7 @@ auto run() -> int {
         .egress_policies = {},
         .secret_mounts = {},
         .selected_runtime_ids = {},
+        .pi_adoption = std::nullopt,
         .hostile_content_analysis = false,
         .dry_run = true,
     };

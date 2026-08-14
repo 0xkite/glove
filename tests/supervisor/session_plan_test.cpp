@@ -132,6 +132,7 @@ auto validator_for(
                         .launch = with_launch
                                       ? std::optional<runtime_launch_template>{launch_template()}
                                       : std::nullopt,
+                        .adoption = std::nullopt,
                     },
                 },
             .library_projection_destinations =
@@ -288,6 +289,7 @@ auto run() -> int {
                 .allowed_path_aliases = {"workspace"},
                 .allowed_projection_destinations = {"libraries"},
                 .launch = discovered_codex,
+                .adoption = std::nullopt,
             }},
             .library_projection_destinations = {library_projection_destination_policy{
                 .alias = "libraries",
@@ -550,6 +552,7 @@ auto run() -> int {
                     .allowed_path_aliases = {"workspace"},
                     .allowed_projection_destinations = {"libraries"},
                     .launch = launch_template(),
+                    .adoption = std::nullopt,
                 },
             },
         .library_projection_destinations =

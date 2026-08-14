@@ -206,6 +206,7 @@ auto run() -> int {
                         .allowed_path_aliases = {},
                         .allowed_projection_destinations = {},
                         .launch = launch,
+                        .adoption = std::nullopt,
                     },
                 },
             .library_projection_destinations = {},

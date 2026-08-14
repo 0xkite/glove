@@ -20,6 +20,7 @@ function(glove_set_warnings target)
         -Wformat=2
         -Wimplicit-fallthrough
         -Wmissing-declarations
+        -Wmissing-designated-field-initializers
         -Wzero-as-null-pointer-constant
     )
 
