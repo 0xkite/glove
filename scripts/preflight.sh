@@ -68,7 +68,7 @@ bold "[1/5] actionlint"
 if ! command -v actionlint >/dev/null; then
     fail "actionlint not on PATH"
 fi
-actionlint_version="$(actionlint -version | sed -n '1p')"
+actionlint_version="$(actionlint -version | sed -n '1{s/^v//;p;}')"
 if [[ "${actionlint_version}" != "${required_actionlint_version}" ]]; then
     fail "actionlint ${required_actionlint_version} required; found ${actionlint_version}"
 fi
