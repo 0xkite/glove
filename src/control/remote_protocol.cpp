@@ -406,6 +406,15 @@ auto decode_remote_response(std::string_view frame)
             .id = std::move(response.id),
             .status = {},
             .error_code = std::move(response.error->code),
+            .executor_digest = {},
+            .container_image_digest = {},
+            .observation_authority = {},
+            .workerd_digest = {},
+            .descriptor_digest = {},
+            .validation_schema_version = 0,
+            .validation_only = false,
+            .lifecycle_operational = false,
+            .independently_verified = false,
         };
     }
     wire::health_result health;

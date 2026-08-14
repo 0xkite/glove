@@ -647,6 +647,7 @@ auto plan_setup(const setup_options& options, const environment& values) -> resu
         .path_exposure_journal =
             canonical_root ? std::optional{roots->state / "path-exposures.journal"} : std::nullopt,
         .apple_container = std::nullopt,
+        .remote_backend = std::nullopt,
     };
 #if defined(__APPLE__)
     if (session_policy) {
