@@ -81,4 +81,55 @@ auto append_managed_runtime_identity(
 ) -> std::expected<void, std::string>;
 auto decode_u32(std::span<const unsigned char, 4> input) noexcept -> std::uint32_t;
 
+// Terminal receipt reference used by hash_terminal_reference/envelope.
+struct terminal_reference {
+    std::uint8_t schema_version = 0;
+    std::uint64_t sequence = 0;
+    std::string_view key_id;
+    std::string_view session_id;
+    std::string_view controller_plan_digest;
+    std::string_view profile_digest;
+    std::string_view receipt_digest;
+    std::string_view previous_hmac;
+    std::string_view this_hmac;
+    container::resource_termination_cause termination_cause =
+        container::resource_termination_cause::supervisor_error;
+    std::uint64_t started_at_ms = 0;
+    std::uint64_t finished_at_ms = 0;
+    std::optional<int> exit_code;
+};
+
+// Record materialization + hashing.
+auto record_material(const persisted_session& record)
+    -> std::expected<std::vector<unsigned char>, std::string>;
+auto hash_record(const persisted_session& record) -> std::expected<std::string, std::string>;
+auto hash_plan(std::string_view plan) -> std::expected<std::string, std::string>;
+auto hash_start_authorization(const session_start_authorization& authorization)
+    -> std::expected<std::string, std::string>;
+auto hash_execution_binding(const session_execution_binding& binding)
+    -> std::expected<std::string, std::string>;
+auto hash_running_commitment(const session_running_commitment& running)
+    -> std::expected<std::string, std::string>;
+auto hash_stopping_commitment(const session_running_commitment& running)
+    -> std::expected<std::string, std::string>;
+auto hash_managed_execution_binding(const managed_session_execution_binding& binding)
+    -> std::expected<std::string, std::string>;
+auto hash_managed_running_commitment(
+    const managed_session_running_commitment& running, std::string_view domain
+) -> std::expected<std::string, std::string>;
+auto termination_cause_name(container::resource_termination_cause cause) -> std::string_view;
+auto termination_cause_from_wire(std::string_view value)
+    -> std::optional<container::resource_termination_cause>;
+auto hash_terminal_reference(const terminal_reference& terminal)
+    -> std::expected<std::string, std::string>;
+auto hash_terminal_envelope(const container::authenticated_resource_enforcement_receipt& terminal)
+    -> std::expected<std::string, std::string>;
+auto hash_terminal_envelope(const container::authenticated_refinement_evaluation_receipt& terminal)
+    -> std::expected<std::string, std::string>;
+auto failure_code_name(session_failure_code code) -> std::string_view;
+auto failure_code_from_wire(std::string_view value) -> std::optional<session_failure_code>;
+auto hash_failure_commitment(const session_failure_commitment& failure)
+    -> std::expected<std::string, std::string>;
+auto state_from_wire(std::string_view state) -> std::optional<session_state>;
+
 } // namespace glove::control::wire
