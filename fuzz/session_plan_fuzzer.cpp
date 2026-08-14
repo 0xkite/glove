@@ -51,6 +51,7 @@ auto constrained_validator() -> const glove::supervisor::session_plan_validator&
                             .allowed_path_aliases = {"workspace"},
                             .allowed_projection_destinations = {"libraries"},
                             .launch = std::nullopt,
+                            .adoption = std::nullopt,
                         },
                     },
                 .library_projection_destinations =
@@ -74,6 +75,8 @@ auto constrained_validator() -> const glove::supervisor::session_plan_validator&
                 .egress_policy_ids = {"no-network"},
                 .tool_policy_ids = {"sage-readonly"},
                 .secret_handles = {"codex-token"},
+                .egress_policies = {},
+                .secret_mounts = {},
             },
             std::move(*paths)
         );

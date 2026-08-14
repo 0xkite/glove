@@ -1,5 +1,7 @@
 include_guard(GLOBAL)
 
+include(CheckCXXCompilerFlag)
+
 # glove_set_warnings(<target>)
 # Attach the project warning set to <target>. <target> may be INTERFACE.
 function(glove_set_warnings target)
@@ -20,9 +22,20 @@ function(glove_set_warnings target)
         -Wformat=2
         -Wimplicit-fallthrough
         -Wmissing-declarations
-        -Wmissing-designated-field-initializers
         -Wzero-as-null-pointer-constant
     )
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        check_cxx_compiler_flag(
+            "-Wmissing-designated-field-initializers"
+            GLOVE_HAS_MISSING_DESIGNATED_FIELD_INITIALIZERS
+        )
+        if(GLOVE_HAS_MISSING_DESIGNATED_FIELD_INITIALIZERS)
+            list(APPEND clang_warnings -Wmissing-designated-field-initializers)
+        else()
+            list(APPEND clang_warnings -Wmissing-field-initializers)
+        endif()
+    endif()
 
     set(gcc_warnings
         ${clang_warnings}
