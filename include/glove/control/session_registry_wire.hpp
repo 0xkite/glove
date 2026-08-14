@@ -2,6 +2,8 @@
 
 #include "glove/control/session_registry.hpp"
 
+#include <glaze/glaze.hpp>
+
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -9,8 +11,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <glaze/glaze.hpp>
 
 namespace glove::control::wire {
 
@@ -139,7 +139,6 @@ auto state_from_wire(std::string_view state) -> std::optional<session_state>;
 
 auto encode_record(const persisted_session& record)
     -> std::expected<std::vector<unsigned char>, std::string>;
-auto decode_record(std::string_view payload)
-    -> std::expected<persisted_session, std::string>;
+auto decode_record(std::string_view payload) -> std::expected<persisted_session, std::string>;
 
 } // namespace glove::control::wire
