@@ -7,6 +7,7 @@ add_library(glove_control STATIC
     remote_validation_executor.cpp
     session_reconciliation.cpp
     session_registry.cpp
+    session_registry_recovery.cpp
     session_registry_wire.cpp
 )
 add_library(glove::control ALIAS glove_control)
