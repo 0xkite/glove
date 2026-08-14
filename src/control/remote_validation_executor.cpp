@@ -739,6 +739,11 @@ private:
             .epoch = binding.session_epoch,
             .stage_name = "s-" + name_digest->substr(0, 32U),
             .container_name = "glove-v-" + name_digest->substr(0, 32U),
+            .state = "prepared",
+            .deadline = {},
+            .output = {},
+            .exit_code = std::nullopt,
+            .container_started = false,
         };
         if (::mkdirat(staging_root_.get(), created.stage_name.c_str(), 0700) != 0) {
             return std::unexpected(
