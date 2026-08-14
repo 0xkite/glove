@@ -30,10 +30,7 @@
 
 namespace glove::control {
 
-
-namespace {
-
-} // namespace
+namespace {} // namespace
 
 session_registry::session_registry(
     [[maybe_unused]] construction_token token, std::unique_ptr<implementation> state

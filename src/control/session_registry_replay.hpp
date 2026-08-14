@@ -38,46 +38,60 @@ auto managed_failed_from_wire(const wire::persisted_session& record)
     -> session_registry_result<managed_session_failed_record>;
 
 auto find_create_replay_locked(
-    session_registry::implementation& state, std::string_view session_id,
-    std::string_view controller_plan_digest, std::string_view request_digest,
+    session_registry::implementation& state,
+    std::string_view session_id,
+    std::string_view controller_plan_digest,
+    std::string_view request_digest,
     std::string_view idempotency_key
 ) -> session_registry_result<replay_lookup>;
 
 auto find_start_replay_locked(
-    session_registry::implementation& state, const session_start_authorization& authorization,
-    std::string_view request_digest, std::string_view idempotency_key
+    session_registry::implementation& state,
+    const session_start_authorization& authorization,
+    std::string_view request_digest,
+    std::string_view idempotency_key
 ) -> session_registry_result<start_replay_lookup>;
 
 auto find_starting_replay_locked(
-    session_registry::implementation& state, const session_execution_binding& binding,
-    std::string_view request_digest, std::string_view idempotency_key
+    session_registry::implementation& state,
+    const session_execution_binding& binding,
+    std::string_view request_digest,
+    std::string_view idempotency_key
 ) -> session_registry_result<starting_replay_lookup>;
 
 auto find_running_replay_locked(
-    session_registry::implementation& state, const session_running_commitment& running_commitment,
-    std::string_view request_digest, std::string_view idempotency_key
+    session_registry::implementation& state,
+    const session_running_commitment& running_commitment,
+    std::string_view request_digest,
+    std::string_view idempotency_key
 ) -> session_registry_result<running_replay_lookup>;
 
 auto find_stopping_replay_locked(
-    session_registry::implementation& state, const session_running_commitment& running_commitment,
-    std::string_view request_digest, std::string_view idempotency_key
+    session_registry::implementation& state,
+    const session_running_commitment& running_commitment,
+    std::string_view request_digest,
+    std::string_view idempotency_key
 ) -> session_registry_result<stopping_replay_lookup>;
 
 auto find_failure_replay_locked(
-    session_registry::implementation& state, const session_failure_commitment& failure_commitment,
-    std::string_view request_digest, std::string_view idempotency_key
+    session_registry::implementation& state,
+    const session_failure_commitment& failure_commitment,
+    std::string_view request_digest,
+    std::string_view idempotency_key
 ) -> session_registry_result<failure_replay_lookup>;
 
 auto find_exited_replay_locked(
     session_registry::implementation& state,
     const container::authenticated_resource_enforcement_receipt& terminal,
-    std::string_view request_digest, std::string_view idempotency_key
+    std::string_view request_digest,
+    std::string_view idempotency_key
 ) -> session_registry_result<exited_replay_lookup>;
 
 auto find_exited_replay_locked(
     session_registry::implementation& state,
     const container::authenticated_refinement_evaluation_receipt& terminal,
-    std::string_view request_digest, std::string_view idempotency_key
+    std::string_view request_digest,
+    std::string_view idempotency_key
 ) -> session_registry_result<exited_replay_lookup>;
 
 auto append_record_locked(session_registry::implementation& state, wire::persisted_session record)
