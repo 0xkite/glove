@@ -3,6 +3,8 @@
 #include "glove/container/digest.hpp"
 #include "glove/control/session_registry_wire.hpp"
 
+#include "session_registry_recovery.hpp"
+
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <sys/file.h>
@@ -590,11 +592,6 @@ auto initialize_empty(session_registry::implementation& state) -> std::expected<
     return sync_descriptor(state.opened.parent.get(), "sync session registry directory");
 }
 
-struct decoded_persisted_record {
-    wire::persisted_session record;
-    std::uint64_t next_offset = 0;
-};
-
 auto read_persisted_record(int descriptor, std::uint64_t file_size, std::uint64_t offset)
     -> std::expected<decoded_persisted_record, std::string> {
     if (file_size - offset < 8U) {
@@ -1038,41 +1035,6 @@ auto rollback_append(session_registry::implementation& state, std::uint64_t orig
     state.identity = *identity;
     return true;
 }
-
-struct replay_lookup {
-    bool found = false;
-    session_record record;
-};
-
-struct start_replay_lookup {
-    bool found = false;
-    session_start_reservation reservation;
-};
-
-struct starting_replay_lookup {
-    bool found = false;
-    session_starting_record record;
-};
-
-struct running_replay_lookup {
-    bool found = false;
-    session_running_record record;
-};
-
-struct stopping_replay_lookup {
-    bool found = false;
-    session_stopping_record record;
-};
-
-struct exited_replay_lookup {
-    bool found = false;
-    session_exited_record record;
-};
-
-struct failure_replay_lookup {
-    bool found = false;
-    session_failed_record record;
-};
 
 auto start_reservation_from_record(
     session_registry::implementation& state, const wire::persisted_session& record
