@@ -38,11 +38,9 @@ using namespace wire;
 constexpr std::array<unsigned char, 8> registry_magic = {'G', 'L', 'V', 'S', 'E', 'S', '0', '5'};
 constexpr std::size_t digest_hex_bytes = 64U;
 constexpr std::uint64_t min_registry_bytes = 1'024U;
-constexpr std::uint64_t max_record_payload_bytes = std::uint64_t{1024} * 1024U;
 constexpr std::size_t max_records = 10'000U;
 constexpr std::size_t max_identifier_bytes = 128U;
 constexpr std::uint64_t max_start_authorization_ttl_ms = 120'000U;
-constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 constexpr glz::opts partial_read_options{.error_on_unknown_keys = false};
 
 class unique_fd {
@@ -561,32 +559,6 @@ auto valid_record_shape(const wire::persisted_session& record, std::uint64_t seq
            record.finished_at_ms >=
                (stopping ? record.stopping_at_ms
                          : (running ? record.running_at_ms : record.starting_at_ms));
-}
-
-auto encode_record(const wire::persisted_session& record)
-    -> std::expected<std::vector<unsigned char>, std::string> {
-    auto payload = glz::write_json(record);
-    if (!payload) {
-        return std::unexpected(std::string{"encode session registry record failed"});
-    }
-    if (payload->empty() || payload->size() > max_record_payload_bytes) {
-        return std::unexpected(std::string{"session registry record exceeds its bound"});
-    }
-    std::vector<unsigned char> bytes;
-    bytes.reserve(payload->size() + 8U);
-    append_u32(bytes, static_cast<std::uint32_t>(payload->size()));
-    bytes.insert(bytes.end(), payload->begin(), payload->end());
-    append_u32(bytes, static_cast<std::uint32_t>(payload->size()));
-    return bytes;
-}
-
-auto decode_record(std::string_view payload)
-    -> std::expected<wire::persisted_session, std::string> {
-    wire::persisted_session record;
-    if (const auto error = glz::read<strict_read_options>(record, payload); error) {
-        return std::unexpected(std::string{"decode session registry record failed"});
-    }
-    return record;
 }
 
 } // namespace

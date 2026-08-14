@@ -98,7 +98,6 @@ auto decode_u32(std::span<const unsigned char, 4> input) noexcept -> std::uint32
            (static_cast<std::uint32_t>(input[2]) << 8U) | static_cast<std::uint32_t>(input[3]);
 }
 
-
 auto record_material(const persisted_session& record)
     -> std::expected<std::vector<unsigned char>, std::string> {
     std::vector<unsigned char> material;
@@ -463,7 +462,6 @@ auto termination_cause_from_wire(std::string_view value)
     return std::nullopt;
 }
 
-
 auto hash_terminal_reference(const terminal_reference& terminal)
     -> std::expected<std::string, std::string> {
     std::vector<unsigned char> material;
@@ -623,5 +621,31 @@ auto state_from_wire(std::string_view state) -> std::optional<session_state> {
     return std::nullopt;
 }
 
+
+auto encode_record(const persisted_session& record)
+    -> std::expected<std::vector<unsigned char>, std::string> {
+    auto payload = glz::write_json(record);
+    if (!payload) {
+        return std::unexpected(std::string{"encode session registry record failed"});
+    }
+    if (payload->empty() || payload->size() > max_record_payload_bytes) {
+        return std::unexpected(std::string{"session registry record exceeds its bound"});
+    }
+    std::vector<unsigned char> bytes;
+    bytes.reserve(payload->size() + 8U);
+    append_u32(bytes, static_cast<std::uint32_t>(payload->size()));
+    bytes.insert(bytes.end(), payload->begin(), payload->end());
+    append_u32(bytes, static_cast<std::uint32_t>(payload->size()));
+    return bytes;
+}
+
+auto decode_record(std::string_view payload)
+    -> std::expected<persisted_session, std::string> {
+    persisted_session record;
+    if (const auto error = glz::read<strict_read_options>(record, payload); error) {
+        return std::unexpected(std::string{"decode session registry record failed"});
+    }
+    return record;
+}
 
 } // namespace glove::control::wire
