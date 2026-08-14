@@ -259,7 +259,7 @@ public:
     auto operator=(implementation&&) -> implementation& = delete;
 
     ~implementation() {
-        watchdog_.request_stop();
+        watchdog_stop_requested_.store(true);
         if (watchdog_.joinable()) {
             watchdog_.join();
         }
@@ -304,9 +304,9 @@ public:
         if (auto reconciled = state->reconcile_startup(); !reconciled) {
             return std::unexpected(reconciled.error());
         }
-        state->watchdog_ = std::jthread{[owner = state.get()](const std::stop_token& stop) {
+        state->watchdog_ = std::thread{[owner = state.get()] {
             try {
-                owner->watchdog_loop(stop);
+                owner->watchdog_loop();
             } catch (...) {
                 owner->watchdog_failed_.store(true);
                 try {
@@ -1113,8 +1113,8 @@ private:
         }
     }
 
-    void watchdog_loop(const std::stop_token& stop) {
-        while (!stop.stop_requested()) {
+    void watchdog_loop() {
+        while (!watchdog_stop_requested_.load()) {
             std::vector<watchdog_record> expired;
             {
                 const std::scoped_lock lock{watchdog_mutex_};
@@ -1150,7 +1150,8 @@ private:
     std::unordered_map<std::string, session_state> sessions_;
     std::deque<tombstone> tombstones_;
     std::unordered_map<std::string, replay_entry> replays_;
-    std::jthread watchdog_;
+    std::thread watchdog_;
+    std::atomic<bool> watchdog_stop_requested_{false};
     std::atomic<bool> watchdog_failed_{false};
 };
 
