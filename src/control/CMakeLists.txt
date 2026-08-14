@@ -8,6 +8,7 @@ add_library(glove_control STATIC
     session_reconciliation.cpp
     session_registry.cpp
     session_registry_recovery.cpp
+    session_registry_replay.cpp
     session_registry_wire.cpp
 )
 add_library(glove::control ALIAS glove_control)

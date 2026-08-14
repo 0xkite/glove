@@ -61,13 +61,12 @@ auto initialize_empty(session_registry::implementation& state) -> std::expected<
 auto read_persisted_record(int descriptor, std::uint64_t file_size, std::uint64_t offset)
     -> std::expected<decoded_persisted_record, std::string>;
 auto accept_recovered_record(
-    session_registry::implementation& state, wire::persisted_session record,
+    session_registry::implementation& state,
+    wire::persisted_session record,
     std::string_view previous_hash
 ) -> std::expected<void, std::string>;
 auto recover(session_registry::implementation& state) -> std::expected<void, std::string>;
 auto verify_identity(session_registry::implementation& state) -> bool;
-auto rollback_append(
-    session_registry::implementation& state, std::uint64_t original_size
-) -> bool;
+auto rollback_append(session_registry::implementation& state, std::uint64_t original_size) -> bool;
 
 } // namespace glove::control
