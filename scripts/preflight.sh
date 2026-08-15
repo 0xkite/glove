@@ -204,8 +204,11 @@ fuzzer_symbolizer="$(dirname "${fuzzer_cxx}")/llvm-symbolizer"
 if [[ -x "${fuzzer_symbolizer}" ]]; then
     export ASAN_SYMBOLIZER_PATH="${fuzzer_symbolizer}"
 fi
+# Ubuntu's packaged libFuzzer runtime uses the compiler-default libstdc++ ABI;
+# do not carry the ordinary job's libc++ override into this isolated preset.
 cmake --preset fuzz \
     -DCMAKE_CXX_COMPILER="${fuzzer_cxx}" \
+    -DCMAKE_CXX_FLAGS= \
     -DFETCHCONTENT_SOURCE_DIR_GLAZE="${ROOT}/build/dev/_deps/glaze-src"
 cmake --build --preset fuzz
 fuzz_workspace="$(mktemp -d "${TMPDIR:-/tmp}/glove-fuzz-corpora.XXXXXX")"
