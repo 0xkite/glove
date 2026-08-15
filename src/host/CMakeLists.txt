@@ -5,6 +5,7 @@ add_library(glove_host STATIC
     control_client.cpp
     daemon.cpp
     doctor.cpp
+    doctor_wire.cpp
     operator_experience.cpp
     onboarding_plan.cpp
     remote_backend.cpp
