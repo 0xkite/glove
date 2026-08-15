@@ -127,6 +127,7 @@ target_link_options(glove_library_bundle_fuzzer PRIVATE -fsanitize=fuzzer)
 # Ubuntu packages libFuzzer with libstdc++, while Glove uses libc++ there for
 # complete C++23 support. The fuzzer boundary is the C ABI entry point, so keep
 # project code on libc++ and satisfy the runtime's internal ABI at final link.
+# Clang injects libFuzzer after user libraries; retain libstdc++ until then.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_FLAGS MATCHES "-stdlib=libc\\+\\+")
     foreach(fuzzer_target IN ITEMS
         glove_mcp_codec_fuzzer
@@ -136,6 +137,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_FLAGS MATCHES "-stdlib=libc\
         glove_change_apply_journal_fuzzer
         glove_library_bundle_fuzzer
     )
+        target_link_options(${fuzzer_target} PRIVATE "LINKER:--no-as-needed")
         target_link_libraries(${fuzzer_target} PRIVATE stdc++)
     endforeach()
 endif()
