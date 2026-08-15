@@ -20,12 +20,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_FLAGS MATCHES "-stdlib=libc\
         OUTPUT_STRIP_TRAILING_WHITESPACE
         RESULT_VARIABLE glove_fuzzer_runtime_result
     )
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.so
+        OUTPUT_VARIABLE glove_fuzzer_libstdcxx
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE glove_fuzzer_libstdcxx_result
+    )
     if(NOT glove_fuzzer_runtime_result EQUAL 0 OR NOT EXISTS "${glove_fuzzer_runtime}")
         message(FATAL_ERROR "unable to locate ${glove_fuzzer_runtime_name}")
     endif()
+    if(NOT glove_fuzzer_libstdcxx_result EQUAL 0 OR NOT EXISTS "${glove_fuzzer_libstdcxx}")
+        message(FATAL_ERROR "unable to locate libstdc++.so")
+    endif()
     list(APPEND GLOVE_FUZZER_RUNTIME_LIBRARIES
         "$<LINK_LIBRARY:WHOLE_ARCHIVE,${glove_fuzzer_runtime}>"
-        stdc++
+        "${glove_fuzzer_libstdcxx}"
     )
 endif()
 
