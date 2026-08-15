@@ -9,6 +9,8 @@
 #include "glove/host/runtime_policy.hpp"
 #include "glove/host/setup.hpp"
 
+#include "doctor_wire.hpp"
+
 #include <glaze/glaze.hpp>
 
 #include <algorithm>
@@ -22,22 +24,6 @@
 #include <vector>
 
 namespace glove::host {
-namespace doctor_wire {
-struct doctor_check_wire {
-    std::string code;
-    std::string status;
-    std::string message;
-    std::string recovery;
-};
-
-struct doctor_report_wire {
-    std::uint8_t schema_version = 1;
-    std::string config_path;
-    bool healthy = false;
-    std::vector<doctor_check_wire> checks;
-};
-} // namespace doctor_wire
-
 namespace policy_wire {
 struct harness {
     std::string runtime_id;
@@ -122,8 +108,6 @@ struct onboarding_plan_report {
 
 namespace {
 
-using doctor_wire::doctor_report_wire;
-
 auto print_error(std::string_view code, std::string_view message, std::string_view recovery)
     -> int {
     std::fprintf(
@@ -145,18 +129,6 @@ auto default_path() -> result<std::filesystem::path> {
         return std::unexpected(directories.error());
     }
     return default_config_path(*directories);
-}
-
-auto status_name(doctor_status value) -> std::string_view {
-    switch (value) {
-    case doctor_status::passed:
-        return "passed";
-    case doctor_status::warning:
-        return "warning";
-    case doctor_status::failed:
-        return "failed";
-    }
-    return "failed";
 }
 
 auto default_project_identifier(std::string_view name) -> std::string {
@@ -1126,20 +1098,7 @@ auto doctor_command(std::span<char* const> arguments) -> int {
     }
     const auto report = diagnose(*config_path);
     if (json) {
-        doctor_report_wire encoded{
-            .config_path = report.config_path.string(),
-            .healthy = report.healthy(),
-            .checks = {},
-        };
-        for (const auto& check : report.checks) {
-            encoded.checks.push_back({
-                .code = check.code,
-                .status = std::string{status_name(check.status)},
-                .message = check.message,
-                .recovery = check.recovery,
-            });
-        }
-        auto output = glz::write_json(encoded);
+        auto output = doctor_wire::encode_report(report);
         if (!output) {
             return print_error(
                 "doctor_encode_failed", "Could not encode diagnostic output.", "glove doctor"
