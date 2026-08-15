@@ -540,13 +540,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(container_linux_exec_test container/linux_exec_test.cpp)
     target_link_libraries(container_linux_exec_test PRIVATE glove_kernel)
     add_test(NAME container_linux_exec COMMAND container_linux_exec_test)
-    # LeakSanitizer cannot trace a process after this test enters its isolated
-    # PID namespace. Keep ASan/UBSan active while disabling only leak tracing
-    # for this containment-specific probe.
-    set_tests_properties(container_linux_exec PROPERTIES
-        TIMEOUT 30
-        ENVIRONMENT "ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0"
-    )
+    set_tests_properties(container_linux_exec PROPERTIES TIMEOUT 30)
 endif()
 
 add_executable(reflect_codegen_availability_test reflect/codegen_availability_test.cpp)
