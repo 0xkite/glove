@@ -62,9 +62,8 @@ public:
     auto operator=(linux_session_preparer&&) -> linux_session_preparer& = delete;
     ~linux_session_preparer() = default;
 
-    [[nodiscard]] static auto create(
-        std::string materialization_root, std::shared_ptr<audit::sink> egress_audit = {}
-    )
+    [[nodiscard]] static auto
+    create(std::string materialization_root, std::shared_ptr<audit::sink> egress_audit = {})
         -> std::expected<linux_session_preparer, std::string>;
 
     [[nodiscard]] auto prepare(session_start_inputs&& inputs, std::uint64_t started_at_ms)

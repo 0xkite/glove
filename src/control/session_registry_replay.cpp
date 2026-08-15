@@ -551,5 +551,4 @@ auto append_record_locked(session_registry::implementation& state, wire::persist
     return public_record(state.records.back());
 }
 
-
 } // namespace glove::control

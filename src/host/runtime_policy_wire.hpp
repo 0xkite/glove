@@ -11,7 +11,6 @@
 
 namespace glove::host::runtime_policy_wire {
 
-
 struct pi_settings_discovery {
     std::vector<std::string> packages;
 };
@@ -98,6 +97,5 @@ struct session_policy {
     std::vector<egress_policy> egress_policies;
     std::vector<secret_mount_policy> secret_mounts;
 };
-
 
 } // namespace glove::host::runtime_policy_wire

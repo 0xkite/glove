@@ -345,6 +345,7 @@ auto plan_validator_for(const std::filesystem::path& source)
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {"libraries"},
                         .launch = {},
+                        .adoption = std::nullopt,
                     },
                 },
             .library_projection_destinations =

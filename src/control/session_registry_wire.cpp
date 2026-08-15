@@ -621,7 +621,6 @@ auto state_from_wire(std::string_view state) -> std::optional<session_state> {
     return std::nullopt;
 }
 
-
 auto encode_record(const persisted_session& record)
     -> std::expected<std::vector<unsigned char>, std::string> {
     auto payload = glz::write_json(record);
@@ -639,8 +638,7 @@ auto encode_record(const persisted_session& record)
     return bytes;
 }
 
-auto decode_record(std::string_view payload)
-    -> std::expected<persisted_session, std::string> {
+auto decode_record(std::string_view payload) -> std::expected<persisted_session, std::string> {
     persisted_session record;
     if (const auto error = glz::read<strict_read_options>(record, payload); error) {
         return std::unexpected(std::string{"decode session registry record failed"});

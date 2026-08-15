@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 

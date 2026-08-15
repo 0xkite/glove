@@ -922,14 +922,11 @@ auto interactive_pty_attach_and_stop_test(
 }
 
 auto declarative_refinement_evaluator_test(
-    cgroup_v2_root& root,
-    const std::filesystem::path& materialization_root,
-    std::uint64_t page
+    cgroup_v2_root& root, const std::filesystem::path& materialization_root, std::uint64_t page
 ) -> int {
     using namespace glove::container;
     const auto limits = limits_for(page * 32U);
-    auto lifecycle =
-        make_lifecycle(root, materialization_root, {}, "managed-refinement", limits);
+    auto lifecycle = make_lifecycle(root, materialization_root, {}, "managed-refinement", limits);
     REQUIRE(lifecycle.has_value());
     refinement_execution_binding execution;
     execution.schema_version = 1;
@@ -967,14 +964,13 @@ auto declarative_refinement_evaluator_test(
         .skill_projection_id = execution.candidate.projection_id,
         .skill_projection_digest = execution.candidate.content_digest,
         .matched_context_digest = std::string(64, '0'),
-        .assertions =
-            {
-                .expected_termination = resource_termination_cause::exited,
-                .expected_exit_code = 0,
-                .required_transcript_literals = {"alpha beta", "done"},
-                .forbidden_transcript_literals = {"forbidden"},
-                .max_latency_ms = 2'000,
-            },
+        .assertions = {
+            .expected_termination = resource_termination_cause::exited,
+            .expected_exit_code = 0,
+            .required_transcript_literals = {"alpha beta", "done"},
+            .forbidden_transcript_literals = {"forbidden"},
+            .max_latency_ms = 2'000,
+        },
     };
     fixture.matched_context_digest =
         refinement_fixture_context_digest(fixture, execution.plan_context_digest).value();
@@ -984,9 +980,8 @@ auto declarative_refinement_evaluator_test(
         reinterpret_cast<const unsigned char*>(encoded.data()), encoded.size()
     };
     execution.fixture.content_digest = sha256_hex(encoded_bytes).value();
-    auto evaluator = refinement_transcript_evaluator::create(
-        encoded_bytes, fixture.session_id, execution
-    );
+    auto evaluator =
+        refinement_transcript_evaluator::create(encoded_bytes, fixture.session_id, execution);
     REQUIRE(evaluator.has_value());
 
     const auto prof = launch_profile(limits);
@@ -1021,9 +1016,7 @@ auto declarative_refinement_evaluator_test(
     auto refinement = (*session)->wait_refinement();
     REQUIRE(refinement.has_value());
     REQUIRE(refinement->has_value());
-    REQUIRE(
-        (*refinement)->evaluated_outcome->metrics.at("passed") == 1
-    );
+    REQUIRE((*refinement)->evaluated_outcome->metrics.at("passed") == 1);
     REQUIRE((*refinement)->transcript.byte_count == 15);
     REQUIRE(std::filesystem::is_empty(materialization_root));
     return 0;

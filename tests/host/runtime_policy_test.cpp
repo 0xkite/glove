@@ -199,6 +199,12 @@ auto run() -> int {
     auto repeated_snapshot = stage_runtime_harness(snapshot_stage_options);
     REQUIRE(repeated_snapshot.has_value());
     REQUIRE(!repeated_snapshot->changed);
+    const auto snapshot_root = snapshot_stage->read_only_paths.front().parent_path();
+    REQUIRE(::chmod(snapshot_root.c_str(), 0700) == 0);
+    auto unprotected_snapshot = stage_runtime_harness(snapshot_stage_options);
+    REQUIRE(!unprotected_snapshot.has_value());
+    REQUIRE(unprotected_snapshot.error().find("not owner-protected") != std::string::npos);
+    REQUIRE(::chmod(snapshot_root.c_str(), 0500) == 0);
     const auto old_snapshot_target =
         std::filesystem::canonical(snapshot_stage->protected_entry_point);
     {
@@ -472,6 +478,7 @@ auto run() -> int {
         .egress_policies = {},
         .secret_mounts = {},
         .selected_runtime_ids = {},
+        .pi_adoption = std::nullopt,
         .hostile_content_analysis = false,
         .dry_run = true,
     };

@@ -73,6 +73,8 @@ auto run() -> int {
     const remote_executor_identity identity{
         .executor_digest = "sha256:" + std::string(64U, 'a'),
         .container_image_digest = "sha256:" + std::string(64U, 'b'),
+        .workerd_digest = {},
+        .descriptor_digest = {},
     };
     auto health = encode_remote_request("health-1", remote_method::remote_health, 5'000);
     REQUIRE(health.has_value());
@@ -128,8 +130,14 @@ auto run() -> int {
     REQUIRE(!remote_request_deadline(malformed, receive_started_at, received_at).has_value());
     REQUIRE(!handle_remote_executor_request(
                  *health,
-                 remote_executor_identity{.executor_digest = {}, .container_image_digest = {}}
-    ).has_value());
+                 remote_executor_identity{
+                     .executor_digest = {},
+                     .container_image_digest = {},
+                     .workerd_digest = {},
+                     .descriptor_digest = {},
+                 }
+    )
+                 .has_value());
 
     pipe_pair framed;
     REQUIRE(framed.read_end() >= 0);

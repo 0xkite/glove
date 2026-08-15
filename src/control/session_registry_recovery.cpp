@@ -457,5 +457,4 @@ auto rollback_append(session_registry::implementation& state, std::uint64_t orig
     return true;
 }
 
-
 } // namespace glove::control

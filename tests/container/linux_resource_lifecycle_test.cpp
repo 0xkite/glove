@@ -212,6 +212,8 @@ auto natural_exit_terminal_test(
                         .projection_destination_alias = std::nullopt,
                         .runtime_adapter_id = std::nullopt,
                         .runtime_context_digest = std::nullopt,
+                        .runtime_adoption_manifest_digest = std::nullopt,
+                        .runtime_adoption_snapshot_digest = std::nullopt,
                         .secret_handle = "codex-auth",
                         .secret_runtime_id = "codex",
                         .writable = true,

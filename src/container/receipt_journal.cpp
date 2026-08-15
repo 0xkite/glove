@@ -287,10 +287,8 @@ auto open_journal_path(const std::filesystem::path& path, bool create)
 }
 
 auto valid_record(const receipt_journal_record& record) -> bool {
-    return (record.kind == "resource_enforcement_v1" && record.resource &&
-            !record.refinement) ||
-           (record.kind == "refinement_evaluation_v1" && !record.resource &&
-            record.refinement);
+    return (record.kind == "resource_enforcement_v1" && record.resource && !record.refinement) ||
+           (record.kind == "refinement_evaluation_v1" && !record.resource && record.refinement);
 }
 
 auto encode_record(const receipt_journal_record& record)
@@ -433,21 +431,20 @@ auto recover_records(
         if (!record) {
             return std::unexpected(record.error());
         }
-        auto verified = record->resource
-                            ? verify_receipt_audit_envelope(
-                                  *record->resource,
-                                  key_hex,
-                                  record->resource->session_id,
-                                  record->resource->controller_plan_digest,
-                                  anchor
-                              )
-                            : verify_refinement_receipt_audit_envelope(
-                                  *record->refinement,
-                                  key_hex,
-                                  record->refinement->session_id,
-                                  record->refinement->controller_plan_digest,
-                                  anchor
-                              );
+        auto verified = record->resource ? verify_receipt_audit_envelope(
+                                               *record->resource,
+                                               key_hex,
+                                               record->resource->session_id,
+                                               record->resource->controller_plan_digest,
+                                               anchor
+                                           )
+                                         : verify_refinement_receipt_audit_envelope(
+                                               *record->refinement,
+                                               key_hex,
+                                               record->refinement->session_id,
+                                               record->refinement->controller_plan_digest,
+                                               anchor
+                                           );
         if (!verified) {
             return std::unexpected(
                 std::string{"receipt journal chain verification: "} + verified.error()
@@ -696,8 +693,7 @@ auto receipt_audit_journal::append_refinement(
     }
     const auto previous_sequence = state_->chain->sequence_;
     auto previous_hmac = state_->chain->head_hmac_;
-    auto envelope =
-        state_->chain->append_refinement(session_id, controller_plan_digest, receipt);
+    auto envelope = state_->chain->append_refinement(session_id, controller_plan_digest, receipt);
     if (!envelope) {
         return std::unexpected(envelope.error());
     }
@@ -818,8 +814,7 @@ auto receipt_audit_journal::contains_exact(
         return false;
     }
     const auto index = static_cast<std::size_t>(envelope.sequence - 1U);
-    return state_->records[index].resource &&
-           *state_->records[index].resource == envelope;
+    return state_->records[index].resource && *state_->records[index].resource == envelope;
 }
 
 auto receipt_audit_journal::contains_exact(
@@ -841,8 +836,7 @@ auto receipt_audit_journal::contains_exact(
         return false;
     }
     const auto index = static_cast<std::size_t>(envelope.sequence - 1U);
-    return state_->records[index].refinement &&
-           *state_->records[index].refinement == envelope;
+    return state_->records[index].refinement && *state_->records[index].refinement == envelope;
 }
 
 auto receipt_audit_journal::terminal_for_execution(
@@ -891,8 +885,7 @@ auto receipt_audit_journal::refinement_terminal_for_execution(
     std::string_view session_id,
     std::string_view controller_plan_digest,
     std::string_view profile_digest
-) const
-    -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string> {
+) const -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string> {
     if (!valid_identifier(session_id) || !valid_digest(controller_plan_digest) ||
         !valid_digest(profile_digest)) {
         return std::unexpected(std::string{"receipt execution lookup binding is invalid"});
