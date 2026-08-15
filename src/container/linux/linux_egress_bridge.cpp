@@ -203,11 +203,11 @@ public:
     ~bridge_impl() override {
         stopping_.store(true, std::memory_order_relaxed);
         static_cast<void>(::shutdown(channel_, SHUT_RDWR));
-        close_descriptor(channel_);
-        channel_ = -1;
         if (receiver_.joinable()) {
             receiver_.join();
         }
+        close_descriptor(channel_);
+        channel_ = -1;
         const std::lock_guard lock{workers_mutex_};
         for (auto& worker : workers_) {
             if (worker.thread.joinable()) {

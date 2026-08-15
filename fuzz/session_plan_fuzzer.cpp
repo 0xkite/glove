@@ -12,6 +12,11 @@
 namespace {
 
 constexpr std::size_t maximum_plan_bytes = 1024U * 1024U;
+#if defined(__APPLE__)
+constexpr auto fixture_host_path = "/private/tmp";
+#else
+constexpr auto fixture_host_path = "/tmp";
+#endif
 
 auto constrained_validator() -> const glove::supervisor::session_plan_validator& {
     using namespace glove::supervisor;
@@ -20,7 +25,7 @@ auto constrained_validator() -> const glove::supervisor::session_plan_validator&
         auto paths = path_alias_registry::build({
             path_alias_policy{
                 .alias = "workspace",
-                .host_path = "/tmp",
+                .host_path = fixture_host_path,
                 .target_path = "/workspace",
                 .max_ttl_secs = 120,
                 .access = {
