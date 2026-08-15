@@ -2,6 +2,43 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "GLOVE_BUILD_FUZZERS requires Clang libFuzzer support")
 endif()
 
+set(GLOVE_FUZZER_COMPILE_FLAG "-fsanitize=fuzzer")
+set(GLOVE_FUZZER_LINK_FLAG "-fsanitize=fuzzer")
+set(GLOVE_FUZZER_RUNTIME_LIBRARIES)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_FLAGS MATCHES "-stdlib=libc\\+\\+")
+    # Ubuntu packages libFuzzer with libstdc++, while Glove uses libc++ there
+    # for complete C++23 support. Place the runtime before its ABI dependency;
+    # Clang's automatic insertion otherwise puts it after all user libraries.
+    set(GLOVE_FUZZER_COMPILE_FLAG "-fsanitize=fuzzer-no-link")
+    set(GLOVE_FUZZER_LINK_FLAG)
+    set(glove_fuzzer_runtime_name
+        "libclang_rt.fuzzer-${CMAKE_SYSTEM_PROCESSOR}.a"
+    )
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=${glove_fuzzer_runtime_name}
+        OUTPUT_VARIABLE glove_fuzzer_runtime
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE glove_fuzzer_runtime_result
+    )
+    if(NOT glove_fuzzer_runtime_result EQUAL 0 OR NOT EXISTS "${glove_fuzzer_runtime}")
+        message(FATAL_ERROR "unable to locate ${glove_fuzzer_runtime_name}")
+    endif()
+    list(APPEND GLOVE_FUZZER_RUNTIME_LIBRARIES
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,${glove_fuzzer_runtime}>"
+        stdc++
+    )
+endif()
+
+function(glove_configure_fuzzer target)
+    target_compile_options(${target} PRIVATE "${GLOVE_FUZZER_COMPILE_FLAG}")
+    if(GLOVE_FUZZER_LINK_FLAG)
+        target_link_options(${target} PRIVATE "${GLOVE_FUZZER_LINK_FLAG}")
+    endif()
+    if(GLOVE_FUZZER_RUNTIME_LIBRARIES)
+        target_link_libraries(${target} PRIVATE ${GLOVE_FUZZER_RUNTIME_LIBRARIES})
+    endif()
+endfunction()
+
 add_library(glove_mcp_codec_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/mcp/codec.cpp
 )
@@ -23,8 +60,7 @@ target_link_libraries(
 target_include_directories(glove_mcp_codec_fuzzer PRIVATE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>
 )
-target_compile_options(glove_mcp_codec_fuzzer PRIVATE -fsanitize=fuzzer)
-target_link_options(glove_mcp_codec_fuzzer PRIVATE -fsanitize=fuzzer)
+glove_configure_fuzzer(glove_mcp_codec_fuzzer)
 
 add_library(glove_policy_jsonpath_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/policy/jsonpath_engine.cpp
@@ -42,8 +78,7 @@ target_link_libraries(
     glove_policy_jsonpath_fuzzer
     PRIVATE glove_policy_jsonpath_fuzz_support glaze::glaze
 )
-target_compile_options(glove_policy_jsonpath_fuzzer PRIVATE -fsanitize=fuzzer)
-target_link_options(glove_policy_jsonpath_fuzzer PRIVATE -fsanitize=fuzzer)
+glove_configure_fuzzer(glove_policy_jsonpath_fuzzer)
 
 add_library(glove_change_manifest_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/supervisor/change_manifest.cpp
@@ -61,8 +96,7 @@ target_link_libraries(
     glove_change_manifest_fuzzer
     PRIVATE glove_change_manifest_fuzz_support glaze::glaze glove_digest
 )
-target_compile_options(glove_change_manifest_fuzzer PRIVATE -fsanitize=fuzzer)
-target_link_options(glove_change_manifest_fuzzer PRIVATE -fsanitize=fuzzer)
+glove_configure_fuzzer(glove_change_manifest_fuzzer)
 
 add_library(glove_session_plan_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/supervisor/session_plan.cpp
@@ -80,8 +114,7 @@ target_link_libraries(
     glove_session_plan_fuzzer
     PRIVATE glove_session_plan_fuzz_support glove_supervisor glaze::glaze
 )
-target_compile_options(glove_session_plan_fuzzer PRIVATE -fsanitize=fuzzer)
-target_link_options(glove_session_plan_fuzzer PRIVATE -fsanitize=fuzzer)
+glove_configure_fuzzer(glove_session_plan_fuzzer)
 
 add_library(glove_change_apply_journal_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/supervisor/change_apply_journal.cpp
@@ -102,8 +135,7 @@ target_link_libraries(
     glove_change_apply_journal_fuzzer
     PRIVATE glove_change_apply_journal_fuzz_support glaze::glaze glove_digest
 )
-target_compile_options(glove_change_apply_journal_fuzzer PRIVATE -fsanitize=fuzzer)
-target_link_options(glove_change_apply_journal_fuzzer PRIVATE -fsanitize=fuzzer)
+glove_configure_fuzzer(glove_change_apply_journal_fuzzer)
 
 add_library(glove_library_bundle_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/supervisor/library_bundle.cpp
@@ -121,23 +153,4 @@ target_link_libraries(
     glove_library_bundle_fuzzer
     PRIVATE glove_library_bundle_fuzz_support glove_digest
 )
-target_compile_options(glove_library_bundle_fuzzer PRIVATE -fsanitize=fuzzer)
-target_link_options(glove_library_bundle_fuzzer PRIVATE -fsanitize=fuzzer)
-
-# Ubuntu packages libFuzzer with libstdc++, while Glove uses libc++ there for
-# complete C++23 support. The fuzzer boundary is the C ABI entry point, so keep
-# project code on libc++ and satisfy the runtime's internal ABI at final link.
-# Clang injects libFuzzer after user libraries; retain libstdc++ until then.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_FLAGS MATCHES "-stdlib=libc\\+\\+")
-    foreach(fuzzer_target IN ITEMS
-        glove_mcp_codec_fuzzer
-        glove_policy_jsonpath_fuzzer
-        glove_change_manifest_fuzzer
-        glove_session_plan_fuzzer
-        glove_change_apply_journal_fuzzer
-        glove_library_bundle_fuzzer
-    )
-        target_link_options(${fuzzer_target} PRIVATE "LINKER:--no-as-needed")
-        target_link_libraries(${fuzzer_target} PRIVATE stdc++)
-    endforeach()
-endif()
+glove_configure_fuzzer(glove_library_bundle_fuzzer)
