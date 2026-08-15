@@ -8,6 +8,7 @@ add_library(glove_host STATIC
     doctor_wire.cpp
     operator_experience.cpp
     onboarding_plan.cpp
+    policy_wire.cpp
     remote_backend.cpp
     runtime_policy.cpp
     runtime_snapshot.cpp
