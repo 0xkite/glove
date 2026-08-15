@@ -9,6 +9,7 @@ add_library(glove_host STATIC
     onboarding_plan.cpp
     remote_backend.cpp
     runtime_policy.cpp
+    runtime_snapshot.cpp
     setup.cpp
 )
 add_library(glove::host ALIAS glove_host)
