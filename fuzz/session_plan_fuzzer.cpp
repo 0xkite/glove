@@ -20,7 +20,7 @@ auto constrained_validator() -> const glove::supervisor::session_plan_validator&
         auto paths = path_alias_registry::build({
             path_alias_policy{
                 .alias = "workspace",
-                .host_path = "/private/tmp",
+                .host_path = "/tmp",
                 .target_path = "/workspace",
                 .max_ttl_secs = 120,
                 .access = {
