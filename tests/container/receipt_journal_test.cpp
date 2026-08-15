@@ -1,5 +1,5 @@
-#include "glove/container/receipt_journal.hpp"
 #include "glove/container/digest.hpp"
+#include "glove/container/receipt_journal.hpp"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -109,9 +109,11 @@ auto refinement_receipt(std::uint64_t cpu_time_ms = 500)
         .metrics = {{"failed_assertions", 0}, {"latency_us", 750'000}, {"passed", 1}},
     };
     const auto outcome_bytes = canonical_refinement_outcome_bytes(outcome).value();
-    const auto outcome_digest = sha256_hex(std::span<const unsigned char>{
-        reinterpret_cast<const unsigned char*>(outcome_bytes.data()), outcome_bytes.size()
-    });
+    const auto outcome_digest = sha256_hex(
+        std::span<const unsigned char>{
+            reinterpret_cast<const unsigned char*>(outcome_bytes.data()), outcome_bytes.size()
+        }
+    );
     return {
         .schema_version = refinement_evaluation_receipt_schema_version,
         .runtime_template_id = std::string{refinement_runtime_template_id},
@@ -137,14 +139,13 @@ auto refinement_receipt(std::uint64_t cpu_time_ms = 500)
                 .byte_count = 1'024,
                 .complete = true,
             },
-        .evaluator =
-            {
-                .schema = std::string{refinement_evaluator_schema},
-                .fixture_complete = true,
-                .transcript_utf8 = true,
-                .required_literals = 1,
-                .forbidden_literals = 1,
-            },
+        .evaluator = {
+            .schema = std::string{refinement_evaluator_schema},
+            .fixture_complete = true,
+            .transcript_utf8 = true,
+            .required_literals = 1,
+            .forbidden_literals = 1,
+        },
     };
 }
 
@@ -244,15 +245,11 @@ auto concurrent_appends_are_serialized_and_recoverable() -> int {
                 const auto session = "session-" + std::to_string(index);
                 const bool appended =
                     index % 2U == 0
-                        ? writer->append(
-                              session, controller_plan_digest, receipt(500U + index)
-                          )
+                        ? writer->append(session, controller_plan_digest, receipt(500U + index))
                               .has_value()
                         : writer
                               ->append_refinement(
-                                  session,
-                                  controller_plan_digest,
-                                  refinement_receipt(500U + index)
+                                  session, controller_plan_digest, refinement_receipt(500U + index)
                               )
                               .has_value();
                 if (appended) {
@@ -284,8 +281,7 @@ auto mixed_receipts_page_and_recover_without_substitution() -> int {
     REQUIRE(genesis.has_value());
     auto journal = glove::container::receipt_audit_journal::create_new(path, audit_key);
     REQUIRE(journal.has_value());
-    auto resource =
-        (*journal)->append("session-resource", controller_plan_digest, receipt());
+    auto resource = (*journal)->append("session-resource", controller_plan_digest, receipt());
     REQUIRE(resource.has_value());
     auto refinement = (*journal)->append_refinement(
         "session-refinement", controller_plan_digest, refinement_receipt()

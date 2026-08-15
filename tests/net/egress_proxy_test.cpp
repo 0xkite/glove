@@ -223,8 +223,7 @@ auto run() -> int {
         REQUIRE(connection >= 0);
         std::string request =
             "CONNECT localhost:" + std::to_string(unix_origin.port) +
-            " HTTP/1.1\r\nProxy-Authorization: " + unix_proxy->proxy_authorization() +
-            "\r\n\r\n";
+            " HTTP/1.1\r\nProxy-Authorization: " + unix_proxy->proxy_authorization() + "\r\n\r\n";
         REQUIRE(
             ::write(connection, request.data(), request.size()) ==
             static_cast<::ssize_t>(request.size())

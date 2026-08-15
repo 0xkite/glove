@@ -212,7 +212,6 @@ auto minimise_roots(std::vector<std::filesystem::path> paths)
     return roots;
 }
 
-
 constexpr std::uint64_t max_snapshot_bytes = std::uint64_t{2} * 1024U * 1024U * 1024U;
 constexpr std::size_t max_snapshot_entries = 200'000U;
 
@@ -259,9 +258,7 @@ auto append_snapshot_file_digest(
 }
 
 auto snapshot_tree_digest(
-    const std::filesystem::path& root,
-    std::uint64_t* logical_bytes,
-    std::uint64_t* entry_count
+    const std::filesystem::path& root, std::uint64_t* logical_bytes, std::uint64_t* entry_count
 ) -> result<std::string> {
     std::error_code error;
     const auto status = std::filesystem::symlink_status(root, error);
@@ -483,7 +480,6 @@ auto closure_launch_is_trusted(const runtime_dependency_closure& closure) -> boo
            std::ranges::all_of(closure.read_only_paths, path_ancestors_are_launch_trusted);
 }
 
-
 auto snapshot_payload_root(const std::filesystem::path& payload_root, std::size_t index)
     -> std::filesystem::path {
     return payload_root / ("root-" + std::to_string(index));
@@ -660,6 +656,14 @@ auto protect_snapshot_tree(const std::filesystem::path& payload_root) -> result<
 auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> result<bool> {
     std::error_code error;
     if (std::filesystem::exists(plan.snapshot_root, error)) {
+        struct stat metadata{};
+        if (::lstat(plan.snapshot_root.c_str(), &metadata) != 0 || !S_ISDIR(metadata.st_mode) ||
+            metadata.st_uid != ::geteuid() ||
+            (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0500U) {
+            return std::unexpected(
+                std::string{"existing runtime snapshot root is not owner-protected"}
+            );
+        }
         auto existing_digest =
             materialized_snapshot_digest(plan.payload_root, plan.source_roots.size());
         if (!existing_digest || *existing_digest != plan.digest) {
@@ -738,12 +742,9 @@ auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> resul
         remove_temporary();
         return std::unexpected(protected_tree.error());
     }
-    // The published snapshot root is also an adoption trust boundary. Do not
-    // leave its creation mode subject to the operator's umask.
-    if (::chmod(temporary.c_str(), 0500) != 0) {
-        remove_temporary();
-        return std::unexpected(system_error("protect runtime snapshot root"));
-    }
+    // Publish under an owner-only parent before sealing the final root. Some
+    // platforms reject renaming a non-writable directory; the verified 0700
+    // parent prevents another principal from observing this transition.
     if (::rename(temporary.c_str(), plan.snapshot_root.c_str()) != 0) {
         const int rename_error = errno;
         remove_temporary();
@@ -755,6 +756,18 @@ auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> resul
             }
         }
         return std::unexpected(system_error("publish runtime snapshot", rename_error));
+    }
+    if (::chmod(plan.snapshot_root.c_str(), 0500) != 0) {
+        const int protection_error = errno;
+        std::error_code ignored;
+        std::filesystem::permissions(
+            plan.snapshot_root,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::add,
+            ignored
+        );
+        std::filesystem::remove_all(plan.snapshot_root, ignored);
+        return std::unexpected(system_error("protect runtime snapshot root", protection_error));
     }
     return true;
 }

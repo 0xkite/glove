@@ -138,6 +138,7 @@ auto run_runtime(
                 .allowed_path_aliases = {"workspace"},
                 .allowed_projection_destinations = {"libraries"},
                 .launch = launch,
+                .adoption = std::nullopt,
             }},
             .library_projection_destinations = {library_projection_destination_policy{
                 .alias = "libraries",

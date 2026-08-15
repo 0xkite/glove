@@ -134,14 +134,13 @@ auto make_fixture() -> fixture_case {
         .skill_projection_id = binding.candidate.projection_id,
         .skill_projection_digest = binding.candidate.content_digest,
         .matched_context_digest = std::string(64, '0'),
-        .assertions =
-            {
-                .expected_termination = resource_termination_cause::exited,
-                .expected_exit_code = 0,
-                .required_transcript_literals = {"alpha beta", "done"},
-                .forbidden_transcript_literals = {"sandbox escaped"},
-                .max_latency_ms = 1'000,
-            },
+        .assertions = {
+            .expected_termination = resource_termination_cause::exited,
+            .expected_exit_code = 0,
+            .required_transcript_literals = {"alpha beta", "done"},
+            .forbidden_transcript_literals = {"sandbox escaped"},
+            .max_latency_ms = 1'000,
+        },
     };
     fixture.matched_context_digest =
         refinement_fixture_context_digest(fixture, binding.plan_context_digest).value();
@@ -182,13 +181,12 @@ auto run() -> int {
         bytes(test.encoded), test.fixture.session_id, test.binding
     );
     REQUIRE(evaluator.has_value());
-    const std::string transcript =
-        R"({"passed":true,"input_tokens":999999}) alpha beta and done)";
+    const std::string transcript = R"({"passed":true,"input_tokens":999999}) alpha beta and done)";
     REQUIRE((*evaluator)->consume(bytes(transcript.substr(0, 38))).has_value());
     REQUIRE((*evaluator)->consume(bytes(transcript.substr(38))).has_value());
-    auto receipt = (*evaluator)->finish(
-        resource_receipt(transcript.size()), transcript_commitment(transcript)
-    );
+    auto receipt =
+        (*evaluator)
+            ->finish(resource_receipt(transcript.size()), transcript_commitment(transcript));
     REQUIRE(receipt.has_value());
     REQUIRE(receipt->evidence_status == refinement_evidence_status::valid_outcome);
     REQUIRE(receipt->evaluated_outcome.has_value());
@@ -215,12 +213,14 @@ auto run() -> int {
     REQUIRE(terminated.has_value());
     const std::string asserted = "alpha beta done";
     REQUIRE((*terminated)->consume(bytes(asserted)).has_value());
-    auto resource_override = (*terminated)->finish(
-        resource_receipt(
-            asserted.size(), resource_termination_cause::wall_time_limit, std::nullopt
-        ),
-        transcript_commitment(asserted)
-    );
+    auto resource_override =
+        (*terminated)
+            ->finish(
+                resource_receipt(
+                    asserted.size(), resource_termination_cause::wall_time_limit, std::nullopt
+                ),
+                transcript_commitment(asserted)
+            );
     REQUIRE(resource_override.has_value());
     REQUIRE(resource_override->evaluated_outcome->metrics.at("passed") == 0);
 
@@ -229,9 +229,9 @@ auto run() -> int {
     );
     REQUIRE(incomplete.has_value());
     REQUIRE((*incomplete)->consume(bytes(asserted)).has_value());
-    auto invalid_stream = (*incomplete)->finish(
-        resource_receipt(asserted.size()), transcript_commitment(asserted, false)
-    );
+    auto invalid_stream =
+        (*incomplete)
+            ->finish(resource_receipt(asserted.size()), transcript_commitment(asserted, false));
     REQUIRE(invalid_stream.has_value());
     REQUIRE(invalid_stream->evidence_status == refinement_evidence_status::invalid_outcome);
     REQUIRE(!invalid_stream->evaluated_outcome.has_value());
@@ -242,10 +242,10 @@ auto run() -> int {
                  bytes(test.encoded), test.fixture.session_id, wrong_variant
     )
                  .has_value());
-    REQUIRE(!refinement_transcript_evaluator::create(
-                 bytes(test.encoded), "session-other", test.binding
-    )
-                 .has_value());
+    REQUIRE(
+        !refinement_transcript_evaluator::create(bytes(test.encoded), "session-other", test.binding)
+             .has_value()
+    );
 
     auto envelope = make_authenticated_refinement_evaluation_receipt(
         audit_key,
@@ -259,19 +259,11 @@ auto run() -> int {
     auto anchor = receipt_audit_anchor::create(audit_key);
     REQUIRE(anchor.has_value());
     REQUIRE(verify_refinement_receipt_audit_envelope(
-                *envelope,
-                audit_key,
-                test.fixture.session_id,
-                controller_plan_digest,
-                **anchor
+                *envelope, audit_key, test.fixture.session_id, controller_plan_digest, **anchor
     )
                 .has_value());
     REQUIRE(!verify_refinement_receipt_audit_envelope(
-                 *envelope,
-                 audit_key,
-                 test.fixture.session_id,
-                 controller_plan_digest,
-                 **anchor
+                 *envelope, audit_key, test.fixture.session_id, controller_plan_digest, **anchor
     )
                  .has_value());
     return 0;

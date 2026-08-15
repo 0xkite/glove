@@ -1,12 +1,12 @@
 #include "apple_container_session_runtime.hpp"
 
-#include "glove/container/digest.hpp"
 #include "glove/audit/event.hpp"
+#include "glove/container/digest.hpp"
 #include "glove/net/egress_proxy.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
-#include "../container/resource_monitor.hpp"
 #include "../container/linux/pty_session_channel.hpp"
+#include "../container/resource_monitor.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -78,16 +78,20 @@ auto system_error(std::string_view operation, int error_number = errno) -> std::
 class unique_fd {
 public:
     explicit unique_fd(int descriptor = -1) noexcept : descriptor_{descriptor} {}
+
     unique_fd(const unique_fd&) = delete;
     auto operator=(const unique_fd&) -> unique_fd& = delete;
-    unique_fd(unique_fd&& other) noexcept
-        : descriptor_{std::exchange(other.descriptor_, -1)} {}
+
+    unique_fd(unique_fd&& other) noexcept : descriptor_{std::exchange(other.descriptor_, -1)} {}
+
     ~unique_fd() {
         if (descriptor_ >= 0) {
             static_cast<void>(::close(descriptor_));
         }
     }
+
     [[nodiscard]] auto get() const noexcept -> int { return descriptor_; }
+
     [[nodiscard]] auto release() noexcept -> int { return std::exchange(descriptor_, -1); }
 
 private:
@@ -108,6 +112,7 @@ public:
     auto operator=(const credential_lease_bundle&) -> credential_lease_bundle& = delete;
     credential_lease_bundle(credential_lease_bundle&&) noexcept = default;
     auto operator=(credential_lease_bundle&&) -> credential_lease_bundle& = delete;
+
     ~credential_lease_bundle() {
         locks_.clear();
         if (!directory_.empty()) {
@@ -130,6 +135,7 @@ public:
     auto operator=(const egress_broker_bundle&) -> egress_broker_bundle& = delete;
     egress_broker_bundle(egress_broker_bundle&&) noexcept = default;
     auto operator=(egress_broker_bundle&&) -> egress_broker_bundle& = delete;
+
     ~egress_broker_bundle() {
         proxy_.reset();
         if (!directory_.empty()) {
@@ -149,6 +155,7 @@ public:
     auto operator=(const projection_lease_bundle&) -> projection_lease_bundle& = delete;
     projection_lease_bundle(projection_lease_bundle&&) noexcept = default;
     auto operator=(projection_lease_bundle&&) -> projection_lease_bundle& = delete;
+
     ~projection_lease_bundle() {
         if (!directory_.empty()) {
             std::error_code ignored;
@@ -233,7 +240,8 @@ auto run_command(const std::filesystem::path& executable, const std::vector<std:
 auto delete_instance_verified(
     const apple_container_runtime_config& config, std::string_view instance_id
 ) -> std::expected<void, std::string> {
-    auto removed = run_command(config.container_cli, {"delete", "--force", std::string{instance_id}});
+    auto removed =
+        run_command(config.container_cli, {"delete", "--force", std::string{instance_id}});
     if (!removed || removed->exit_code != 0) {
         return std::unexpected(
             removed ? std::string{"delete Apple Container session: "} + removed->output
@@ -253,7 +261,7 @@ auto delete_instance_verified(
 auto remove_owner_only_directory(
     const std::filesystem::path& root, const std::filesystem::path& directory
 ) -> std::expected<void, std::string> {
-    struct stat root_status {};
+    struct stat root_status{};
     if (::lstat(root.c_str(), &root_status) != 0) {
         if (errno == ENOENT) {
             return {};
@@ -267,7 +275,7 @@ auto remove_owner_only_directory(
             root.string()
         );
     }
-    struct stat directory_status {};
+    struct stat directory_status{};
     if (::lstat(directory.c_str(), &directory_status) != 0) {
         if (errno == ENOENT) {
             return {};
@@ -382,7 +390,7 @@ auto resolve_credential_leases(
     if (root_created && ::chmod(root.c_str(), 0700) != 0) {
         return std::unexpected(system_error("protect Apple Container credential root"));
     }
-    struct stat root_status {};
+    struct stat root_status{};
     if (::lstat(root.c_str(), &root_status) != 0 || !S_ISDIR(root_status.st_mode) ||
         root_status.st_uid != ::geteuid() ||
         (static_cast<unsigned int>(root_status.st_mode) & 0777U) != 0700U) {
@@ -394,23 +402,19 @@ auto resolve_credential_leases(
     if (!std::filesystem::create_directory(result.directory_, filesystem_error) ||
         ::chmod(result.directory_.c_str(), 0700) != 0) {
         return std::unexpected(
-            filesystem_error
-                ? std::string{"create Apple Container credential lease: "} +
-                      filesystem_error.message()
-                : system_error("protect Apple Container credential lease")
+            filesystem_error ? std::string{"create Apple Container credential lease: "} +
+                                   filesystem_error.message()
+                             : system_error("protect Apple Container credential lease")
         );
     }
     result.locks_.reserve(policies.size());
     result.commitments_.reserve(policies.size());
     for (const auto& policy : policies) {
-        unique_fd source{::open(
-            policy.source_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW
-        )};
-        struct stat before {};
-        if (source.get() < 0 || ::fstat(source.get(), &before) != 0 ||
-            !S_ISREG(before.st_mode) || before.st_uid != ::geteuid() || before.st_nlink != 1 ||
-            (static_cast<unsigned int>(before.st_mode) & 0777U) != 0600U ||
-            before.st_size <= 0 ||
+        unique_fd source{::open(policy.source_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+        struct stat before{};
+        if (source.get() < 0 || ::fstat(source.get(), &before) != 0 || !S_ISREG(before.st_mode) ||
+            before.st_uid != ::geteuid() || before.st_nlink != 1 ||
+            (static_cast<unsigned int>(before.st_mode) & 0777U) != 0600U || before.st_size <= 0 ||
             static_cast<std::uint64_t>(before.st_size) > max_secret_file_bytes) {
             return std::unexpected(
                 std::string{"credential handle is not an owner-only bounded regular file: "} +
@@ -422,11 +426,9 @@ auto resolve_credential_leases(
             return std::unexpected(source_digest.error());
         }
         const auto lease_path = result.directory_ / policy.handle;
-        unique_fd lease{::open(
-            lease_path.c_str(),
-            O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-            0600
-        )};
+        unique_fd lease{
+            ::open(lease_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)
+        };
         if (lease.get() < 0 || ::flock(lease.get(), LOCK_EX | LOCK_NB) != 0) {
             return std::unexpected(system_error("create Apple Container credential lease"));
         }
@@ -435,7 +437,7 @@ auto resolve_credential_leases(
             !copied) {
             return std::unexpected(copied.error());
         }
-        struct stat after {};
+        struct stat after{};
         auto lease_digest = container::sha256_fd_hex(lease.get(), max_secret_file_bytes);
         if (!lease_digest || *lease_digest != *source_digest ||
             ::fstat(source.get(), &after) != 0 || before.st_dev != after.st_dev ||
@@ -467,7 +469,9 @@ auto start_egress_broker(
     }
     if (!config.egress_audit || !config.harness_closure_digest) {
         return std::unexpected(
-            std::string{"online Apple Container session requires a managed closure and durable audit"}
+            std::string{
+                "online Apple Container session requires a managed closure and durable audit"
+            }
         );
     }
     const auto root = config.session_root / ".e";
@@ -476,12 +480,12 @@ auto start_egress_broker(
     if ((!root_created && filesystem_error && filesystem_error != std::errc::file_exists) ||
         (root_created && ::chmod(root.c_str(), 0700) != 0)) {
         return std::unexpected(
-            filesystem_error ? std::string{"create Apple egress root: "} +
-                                   filesystem_error.message()
-                             : system_error("protect Apple egress root")
+            filesystem_error
+                ? std::string{"create Apple egress root: "} + filesystem_error.message()
+                : system_error("protect Apple egress root")
         );
     }
-    struct stat root_status {};
+    struct stat root_status{};
     if (::lstat(root.c_str(), &root_status) != 0 || !S_ISDIR(root_status.st_mode) ||
         root_status.st_uid != ::geteuid() ||
         (static_cast<unsigned int>(root_status.st_mode) & 0777U) != 0700U) {
@@ -491,9 +495,9 @@ auto start_egress_broker(
     if (!std::filesystem::create_directory(result.directory_, filesystem_error) ||
         ::chmod(result.directory_.c_str(), 0700) != 0) {
         return std::unexpected(
-            filesystem_error ? std::string{"create Apple egress lease: "} +
-                                   filesystem_error.message()
-                             : system_error("protect Apple egress lease")
+            filesystem_error
+                ? std::string{"create Apple egress lease: "} + filesystem_error.message()
+                : system_error("protect Apple egress lease")
         );
     }
     net::egress_options options;
@@ -512,17 +516,16 @@ auto start_egress_broker(
                        ) -> std::expected<void, std::string> {
         return sink->record({
             .what = audit::action::egress,
-            .tool_name = session_id + ":" + policy_id + ":" + event.host + ":" +
-                         std::to_string(event.port),
+            .tool_name =
+                session_id + ":" + policy_id + ":" + event.host + ":" + std::to_string(event.port),
             .arguments_json = {},
             .status = event.allowed ? mcp::tool_call_status::ok
                                     : mcp::tool_call_status::invalid_arguments,
             .error_message = event.detail,
         });
     };
-    auto proxy = net::start_egress_proxy_on_unix_socket(
-        std::move(options), result.directory_ / "s", 31'820
-    );
+    auto proxy =
+        net::start_egress_proxy_on_unix_socket(std::move(options), result.directory_ / "s", 31'820);
     if (!proxy) {
         return std::unexpected(std::string{"start Apple audited egress broker: "} + proxy.error());
     }
@@ -562,12 +565,12 @@ auto resolve_projection_lease(
     if ((!root_created && filesystem_error && filesystem_error != std::errc::file_exists) ||
         (root_created && ::chmod(root.c_str(), 0700) != 0)) {
         return std::unexpected(
-            filesystem_error ? std::string{"create Apple projection root: "} +
-                                   filesystem_error.message()
-                             : system_error("protect Apple projection root")
+            filesystem_error
+                ? std::string{"create Apple projection root: "} + filesystem_error.message()
+                : system_error("protect Apple projection root")
         );
     }
-    struct stat root_status {};
+    struct stat root_status{};
     if (::lstat(root.c_str(), &root_status) != 0 || !S_ISDIR(root_status.st_mode) ||
         root_status.st_uid != ::geteuid() ||
         (static_cast<unsigned int>(root_status.st_mode) & 0777U) != 0700U) {
@@ -580,9 +583,9 @@ auto resolve_projection_lease(
         !std::filesystem::create_directory(home, filesystem_error) ||
         ::chmod(home.c_str(), 0700) != 0) {
         return std::unexpected(
-            filesystem_error ? std::string{"create Apple projection lease: "} +
-                                   filesystem_error.message()
-                             : system_error("protect Apple projection lease")
+            filesystem_error
+                ? std::string{"create Apple projection lease: "} + filesystem_error.message()
+                : system_error("protect Apple projection lease")
         );
     }
     unique_fd home_descriptor{
@@ -701,7 +704,8 @@ auto converted_limits(const supervisor::resource_limits& limits) -> container::r
     };
 }
 
-auto registry_error(std::string_view operation, const session_registry_error& error) -> std::string {
+auto registry_error(std::string_view operation, const session_registry_error& error)
+    -> std::string {
     return std::string{operation} + ": " + error.message;
 }
 
@@ -797,8 +801,7 @@ public:
         return channel_->write_input(bytes);
     }
 
-    auto resize(std::uint16_t rows, std::uint16_t columns)
-        -> std::expected<void, std::string> {
+    auto resize(std::uint16_t rows, std::uint16_t columns) -> std::expected<void, std::string> {
         return channel_->resize(rows, columns);
     }
 
@@ -830,13 +833,14 @@ public:
             running_, idempotency_key, std::max(current_epoch_ms(), started_at_ms_)
         );
         if (!stopping && stopping.error().code != session_registry_error_code::invalid_state) {
-            return std::unexpected(registry_error(
-                "persist Apple Container stopping intent", stopping.error()
-            ));
+            return std::unexpected(
+                registry_error("persist Apple Container stopping intent", stopping.error())
+            );
         }
         auto killed =
             run_command(config_.container_cli, {"kill", running_.runtime_identity.instance_id});
-        if (!killed || (killed->exit_code != 0 && killed->output.find("not found") == std::string::npos)) {
+        if (!killed ||
+            (killed->exit_code != 0 && killed->output.find("not found") == std::string::npos)) {
             static_cast<void>(::killpg(attach_pid_, SIGTERM));
             return killed ? std::unexpected(
                                 std::string{"kill Apple Container session: "} + killed->output
@@ -862,6 +866,7 @@ public:
     }
 
     void preserve_credential_leases() noexcept { credential_leases_.preserve(); }
+
     void preserve_projection_lease() noexcept { projection_lease_.preserve(); }
 
 private:
@@ -907,8 +912,7 @@ private:
             monitor_->finish();
             static_cast<void>(channel_->finish_draining());
             const auto snapshot = monitor_->snapshot();
-            auto removed =
-                delete_instance_verified(config_, running_.runtime_identity.instance_id);
+            auto removed = delete_instance_verified(config_, running_.runtime_identity.instance_id);
             if (!removed) {
                 credential_leases_.preserve();
                 projection_lease_.preserve();
@@ -916,11 +920,10 @@ private:
                 return;
             }
             const auto finished_at_ms = std::max(current_epoch_ms(), started_at_ms_);
-            container::resource_termination_cause cause =
-                snapshot.forced_cause.value_or(
-                    WIFEXITED(status) ? container::resource_termination_cause::exited
-                                      : container::resource_termination_cause::signaled
-                );
+            container::resource_termination_cause cause = snapshot.forced_cause.value_or(
+                WIFEXITED(status) ? container::resource_termination_cause::exited
+                                  : container::resource_termination_cause::signaled
+            );
             std::optional<int> exit_code;
             if (cause == container::resource_termination_cause::exited && WIFEXITED(status)) {
                 exit_code = WEXITSTATUS(status);
@@ -1046,8 +1049,7 @@ auto validate_config(const apple_container_runtime_config& config)
     -> std::expected<void, std::string> {
     if (!config.container_cli.is_absolute() || !config.session_root.is_absolute() ||
         config.image_reference.empty() || config.image_reference.size() > 256U ||
-        config.image_digest.size() != 71U ||
-        !config.image_digest.starts_with("sha256:") ||
+        config.image_digest.size() != 71U || !config.image_digest.starts_with("sha256:") ||
         !valid_digest(std::string_view{config.image_digest}.substr(7)) ||
         config.max_sessions == 0 || config.max_sessions > 1024U) {
         return std::unexpected(std::string{"invalid Apple Container runtime configuration"});
@@ -1058,24 +1060,24 @@ auto validate_config(const apple_container_runtime_config& config)
          !valid_digest(std::string_view{*config.harness_closure_digest}.substr(7)))) {
         return std::unexpected(std::string{"invalid Apple Container harness closure digest"});
     }
-    struct stat cli_status {};
-    struct stat root_status {};
-    if (::stat(config.container_cli.c_str(), &cli_status) != 0 ||
-        !S_ISREG(cli_status.st_mode) || (cli_status.st_mode & 0111U) == 0 ||
-        ::lstat(config.session_root.c_str(), &root_status) != 0 ||
-        !S_ISDIR(root_status.st_mode) || root_status.st_uid != ::geteuid() ||
+    struct stat cli_status{};
+    struct stat root_status{};
+    if (::stat(config.container_cli.c_str(), &cli_status) != 0 || !S_ISREG(cli_status.st_mode) ||
+        (cli_status.st_mode & 0111U) == 0 ||
+        ::lstat(config.session_root.c_str(), &root_status) != 0 || !S_ISDIR(root_status.st_mode) ||
+        root_status.st_uid != ::geteuid() ||
         (static_cast<unsigned int>(root_status.st_mode) & 0777U) != 0700U) {
         return std::unexpected(
             std::string{"Apple Container CLI or owner-only session root is unavailable"}
         );
     }
-    auto inspected = run_command(config.container_cli, {"image", "inspect", config.image_reference});
+    auto inspected =
+        run_command(config.container_cli, {"image", "inspect", config.image_reference});
     const bool closure_matches =
         !config.harness_closure_digest ||
         (inspected &&
-         inspected->output.find(
-             "dev.sage.glove.harness-closure-schema\" : \"1\""
-         ) != std::string::npos &&
+         inspected->output.find("dev.sage.glove.harness-closure-schema\" : \"1\"") !=
+             std::string::npos &&
          inspected->output.find(config.harness_closure_digest->substr(7)) != std::string::npos);
     if (!inspected || inspected->exit_code != 0 ||
         inspected->output.find(config.image_digest) == std::string::npos || !closure_matches) {
@@ -1091,9 +1093,10 @@ auto spawn_attach(
     const apple_container_runtime_config& config,
     std::string_view instance_id,
     const std::shared_ptr<container::detail::wall_output_monitor>& monitor
-) -> std::expected<
-    std::pair<::pid_t, std::unique_ptr<container::linux_detail::pty_session_channel>>,
-    std::string> {
+)
+    -> std::expected<
+        std::pair<::pid_t, std::unique_ptr<container::linux_detail::pty_session_channel>>,
+        std::string> {
     auto pair = container::linux_detail::open_pty_pair();
     if (!pair) {
         return std::unexpected(pair.error());
@@ -1192,9 +1195,9 @@ auto apple_container_session_runtime::reconcile(
     }
     auto candidates = state_->registry->managed_recovery_candidates();
     if (!candidates) {
-        return std::unexpected(registry_error(
-            "read Apple Container recovery candidates", candidates.error()
-        ));
+        return std::unexpected(
+            registry_error("read Apple Container recovery candidates", candidates.error())
+        );
     }
     session_reconciliation_report report;
     for (const auto& candidate : *candidates) {
@@ -1224,10 +1227,9 @@ auto apple_container_session_runtime::reconcile(
                 report.unresolved_running_session_ids.push_back(candidate.session.session_id);
                 continue;
             }
-            if (auto removed =
-                    remove_managed_artifacts(
-                        state_->config, candidate.runtime_identity.instance_id
-                    );
+            if (auto removed = remove_managed_artifacts(
+                    state_->config, candidate.runtime_identity.instance_id
+                );
                 !removed) {
                 return std::unexpected(removed.error());
             }
@@ -1237,9 +1239,9 @@ auto apple_container_session_runtime::reconcile(
                 "apple-reconcile-terminal." + candidate.session.session_id
             );
             if (!exited) {
-                return std::unexpected(registry_error(
-                    "recover Apple Container terminal receipt", exited.error()
-                ));
+                return std::unexpected(
+                    registry_error("recover Apple Container terminal receipt", exited.error())
+                );
             }
             ++report.recovered_exited;
             continue;
@@ -1253,12 +1255,10 @@ auto apple_container_session_runtime::reconcile(
                 continue;
             }
             static_cast<void>(run_command(
-                state_->config.container_cli,
-                {"kill", candidate.runtime_identity.instance_id}
+                state_->config.container_cli, {"kill", candidate.runtime_identity.instance_id}
             ));
-            auto removed = delete_instance_verified(
-                state_->config, candidate.runtime_identity.instance_id
-            );
+            auto removed =
+                delete_instance_verified(state_->config, candidate.runtime_identity.instance_id);
             if (!removed) {
                 report.unresolved_running_session_ids.push_back(candidate.session.session_id);
                 continue;
@@ -1267,9 +1267,7 @@ auto apple_container_session_runtime::reconcile(
             ++report.recovered_terminated;
         }
         if (auto removed =
-                remove_managed_artifacts(
-                    state_->config, candidate.runtime_identity.instance_id
-                );
+                remove_managed_artifacts(state_->config, candidate.runtime_identity.instance_id);
             !removed) {
             return std::unexpected(removed.error());
         }
@@ -1317,9 +1315,7 @@ auto apple_container_session_runtime::start(
         authorization, std::string{idempotency_namespace} + ".reserve", now_ms
     );
     if (!reserved) {
-        return std::unexpected(
-            registry_error("reserve Apple Container session", reserved.error())
-        );
+        return std::unexpected(registry_error("reserve Apple Container session", reserved.error()));
     }
     auto current = state_->registry->status(authorization.session_id);
     if (!current) {
@@ -1333,7 +1329,9 @@ auto apple_container_session_runtime::start(
     {
         std::lock_guard lock{state_->sessions_mutex};
         if (state_->sessions.contains(authorization.session_id)) {
-            return std::unexpected(std::string{"Apple Container live-session index is inconsistent"});
+            return std::unexpected(
+                std::string{"Apple Container live-session index is inconsistent"}
+            );
         }
         if (state_->sessions.size() >= state_->config.max_sessions) {
             return std::unexpected(std::string{"Apple Container live-session capacity exhausted"});
@@ -1349,10 +1347,9 @@ auto apple_container_session_runtime::start(
     }
     const auto managed_adapter =
         supervisor::native_skill_runtime_adapter_for(inputs->launch.runtime_id);
-    const bool managed_closure =
-        state_->config.harness_closure_digest &&
-        ((managed_adapter && inputs->launch.runtime_id != "codex") ||
-         inputs->launch.runtime_id == "glove-egress-probe");
+    const bool managed_closure = state_->config.harness_closure_digest &&
+                                 ((managed_adapter && inputs->launch.runtime_id != "codex") ||
+                                  inputs->launch.runtime_id == "glove-egress-probe");
     const bool online = !inputs->launch.egress_targets.empty();
     if (inputs->launch.backend != supervisor::sandbox_backend::apple_container ||
         (online ? (!managed_closure || inputs->launch.egress_policy_id == "no-network")
@@ -1362,10 +1359,12 @@ auto apple_container_session_runtime::start(
         !inputs->launch.read_only_paths.empty() || inputs->launch.argv.empty() ||
         !std::filesystem::path{inputs->launch.argv.front()}.is_absolute() ||
         (!inputs->launch.secret_mounts.empty() && !managed_closure)) {
-        return std::unexpected(std::string{
-            "Apple Container managed launch currently requires an image-contained no-network "
-            "closure without host path or library projections"
-        });
+        return std::unexpected(
+            std::string{
+                "Apple Container managed launch currently requires an image-contained no-network "
+                "closure without host path or library projections"
+            }
+        );
     }
     auto instance = instance_identity(authorization.session_id);
     if (!instance) {
@@ -1386,10 +1385,7 @@ auto apple_container_session_runtime::start(
         return std::unexpected(projection_lease.error());
     }
     auto profile = profile_digest(
-        *inputs,
-        state_->config,
-        credential_leases->commitments_,
-        projection_lease->digest_
+        *inputs, state_->config, credential_leases->commitments_, projection_lease->digest_
     );
     if (!profile) {
         return std::unexpected(profile.error());
@@ -1422,9 +1418,8 @@ auto apple_container_session_runtime::start(
             std::string{"reserve Apple Container terminal receipt: "} + reservation.error()
         );
     }
-    const auto cpu_seconds = std::max<std::uint64_t>(
-        1U, (inputs->launch.limits.cpu_time_ms + 999U) / 1'000U
-    );
+    const auto cpu_seconds =
+        std::max<std::uint64_t>(1U, (inputs->launch.limits.cpu_time_ms + 999U) / 1'000U);
     std::vector<std::string> create_arguments{
         "create",
         "--name",
@@ -1470,26 +1465,22 @@ auto apple_container_session_runtime::start(
     for (const auto& credential : credential_leases->commitments_) {
         create_arguments.push_back("--volume");
         create_arguments.push_back(
-            (credential_leases->directory_ / credential.handle).string() +
-            ":/run/glove-secrets/" + credential.handle + ":ro"
+            (credential_leases->directory_ / credential.handle).string() + ":/run/glove-secrets/" +
+            credential.handle + ":ro"
         );
     }
     if (egress_broker->proxy_) {
         create_arguments.push_back("--volume");
         create_arguments.push_back(
-            (egress_broker->directory_ / "s").string() +
-            ":/run/glove-services/egress.sock"
+            (egress_broker->directory_ / "s").string() + ":/run/glove-services/egress.sock"
         );
         create_arguments.push_back("--env");
-        create_arguments.push_back(
-            "GLOVE_EGRESS_PROXY_URL=" + egress_broker->proxy_->proxy_url()
-        );
+        create_arguments.push_back("GLOVE_EGRESS_PROXY_URL=" + egress_broker->proxy_->proxy_url());
     }
     if (projection_lease->digest_) {
         create_arguments.push_back("--volume");
         create_arguments.push_back(
-            (projection_lease->directory_ / "home").string() +
-            ":/run/glove-projections/home:ro"
+            (projection_lease->directory_ / "home").string() + ":/run/glove-projections/home:ro"
         );
     }
     for (const auto& environment : inputs->launch.environment) {
@@ -1525,15 +1516,14 @@ auto apple_container_session_runtime::start(
         if (!inspected_after_failure) {
             credential_leases->preserve();
             projection_lease->preserve();
-            cleanup_error = "; partial create state could not be inspected: " +
-                            inspected_after_failure.error();
+            cleanup_error =
+                "; partial create state could not be inspected: " + inspected_after_failure.error();
         } else if (inspected_after_failure->exit_code == 0) {
             if (inspected_after_failure->output.find(runtime_identity.launch_identity_digest) ==
                 std::string::npos) {
                 credential_leases->preserve();
                 projection_lease->preserve();
-                cleanup_error =
-                    "; partial create identity mismatch; instance and leases preserved";
+                cleanup_error = "; partial create identity mismatch; instance and leases preserved";
             } else {
                 auto removed =
                     delete_instance_verified(state_->config, runtime_identity.instance_id);
@@ -1580,10 +1570,7 @@ auto apple_container_session_runtime::start(
         .runtime_identity = runtime_identity,
     };
     auto starting = state_->registry->mark_managed_starting(
-        binding,
-        *reservation,
-        std::string{idempotency_namespace} + ".starting",
-        now_ms
+        binding, *reservation, std::string{idempotency_namespace} + ".starting", now_ms
     );
     if (!starting) {
         auto cleanup_error = remove_created_instance();
@@ -1759,8 +1746,7 @@ auto apple_container_session_runtime::write_input(
     std::string_view session_id, std::string_view bytes
 ) -> std::expected<void, std::string> {
     auto session = lookup(*state_, session_id);
-    return session ? (*session)->write_input(bytes)
-                   : std::unexpected(std::move(session.error()));
+    return session ? (*session)->write_input(bytes) : std::unexpected(std::move(session.error()));
 }
 
 auto apple_container_session_runtime::resize(
@@ -1771,12 +1757,10 @@ auto apple_container_session_runtime::resize(
                    : std::unexpected(std::move(session.error()));
 }
 
-auto apple_container_session_runtime::signal(
-    std::string_view session_id, session_signal requested
-) -> std::expected<void, std::string> {
+auto apple_container_session_runtime::signal(std::string_view session_id, session_signal requested)
+    -> std::expected<void, std::string> {
     auto session = lookup(*state_, session_id);
-    return session ? (*session)->signal(requested)
-                   : std::unexpected(std::move(session.error()));
+    return session ? (*session)->signal(requested) : std::unexpected(std::move(session.error()));
 }
 
 auto apple_container_session_runtime::stop(std::string_view session_id)
@@ -1809,7 +1793,9 @@ auto apple_container_session_runtime::cleanup(std::string_view session_id)
         return std::unexpected(std::string{"Apple Container session is not live"});
     }
     if (!found->second->finished()) {
-        return std::unexpected(std::string{"Apple Container session has not reached terminal state"});
+        return std::unexpected(
+            std::string{"Apple Container session has not reached terminal state"}
+        );
     }
     state_->sessions.erase(found);
     return {};

@@ -752,6 +752,7 @@ auto run() -> int {
         .path_exposure_policy = exposure_policy_path,
         .path_exposure_journal = exposure_journal_path,
         .apple_container = std::nullopt,
+        .remote_backend = std::nullopt,
     };
     const auto encoded_config = glove::host::encode_config(host_config);
     REQUIRE(encoded_config.has_value());

@@ -21,6 +21,7 @@ namespace {
         .session_epoch = "00112233445566778899aabbccddeeff",
         .descriptor_digest = "sha256:" + std::string(64U, 'd'),
         .idempotency_key = std::move(key),
+        .payload_digest = {},
     };
 }
 
@@ -121,6 +122,7 @@ auto main() -> int {
                 .session_epoch = "not-an-owner-epoch",
                 .descriptor_digest = "sha256:" + std::string(64U, 'd'),
                 .idempotency_key = "key",
+                .payload_digest = {},
             }
         }
     );

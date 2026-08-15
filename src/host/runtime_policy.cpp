@@ -917,6 +917,7 @@ auto generate_runtime_policy(const runtime_policy_generation_options& options)
         .allowed_path_aliases = std::move(*aliases),
         .allowed_projection_destinations = std::move(*destinations),
         .launch = std::move(launch),
+        .adoption = std::nullopt,
     };
     auto json = glz::write_json(encoded);
     if (!json) {

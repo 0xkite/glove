@@ -1,16 +1,15 @@
 #include "glove/audit/event.hpp"
 #include "glove/audit/sink.hpp"
 
-#include <glaze/glaze.hpp>
-
 #include <fcntl.h>
+#include <glaze/glaze.hpp>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
-#include <cerrno>
 #include <expected>
 #include <filesystem>
 #include <memory>

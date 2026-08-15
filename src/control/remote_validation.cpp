@@ -190,6 +190,8 @@ template<typename Value>
         .descriptor_digest = binding.descriptor_digest,
         .idempotency_key = binding.idempotency_key,
         .payload_digest = binding.payload_digest,
+        .cursor = std::nullopt,
+        .max_bytes = std::nullopt,
     };
     if (const auto* read = std::get_if<remote_read_payload>(&payload); read != nullptr) {
         encoded.cursor = read->cursor;

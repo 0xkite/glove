@@ -461,8 +461,7 @@ auto receipt_audit_producer::commit_refinement_terminal(
             std::string{"terminal reservation does not match the refinement execution"}
         );
     }
-    auto appended =
-        journal_->append_refinement(session_id, controller_plan_digest, receipt);
+    auto appended = journal_->append_refinement(session_id, controller_plan_digest, receipt);
     reservation.release();
     return appended;
 }
@@ -491,8 +490,7 @@ auto receipt_audit_producer::refinement_terminal_for_execution(
     std::string_view session_id,
     std::string_view controller_plan_digest,
     std::string_view profile_digest
-) const
-    -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string> {
+) const -> std::expected<std::optional<authenticated_refinement_evaluation_receipt>, std::string> {
     return journal_->refinement_terminal_for_execution(
         session_id, controller_plan_digest, profile_digest
     );

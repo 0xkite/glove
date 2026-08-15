@@ -247,6 +247,9 @@ auto run(const std::filesystem::path& self) -> int {
     auto proxy = glove::net::start_egress_proxy(std::move(egress_options));
     REQUIRE(proxy.has_value());
     glove::container::profile online = prof;
+    // LeakSanitizer cannot trace the nested exec after it enters the isolated
+    // PID namespace. Keep ASan/UBSan active and disable only child leak tracing.
+    online.environment.emplace_back("ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0");
     online.proxy = glove::container::proxy_settings{
         .port = (*proxy)->port(),
         .url = (*proxy)->proxy_url(),

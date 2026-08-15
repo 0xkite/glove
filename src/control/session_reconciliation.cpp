@@ -144,8 +144,7 @@ auto reconcile_session_registry_impl(
             continue;
         }
         std::optional<container::authenticated_resource_enforcement_receipt> terminal;
-        std::optional<container::authenticated_refinement_evaluation_receipt>
-            refinement_terminal;
+        std::optional<container::authenticated_refinement_evaluation_receipt> refinement_terminal;
         if (candidate.requires_refinement_receipt) {
             auto found = receipt_producer.refinement_terminal_for_execution(
                 candidate.session.session_id,
@@ -180,15 +179,12 @@ auto reconcile_session_registry_impl(
             }
             continue;
         }
-        const auto sequence =
-            terminal ? terminal->sequence : refinement_terminal->sequence;
+        const auto sequence = terminal ? terminal->sequence : refinement_terminal->sequence;
         const auto idempotency_key = "recovery-exit-" + std::to_string(sequence);
-        auto exited =
-            terminal
-                ? registry.mark_exited(*terminal, receipt_producer, idempotency_key)
-                : registry.mark_refinement_exited(
-                      *refinement_terminal, receipt_producer, idempotency_key
-                  );
+        auto exited = terminal ? registry.mark_exited(*terminal, receipt_producer, idempotency_key)
+                               : registry.mark_refinement_exited(
+                                     *refinement_terminal, receipt_producer, idempotency_key
+                                 );
         if (!exited) {
             return std::unexpected(
                 registry_error("project durable terminal receipt", exited.error())
