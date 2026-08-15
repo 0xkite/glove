@@ -1,6 +1,9 @@
 add_library(glove_control STATIC
     receipt_audit_protocol.cpp
     receipt_audit_unix_server.cpp
+    receipt_handlers.cpp
+    receipt_path_handlers.cpp
+    receipt_session_handlers.cpp
     receipt_wire.cpp
     remote_protocol.cpp
     remote_session_runtime.cpp
