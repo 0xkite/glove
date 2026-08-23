@@ -2,6 +2,8 @@
 #include "glove/container/profile.hpp"
 #include "glove/container/receipt_chain.hpp"
 #include "glove/container/receipt_producer.hpp"
+#include "glove/host/runtime_policy.hpp"
+#include "glove/supervisor/harness_adoption.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/linux_session_filesystem.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
@@ -23,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -92,6 +95,54 @@ auto epoch_ms() -> std::uint64_t {
     );
 }
 
+auto make_pi_adoption(const std::filesystem::path& root, std::string_view name)
+    -> std::expected<glove::supervisor::resolved_native_harness_adoption, std::string> {
+    const auto fixture_root = root / std::string{name};
+    const auto settings_path = fixture_root / "source/settings.json";
+    const auto package_root = fixture_root / "store/example-extension";
+    std::error_code error;
+    if (!std::filesystem::create_directories(settings_path.parent_path(), error) || error ||
+        !std::filesystem::create_directories(package_root, error) || error ||
+        ::chmod(fixture_root.c_str(), 0700) != 0) {
+        return std::unexpected(std::string{"create Pi adoption fixture"});
+    }
+    {
+        std::ofstream settings{settings_path, std::ios::binary | std::ios::trunc};
+        std::ofstream package{package_root / "package.json", std::ios::binary | std::ios::trunc};
+        std::ofstream entry{package_root / "index.js", std::ios::binary | std::ios::trunc};
+        settings << R"({"packages":["npm:example-extension"]})";
+        package << R"({"name":"example-extension","dependencies":{}})";
+        entry << "export default {};\n";
+    }
+    if (::chmod(settings_path.c_str(), 0600) != 0 ||
+        ::chmod((package_root / "package.json").c_str(), 0600) != 0 ||
+        ::chmod((package_root / "index.js").c_str(), 0600) != 0) {
+        return std::unexpected(std::string{"protect Pi adoption fixture"});
+    }
+    const auto protected_directory = fixture_root / "protected";
+    auto generated = glove::host::generate_pi_adoption_manifest({
+        .settings_path = settings_path,
+        .package_store_root = fixture_root / "store",
+        .protected_directory = protected_directory,
+        .dry_run = false,
+    });
+    if (!generated) {
+        return std::unexpected(generated.error());
+    }
+    const auto canonical_root = std::filesystem::canonical(protected_directory, error);
+    if (error) {
+        return std::unexpected(std::string{"canonicalize Pi adoption fixture"});
+    }
+    return glove::supervisor::resolve_native_harness_adoption(
+        {
+            .manifest_root = canonical_root.string(),
+            .manifest_digest = generated->manifest_digest,
+            .snapshot_digest = generated->snapshot_digest,
+        },
+        "pi"
+    );
+}
+
 auto policy_for(const requested_alias& requested, std::uint64_t quota)
     -> glove::supervisor::path_alias_policy {
     const bool read_only = requested.access == glove::supervisor::path_access::read;
@@ -120,7 +171,8 @@ auto make_lifecycle(
     std::string_view session_id,
     const resource_limits& limits,
     std::vector<glove::supervisor::resolved_library_projection>&& library_projections = {},
-    std::string_view runtime_id = {}
+    std::string_view runtime_id = {},
+    std::optional<glove::supervisor::resolved_native_harness_adoption>&& adoption = {}
 ) -> std::expected<std::unique_ptr<linux_resource_lifecycle>, std::string> {
     std::vector<glove::supervisor::resolved_path_grant> grants;
     if (!requested_aliases.empty()) {
@@ -155,7 +207,8 @@ auto make_lifecycle(
         limits.disk_bytes,
         std::move(grants),
         std::move(library_projections),
-        runtime_id
+        runtime_id,
+        std::move(adoption)
     );
     if (!filesystem) {
         return std::unexpected(filesystem.error());
@@ -524,6 +577,12 @@ auto codex_runtime_context_test(
             .target_path = "/opt/sage/library-bundles",
         }});
         REQUIRE(native_projections.has_value());
+        std::optional<glove::supervisor::resolved_native_harness_adoption> adoption;
+        if (runtime.runtime_id == "pi") {
+            auto resolved = make_pi_adoption(materialization_root.parent_path(), "pi-context");
+            REQUIRE(resolved.has_value());
+            adoption.emplace(std::move(*resolved));
+        }
         auto native_lifecycle = make_lifecycle(
             root,
             materialization_root,
@@ -531,7 +590,8 @@ auto codex_runtime_context_test(
             std::string{"managed-"} + std::string{runtime.runtime_id} + "-context",
             limits,
             std::move(*native_projections),
-            runtime.runtime_id
+            runtime.runtime_id,
+            std::move(adoption)
         );
         REQUIRE(native_lifecycle.has_value());
         auto native_profile = launch_profile(limits);
@@ -567,23 +627,60 @@ auto codex_runtime_context_test(
     return 0;
 }
 
+struct native_harness_case {
+    std::string_view runtime_id;
+    std::string_view executable;
+};
+
+constexpr std::array<native_harness_case, 5> native_harnesses{{
+    {"codex", "codex"},
+    {"claude-code", "claude"},
+    {"pi", "pi"},
+    {"copilot", "copilot"},
+    {"opencode", "opencode"},
+}};
+
 // A test-only image supplies pinned, operator-like harness installations under
 // this one read-only runtime root. The regular containment image intentionally
 // has no vendor client, so ordinary unit and workflow lanes retain that guard.
+auto resolve_native_harness_root() -> std::expected<std::filesystem::path, std::string> {
+    const char* configured_root = ::getenv("GLOVE_TEST_NATIVE_HARNESS_ROOT");
+    if (configured_root == nullptr || *configured_root == '\0') {
+        return std::unexpected("GLOVE_TEST_NATIVE_HARNESS_ROOT is not configured");
+    }
+    std::error_code error;
+    auto harness_root = std::filesystem::canonical(configured_root, error);
+    if (error || !std::filesystem::is_directory(harness_root)) {
+        return std::unexpected("GLOVE_TEST_NATIVE_HARNESS_ROOT is not an available directory");
+    }
+    const auto bin_directory = harness_root / "node_modules" / ".bin";
+    for (const auto& harness : native_harnesses) {
+        const auto executable = bin_directory / harness.executable;
+        if (!std::filesystem::is_regular_file(executable) ||
+            ::access(executable.c_str(), X_OK) != 0) {
+            return std::unexpected(
+                "managed native harness distribution is unavailable (" +
+                std::string{harness.runtime_id} + ": " + executable.string() + ")"
+            );
+        }
+    }
+    return harness_root;
+}
+
 auto real_native_harness_test(
     cgroup_v2_root& root,
     const std::filesystem::path& materialization_root,
     const std::filesystem::path& library_root,
     std::uint64_t page
 ) -> int {
-    const char* configured_root = ::getenv("GLOVE_TEST_NATIVE_HARNESS_ROOT");
-    if (configured_root == nullptr || *configured_root == '\0') {
-        return 0;
+    auto resolved_harness_root = resolve_native_harness_root();
+    if (!resolved_harness_root) {
+        std::fprintf(stderr, "SKIP: %s\n", resolved_harness_root.error().c_str());
+        return 77;
     }
-    std::error_code error;
-    const auto harness_root = std::filesystem::canonical(configured_root, error);
-    REQUIRE(!error);
-    REQUIRE(std::filesystem::is_directory(harness_root));
+    const auto& harness_root = *resolved_harness_root;
+    const auto bin_directory = harness_root / "node_modules" / ".bin";
+    const auto node_directory = harness_root / "node-runtime" / "bin";
 
     constexpr std::string_view bundle =
         R"({"schema_version":1,"source_library_ref":"bafy-native","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"}]})";
@@ -598,17 +695,6 @@ auto real_native_harness_test(
     auto store = glove::supervisor::library_bundle_store::open(library_root);
     REQUIRE(store.has_value());
 
-    struct harness_case {
-        std::string_view runtime_id;
-        std::string_view executable;
-    };
-
-    constexpr std::array<harness_case, 4> harnesses{{
-        {"claude-code", "claude"},
-        {"pi", "pi"},
-        {"copilot", "copilot"},
-        {"opencode", "opencode"},
-    }};
     auto limits = limits_for(page * 256U);
     // Vendor startup shapes differ; this is a conformance ceiling, not the
     // low-limit enforcement probe elsewhere in this test suite.
@@ -616,9 +702,7 @@ auto real_native_harness_test(
     limits.pids = 64;
     limits.wall_time_ms = 20'000;
     limits.disk_bytes = std::uint64_t{512} * 1024U * 1024U;
-    const auto bin_directory = harness_root / "node_modules" / ".bin";
-    const auto node_directory = harness_root / "node-runtime" / "bin";
-    for (const auto& harness : harnesses) {
+    for (const auto& harness : native_harnesses) {
         const auto adapter =
             glove::supervisor::native_skill_runtime_adapter_for(harness.runtime_id);
         REQUIRE(adapter.has_value());
@@ -636,6 +720,12 @@ auto real_native_harness_test(
             .target_path = "/opt/sage/library-bundles",
         }});
         REQUIRE(projections.has_value());
+        std::optional<glove::supervisor::resolved_native_harness_adoption> adoption;
+        if (harness.runtime_id == "pi") {
+            auto resolved = make_pi_adoption(materialization_root.parent_path(), "pi-real");
+            REQUIRE(resolved.has_value());
+            adoption.emplace(std::move(*resolved));
+        }
         auto lifecycle = make_lifecycle(
             root,
             materialization_root,
@@ -643,7 +733,8 @@ auto real_native_harness_test(
             std::string{"managed-real-"} + std::string{harness.runtime_id},
             limits,
             std::move(*projections),
-            harness.runtime_id
+            harness.runtime_id,
+            std::move(adoption)
         );
         REQUIRE(lifecycle.has_value());
         auto prof = launch_profile(limits);
@@ -1022,7 +1113,14 @@ auto declarative_refinement_evaluator_test(
     return 0;
 }
 
-auto run() -> int {
+auto run(bool native_harness_matrix_only) -> int {
+    if (native_harness_matrix_only) {
+        auto harness_root = resolve_native_harness_root();
+        if (!harness_root) {
+            std::fprintf(stderr, "SKIP: %s\n", harness_root.error().c_str());
+            return 77;
+        }
+    }
     temporary_tree tree;
     REQUIRE(!tree.root().empty());
     const auto materialization_root = tree.root() / "materializations";
@@ -1053,6 +1151,9 @@ auto run() -> int {
         std::fprintf(stderr, "managed-session topology unavailable: %s\n", root.error().c_str());
         return 77;
     }
+    if (native_harness_matrix_only) {
+        return real_native_harness_test(*root, materialization_root, library_root, page);
+    }
     REQUIRE(
         mounted_copy_is_isolated_test(
             *root, materialization_root, source, file_source, reference_source, page
@@ -1060,7 +1161,6 @@ auto run() -> int {
     );
     REQUIRE(managed_policy_rejection_test(*root, materialization_root, source, page) == 0);
     REQUIRE(codex_runtime_context_test(*root, materialization_root, library_root, page) == 0);
-    REQUIRE(real_native_harness_test(*root, materialization_root, library_root, page) == 0);
     REQUIRE(
         child_release_is_gated_by_durable_callback_test(*root, materialization_root, page) == 0
     );
@@ -1073,6 +1173,13 @@ auto run() -> int {
 
 } // namespace
 
-auto main() -> int {
-    return run();
+auto main(int argc, char* argv[]) -> int {
+    if (argc == 1) {
+        return run(false);
+    }
+    if (argc == 2 && std::string_view{argv[1]} == "--native-harness-matrix") {
+        return run(true);
+    }
+    std::fprintf(stderr, "usage: %s [--native-harness-matrix]\n", argv[0]);
+    return 2;
 }

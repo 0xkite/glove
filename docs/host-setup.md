@@ -72,7 +72,9 @@ Pi adoption additionally requires all of `--pi-settings`, `--pi-package-store`,
 and `--pi-adoption-root`; Glove snapshots the selected package closure and
 generates a private home. It never imports host Pi authentication, sessions,
 provider/model settings, or package-manager credentials. The exact contract is
-in [session-policy.md](session-policy.md).
+in [session-policy.md](session-policy.md). For the five-client staging,
+credential, egress, rotation, smoke-test, and recovery sequence, use
+[managed-client-setup.md](managed-client-setup.md).
 
 ## 3. Start and verify the local service
 
