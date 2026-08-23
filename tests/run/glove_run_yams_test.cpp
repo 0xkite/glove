@@ -16,6 +16,17 @@
 
 extern char** environ;
 
+// LeakSanitizer cannot inspect the contained fixture after Glove installs its Linux sandbox.
+// Keep LSan on the parent while the child retains ASan/UBSan with leak detection disabled.
+#if defined(__has_feature)
+#    if __has_feature(address_sanitizer)
+#        define GLOVE_TEST_ADDRESS_SANITIZER 1
+#    endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) && !defined(GLOVE_TEST_ADDRESS_SANITIZER)
+#    define GLOVE_TEST_ADDRESS_SANITIZER 1
+#endif
+
 #ifndef GLOVE_BIN
 #    error "GLOVE_BIN must be defined"
 #endif
@@ -40,11 +51,20 @@ auto run() -> int {
     std::vector<std::string> argv_owned{
         GLOVE_BIN,
         "run",
+#if defined(GLOVE_TEST_ADDRESS_SANITIZER)
+        "--read",
+        GLOVE_SYNTHETIC_AGENT_BIN,
+#endif
         "--upstream",
         std::string{"yams="} + GLOVE_YAMS_BIN + ",serve,--quiet",
         "--allow",
         "yams.mcp.echo",
         "--",
+#if defined(GLOVE_TEST_ADDRESS_SANITIZER)
+        "/usr/bin/env",
+        "ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0",
+        "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1",
+#endif
         GLOVE_SYNTHETIC_AGENT_BIN,
         "--mode=client",
     };
