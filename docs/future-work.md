@@ -31,7 +31,7 @@ version control, tests, and architecture documentation.
 |---|---|
 | Bundle parser fuzzing | The derived prompt-library bundle decoder has a sanitizer-backed target and checked adversarial corpus. |
 | Remaining fault injection | Persisted journals share short-write/disk-full seams, and every lifecycle transition has crash/replay coverage. |
-| Multi-agent matrix | Supported Codex, Pi, Claude, and other adapters are tested against the same filesystem, environment, tool, terminal, and recovery invariants. |
+| Multi-agent matrix | Complete every required row in [`client-adoption-matrix.md`](client-adoption-matrix.md): all five built-in adapters share filesystem, environment, tool-policy binding, terminal, cleanup, and recovery evidence; the installed-client lane includes Codex and reports missing distributions as skips rather than silently passing. |
 | Performance characterization | Startup cost, request latency, throughput, and memory overhead are measured with reproducible workloads and confidence intervals. |
 | Comparative evaluation | Claims are evaluated against comparable containment and gateway designs using the same threat model and workload. |
 

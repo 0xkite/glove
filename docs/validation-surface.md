@@ -30,6 +30,18 @@ programmatic Glove adapter path and shared invariant manifest. Test images do
 not bundle vendor clients or credentials. Synthetic probes remain useful for
 fault isolation but cannot replace an installed-client lane.
 
+Provide an owner-reviewed, immutable harness root explicitly and run the
+separate matrix test:
+
+```sh
+GLOVE_TEST_NATIVE_HARNESS_ROOT=/absolute/protected/harness-root \
+  ctest --test-dir build/dev --output-on-failure \
+  -R '^container_linux_native_harness_matrix$'
+```
+
+The root must contain all five reviewed client distributions. When the variable
+is absent, CTest reports this lane as skipped; that skip is not client evidence.
+
 ## Performance evidence
 
 Benchmarks are opt-in and emit schema-versioned JSON Lines. Retain raw results

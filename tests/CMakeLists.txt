@@ -486,13 +486,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         container_linux_managed_session_test
         container/linux_managed_session_test.cpp
     )
-    target_link_libraries(container_linux_managed_session_test PRIVATE glove_container)
+    target_link_libraries(
+        container_linux_managed_session_test
+        PRIVATE glove_container glove_host
+    )
     target_include_directories(container_linux_managed_session_test PRIVATE
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container/linux>
     )
     add_test(NAME container_linux_managed_session COMMAND container_linux_managed_session_test)
     set_tests_properties(container_linux_managed_session PROPERTIES
         TIMEOUT 30
+        SKIP_RETURN_CODE 77
+    )
+    add_test(
+        NAME container_linux_native_harness_matrix
+        COMMAND container_linux_managed_session_test --native-harness-matrix
+    )
+    set_tests_properties(container_linux_native_harness_matrix PROPERTIES
+        TIMEOUT 120
         SKIP_RETURN_CODE 77
     )
 
