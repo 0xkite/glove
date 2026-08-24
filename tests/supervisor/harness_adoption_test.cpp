@@ -144,13 +144,16 @@ auto make_fixture(const std::filesystem::path& parent, std::string_view name)
     const auto settings_path = fixture_root / "source/settings.json";
     const auto package = fixture_root / "store/example-extension";
     if (!std::filesystem::create_directories(settings_path.parent_path()) ||
-        !std::filesystem::create_directories(package) || ::chmod(fixture_root.c_str(), 0700) != 0) {
+        !std::filesystem::create_directories(package / "feature") ||
+        ::chmod(fixture_root.c_str(), 0700) != 0) {
         return std::nullopt;
     }
     if (!write_file(settings_path, R"({"packages":["npm:example-extension"]})", 0600) ||
         !write_file(
             package / "package.json", R"({"name":"example-extension","dependencies":{}})", 0600
         ) ||
+        !write_file(package / "feature.js", "export const sibling = true;\n", 0600) ||
+        !write_file(package / "feature/inside.js", "export const nested = true;\n", 0600) ||
         !write_file(package / "index.js", "export default {};\n", 0600)) {
         return std::nullopt;
     }
@@ -256,6 +259,8 @@ auto run() -> int {
         "{\"packages\":[\"./extensions/0\"],\"enableSkillCommands\":true}\n"
     );
     REQUIRE(std::filesystem::exists(private_home / ".pi/agent/extensions/0/package.json"));
+    REQUIRE(std::filesystem::exists(private_home / ".pi/agent/extensions/0/feature.js"));
+    REQUIRE(std::filesystem::exists(private_home / ".pi/agent/extensions/0/feature/inside.js"));
     REQUIRE(std::filesystem::exists(private_home / ".pi/agent/extensions/0/index.js"));
     REQUIRE(!std::filesystem::exists(private_home / ".pi/agent/auth.json"));
     REQUIRE(!std::filesystem::exists(private_home / ".pi/agent/sessions"));
