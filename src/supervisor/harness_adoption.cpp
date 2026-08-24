@@ -50,6 +50,7 @@ constexpr std::uint64_t max_payload_bytes = std::uint64_t{2} * 1024U * 1024U * 1
 constexpr std::size_t max_payload_entries = 200'000U;
 constexpr std::size_t max_payload_roots = 64U;
 constexpr std::size_t max_relative_path_bytes = 4'096U;
+constexpr std::size_t max_tree_manifest_bytes = std::size_t{64} * 1024U * 1024U;
 constexpr std::size_t copy_buffer_bytes = std::size_t{64} * 1024U;
 constexpr auto permission_mask = 0777U;
 constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
@@ -135,8 +136,14 @@ struct tree_digest {
     std::uint64_t entries = 0;
 };
 
+struct tree_manifest_record {
+    std::string relative;
+    std::string encoded;
+};
+
 struct tree_state {
-    std::string manifest;
+    std::vector<tree_manifest_record> records;
+    std::size_t encoded_bytes = 0;
     std::uint64_t bytes = 0;
     std::uint64_t entries = 0;
 };
@@ -344,7 +351,6 @@ auto directory_entries(int descriptor, std::size_t maximum)
 }
 
 auto append(std::string& destination, std::string_view value) -> std::expected<void, std::string> {
-    constexpr std::size_t max_tree_manifest_bytes = std::size_t{64} * 1024U * 1024U;
     if (destination.size() > max_tree_manifest_bytes ||
         value.size() > max_tree_manifest_bytes - destination.size()) {
         return std::unexpected(std::string{"adoption snapshot manifest exceeds its bound"});
@@ -355,6 +361,17 @@ auto append(std::string& destination, std::string_view value) -> std::expected<v
 
 auto append_nul(std::string& destination) -> std::expected<void, std::string> {
     return append(destination, std::string_view{"\0", 1U});
+}
+
+auto record_tree_entry(tree_state& state, std::string relative, std::string encoded)
+    -> std::expected<void, std::string> {
+    if (state.encoded_bytes > max_tree_manifest_bytes ||
+        encoded.size() > max_tree_manifest_bytes - state.encoded_bytes) {
+        return std::unexpected(std::string{"adoption snapshot manifest exceeds its bound"});
+    }
+    state.encoded_bytes += encoded.size();
+    state.records.push_back({.relative = std::move(relative), .encoded = std::move(encoded)});
+    return {};
 }
 
 auto hash_payload_file(
@@ -382,36 +399,40 @@ auto hash_payload_file(
                    : std::string{"hash adoption payload file: "} + digest.error()
         );
     }
-    if (auto appended = append(state.manifest, "f"); !appended) {
+    std::string encoded;
+    if (auto appended = append(encoded, "f"); !appended) {
         return appended;
     }
-    if (auto appended = append_nul(state.manifest); !appended) {
+    if (auto appended = append_nul(encoded); !appended) {
         return appended;
     }
-    if (auto appended = append(state.manifest, relative); !appended) {
+    if (auto appended = append(encoded, relative); !appended) {
         return appended;
     }
-    if (auto appended = append_nul(state.manifest); !appended) {
+    if (auto appended = append_nul(encoded); !appended) {
         return appended;
     }
-    if (auto appended = append(state.manifest, (before.st_mode & 0111U) != 0 ? "x" : "-");
-        !appended) {
+    if (auto appended = append(encoded, (before.st_mode & 0111U) != 0 ? "x" : "-"); !appended) {
         return appended;
     }
-    if (auto appended = append_nul(state.manifest); !appended) {
+    if (auto appended = append_nul(encoded); !appended) {
         return appended;
     }
-    if (auto appended = append(state.manifest, std::to_string(size)); !appended) {
+    if (auto appended = append(encoded, std::to_string(size)); !appended) {
         return appended;
     }
-    if (auto appended = append_nul(state.manifest); !appended) {
+    if (auto appended = append_nul(encoded); !appended) {
         return appended;
     }
-    if (auto appended = append(state.manifest, *digest); !appended) {
+    if (auto appended = append(encoded, *digest); !appended) {
         return appended;
     }
-    if (auto appended = append_nul(state.manifest); !appended) {
+    if (auto appended = append_nul(encoded); !appended) {
         return appended;
+    }
+    if (auto recorded = record_tree_entry(state, std::string{relative}, std::move(encoded));
+        !recorded) {
+        return recorded;
     }
     state.bytes += size;
     return {};
@@ -445,17 +466,21 @@ auto snapshot_tree_digest_at(int descriptor, std::string_view prefix, tree_state
             if (!child) {
                 return std::unexpected(child.error());
             }
-            if (auto appended = append(state.manifest, "d"); !appended) {
+            std::string encoded;
+            if (auto appended = append(encoded, "d"); !appended) {
                 return appended;
             }
-            if (auto appended = append_nul(state.manifest); !appended) {
+            if (auto appended = append_nul(encoded); !appended) {
                 return appended;
             }
-            if (auto appended = append(state.manifest, relative); !appended) {
+            if (auto appended = append(encoded, relative); !appended) {
                 return appended;
             }
-            if (auto appended = append_nul(state.manifest); !appended) {
+            if (auto appended = append_nul(encoded); !appended) {
                 return appended;
+            }
+            if (auto recorded = record_tree_entry(state, relative, std::move(encoded)); !recorded) {
+                return recorded;
             }
             if (auto nested = snapshot_tree_digest_at(child->get(), relative, state); !nested) {
                 return nested;
@@ -486,9 +511,19 @@ auto snapshot_tree_digest_at(int descriptor) -> std::expected<tree_digest, std::
     if (auto scanned = snapshot_tree_digest_at(descriptor, {}, state); !scanned) {
         return std::unexpected(scanned.error());
     }
-    const auto bytes = std::span{
-        reinterpret_cast<const unsigned char*>(state.manifest.data()), state.manifest.size()
-    };
+    // The host planner hashes one flat lexicographic relative-path sequence. The
+    // descriptor-safe walk above is depth-first, so order its bounded records
+    // before hashing to preserve the planner's canonical snapshot identity.
+    std::ranges::sort(state.records, {}, &tree_manifest_record::relative);
+    std::string manifest;
+    manifest.reserve(state.encoded_bytes);
+    for (const auto& record : state.records) {
+        if (auto appended = append(manifest, record.encoded); !appended) {
+            return std::unexpected(appended.error());
+        }
+    }
+    const auto bytes =
+        std::span{reinterpret_cast<const unsigned char*>(manifest.data()), manifest.size()};
     auto digest = container::sha256_hex(bytes);
     if (!digest) {
         return std::unexpected(std::string{"hash adoption payload tree: "} + digest.error());
