@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <string>
@@ -1610,9 +1611,11 @@ auto session_plan_validator::resolve_runtime_launch_json(
     argv.reserve(launch.arguments.size() + 1U + (adapter ? adapter->managed_arguments.size() : 0U));
     argv.push_back(std::move(*executable));
     argv.insert(argv.end(), launch.arguments.begin(), launch.arguments.end());
-    if (adapter) {
+    if (adapter && !adapter->managed_arguments.empty()) {
+        const auto exec_at = std::ranges::find(argv, "exec");
+        const auto insert_at = exec_at == argv.end() ? argv.end() : std::next(exec_at);
         argv.insert(
-            argv.end(), adapter->managed_arguments.begin(), adapter->managed_arguments.end()
+            insert_at, adapter->managed_arguments.begin(), adapter->managed_arguments.end()
         );
     }
     std::vector<egress_target_policy> egress_targets;

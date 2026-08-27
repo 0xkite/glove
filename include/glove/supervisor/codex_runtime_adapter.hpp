@@ -30,8 +30,9 @@ struct codex_runtime_projection {
 };
 
 // Strictly decodes each verified Sage session-library bundle. Only `skill`
-// entries have an unambiguous Codex-native location. Other entry kinds are
-// rejected rather than silently dropping controller-selected context.
+// entries materialize into the Codex private home. Known inert kinds
+// (`behavior`, `prompt`, `template`, `workflow`) are validated and counted
+// but not written as SKILL.md. Unknown kinds fail closed.
 [[nodiscard]] auto
 resolve_codex_runtime_projection(const std::vector<resolved_library_projection>& bundles)
     -> std::expected<codex_runtime_projection, std::string>;

@@ -450,8 +450,11 @@ codes. Ambiguous transactions are never retried or terminalized automatically.
 
 ## Remaining boundary
 
-Glove's Codex adapter expands only exact `skill` bundle entries; unsupported
-bundle entry kinds fail closed. Other harnesses do not inherit Codex's layout,
-and `prompt_ref` remains rejected. Live direct host writes are outside v2.
+Glove's Codex adapter expands only exact `skill` bundle entries into the
+private home. Known inert kinds (`behavior`, `prompt`, `template`,
+`workflow`) stay in the mounted dest bundle and are not written as
+`SKILL.md`. Unknown kinds fail closed. Other harnesses do not inherit
+Codex's layout, and `prompt_ref` remains rejected. Live direct host writes
+are outside v2.
 Applying a retained stage remains unavailable until Glove verifies an
 independently signed, single-use local authorization.

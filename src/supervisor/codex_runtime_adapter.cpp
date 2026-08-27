@@ -77,6 +77,10 @@ auto valid_skill_directory_name(std::string_view projection_id, std::string_view
            projection_id.size() <= max_skill_directory_bytes - key.size() - 1U;
 }
 
+auto known_inert_bundle_kind(std::string_view kind) -> bool {
+    return kind == "behavior" || kind == "prompt" || kind == "template" || kind == "workflow";
+}
+
 auto read_bundle(const resolved_library_bundle& bundle) -> std::expected<std::string, std::string> {
     if (auto verified = bundle.verify_identity(); !verified) {
         return std::unexpected(verified.error());
@@ -193,8 +197,11 @@ auto resolve_codex_runtime_projection(const std::vector<resolved_library_project
             return std::unexpected(document.error());
         }
         for (const auto& entry : document->entries) {
-            if (entry.kind != "skill" || !valid_skill_key(entry.key) ||
-                !valid_skill_directory_name(bundle_projection.projection_id, entry.key) ||
+            const bool materialize = entry.kind == "skill";
+            if ((!materialize && !known_inert_bundle_kind(entry.kind)) ||
+                !valid_skill_key(entry.key) ||
+                (materialize &&
+                 !valid_skill_directory_name(bundle_projection.projection_id, entry.key)) ||
                 !valid_digest(entry.content_digest) || entry.content.empty() ||
                 entry.content.size() > max_entry_bytes ||
                 entry.content.find('\0') != std::string::npos ||
@@ -208,6 +215,9 @@ auto resolve_codex_runtime_projection(const std::vector<resolved_library_project
                 return std::unexpected(std::string{"Codex bundle entry digest or size is invalid"});
             }
             total_bytes += entry.content.size();
+            if (!materialize) {
+                continue;
+            }
             projection.skills.push_back({
                 .projection_id = bundle_projection.projection_id,
                 .bundle_content_digest = std::string{bundle_projection.bundle.content_digest()},

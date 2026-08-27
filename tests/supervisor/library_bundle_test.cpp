@@ -170,23 +170,44 @@ auto run() -> int {
     ::close(oversized_home_fd);
     REQUIRE(std::filesystem::is_empty(oversized_home));
 
-    constexpr std::string_view unsupported_codex_canonical =
-        R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"selected-prompt","kind":"prompt","content_digest":"3514cf816e5407a39cb7a1c1e1243f176dda121e06398a8934edb1dc426b0b34","content":"ignored"}]})";
-    const auto unsupported_codex_digest = digest_for(unsupported_codex_canonical);
-    write_bundle(root, unsupported_codex_canonical);
-    std::vector<glove::supervisor::resolved_library_projection_target> unsupported_codex_targets;
-    unsupported_codex_targets.push_back({
+    constexpr std::string_view mixed_codex_canonical =
+        R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"},{"key":"selected-prompt","kind":"prompt","content_digest":"3514cf816e5407a39cb7a1c1e1243f176dda121e06398a8934edb1dc426b0b34","content":"ignored"},{"key":"review-cycle","kind":"behavior","content_digest":"a5a24850efa7c6221289d949e66ab2d82d1b31e1e9969ff2b6f96324b85e8007","content":"behavior graph\n"}]})";
+    const auto mixed_codex_digest = digest_for(mixed_codex_canonical);
+    write_bundle(root, mixed_codex_canonical);
+    std::vector<glove::supervisor::resolved_library_projection_target> mixed_codex_targets;
+    mixed_codex_targets.push_back({
         .projection =
             {
-                .projection_id = "sage-prompt",
-                .content_digest = unsupported_codex_digest,
+                .projection_id = "sage-mixed",
+                .content_digest = mixed_codex_digest,
                 .destination_alias = "libraries",
             },
         .target_path = "/opt/sage/library-bundles",
     });
-    auto unsupported_codex_projections = store->resolve_projections(unsupported_codex_targets);
-    REQUIRE(unsupported_codex_projections.has_value());
-    REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*unsupported_codex_projections));
+    auto mixed_codex_projections = store->resolve_projections(mixed_codex_targets);
+    REQUIRE(mixed_codex_projections.has_value());
+    auto mixed_codex = glove::supervisor::resolve_codex_runtime_projection(*mixed_codex_projections);
+    REQUIRE(mixed_codex.has_value());
+    REQUIRE(mixed_codex->skills.size() == 1U);
+    REQUIRE(mixed_codex->skills.front().key == "sage-core");
+
+    constexpr std::string_view unknown_codex_canonical =
+        R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"selected-prompt","kind":"skill_v2","content_digest":"3514cf816e5407a39cb7a1c1e1243f176dda121e06398a8934edb1dc426b0b34","content":"ignored"}]})";
+    const auto unknown_codex_digest = digest_for(unknown_codex_canonical);
+    write_bundle(root, unknown_codex_canonical);
+    std::vector<glove::supervisor::resolved_library_projection_target> unknown_codex_targets;
+    unknown_codex_targets.push_back({
+        .projection =
+            {
+                .projection_id = "sage-unknown",
+                .content_digest = unknown_codex_digest,
+                .destination_alias = "libraries",
+            },
+        .target_path = "/opt/sage/library-bundles",
+    });
+    auto unknown_codex_projections = store->resolve_projections(unknown_codex_targets);
+    REQUIRE(unknown_codex_projections.has_value());
+    REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*unknown_codex_projections));
 
     // Every built-in harness consumes the same verified Agent Skills bundle,
     // but receives it in an adapter-owned private-home layout. This proves the
