@@ -310,7 +310,6 @@ auto handle_page(
             request_id, "audit_reconciliation_failed", "receipt audit producer bootstrap failed"
         );
     }
-#if defined(__linux__)
     if (state.session_runtime && state.session_runtime->lifecycle_operational() &&
         (*producer)->bootstrap_reconciled()) {
         if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
@@ -321,9 +320,6 @@ auto handle_page(
             );
         }
     }
-#else
-    static_cast<void>(now_ms);
-#endif
     auto page = (*producer)->page_after(payload->sage_anchor, effective_limit);
     if (!page) {
         return error_response(
@@ -388,7 +384,6 @@ auto handle_acknowledgement(
             request_id, "audit_reconciliation_failed", "receipt audit head was not accepted"
         );
     }
-#if defined(__linux__)
     if (state.session_runtime && state.session_runtime->lifecycle_operational()) {
         if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
             return error_response(
@@ -398,9 +393,6 @@ auto handle_acknowledgement(
             );
         }
     }
-#else
-    static_cast<void>(now_ms);
-#endif
     auto result = encode_json(
         acknowledgement_result{
             .acknowledged_anchor = payload->anchor,

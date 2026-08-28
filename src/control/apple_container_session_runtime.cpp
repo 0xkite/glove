@@ -704,6 +704,21 @@ auto converted_limits(const supervisor::resource_limits& limits) -> container::r
     };
 }
 
+auto projection_receipts(std::span<const supervisor::resolved_library_projection> projections)
+    -> std::vector<container::library_projection_receipt> {
+    std::vector<container::library_projection_receipt> receipts;
+    receipts.reserve(projections.size());
+    for (const auto& projection : projections) {
+        receipts.push_back({
+            .projection_id = projection.projection_id,
+            .destination_alias = projection.destination_alias,
+            .target_path = projection.target_path,
+            .content_digest = std::string{projection.bundle.content_digest()},
+        });
+    }
+    return receipts;
+}
+
 auto registry_error(std::string_view operation, const session_registry_error& error)
     -> std::string {
     return std::string{operation} + ": " + error.message;
@@ -728,7 +743,8 @@ public:
         std::string idempotency_namespace,
         credential_lease_bundle credential_leases,
         egress_broker_bundle egress_broker,
-        projection_lease_bundle projection_lease
+        projection_lease_bundle projection_lease,
+        std::vector<container::library_projection_receipt> library_projections
     )
         : registry_{&registry},
           producer_{&producer},
@@ -744,7 +760,8 @@ public:
           idempotency_namespace_{std::move(idempotency_namespace)},
           credential_leases_{std::move(credential_leases)},
           egress_broker_{std::move(egress_broker)},
-          projection_lease_{std::move(projection_lease)} {}
+          projection_lease_{std::move(projection_lease)},
+          library_projections_{std::move(library_projections)} {}
 
     apple_live_session(const apple_live_session&) = delete;
     auto operator=(const apple_live_session&) -> apple_live_session& = delete;
@@ -948,7 +965,7 @@ private:
                 .exit_code = exit_code,
                 .started_at_ms = started_at_ms_,
                 .finished_at_ms = finished_at_ms,
-                .library_projections = {},
+                .library_projections = library_projections_,
                 .retained_changes = {},
             };
             auto terminal = producer_->commit_terminal(
@@ -1012,6 +1029,7 @@ private:
     credential_lease_bundle credential_leases_;
     egress_broker_bundle egress_broker_;
     projection_lease_bundle projection_lease_;
+    std::vector<container::library_projection_receipt> library_projections_;
     std::mutex transition_mutex_;
     mutable std::mutex state_mutex_;
     std::condition_variable state_changed_;
@@ -1384,6 +1402,7 @@ auto apple_container_session_runtime::start(
     if (!projection_lease) {
         return std::unexpected(projection_lease.error());
     }
+    auto library_projections = projection_receipts(inputs->library_projections);
     auto profile = profile_digest(
         *inputs, state_->config, credential_leases->commitments_, projection_lease->digest_
     );
@@ -1671,7 +1690,8 @@ auto apple_container_session_runtime::start(
         std::string{idempotency_namespace},
         std::move(*credential_leases),
         std::move(*egress_broker),
-        std::move(*projection_lease)
+        std::move(*projection_lease),
+        std::move(library_projections)
     );
     if (auto finalizer = session->start_finalizer(); !finalizer) {
         static_cast<void>(session->stop(std::string{idempotency_namespace} + ".finalizer-stop"));
