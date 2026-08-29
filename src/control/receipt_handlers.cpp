@@ -231,6 +231,8 @@ auto handle_capabilities(
                 lifecycle_operational
                     ? state.session_runtime->refinement_evaluation_protocol_schema_version()
                     : std::uint8_t{0},
+            .observation_intent_channel_schema_version =
+                state.sessions ? std::uint8_t{1} : std::uint8_t{0},
             .backends = {
                 backend_capabilities{
                     .backend = "linux_production",
@@ -511,6 +513,14 @@ auto handle_frame(
 
     if (request->method == "acknowledge_audit_chain") {
         return handle_acknowledgement(state, request->id, *params, now_ms);
+    }
+
+    if (request->method == "page_observation_intents") {
+        return handle_page_observation_intents(state, request->id, *params, now_ms);
+    }
+
+    if (request->method == "set_observation_intent_disposition") {
+        return handle_set_observation_intent_disposition(state, request->id, *params, now_ms);
     }
 
     return error_response(request->id, "method_not_found", "control method is unavailable");

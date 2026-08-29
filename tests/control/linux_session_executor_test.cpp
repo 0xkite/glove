@@ -99,6 +99,7 @@ struct supervisor_capabilities {
     std::uint8_t change_manifest_schema_version = 0;
     std::uint8_t change_apply_authorization_schema_version = 0;
     std::uint8_t refinement_evaluation_protocol_schema_version = 0;
+    std::uint8_t observation_intent_channel_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 

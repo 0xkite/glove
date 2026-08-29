@@ -1,6 +1,8 @@
 #include "glove/container/digest.hpp"
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/receipt_audit_protocol.hpp"
+#include "glove/control/session_registry.hpp"
+#include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/path_alias.hpp"
 #include "glove/supervisor/path_exposure.hpp"
 #include "glove/supervisor/session_plan.hpp"
@@ -19,6 +21,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -38,8 +41,14 @@ constexpr std::string_view audit_key =
     "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 constexpr std::string_view bootstrap_secret =
     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+constexpr std::string_view intent_bootstrap_secret =
+    "9999999999999999999999999999999999999999999999999999999999999999";
 constexpr std::string_view plan_digest =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+constexpr std::string_view intent_controller_digest =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+constexpr std::string_view library_bundle =
+    R"({"schema_version":1,"source_library_ref":"bafy-test","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[]})";
 
 class temporary_directory {
 public:
@@ -239,6 +248,7 @@ struct supervisor_capabilities {
     std::uint8_t change_manifest_schema_version = 0;
     std::uint8_t change_apply_authorization_schema_version = 0;
     std::uint8_t refinement_evaluation_protocol_schema_version = 0;
+    std::uint8_t observation_intent_channel_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
@@ -279,6 +289,47 @@ struct path_exposure_list_result {
 struct session_plan_validation {
     std::uint8_t schema_version = 0;
     std::uint64_t policy_revision = 0;
+};
+
+struct observation_intent_body_wire {
+    std::string schema;
+    std::string intent_id;
+    std::string observation;
+    std::string value_digest;
+    std::uint64_t item_count = 0;
+};
+
+struct observation_intent_context_wire {
+    std::string session_id;
+    std::string controller_plan_digest;
+    std::string profile_digest;
+    std::string runtime_id;
+    std::string projection_digest;
+    std::uint64_t policy_revision = 0;
+    std::string channel_id;
+    std::uint64_t channel_generation = 0;
+    std::uint64_t issued_at_ms = 0;
+    std::uint64_t expires_at_ms = 0;
+};
+
+struct observation_intent_queue_item_wire {
+    std::uint64_t sequence = 0;
+    observation_intent_body_wire body;
+    observation_intent_context_wire context;
+    std::string intent_digest;
+    std::string disposition;
+    std::uint64_t decided_at_ms = 0;
+};
+
+struct page_observation_intents_result {
+    std::uint8_t schema_version = 0;
+    std::vector<observation_intent_queue_item_wire> items;
+    std::optional<std::uint64_t> next_after_sequence;
+};
+
+struct observation_intent_disposition_result {
+    std::uint8_t schema_version = 0;
+    observation_intent_queue_item_wire item;
 };
 
 struct session_record_result {
@@ -404,6 +455,639 @@ auto make_request(
     return request;
 }
 
+auto library_bundle_digest() -> std::string {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(library_bundle.data());
+    return glove::container::sha256_hex(std::span{bytes, library_bundle.size()}).value_or("");
+}
+
+auto intent_launch_template() -> glove::supervisor::runtime_launch_template {
+    return {
+        .runtime_discovery = {},
+        .executable_path = "/usr/bin/true",
+        .executable_search_paths = {},
+        .arguments = {"--version"},
+        .environment = {"PATH=/usr/bin:/bin", "TERM=xterm-256color"},
+        .read_only_paths = {},
+    };
+}
+
+auto intent_runtime_digest() -> std::string {
+    return glove::supervisor::runtime_launch_template_digest(intent_launch_template()).value_or("");
+}
+
+auto intent_valid_plan_at(std::uint64_t now_ms) -> std::string {
+    return R"({"schema_version":1,"runtime_id":"codex","runtime_template_id":"codex-safe","adapter_command_digest":")" +
+           intent_runtime_digest() +
+           R"(","sandbox_backend":"linux_production","egress_policy_id":"no-network","tool_policy_id":"sage-readonly","path_grants":[{"alias":"workspace","access":"ephemeral_write","materialization":"copy","max_bytes":1048576,"ttl_secs":60,"cleanup_policy":"remove"}],"library_projections":[{"projection_id":"sage-core","content_digest":")" +
+           library_bundle_digest() +
+           R"(","destination_alias":"libraries"}],"secret_handles":["codex-token"],"limits":{"cpu_time_ms":1000,"memory_bytes":67108864,"pids":16,"wall_time_ms":2000,"disk_bytes":2097152,"terminal_output_bytes":1048576},"policy_revision":7,"expires_at_ms":)" +
+           std::to_string(now_ms + 120'000) + "}";
+}
+
+auto intent_sage_guest_plan_at(std::uint64_t now_ms) -> std::string {
+    auto plan = intent_valid_plan_at(now_ms);
+    for (const auto& [from, to] : {
+             std::pair{std::string_view{"\"runtime_id\":\"codex\""},
+                       std::string_view{"\"runtime_id\":\"sage-guest\""}},
+             std::pair{std::string_view{"\"runtime_template_id\":\"codex-safe\""},
+                       std::string_view{"\"runtime_template_id\":\"sage-guest-safe\""}},
+             std::pair{std::string_view{"\"secret_handles\":[\"codex-token\"]"},
+                       std::string_view{"\"secret_handles\":[]"}},
+         }) {
+        const auto offset = plan.find(from);
+        if (offset != std::string::npos) {
+            plan.replace(offset, from.size(), to);
+        }
+    }
+    return plan;
+}
+
+auto intent_validator_for(const std::filesystem::path& source)
+    -> glove::supervisor::result<glove::supervisor::session_plan_validator> {
+    using namespace glove::supervisor;
+    auto paths = path_alias_registry::build({
+        path_alias_policy{
+            .alias = "workspace",
+            .host_path = std::filesystem::canonical(source).string(),
+            .target_path = "/workspace",
+            .max_ttl_secs = 120,
+            .access = {
+                path_access_policy{
+                    .access = path_access::ephemeral_write,
+                    .materialization = path_materialization::copy,
+                    .create_policy = path_create_policy::empty_directory,
+                    .cleanup_policy = path_cleanup_policy::remove,
+                    .max_bytes = 2'097'152,
+                },
+            },
+        },
+    });
+    if (!paths) {
+        return std::unexpected(paths.error());
+    }
+    return session_plan_validator::build(
+        session_plan_policy{
+            .revision = 7,
+            .max_plan_ttl_ms = 120'000,
+            .runtime_templates =
+                {
+                    runtime_template_policy{
+                        .runtime_template_id = "codex-safe",
+                        .runtime_id = "codex",
+                        .adapter_command_digest = intent_runtime_digest(),
+                        .backend = sandbox_backend::linux_production,
+                        .allowed_path_aliases = {"workspace"},
+                        .allowed_projection_destinations = {"libraries"},
+                        .launch = intent_launch_template(),
+                        .adoption = std::nullopt,
+                    },
+                    runtime_template_policy{
+                        .runtime_template_id = "sage-guest-safe",
+                        .runtime_id = "sage-guest",
+                        .adapter_command_digest = intent_runtime_digest(),
+                        .backend = sandbox_backend::linux_production,
+                        .allowed_path_aliases = {"workspace"},
+                        .allowed_projection_destinations = {"libraries"},
+                        .launch = intent_launch_template(),
+                        .adoption = std::nullopt,
+                    },
+                },
+            .library_projection_destinations =
+                {
+                    library_projection_destination_policy{
+                        .alias = "libraries",
+                        .target_path = "/opt/sage/library-bundles",
+                    },
+                },
+            .resource_profiles =
+                {
+                    resource_limits{
+                        .cpu_time_ms = 1'000,
+                        .memory_bytes = 67'108'864,
+                        .pids = 16,
+                        .wall_time_ms = 2'000,
+                        .disk_bytes = 2'097'152,
+                        .terminal_output_bytes = 1'048'576,
+                    },
+                },
+            .egress_policy_ids = {"no-network"},
+            .tool_policy_ids = {"sage-readonly"},
+            .secret_handles = {"codex-token"},
+            .egress_policies = {},
+            .secret_mounts = {},
+        },
+        std::move(*paths)
+    );
+}
+
+auto intent_cgroup_identity(std::uint32_t pid) -> glove::control::linux_cgroup_recovery_identity {
+    return {
+        .schema_version = 1,
+        .device = 42,
+        .inode = 20'000U + pid,
+    };
+}
+
+auto intent_filesystem_identity() -> glove::control::linux_filesystem_recovery_identity {
+    return {
+        .schema_version = 1,
+        .disk_limit_bytes = 2'097'152,
+        .partitions = {{.alias = "workspace", .quota_bytes = 1'048'576}},
+    };
+}
+
+auto intent_process_identity(std::uint32_t pid) -> glove::control::linux_process_identity {
+    return {
+        .schema_version = 1,
+        .pid = pid,
+        .boot_id = "12345678-1234-1234-1234-123456789abc",
+        .start_time_ticks = 10'000U + pid,
+        .cgroup_device = 42,
+        .cgroup_inode = 20'000U + pid,
+        .cgroup_path_digest = std::string(64, 'd'),
+    };
+}
+
+auto response_excludes_sensitive_material(std::string_view frame) -> bool {
+    return frame.find("codex-token") == std::string_view::npos &&
+           frame.find("\"secret_handles\"") == std::string_view::npos &&
+           frame.find("\"path_grants\"") == std::string_view::npos &&
+           frame.find("\"bootstrap_secret\"") == std::string_view::npos &&
+           frame.find(intent_bootstrap_secret) == std::string_view::npos &&
+           frame.find("\"runtime_template_id\"") == std::string_view::npos &&
+           frame.find("\"plan\"") == std::string_view::npos &&
+           frame.find("intent-source") == std::string_view::npos;
+}
+
+auto run_observation_intent_control_contract() -> int {
+    using wire_test::observation_intent_disposition_result;
+    using wire_test::page_observation_intents_result;
+    using wire_test::supervisor_capabilities;
+    constexpr std::uint64_t intent_deadline_ms = 60'000;
+    const auto intent_request =
+        [](std::string_view id,
+           std::string_view method,
+           std::string_view payload,
+           std::optional<std::string_view> idempotency_key = std::nullopt) {
+            return make_request(
+                id, method, intent_bootstrap_secret, payload, idempotency_key, intent_deadline_ms
+            );
+        };
+    temporary_directory temp;
+    REQUIRE(!temp.root().empty());
+    const auto source = temp.root() / "intent-source";
+    REQUIRE(std::filesystem::create_directory(source));
+    auto validator = intent_validator_for(source);
+    REQUIRE(validator.has_value());
+    auto shared_validator =
+        std::make_shared<const glove::supervisor::session_plan_validator>(std::move(*validator));
+
+    const auto bundle_root = temp.root() / "library-bundles";
+    REQUIRE(std::filesystem::create_directory(bundle_root));
+    REQUIRE(::chmod(bundle_root.c_str(), 0700) == 0);
+    const auto bundle_path = bundle_root / (library_bundle_digest() + ".json");
+    {
+        std::ofstream output{bundle_path, std::ios::binary};
+        output.write(library_bundle.data(), static_cast<std::streamsize>(library_bundle.size()));
+    }
+    REQUIRE(::chmod(bundle_path.c_str(), 0600) == 0);
+    auto opened_bundle_store = glove::supervisor::library_bundle_store::open(bundle_root);
+    REQUIRE(opened_bundle_store.has_value());
+    auto shared_bundle_store = std::make_shared<const glove::supervisor::library_bundle_store>(
+        std::move(*opened_bundle_store)
+    );
+
+    const auto intent_key_path = temp.root() / "intent-receipt.key";
+    REQUIRE(write_owner_only(intent_key_path, audit_key));
+    auto intent_producer = glove::container::receipt_audit_producer::initialize({
+        .key_path = intent_key_path,
+        .journal_path = temp.root() / "intent-receipts.journal",
+    });
+    REQUIRE(intent_producer.has_value());
+    REQUIRE((*intent_producer)->acknowledge_bootstrap((*intent_producer)->anchor()).has_value());
+
+    auto registry = glove::control::session_registry::open_or_create(
+        temp.root() / "intent-sessions.journal", shared_validator, shared_bundle_store
+    );
+    REQUIRE(registry.has_value());
+    auto shared_sessions =
+        std::shared_ptr<glove::control::session_registry>{std::move(*registry)};
+
+    auto intent_protocol = glove::control::receipt_audit_protocol::create(
+        intent_bootstrap_secret, *intent_producer, shared_validator, shared_sessions
+    );
+    REQUIRE(intent_protocol.has_value());
+
+    auto capabilities_frame =
+        (*intent_protocol)
+            ->handle_frame(intent_request("intent-capabilities", "capabilities", "null"), 50'000);
+    REQUIRE(capabilities_frame.has_value());
+    auto capabilities_response = decode_response(*capabilities_frame);
+    REQUIRE(capabilities_response.has_value());
+    REQUIRE(capabilities_response->result.has_value());
+    supervisor_capabilities capability_set;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        capability_set, capabilities_response->result->str
+    ));
+    REQUIRE(capability_set.observation_intent_channel_schema_version == 1);
+
+    auto unauthorized_page = (*intent_protocol)->handle_frame(
+        make_request(
+            "intent-page-unauthorized",
+            "page_observation_intents",
+            std::string(64, 'f'),
+            "{\"after_sequence\":0,\"limit\":1}",
+            std::nullopt,
+            intent_deadline_ms
+        ),
+        50'000
+    );
+    REQUIRE(unauthorized_page.has_value());
+    auto unauthorized_page_response = decode_response(*unauthorized_page);
+    REQUIRE(unauthorized_page_response.has_value());
+    REQUIRE(unauthorized_page_response->error.has_value());
+    REQUIRE(unauthorized_page_response->error->code == "unauthorized");
+
+    auto keyed_page = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-keyed",
+            "page_observation_intents",
+            "{\"after_sequence\":0,\"limit\":1}",
+            "page-must-be-read-only"
+        ),
+        50'000
+    );
+    REQUIRE(keyed_page.has_value());
+    auto keyed_page_response = decode_response(*keyed_page);
+    REQUIRE(keyed_page_response.has_value());
+    REQUIRE(keyed_page_response->error.has_value());
+    REQUIRE(keyed_page_response->error->code == "invalid_request");
+
+    auto missing_limit = (*intent_protocol)->handle_frame(
+        intent_request("intent-page-missing-limit", "page_observation_intents", "{\"after_sequence\":0}"),
+        50'000
+    );
+    REQUIRE(missing_limit.has_value());
+    auto missing_limit_response = decode_response(*missing_limit);
+    REQUIRE(missing_limit_response.has_value());
+    REQUIRE(missing_limit_response->error.has_value());
+    REQUIRE(missing_limit_response->error->code == "invalid_request");
+
+    auto missing_after_sequence = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-missing-after", "page_observation_intents", "{\"limit\":1}"
+        ),
+        50'000
+    );
+    REQUIRE(missing_after_sequence.has_value());
+    auto missing_after_sequence_response = decode_response(*missing_after_sequence);
+    REQUIRE(missing_after_sequence_response.has_value());
+    REQUIRE(missing_after_sequence_response->error.has_value());
+    REQUIRE(missing_after_sequence_response->error->code == "invalid_request");
+
+    auto unknown_page_field = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-unknown",
+            "page_observation_intents",
+            "{\"after_sequence\":0,\"limit\":1,\"now_ms\":1}"
+        ),
+        50'000
+    );
+    REQUIRE(unknown_page_field.has_value());
+    auto unknown_page_field_response = decode_response(*unknown_page_field);
+    REQUIRE(unknown_page_field_response.has_value());
+    REQUIRE(unknown_page_field_response->error.has_value());
+    REQUIRE(unknown_page_field_response->error->code == "invalid_request");
+
+    auto zero_limit = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-zero", "page_observation_intents", "{\"after_sequence\":0,\"limit\":0}"
+        ),
+        50'000
+    );
+    REQUIRE(zero_limit.has_value());
+    auto zero_limit_response = decode_response(*zero_limit);
+    REQUIRE(zero_limit_response.has_value());
+    REQUIRE(zero_limit_response->error.has_value());
+    REQUIRE(zero_limit_response->error->code == "invalid_request");
+
+    auto oversize_limit = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-oversize",
+            "page_observation_intents",
+            std::string{"{\"after_sequence\":0,\"limit\":"} +
+                std::to_string(glove::control::max_pending_intent_page_size + 1U) + "}"
+        ),
+        50'000
+    );
+    REQUIRE(oversize_limit.has_value());
+    auto oversize_limit_response = decode_response(*oversize_limit);
+    REQUIRE(oversize_limit_response.has_value());
+    REQUIRE(oversize_limit_response->error.has_value());
+    REQUIRE(oversize_limit_response->error->code == "invalid_request");
+
+    auto missing_disposition_key =
+        (*intent_protocol)
+            ->handle_frame(
+                intent_request(
+                    "intent-disposition-no-key",
+                    "set_observation_intent_disposition",
+                    "{\"session_id\":\"missing\",\"channel_generation\":1,\"intent_id\":\"intent-1\","
+                    "\"intent_digest\":\"" +
+                        std::string(64, 'a') + "\",\"disposition\":\"accepted\"}"
+                ),
+                50'000
+            );
+    REQUIRE(missing_disposition_key.has_value());
+    auto missing_disposition_key_response = decode_response(*missing_disposition_key);
+    REQUIRE(missing_disposition_key_response.has_value());
+    REQUIRE(missing_disposition_key_response->error.has_value());
+    REQUIRE(missing_disposition_key_response->error->code == "invalid_request");
+
+    auto timestamped_disposition = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-timestamp",
+            "set_observation_intent_disposition",
+            "{\"session_id\":\"missing\",\"channel_generation\":1,\"intent_id\":\"intent-1\","
+            "\"intent_digest\":\"" +
+                std::string(64, 'a') +
+                "\",\"disposition\":\"accepted\",\"decided_at_ms\":50000}",
+            "intent-disposition-timestamp"
+        ),
+        50'000
+    );
+    REQUIRE(timestamped_disposition.has_value());
+    auto timestamped_disposition_response = decode_response(*timestamped_disposition);
+    REQUIRE(timestamped_disposition_response.has_value());
+    REQUIRE(timestamped_disposition_response->error.has_value());
+    REQUIRE(timestamped_disposition_response->error->code == "invalid_request");
+
+    const std::string session_id = "intent-session";
+    const std::uint64_t start_ms = 50'000;
+    auto created = shared_sessions->create(
+        session_id,
+        intent_controller_digest,
+        intent_sage_guest_plan_at(start_ms),
+        "create-intent-session",
+        start_ms
+    );
+    REQUIRE(created.has_value());
+    const glove::control::session_start_authorization authorization{
+        .schema_version = 1,
+        .authorization_id = "approval-intent-session",
+        .session_id = session_id,
+        .controller_plan_digest = std::string{intent_controller_digest},
+        .plan_content_digest = created->plan_content_digest,
+        .approved_at_ms = start_ms + 1U,
+        .expires_at_ms = start_ms + 60'000U,
+    };
+    auto reserved = shared_sessions->reserve_start(
+        authorization, "reserve-intent-session", start_ms + 2U
+    );
+    REQUIRE(reserved.has_value());
+    const glove::control::session_execution_binding binding{
+        .schema_version = 1,
+        .session_id = session_id,
+        .controller_plan_digest = std::string{intent_controller_digest},
+        .plan_content_digest = created->plan_content_digest,
+        .authorization_id = authorization.authorization_id,
+        .profile_digest = std::string(64, 'a'),
+        .cgroup_identity = intent_cgroup_identity(6001),
+        .filesystem_identity = intent_filesystem_identity(),
+    };
+    auto reservation = (*intent_producer)->reserve_terminal(
+        binding.session_id, binding.controller_plan_digest, binding.profile_digest
+    );
+    REQUIRE(reservation.has_value());
+    auto starting = shared_sessions->mark_starting(
+        binding, *reservation, "starting-intent-session", start_ms + 3U
+    );
+    REQUIRE(starting.has_value());
+    glove::control::session_running_commitment running{
+        .schema_version = 1,
+        .session_id = session_id,
+        .controller_plan_digest = binding.controller_plan_digest,
+        .plan_content_digest = binding.plan_content_digest,
+        .authorization_id = binding.authorization_id,
+        .profile_digest = binding.profile_digest,
+        .process_identity = intent_process_identity(6001),
+        .filesystem_identity = binding.filesystem_identity,
+    };
+    auto marked_running = shared_sessions->mark_running(
+        running, *reservation, "running-intent-session", start_ms + 4U
+    );
+    REQUIRE(marked_running.has_value());
+
+    const glove::control::glove_observation_body body{
+        .schema = "sage.glove-observation.v1",
+        .intent_id = "intent-1",
+        .observation = "guest-capability-inventory",
+        .value_digest = std::string(64, 'd'),
+        .item_count = 4,
+    };
+    const glove::control::observation_intent_context context{
+        .session_id = session_id,
+        .controller_plan_digest = running.controller_plan_digest,
+        .profile_digest = running.profile_digest,
+        .runtime_id = "sage-guest",
+        .projection_digest = std::string(64, 'c'),
+        .policy_revision = 7,
+        .channel_id = "intent-session-observation-v1",
+        .channel_generation = 1,
+        .issued_at_ms = 50'010,
+        .expires_at_ms = 50'110,
+    };
+    auto enqueued = shared_sessions->enqueue_observation_intent(body, context, 50'010);
+    REQUIRE(enqueued.has_value());
+
+    auto second_body = body;
+    second_body.intent_id = "intent-2";
+    second_body.value_digest = std::string(64, 'e');
+    auto second_context = context;
+    second_context.issued_at_ms = 50'011;
+    second_context.expires_at_ms = 50'111;
+    auto second = shared_sessions->enqueue_observation_intent(second_body, second_context, 50'011);
+    REQUIRE(second.has_value());
+
+    auto expiring_body = body;
+    expiring_body.intent_id = "intent-expired";
+    expiring_body.value_digest = std::string(64, 'f');
+    auto expiring_context = context;
+    expiring_context.issued_at_ms = 50'012;
+    expiring_context.expires_at_ms = 50'020;
+    auto expiring =
+        shared_sessions->enqueue_observation_intent(expiring_body, expiring_context, 50'012);
+    REQUIRE(expiring.has_value());
+
+    auto first_page_frame = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-first", "page_observation_intents", "{\"after_sequence\":0,\"limit\":1}"
+        ),
+        50'015
+    );
+    REQUIRE(first_page_frame.has_value());
+    REQUIRE(response_excludes_sensitive_material(*first_page_frame));
+    auto first_page_response = decode_response(*first_page_frame);
+    REQUIRE(first_page_response.has_value());
+    REQUIRE(first_page_response->result.has_value());
+    page_observation_intents_result first_page;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        first_page, first_page_response->result->str
+    ));
+    REQUIRE(first_page.schema_version == 1);
+    REQUIRE(first_page.items.size() == 1U);
+    REQUIRE(first_page.items.front().body.intent_id == "intent-1");
+    REQUIRE(first_page.items.front().disposition == "pending");
+    REQUIRE(first_page.next_after_sequence.has_value());
+    REQUIRE(*first_page.next_after_sequence == first_page.items.front().sequence);
+
+    auto second_page_frame = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-second",
+            "page_observation_intents",
+            std::string{"{\"after_sequence\":"} +
+                std::to_string(*first_page.next_after_sequence) + ",\"limit\":1}"
+        ),
+        50'015
+    );
+    REQUIRE(second_page_frame.has_value());
+    auto second_page_response = decode_response(*second_page_frame);
+    REQUIRE(second_page_response.has_value());
+    REQUIRE(second_page_response->result.has_value());
+    page_observation_intents_result second_page;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        second_page, second_page_response->result->str
+    ));
+    REQUIRE(second_page.items.size() == 1U);
+    REQUIRE(second_page.items.front().body.intent_id == "intent-2");
+    REQUIRE(second_page.items.front().sequence > first_page.items.front().sequence);
+    REQUIRE(second_page.next_after_sequence.has_value());
+    REQUIRE(*second_page.next_after_sequence == second_page.items.front().sequence);
+
+    const std::string disposition_payload =
+        std::string{"{\"session_id\":\""} + session_id +
+        "\",\"channel_generation\":1,\"intent_id\":\"intent-1\",\"intent_digest\":\"" +
+        enqueued->intent_digest + "\",\"disposition\":\"accepted\"}";
+    auto accepted_frame = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-accepted",
+            "set_observation_intent_disposition",
+            disposition_payload,
+            "intent-disposition-accepted"
+        ),
+        50'020
+    );
+    REQUIRE(accepted_frame.has_value());
+    REQUIRE(response_excludes_sensitive_material(*accepted_frame));
+    auto accepted_response = decode_response(*accepted_frame);
+    REQUIRE(accepted_response.has_value());
+    REQUIRE(accepted_response->result.has_value());
+    observation_intent_disposition_result accepted_result;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        accepted_result, accepted_response->result->str
+    ));
+    REQUIRE(accepted_result.schema_version == 1);
+    REQUIRE(accepted_result.item.disposition == "accepted");
+    REQUIRE(accepted_result.item.decided_at_ms == 50'020);
+
+    auto accepted_replay = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-replay",
+            "set_observation_intent_disposition",
+            disposition_payload,
+            "intent-disposition-accepted"
+        ),
+        50'021
+    );
+    REQUIRE(accepted_replay.has_value());
+    auto accepted_replay_response = decode_response(*accepted_replay);
+    REQUIRE(accepted_replay_response.has_value());
+    REQUIRE(accepted_replay_response->result.has_value());
+    REQUIRE(accepted_replay_response->result->str == accepted_response->result->str);
+
+    auto disposition_conflict = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-conflict",
+            "set_observation_intent_disposition",
+            std::string{"{\"session_id\":\""} + session_id +
+                "\",\"channel_generation\":1,\"intent_id\":\"intent-1\",\"intent_digest\":\"" +
+                enqueued->intent_digest + "\",\"disposition\":\"rejected\"}",
+            "intent-disposition-accepted"
+        ),
+        50'022
+    );
+    REQUIRE(disposition_conflict.has_value());
+    auto disposition_conflict_response = decode_response(*disposition_conflict);
+    REQUIRE(disposition_conflict_response.has_value());
+    REQUIRE(disposition_conflict_response->error.has_value());
+    REQUIRE(disposition_conflict_response->error->code == "idempotency_conflict");
+    REQUIRE(response_excludes_sensitive_material(*disposition_conflict));
+
+    auto missing_intent_payload =
+        std::string{"{\"session_id\":\""} + session_id +
+        "\",\"channel_generation\":1,\"intent_id\":\"missing-intent\",\"intent_digest\":\"" +
+        std::string(64, 'b') + "\",\"disposition\":\"accepted\"}";
+    auto missing_intent = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-missing",
+            "set_observation_intent_disposition",
+            missing_intent_payload,
+            "intent-disposition-missing"
+        ),
+        50'023
+    );
+    REQUIRE(missing_intent.has_value());
+    auto missing_intent_response = decode_response(*missing_intent);
+    REQUIRE(missing_intent_response.has_value());
+    REQUIRE(missing_intent_response->error.has_value());
+    REQUIRE(missing_intent_response->error->code == "observation_intent_not_found");
+    REQUIRE(missing_intent_response->error->message == "observation intent was not found");
+    REQUIRE(response_excludes_sensitive_material(*missing_intent));
+
+    auto expired_disposition_payload =
+        std::string{"{\"session_id\":\""} + session_id +
+        "\",\"channel_generation\":1,\"intent_id\":\"intent-expired\",\"intent_digest\":\"" +
+        expiring->intent_digest + "\",\"disposition\":\"accepted\"}";
+    auto expired_disposition = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-expired",
+            "set_observation_intent_disposition",
+            expired_disposition_payload,
+            "intent-disposition-expired"
+        ),
+        50'030
+    );
+    REQUIRE(expired_disposition.has_value());
+    auto expired_disposition_response = decode_response(*expired_disposition);
+    REQUIRE(expired_disposition_response.has_value());
+    REQUIRE(expired_disposition_response->error.has_value());
+    REQUIRE(expired_disposition_response->error->code == "invalid_request");
+    REQUIRE(expired_disposition_response->error->message == "invalid observation intent request");
+    REQUIRE(response_excludes_sensitive_material(*expired_disposition));
+
+    auto expired_page = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-page-after-expiry",
+            "page_observation_intents",
+            "{\"after_sequence\":0,\"limit\":16}"
+        ),
+        50'030
+    );
+    REQUIRE(expired_page.has_value());
+    auto expired_page_response = decode_response(*expired_page);
+    REQUIRE(expired_page_response.has_value());
+    REQUIRE(expired_page_response->result.has_value());
+    page_observation_intents_result expired_page_result;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        expired_page_result, expired_page_response->result->str
+    ));
+    REQUIRE(std::ranges::none_of(expired_page_result.items, [](const auto& item) {
+        return item.body.intent_id == "intent-expired";
+    }));
+
+    return 0;
+}
+
 auto run() -> int {
     temporary_directory temp;
     REQUIRE(!temp.root().empty());
@@ -514,6 +1198,7 @@ auto run() -> int {
     REQUIRE(capabilities.change_manifest_schema_version == 0);
     REQUIRE(capabilities.change_apply_authorization_schema_version == 0);
     REQUIRE(capabilities.refinement_evaluation_protocol_schema_version == 0);
+    REQUIRE(capabilities.observation_intent_channel_schema_version == 0);
     REQUIRE(capabilities.backends.size() == 2);
     for (const auto& backend : capabilities.backends) {
         REQUIRE(backend.resource_enforcement.cpu_time == "unavailable");
@@ -548,6 +1233,36 @@ auto run() -> int {
                 bootstrap_secret,
                 "null",
                 std::string{"unavailable-"} + std::string{method}
+            ),
+            1'000
+        );
+        REQUIRE(unavailable.has_value());
+        auto unavailable_response = decode_response(*unavailable);
+        REQUIRE(unavailable_response.has_value());
+        REQUIRE(unavailable_response->error.has_value());
+        REQUIRE(unavailable_response->error->code == "method_not_found");
+    }
+
+    constexpr std::array<std::string_view, 2> unavailable_intent_methods{
+        "page_observation_intents",
+        "set_observation_intent_disposition",
+    };
+    for (const auto method : unavailable_intent_methods) {
+        auto unavailable = (*protocol)->handle_frame(
+            make_request(
+                std::string{"unavailable-intent-"} + std::string{method},
+                method,
+                bootstrap_secret,
+                method == "page_observation_intents" ? "{\"after_sequence\":0,\"limit\":1}"
+                                                     : "{\"session_id\":\"missing\","
+                                                       "\"channel_generation\":1,"
+                                                       "\"intent_id\":\"intent-1\","
+                                                       "\"intent_digest\":\"" +
+                                                           std::string(64, 'a') +
+                                                           "\",\"disposition\":\"accepted\"}",
+                method == "set_observation_intent_disposition"
+                    ? std::optional<std::string_view>{"unavailable-intent-key"}
+                    : std::nullopt
             ),
             1'000
         );
@@ -756,6 +1471,7 @@ auto run() -> int {
     REQUIRE(planned_capability_set.session_control.create_session);
     REQUIRE(planned_capability_set.session_control.session_status);
     REQUIRE(!planned_capability_set.session_control.start_session);
+    REQUIRE(planned_capability_set.observation_intent_channel_schema_version == 1);
 
     auto remote_runtime = glove::control::remote_session_runtime::create({
         .ssh_argv = {"/usr/bin/ssh", "-F", "/tmp/glove-remote/config", "glove-remote"},
@@ -1183,6 +1899,8 @@ auto run() -> int {
     auto fresh_ack_response = decode_response(*fresh_ack);
     REQUIRE(fresh_ack_response.has_value());
     REQUIRE(fresh_ack_response->result.has_value());
+
+    REQUIRE(run_observation_intent_control_contract() == 0);
     return 0;
 }
 

@@ -180,6 +180,18 @@ valid_identifier(std::string_view value, std::size_t max_bytes = max_identifier_
     const wire::rpc_params& params,
     std::uint64_t now_ms
 ) -> std::expected<std::string, std::string>;
+[[nodiscard]] auto handle_page_observation_intents(
+    const receipt_audit_protocol::implementation& state,
+    std::string_view request_id,
+    const wire::rpc_params& params,
+    std::uint64_t now_ms
+) -> std::expected<std::string, std::string>;
+[[nodiscard]] auto handle_set_observation_intent_disposition(
+    receipt_audit_protocol::implementation& state,
+    std::string_view request_id,
+    const wire::rpc_params& params,
+    std::uint64_t now_ms
+) -> std::expected<std::string, std::string>;
 
 [[nodiscard]] auto handle_frame(
     receipt_audit_protocol::implementation& state, std::string_view frame, std::uint64_t now_ms

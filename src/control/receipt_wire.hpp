@@ -265,6 +265,60 @@ struct backend_capabilities {
     resource_enforcement_capabilities resource_enforcement;
 };
 
+struct page_observation_intents_request {
+    std::uint64_t after_sequence = 0;
+    std::size_t limit = 0;
+};
+
+struct observation_intent_body_wire {
+    std::string schema;
+    std::string intent_id;
+    std::string observation;
+    std::string value_digest;
+    std::uint64_t item_count = 0;
+};
+
+struct observation_intent_context_wire {
+    std::string session_id;
+    std::string controller_plan_digest;
+    std::string profile_digest;
+    std::string runtime_id;
+    std::string projection_digest;
+    std::uint64_t policy_revision = 0;
+    std::string channel_id;
+    std::uint64_t channel_generation = 0;
+    std::uint64_t issued_at_ms = 0;
+    std::uint64_t expires_at_ms = 0;
+};
+
+struct observation_intent_queue_item_wire {
+    std::uint64_t sequence = 0;
+    observation_intent_body_wire body;
+    observation_intent_context_wire context;
+    std::string intent_digest;
+    std::string disposition;
+    std::uint64_t decided_at_ms = 0;
+};
+
+struct page_observation_intents_result {
+    std::uint8_t schema_version = 1;
+    std::vector<observation_intent_queue_item_wire> items;
+    std::optional<std::uint64_t> next_after_sequence;
+};
+
+struct set_observation_intent_disposition_request {
+    std::string session_id;
+    std::uint64_t channel_generation = 0;
+    std::string intent_id;
+    std::string intent_digest;
+    std::string disposition;
+};
+
+struct observation_intent_disposition_result {
+    std::uint8_t schema_version = 1;
+    observation_intent_queue_item_wire item;
+};
+
 struct supervisor_capabilities {
     std::uint8_t schema_version = 1;
     receipt_audit_capabilities receipt_audit;
@@ -279,6 +333,7 @@ struct supervisor_capabilities {
     std::uint8_t change_manifest_schema_version = 0;
     std::uint8_t change_apply_authorization_schema_version = 0;
     std::uint8_t refinement_evaluation_protocol_schema_version = 0;
+    std::uint8_t observation_intent_channel_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
