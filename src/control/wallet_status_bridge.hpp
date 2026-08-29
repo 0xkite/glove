@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -227,13 +228,17 @@ encode_wallet_status_request(std::string_view id, std::uint64_t deadline_remaini
 [[nodiscard]] auto decode_wallet_status_response(std::string_view frame)
     -> std::expected<wallet_status_bridge_response, std::string>;
 
-// Four-byte big-endian framing for one inherited per-session Unix socket. These
-// helpers do not create, discover, connect, own, or close the socket.
-[[nodiscard]] auto
-read_wallet_status_frame(int descriptor, std::chrono::steady_clock::time_point deadline)
-    -> std::expected<std::string, std::string>;
+// Four-byte big-endian framing for one per-session Unix socket. One absolute
+// deadline spans partial I/O, and cancellation never attempts resynchronization.
+// These helpers do not create, discover, connect, own, or close the socket.
+[[nodiscard]] auto read_wallet_status_frame(
+    int descriptor, std::chrono::steady_clock::time_point deadline, const std::stop_token& stop = {}
+) -> std::expected<std::string, std::string>;
 [[nodiscard]] auto write_wallet_status_frame(
-    int descriptor, std::string_view frame, std::chrono::steady_clock::time_point deadline
+    int descriptor,
+    std::string_view frame,
+    std::chrono::steady_clock::time_point deadline,
+    const std::stop_token& stop = {}
 ) -> std::expected<void, std::string>;
 
 } // namespace glove::control

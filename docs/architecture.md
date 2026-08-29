@@ -135,12 +135,31 @@ malformed JSON, more than 64 nested containers, and repeated decoded object
 keys at every level. This includes equivalent escaped keys and keys inside the
 raw result object. A dedicated 64-KiB fuzz target and adversarial corpus keep
 that precondition exercised. Only deterministic offline authority fakes exist
-in this milestone. A future runtime composition must implement the interfaces
-with concrete protected registry, policy, audit/journal, adapter-digest, and
-status objects; create and close the socketpair correctly; preserve the same
-absolute deadline; and prove descriptor containment before capability discovery
-may expose schema version 1. Live Sage/P2P/wallet connection remains a separate
-operator gate.
+in this milestone.
+
+A second private, disabled-by-default synthetic owner composes one unnamed Unix
+stream socketpair with the processor. Construction verifies the creator/owner
+UID and the creation-time socketpair peer UID (the same synthetic owner, not a
+future child identity), plus `AF_UNIX`, `SOCK_STREAM`, nonblocking mode, and
+`FD_CLOEXEC` on both endpoints.
+One sequential `std::jthread` exclusively owns the host endpoint. It uses one
+absolute request deadline for framing, authority processing, and response
+writing; cancellation, EOF, malformed or partial framing, oversized input,
+processing failure, backpressure timeout, session expiry, or destruction closes
+every endpoint still owned by the session without resynchronization. The guest
+endpoint can be transferred
+exactly once for in-process socketpair tests and remains `CLOEXEC`. No production
+launcher maps it into a child, no environment variable advertises it, and no
+managed Pi process is started by this milestone.
+
+A future runtime composition must implement the authority interfaces with
+concrete protected registry, policy, audit/journal, adapter-digest, and status
+objects; add separately reviewed child descriptor mapping and unintended-FD
+closure; preserve the same absolute deadline; and prove descriptor containment
+before capability discovery may expose schema version 1. Live Sage/P2P/wallet
+connection remains a separate operator gate. Authority callbacks may request
+session close, but they must not destroy the session owner from its worker
+thread; live composition requires an independently owned lifetime.
 
 `glove exec` bypasses the MCP kernel. It is intended for agents that manage
 their own tool protocol, so its security boundary is the OS sandbox and explicit

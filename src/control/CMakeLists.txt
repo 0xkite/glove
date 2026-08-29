@@ -17,6 +17,7 @@ add_library(glove_control STATIC
     wallet_status_bridge.cpp
     wallet_status_channel.cpp
     wallet_status_json.cpp
+    wallet_status_managed_session.cpp
 )
 add_library(glove::control ALIAS glove_control)
 

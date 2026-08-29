@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -24,9 +25,25 @@ auto system_error(std::string_view operation, int error_number = errno) -> std::
            std::error_code{error_number, std::generic_category()}.message();
 }
 
-auto poll_ready(int descriptor, short events, steady_time deadline)
+auto classify_poll_event(short returned, short expected) -> std::expected<bool, std::string> {
+    if ((returned & (POLLERR | POLLNVAL)) != 0) {
+        return std::unexpected(std::string{"wallet status descriptor failed"});
+    }
+    if ((returned & expected) != 0) {
+        return true;
+    }
+    if ((returned & POLLHUP) != 0) {
+        return std::unexpected(std::string{"wallet status descriptor closed"});
+    }
+    return false;
+}
+
+auto poll_ready(int descriptor, short events, steady_time deadline, const std::stop_token& stop)
     -> std::expected<void, std::string> {
     while (true) {
+        if (stop.stop_requested()) {
+            return std::unexpected(std::string{"wallet status protocol cancelled"});
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             return std::unexpected(std::string{"wallet status protocol deadline exceeded"});
@@ -35,25 +52,30 @@ auto poll_ready(int descriptor, short events, steady_time deadline)
         if (remaining.count() == 0) {
             remaining = std::chrono::milliseconds{1};
         }
-        const auto timeout = static_cast<int>(std::min<std::int64_t>(
+        auto timeout_count = std::min<std::int64_t>(
             remaining.count(), static_cast<std::int64_t>(std::numeric_limits<int>::max())
-        ));
+        );
+        if (stop.stop_possible()) {
+            timeout_count = std::min<std::int64_t>(timeout_count, 50);
+        }
+        const auto timeout = static_cast<int>(timeout_count);
         pollfd descriptor_state{.fd = descriptor, .events = events, .revents = 0};
         const auto result = ::poll(&descriptor_state, 1, timeout);
+        if (stop.stop_requested()) {
+            return std::unexpected(std::string{"wallet status protocol cancelled"});
+        }
         if (result > 0) {
-            if ((descriptor_state.revents & (POLLERR | POLLNVAL)) != 0) {
-                return std::unexpected(std::string{"wallet status descriptor failed"});
+            auto readiness = classify_poll_event(descriptor_state.revents, events);
+            if (!readiness) {
+                return std::unexpected(readiness.error());
             }
-            if ((descriptor_state.revents & events) != 0) {
+            if (*readiness) {
                 return {};
-            }
-            if ((descriptor_state.revents & POLLHUP) != 0) {
-                return std::unexpected(std::string{"wallet status descriptor closed"});
             }
             continue;
         }
         if (result == 0) {
-            return std::unexpected(std::string{"wallet status protocol deadline exceeded"});
+            continue;
         }
         if (errno != EINTR) {
             return std::unexpected(system_error("wallet status poll"));
@@ -61,11 +83,15 @@ auto poll_ready(int descriptor, short events, steady_time deadline)
     }
 }
 
-auto read_exact(int descriptor, std::span<unsigned char> output, steady_time deadline)
-    -> std::expected<void, std::string> {
+auto read_exact(
+    int descriptor,
+    std::span<unsigned char> output,
+    steady_time deadline,
+    const std::stop_token& stop
+) -> std::expected<void, std::string> {
     std::size_t offset = 0;
     while (offset < output.size()) {
-        if (auto waited = poll_ready(descriptor, POLLIN, deadline); !waited) {
+        if (auto waited = poll_ready(descriptor, POLLIN, deadline, stop); !waited) {
             return waited;
         }
         const auto count = ::recv(descriptor, output.data() + offset, output.size() - offset, 0);
@@ -83,11 +109,15 @@ auto read_exact(int descriptor, std::span<unsigned char> output, steady_time dea
     return {};
 }
 
-auto write_exact(int descriptor, std::span<const unsigned char> input, steady_time deadline)
-    -> std::expected<void, std::string> {
+auto write_exact(
+    int descriptor,
+    std::span<const unsigned char> input,
+    steady_time deadline,
+    const std::stop_token& stop
+) -> std::expected<void, std::string> {
     std::size_t offset = 0;
     while (offset < input.size()) {
-        if (auto waited = poll_ready(descriptor, POLLOUT, deadline); !waited) {
+        if (auto waited = poll_ready(descriptor, POLLOUT, deadline, stop); !waited) {
             return waited;
         }
 #if defined(MSG_NOSIGNAL)
@@ -112,10 +142,10 @@ auto write_exact(int descriptor, std::span<const unsigned char> input, steady_ti
 
 } // namespace
 
-auto read_wallet_status_frame(int descriptor, steady_time deadline)
+auto read_wallet_status_frame(int descriptor, steady_time deadline, const std::stop_token& stop)
     -> std::expected<std::string, std::string> {
     std::array<unsigned char, 4> header{};
-    if (auto read = read_exact(descriptor, header, deadline); !read) {
+    if (auto read = read_exact(descriptor, header, deadline, stop); !read) {
         return std::unexpected(read.error());
     }
     const auto length = (static_cast<std::uint32_t>(header[0]) << 24U) |
@@ -128,14 +158,15 @@ auto read_wallet_status_frame(int descriptor, steady_time deadline)
     std::string frame(length, '\0');
     auto bytes =
         std::span<unsigned char>{reinterpret_cast<unsigned char*>(frame.data()), frame.size()};
-    if (auto read = read_exact(descriptor, bytes, deadline); !read) {
+    if (auto read = read_exact(descriptor, bytes, deadline, stop); !read) {
         return std::unexpected(read.error());
     }
     return frame;
 }
 
-auto write_wallet_status_frame(int descriptor, std::string_view frame, steady_time deadline)
-    -> std::expected<void, std::string> {
+auto write_wallet_status_frame(
+    int descriptor, std::string_view frame, steady_time deadline, const std::stop_token& stop
+) -> std::expected<void, std::string> {
 #if defined(SO_NOSIGPIPE)
     constexpr int enabled = 1;
     if (::setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
@@ -153,7 +184,7 @@ auto write_wallet_status_frame(int descriptor, std::string_view frame, steady_ti
         static_cast<unsigned char>((length >> 8U) & 0xffU),
         static_cast<unsigned char>(length & 0xffU),
     };
-    if (auto wrote = write_exact(descriptor, header, deadline); !wrote) {
+    if (auto wrote = write_exact(descriptor, header, deadline, stop); !wrote) {
         return std::unexpected(wrote.error());
     }
     return write_exact(
@@ -161,7 +192,8 @@ auto write_wallet_status_frame(int descriptor, std::string_view frame, steady_ti
         std::span<const unsigned char>{
             reinterpret_cast<const unsigned char*>(frame.data()), frame.size()
         },
-        deadline
+        deadline,
+        stop
     );
 }
 
