@@ -214,7 +214,7 @@ auto apple_host_checks(const std::optional<apple_container_config>& runtime)
             .code = "apple_container_guest",
             .status = image_ready ? doctor_status::passed : doctor_status::failed,
             .message = image_ready
-                           ? "The digest-addressed managed guest and harness closure are available."
+                           ? "The configured managed guest image is available for validation."
                            : "The configured digest-addressed managed guest is unavailable.",
             .recovery = "Rerun `glove setup --yes` to pull the paired managed guest.",
         },

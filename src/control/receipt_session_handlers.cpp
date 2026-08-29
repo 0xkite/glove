@@ -3,10 +3,6 @@
 #include "receipt_audit_wire.hpp"
 #include "receipt_handlers.hpp"
 
-#if defined(__linux__)
-#    include "linux_session_executor.hpp"
-#endif
-
 #include <glaze/glaze.hpp>
 
 #include <cstdint>
@@ -46,7 +42,6 @@ auto decode_strict(std::string_view input) -> std::expected<Value, std::string> 
     return value;
 }
 
-#if defined(__linux__)
 auto mutation_payload_digest(std::string_view method, std::string_view payload)
     -> std::expected<std::string, std::string> {
     std::vector<unsigned char> material;
@@ -60,7 +55,6 @@ auto mutation_payload_digest(std::string_view method, std::string_view payload)
     }
     return container::sha256_hex(std::span<const unsigned char>{material});
 }
-#endif
 
 } // namespace
 
@@ -321,7 +315,6 @@ auto handle_start_session(
             request_id, "audit_reconciliation_required", "receipt audit acknowledgement is required"
         );
     }
-#if defined(__linux__)
     if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
         return error_response(
             request_id,
@@ -352,10 +345,6 @@ auto handle_start_session(
         return std::unexpected(result.error());
     }
     return success_response(request_id, std::move(*result));
-#else
-    static_cast<void>(now_ms);
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
 auto handle_stop_session(
@@ -374,7 +363,6 @@ auto handle_stop_session(
     if (!payload || !valid_identifier(payload->session_id)) {
         return error_response(request_id, "invalid_request", "invalid session stop request");
     }
-#if defined(__linux__)
     if (auto stopped = state.session_runtime->stop(payload->session_id, idempotency_key);
         !stopped) {
         return error_response(request_id, "session_stop_failed", "session stop was rejected");
@@ -392,9 +380,6 @@ auto handle_stop_session(
         return std::unexpected(result.error());
     }
     return success_response(request_id, std::move(*result));
-#else
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
 auto handle_attach(
@@ -415,7 +400,6 @@ auto handle_attach(
         payload->max_bytes > max_session_io_bytes) {
         return error_response(request_id, "invalid_request", "invalid session attach request");
     }
-#if defined(__linux__)
     auto read =
         state.session_runtime->read(payload->session_id, payload->cursor, payload->max_bytes);
     if (!read) {
@@ -440,12 +424,8 @@ auto handle_attach(
         return std::unexpected(result.error());
     }
     return success_response(request_id, std::move(*result));
-#else
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
-#if defined(__linux__)
 template<typename Operation>
 auto handle_idempotent_session_mutation(
     receipt_audit_protocol::implementation& state,
@@ -497,7 +477,6 @@ auto handle_idempotent_session_mutation(
     );
     return success_response(request_id, std::move(*result));
 }
-#endif
 
 auto handle_write_stdin(
     receipt_audit_protocol::implementation& state,
@@ -516,7 +495,6 @@ auto handle_write_stdin(
         payload->bytes.size() > max_session_io_bytes) {
         return error_response(request_id, "invalid_request", "invalid session input request");
     }
-#if defined(__linux__)
     const std::string bytes{payload->bytes.begin(), payload->bytes.end()};
     const auto session_id = payload->session_id;
     return handle_idempotent_session_mutation(
@@ -532,9 +510,6 @@ auto handle_write_stdin(
             return state.session_runtime->write_input(session_id, bytes);
         }
     );
-#else
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
 auto handle_resize(
@@ -555,7 +530,6 @@ auto handle_resize(
         payload->columns > max_terminal_dimension) {
         return error_response(request_id, "invalid_request", "invalid session resize request");
     }
-#if defined(__linux__)
     const auto session_id = payload->session_id;
     const auto rows = payload->rows;
     const auto columns = payload->columns;
@@ -572,9 +546,6 @@ auto handle_resize(
             return state.session_runtime->resize(session_id, rows, columns);
         }
     );
-#else
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
 auto handle_signal(
@@ -593,7 +564,6 @@ auto handle_signal(
     if (!payload || !valid_identifier(payload->session_id)) {
         return error_response(request_id, "invalid_request", "invalid session signal request");
     }
-#if defined(__linux__)
     std::optional<session_signal> requested;
     if (payload->signal == "interrupt") {
         requested = session_signal::interrupt;
@@ -619,9 +589,6 @@ auto handle_signal(
             return state.session_runtime->signal(session_id, requested);
         }
     );
-#else
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
 auto handle_detach(
@@ -640,7 +607,6 @@ auto handle_detach(
     if (!payload || !valid_identifier(payload->session_id)) {
         return error_response(request_id, "invalid_request", "invalid session detach request");
     }
-#if defined(__linux__)
     auto payload_digest = mutation_payload_digest("detach", params.payload.str);
     if (!payload_digest) {
         return error_response(
@@ -686,9 +652,6 @@ auto handle_detach(
         }
     );
     return success_response(request_id, std::move(*result));
-#else
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
 auto handle_cleanup_session(
@@ -709,7 +672,6 @@ auto handle_cleanup_session(
     if (!payload || !valid_identifier(payload->session_id)) {
         return error_response(request_id, "invalid_request", "invalid session cleanup request");
     }
-#if defined(__linux__)
     const auto session_id = payload->session_id;
     return handle_idempotent_session_mutation(
         state,
@@ -722,9 +684,6 @@ auto handle_cleanup_session(
         session_id,
         [&state, &session_id] { return state.session_runtime->cleanup(session_id); }
     );
-#else
-    return error_response(request_id, "method_not_found", "control method is unavailable");
-#endif
 }
 
 } // namespace glove::control::receipt_handlers

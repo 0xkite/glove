@@ -19,11 +19,19 @@
 
 namespace glove::host {
 namespace config_wire_types {
+struct sage_guest_wire {
+    std::string binary_digest;
+    std::string source_revision;
+    std::uint8_t policy_schema_version = 0;
+    std::string library_projection_schema;
+};
+
 struct apple_container_wire {
     std::string cli;
     std::string image;
     std::string image_digest;
     std::optional<std::string> harness_closure_digest;
+    std::optional<sage_guest_wire> sage_guest;
 };
 
 struct remote_backend_wire {
@@ -64,6 +72,7 @@ namespace {
 using config_wire_types::apple_container_wire;
 using config_wire_types::config_wire;
 using config_wire_types::remote_backend_wire;
+using config_wire_types::sage_guest_wire;
 
 constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 constexpr std::uint64_t max_config_bytes = std::uint64_t{1024} * 1024U;
@@ -322,10 +331,22 @@ auto validate(const config& value) -> result<void> {
         const auto& apple = *value.apple_container;
         const bool valid_closure_digest =
             !apple.harness_closure_digest || valid_sha256_digest(*apple.harness_closure_digest);
-        if (!value.session_store || !value.materialization_root || apple.image.empty() ||
-            apple.image.size() > 256U ||
-            apple.image.find_first_of(" \t\r\n") != std::string::npos ||
-            !valid_sha256_digest(apple.image_digest) || !valid_closure_digest) {
+        const bool valid_guest =
+            !apple.sage_guest ||
+            (apple.harness_closure_digest && valid_sha256_digest(apple.sage_guest->binary_digest) &&
+             (apple.sage_guest->source_revision == "unknown" ||
+              (apple.sage_guest->source_revision.size() == 40U &&
+               std::ranges::all_of(
+                   apple.sage_guest->source_revision,
+                   [](char byte) {
+                       return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+                   }
+               ))) &&
+             apple.sage_guest->policy_schema_version == 1U &&
+             apple.sage_guest->library_projection_schema == "sage_bundle_v1");
+        if (!value.session_store || !value.materialization_root ||
+            !container::valid_immutable_container_image(apple.image, apple.image_digest) ||
+            !valid_closure_digest || !valid_guest) {
             return std::unexpected(
                 std::string{"Apple Container runtime requires managed-session roots and an exact "
                             "image digest"}
@@ -381,6 +402,19 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
                       .image = encoded.apple_container->image,
                       .image_digest = encoded.apple_container->image_digest,
                       .harness_closure_digest = encoded.apple_container->harness_closure_digest,
+                      .sage_guest =
+                          encoded.apple_container->sage_guest
+                              ? std::optional<sage_guest_config>{sage_guest_config{
+                                    .binary_digest =
+                                        encoded.apple_container->sage_guest->binary_digest,
+                                    .source_revision =
+                                        encoded.apple_container->sage_guest->source_revision,
+                                    .policy_schema_version =
+                                        encoded.apple_container->sage_guest->policy_schema_version,
+                                    .library_projection_schema = encoded.apple_container->sage_guest
+                                                                     ->library_projection_schema,
+                                }}
+                              : std::nullopt,
                   }}
                 : std::nullopt,
         .remote_backend =
@@ -432,6 +466,20 @@ auto encode_config(const config& value) -> result<std::string> {
                           .image = value.apple_container->image,
                           .image_digest = value.apple_container->image_digest,
                           .harness_closure_digest = value.apple_container->harness_closure_digest,
+                          .sage_guest =
+                              value.apple_container->sage_guest
+                                  ? std::optional<sage_guest_wire>{sage_guest_wire{
+                                        .binary_digest =
+                                            value.apple_container->sage_guest->binary_digest,
+                                        .source_revision =
+                                            value.apple_container->sage_guest->source_revision,
+                                        .policy_schema_version = value.apple_container->sage_guest
+                                                                     ->policy_schema_version,
+                                        .library_projection_schema =
+                                            value.apple_container->sage_guest
+                                                ->library_projection_schema,
+                                    }}
+                                  : std::nullopt,
                       }}
                     : std::nullopt,
             .remote_backend =

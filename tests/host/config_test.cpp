@@ -183,9 +183,15 @@ auto run() -> int {
     auto apple = managed_plan->service;
     apple.apple_container = apple_container_config{
         .cli = "/usr/local/bin/container",
-        .image = "ghcr.io/sage-protocol/glove-agent-runtime:0.0.1",
+        .image = "ghcr.io/sage-protocol/glove-agent-runtime@sha256:" + std::string(64U, 'a'),
         .image_digest = "sha256:" + std::string(64U, 'a'),
         .harness_closure_digest = "sha256:" + std::string(64U, 'b'),
+        .sage_guest = sage_guest_config{
+            .binary_digest = "sha256:" + std::string(64U, 'c'),
+            .source_revision = std::string(40U, 'd'),
+            .policy_schema_version = 1,
+            .library_projection_schema = "sage_bundle_v1",
+        },
     };
     REQUIRE(write_config_exclusive(apple_path, apple).has_value());
     REQUIRE(load_config(apple_path) == apple);
@@ -193,7 +199,16 @@ auto run() -> int {
     invalid_apple.apple_container->image_digest = "sha256:latest";
     REQUIRE(!validate(invalid_apple).has_value());
     invalid_apple = apple;
+    invalid_apple.apple_container->image = "ghcr.io/sage-protocol/glove-agent-runtime:latest";
+    REQUIRE(!validate(invalid_apple).has_value());
+    invalid_apple = apple;
     invalid_apple.apple_container->harness_closure_digest = "sha256:latest";
+    REQUIRE(!validate(invalid_apple).has_value());
+    invalid_apple = apple;
+    invalid_apple.apple_container->sage_guest->library_projection_schema = "latest";
+    REQUIRE(!validate(invalid_apple).has_value());
+    invalid_apple = apple;
+    invalid_apple.apple_container->harness_closure_digest.reset();
     REQUIRE(!validate(invalid_apple).has_value());
     invalid_apple = apple;
     invalid_apple.materialization_root.reset();

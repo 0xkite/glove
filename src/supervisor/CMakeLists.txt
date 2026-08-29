@@ -15,6 +15,7 @@ add_library(glove_supervisor STATIC
     path_exposure.cpp
     path_exposure_journal.cpp
     path_exposure_policy.cpp
+    sage_bundle_projection.cpp
     session_plan.cpp
 )
 add_library(glove::supervisor ALIAS glove_supervisor)

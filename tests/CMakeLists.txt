@@ -579,6 +579,20 @@ if(APPLE)
         SKIP_RETURN_CODE 77
     )
 
+    add_executable(
+        control_apple_container_unavailable_test
+        control/apple_container_unavailable_test.cpp
+    )
+    target_link_libraries(control_apple_container_unavailable_test PRIVATE glove_control)
+    target_include_directories(control_apple_container_unavailable_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+    )
+    add_test(
+        NAME control_apple_container_unavailable
+        COMMAND control_apple_container_unavailable_test
+    )
+    set_tests_properties(control_apple_container_unavailable PROPERTIES TIMEOUT 30)
+
     add_executable(mcp_stdio_transport_test mcp/stdio_transport_test.cpp)
     target_link_libraries(mcp_stdio_transport_test PRIVATE glove_kernel)
     add_test(NAME mcp_stdio_transport COMMAND mcp_stdio_transport_test)

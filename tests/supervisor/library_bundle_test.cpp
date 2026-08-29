@@ -2,6 +2,7 @@
 #include "glove/supervisor/codex_runtime_adapter.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
+#include "glove/supervisor/sage_bundle_projection.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -182,6 +183,64 @@ auto run() -> int {
     REQUIRE(projections->front().target_path == "/opt/sage/library-bundles/" + digest + ".json");
     REQUIRE(projections->front().bundle.content_digest() == digest);
     REQUIRE(projections->front().bundle.verify_identity().has_value());
+
+    auto sage_projection_digest = glove::supervisor::sage_bundle_projection_digest(*projections);
+    REQUIRE(sage_projection_digest.has_value());
+    REQUIRE(sage_projection_digest->size() == 64U);
+    const auto sage_projection_root = temporary.root() / "sage-bundles";
+    REQUIRE(std::filesystem::create_directory(sage_projection_root));
+    REQUIRE(::chmod(sage_projection_root.c_str(), 0700) == 0);
+    const int sage_projection_fd =
+        ::open(sage_projection_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    REQUIRE(sage_projection_fd >= 0);
+    REQUIRE(
+        glove::supervisor::materialize_sage_bundle_projection(sage_projection_fd, *projections)
+            .has_value()
+    );
+    ::close(sage_projection_fd);
+    const auto projected_bundle = sage_projection_root / (digest + ".json");
+    std::ifstream projected_input{projected_bundle, std::ios::binary};
+    const std::string projected_contents{
+        std::istreambuf_iterator<char>{projected_input}, std::istreambuf_iterator<char>{}
+    };
+    REQUIRE(projected_contents == canonical);
+    struct stat projected_status{};
+    REQUIRE(::lstat(projected_bundle.c_str(), &projected_status) == 0);
+    REQUIRE((static_cast<unsigned int>(projected_status.st_mode) & 0777U) == 0444U);
+    REQUIRE(::chmod(sage_projection_root.c_str(), 0700) == 0);
+
+    std::vector<glove::supervisor::resolved_library_projection_target> oversized_targets;
+    for (std::size_t index = 0; index < 5U; ++index) {
+        std::string contents(
+            static_cast<std::size_t>(glove::supervisor::max_library_bundle_bytes) - 1U,
+            static_cast<char>('a' + index)
+        );
+        const auto content_digest = digest_for(contents);
+        write_bundle(root, contents);
+        oversized_targets.push_back({
+            .projection =
+                {
+                    .projection_id = "large-" + std::to_string(index),
+                    .content_digest = content_digest,
+                    .destination_alias = "sage-bundles",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        });
+    }
+    auto oversized_projections = store->resolve_projections(oversized_targets);
+    REQUIRE(oversized_projections.has_value());
+    const auto oversized_projection_root = temporary.root() / "oversized-sage-bundles";
+    REQUIRE(std::filesystem::create_directory(oversized_projection_root));
+    REQUIRE(::chmod(oversized_projection_root.c_str(), 0700) == 0);
+    const int oversized_projection_fd =
+        ::open(oversized_projection_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    REQUIRE(oversized_projection_fd >= 0);
+    REQUIRE(!glove::supervisor::materialize_sage_bundle_projection(
+                 oversized_projection_fd, *oversized_projections
+    )
+                 .has_value());
+    ::close(oversized_projection_fd);
+    REQUIRE(std::filesystem::is_empty(oversized_projection_root));
 
     constexpr std::string_view codex_canonical =
         R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"}]})";
@@ -571,6 +630,27 @@ auto run() -> int {
         glove::supervisor::codex_runtime_projection_digest(*forward_projection) ==
         glove::supervisor::codex_runtime_projection_digest(*reverse_projection)
     );
+
+    const auto raw_mixed_root = temporary.root() / "raw-mixed-bundles";
+    REQUIRE(std::filesystem::create_directory(raw_mixed_root));
+    REQUIRE(::chmod(raw_mixed_root.c_str(), 0700) == 0);
+    const int raw_mixed_fd =
+        ::open(raw_mixed_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    REQUIRE(raw_mixed_fd >= 0);
+    REQUIRE(
+        glove::supervisor::materialize_sage_bundle_projection(
+            raw_mixed_fd, *mixed_codex_projections
+        )
+            .has_value()
+    );
+    ::close(raw_mixed_fd);
+    std::ifstream raw_mixed_input{
+        raw_mixed_root / (mixed_codex_digest + ".json"), std::ios::binary
+    };
+    const std::string raw_mixed_contents{
+        std::istreambuf_iterator<char>{raw_mixed_input}, std::istreambuf_iterator<char>{}
+    };
+    REQUIRE(raw_mixed_contents == mixed_codex_canonical);
 
     const auto admission_adapter =
         glove::supervisor::native_skill_runtime_adapter_for("claude-code");
