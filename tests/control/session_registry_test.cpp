@@ -1664,9 +1664,11 @@ auto run_intent_queue_contract() -> int {
     auto pending_after_terminal_dispositions =
         (*registry)->pending_observation_intents(0, 16, 30'101);
     REQUIRE(pending_after_terminal_dispositions.has_value());
-    REQUIRE(std::ranges::none_of(pending_after_terminal_dispositions->items, [](const auto& item) {
-        return item.disposition != glove::control::intent_disposition::pending ||
-               item.body.intent_id == "intent-2";
+    REQUIRE(std::ranges::all_of(pending_after_terminal_dispositions->items, [](const auto& item) {
+        return item.disposition == glove::control::intent_disposition::pending;
+    }));
+    REQUIRE(std::ranges::any_of(pending_after_terminal_dispositions->items, [](const auto& item) {
+        return item.body.intent_id == "intent-2";
     }));
 
     registry->reset();

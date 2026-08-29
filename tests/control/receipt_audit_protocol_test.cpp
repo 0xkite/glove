@@ -1105,9 +1105,34 @@ auto run_observation_intent_control_contract() -> int {
     REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
         expired_page_result, expired_page_response->result->str
     ));
-    REQUIRE(std::ranges::none_of(expired_page_result.items, [](const auto& item) {
+    REQUIRE(std::ranges::any_of(expired_page_result.items, [](const auto& item) {
         return item.body.intent_id == "intent-expired";
     }));
+
+    const std::string expire_payload =
+        std::string{"{\"session_id\":\""} + session_id +
+        "\",\"channel_generation\":1,\"intent_id\":\"intent-expired\",\"intent_digest\":\"" +
+        expiring->intent_digest +
+        "\",\"disposition\":\"expired\",\"decided_at_ms\":50020}";
+    auto expire_frame = (*intent_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-mark-expired",
+            "set_observation_intent_disposition",
+            expire_payload,
+            "intent-disposition-mark-expired"
+        ),
+        50'030
+    );
+    REQUIRE(expire_frame.has_value());
+    auto expire_response = decode_response(*expire_frame);
+    REQUIRE(expire_response.has_value());
+    REQUIRE(expire_response->result.has_value());
+    observation_intent_disposition_result expire_result;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        expire_result, expire_response->result->str
+    ));
+    REQUIRE(expire_result.item.disposition == "expired");
+    REQUIRE(expire_result.item.decided_at_ms == 50'020);
 
     return 0;
 }

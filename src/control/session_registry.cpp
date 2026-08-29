@@ -2332,7 +2332,7 @@ auto session_registry::pending_observation_intents(
         const auto& intent = *record.observation_intent;
         const auto key =
             observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id);
-        if (state_->observation_dispositions.contains(key) || now_ms >= intent.expires_at_ms) {
+        if (state_->observation_dispositions.contains(key)) {
             continue;
         }
         if (page.items.size() == limit) {
