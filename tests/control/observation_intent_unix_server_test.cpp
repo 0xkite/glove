@@ -605,6 +605,7 @@ auto serve_in_background(
         for (std::size_t index = 0; index < count; ++index) {
             auto served = server.serve_one_for(5'000);
             if (!served) {
+                std::fprintf(stderr, "observation server failed: %s\n", served.error().c_str());
                 error_out = served.error();
                 return;
             }
@@ -741,23 +742,65 @@ auto run() -> int {
     REQUIRE(oversized_error.has_value());
     REQUIRE(oversized_error->code == "invalid_request");
 
+    const auto count_before_resilience = fixture->registry->record_count();
     serve_error.reset();
     server_thread = serve_in_background(**server, 1, serve_error);
-    auto truncated_descriptor = connect_to(socket_path);
-    REQUIRE(truncated_descriptor.get() >= 0);
-    const std::uint32_t declared = htonl(128U);
-    REQUIRE(write_exact(truncated_descriptor.get(), &declared, sizeof(declared)));
-    REQUIRE(write_exact(truncated_descriptor.get(), "{\"schema_version\":1", 18U));
+    {
+        auto truncated_descriptor = connect_to(socket_path);
+        REQUIRE(truncated_descriptor.get() >= 0);
+        const std::uint32_t declared = htonl(128U);
+        REQUIRE(write_exact(truncated_descriptor.get(), &declared, sizeof(declared)));
+        REQUIRE(write_exact(truncated_descriptor.get(), "{\"schema_version\":1", 18U));
+    }
     server_thread.join();
-    REQUIRE(serve_error.has_value());
+    REQUIRE(!serve_error.has_value());
 
     serve_error.reset();
     server_thread = serve_in_background(**server, 1, serve_error);
-    auto stalled = connect_to(socket_path);
-    REQUIRE(stalled.get() >= 0);
+    auto resilience_after_truncation = transact(
+        socket_path,
+        make_enqueue_request(
+            channel_token,
+            "intent-resilience-truncated",
+            "guest-capability-inventory",
+            std::string(64, '7')
+        )
+    );
     server_thread.join();
-    REQUIRE(serve_error.has_value());
-    REQUIRE(serve_error->find("timed out") != std::string::npos);
+    REQUIRE(!serve_error.has_value());
+    REQUIRE(resilience_after_truncation.has_value());
+    auto resilience_truncated_success = decode_success(*resilience_after_truncation);
+    REQUIRE(resilience_truncated_success.has_value());
+    REQUIRE(resilience_truncated_success->status == "queued");
+    REQUIRE(fixture->registry->record_count() > count_before_resilience);
+
+    serve_error.reset();
+    server_thread = serve_in_background(**server, 1, serve_error);
+    {
+        auto stalled = connect_to(socket_path);
+        REQUIRE(stalled.get() >= 0);
+    }
+    server_thread.join();
+    REQUIRE(!serve_error.has_value());
+
+    serve_error.reset();
+    server_thread = serve_in_background(**server, 1, serve_error);
+    auto resilience_after_disconnect = transact(
+        socket_path,
+        make_enqueue_request(
+            channel_token,
+            "intent-resilience-disconnect",
+            "guest-capability-inventory",
+            std::string(64, '6')
+        )
+    );
+    server_thread.join();
+    REQUIRE(!serve_error.has_value());
+    REQUIRE(resilience_after_disconnect.has_value());
+    auto resilience_disconnect_success = decode_success(*resilience_after_disconnect);
+    REQUIRE(resilience_disconnect_success.has_value());
+    REQUIRE(resilience_disconnect_success->status == "queued");
+    REQUIRE(fixture->registry->record_count() > count_before_resilience + 1U);
 
     server->reset();
     REQUIRE(::access(socket_path.c_str(), F_OK) != 0);

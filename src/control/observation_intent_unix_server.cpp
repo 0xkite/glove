@@ -476,11 +476,11 @@ auto observation_intent_unix_server::serve_one_for(std::uint64_t accept_timeout_
 #endif
     if (auto timeout_set = set_io_timeout(client.get(), state_->config.io_timeout_ms);
         !timeout_set) {
-        return std::unexpected(timeout_set.error());
+        return true;
     }
     std::uint32_t network_length = 0;
     if (auto read = read_exact(client.get(), &network_length, sizeof(network_length)); !read) {
-        return std::unexpected(read.error());
+        return true;
     }
     const auto frame_size = static_cast<std::size_t>(ntohl(network_length));
     if (frame_size == 0U || frame_size > max_observation_frame_bytes) {
@@ -488,23 +488,20 @@ auto observation_intent_unix_server::serve_one_for(std::uint64_t accept_timeout_
         if (!response) {
             return std::unexpected(response.error());
         }
-        if (auto sent = send_frame(client.get(), *response); !sent) {
-            return std::unexpected(sent.error());
-        }
+        static_cast<void>(send_frame(client.get(), *response));
         return true;
     }
     std::string frame(frame_size, '\0');
     if (auto read = read_exact(client.get(), frame.data(), frame.size()); !read) {
-        return std::unexpected(read.error());
+        wipe(frame);
+        return true;
     }
     auto response = state_->handle(frame, current_epoch_ms());
     wipe(frame);
     if (!response) {
         return std::unexpected(response.error());
     }
-    if (auto sent = send_frame(client.get(), *response); !sent) {
-        return std::unexpected(sent.error());
-    }
+    static_cast<void>(send_frame(client.get(), *response));
     return true;
 }
 
