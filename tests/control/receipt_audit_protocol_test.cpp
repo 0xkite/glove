@@ -794,7 +794,8 @@ auto run_observation_intent_control_contract() -> int {
                     "set_observation_intent_disposition",
                     "{\"session_id\":\"missing\",\"channel_generation\":1,\"intent_id\":\"intent-1\","
                     "\"intent_digest\":\"" +
-                        std::string(64, 'a') + "\",\"disposition\":\"accepted\"}"
+                        std::string(64, 'a') +
+                        "\",\"disposition\":\"accepted\",\"decided_at_ms\":50000}"
                 ),
                 50'000
             );
@@ -811,7 +812,7 @@ auto run_observation_intent_control_contract() -> int {
             "{\"session_id\":\"missing\",\"channel_generation\":1,\"intent_id\":\"intent-1\","
             "\"intent_digest\":\"" +
                 std::string(64, 'a') +
-                "\",\"disposition\":\"accepted\",\"decided_at_ms\":50000}",
+                "\",\"disposition\":\"accepted\",\"decided_at_ms\":50001}",
             "intent-disposition-timestamp"
         ),
         50'000
@@ -967,7 +968,8 @@ auto run_observation_intent_control_contract() -> int {
     const std::string disposition_payload =
         std::string{"{\"session_id\":\""} + session_id +
         "\",\"channel_generation\":1,\"intent_id\":\"intent-1\",\"intent_digest\":\"" +
-        enqueued->intent_digest + "\",\"disposition\":\"accepted\"}";
+        enqueued->intent_digest +
+        "\",\"disposition\":\"accepted\",\"decided_at_ms\":50020}";
     auto accepted_frame = (*intent_protocol)->handle_frame(
         intent_request(
             "intent-disposition-accepted",
@@ -1005,13 +1007,33 @@ auto run_observation_intent_control_contract() -> int {
     REQUIRE(accepted_replay_response->result.has_value());
     REQUIRE(accepted_replay_response->result->str == accepted_response->result->str);
 
+    auto restarted_protocol = glove::control::receipt_audit_protocol::create(
+        intent_bootstrap_secret, *intent_producer, shared_validator, shared_sessions
+    );
+    REQUIRE(restarted_protocol.has_value());
+    auto accepted_restart_replay = (*restarted_protocol)->handle_frame(
+        intent_request(
+            "intent-disposition-restart-replay",
+            "set_observation_intent_disposition",
+            disposition_payload,
+            "intent-disposition-accepted"
+        ),
+        50'022
+    );
+    REQUIRE(accepted_restart_replay.has_value());
+    auto accepted_restart_response = decode_response(*accepted_restart_replay);
+    REQUIRE(accepted_restart_response.has_value());
+    REQUIRE(accepted_restart_response->result.has_value());
+    REQUIRE(accepted_restart_response->result->str == accepted_response->result->str);
+
     auto disposition_conflict = (*intent_protocol)->handle_frame(
         intent_request(
             "intent-disposition-conflict",
             "set_observation_intent_disposition",
             std::string{"{\"session_id\":\""} + session_id +
                 "\",\"channel_generation\":1,\"intent_id\":\"intent-1\",\"intent_digest\":\"" +
-                enqueued->intent_digest + "\",\"disposition\":\"rejected\"}",
+                enqueued->intent_digest +
+                "\",\"disposition\":\"rejected\",\"decided_at_ms\":50020}",
             "intent-disposition-accepted"
         ),
         50'022
@@ -1026,7 +1048,8 @@ auto run_observation_intent_control_contract() -> int {
     auto missing_intent_payload =
         std::string{"{\"session_id\":\""} + session_id +
         "\",\"channel_generation\":1,\"intent_id\":\"missing-intent\",\"intent_digest\":\"" +
-        std::string(64, 'b') + "\",\"disposition\":\"accepted\"}";
+        std::string(64, 'b') +
+        "\",\"disposition\":\"accepted\",\"decided_at_ms\":50023}";
     auto missing_intent = (*intent_protocol)->handle_frame(
         intent_request(
             "intent-disposition-missing",
@@ -1047,7 +1070,8 @@ auto run_observation_intent_control_contract() -> int {
     auto expired_disposition_payload =
         std::string{"{\"session_id\":\""} + session_id +
         "\",\"channel_generation\":1,\"intent_id\":\"intent-expired\",\"intent_digest\":\"" +
-        expiring->intent_digest + "\",\"disposition\":\"accepted\"}";
+        expiring->intent_digest +
+        "\",\"disposition\":\"accepted\",\"decided_at_ms\":50030}";
     auto expired_disposition = (*intent_protocol)->handle_frame(
         intent_request(
             "intent-disposition-expired",
@@ -1259,7 +1283,8 @@ auto run() -> int {
                                                        "\"intent_id\":\"intent-1\","
                                                        "\"intent_digest\":\"" +
                                                            std::string(64, 'a') +
-                                                           "\",\"disposition\":\"accepted\"}",
+                                                           "\",\"disposition\":\"accepted\","
+                                                           "\"decided_at_ms\":1000}",
                 method == "set_observation_intent_disposition"
                     ? std::optional<std::string_view>{"unavailable-intent-key"}
                     : std::nullopt

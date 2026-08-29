@@ -393,7 +393,8 @@ auto handle_set_observation_intent_disposition(
     auto payload =
         decode_strict_complete<set_observation_intent_disposition_request>(params.payload.str);
     if (!payload || !valid_identifier(payload->session_id) || payload->channel_generation == 0 ||
-        !valid_identifier(payload->intent_id) || !valid_digest(payload->intent_digest)) {
+        !valid_identifier(payload->intent_id) || !valid_digest(payload->intent_digest) ||
+        payload->decided_at_ms == 0 || payload->decided_at_ms > now_ms) {
         return error_response(
             request_id, "invalid_request", "invalid observation intent disposition request"
         );
@@ -435,7 +436,7 @@ auto handle_set_observation_intent_disposition(
         .intent_id = payload->intent_id,
         .intent_digest = payload->intent_digest,
         .disposition = *disposition,
-        .decided_at_ms = now_ms,
+        .decided_at_ms = payload->decided_at_ms,
     };
     auto updated = state.sessions->set_observation_intent_disposition(registry_disposition);
     if (!updated) {

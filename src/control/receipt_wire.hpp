@@ -312,6 +312,7 @@ struct set_observation_intent_disposition_request {
     std::string intent_id;
     std::string intent_digest;
     std::string disposition;
+    std::uint64_t decided_at_ms = 0;
 };
 
 struct observation_intent_disposition_result {
