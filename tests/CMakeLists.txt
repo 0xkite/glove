@@ -182,6 +182,23 @@ target_include_directories(control_session_registry_test PRIVATE
 )
 add_test(NAME control_session_registry COMMAND control_session_registry_test)
 
+add_executable(
+    control_observation_intent_unix_server_test
+    control/observation_intent_unix_server_test.cpp
+)
+target_link_libraries(
+    control_observation_intent_unix_server_test
+    PRIVATE glove_control glaze::glaze
+)
+target_include_directories(control_observation_intent_unix_server_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+)
+add_test(
+    NAME control_observation_intent_unix_server
+    COMMAND control_observation_intent_unix_server_test
+)
+set_tests_properties(control_observation_intent_unix_server PROPERTIES TIMEOUT 15)
+
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(
         control_receipt_audit_server_fixture
