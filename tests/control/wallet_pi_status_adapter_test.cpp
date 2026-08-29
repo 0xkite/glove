@@ -351,6 +351,7 @@ private:
         disconnected.structured_json ==
         R"({"schema_version":1,"connected":false,"fresh_at_ms":9000,"wallet_server_alias":"synthetic-wallet-host","allowed_chain_ids":[8453],"available_actions":["status"],"mutating_actions":[]})"
     );
+    REQUIRE(disconnected.content == "Wallet is not connected.");
     state->authority.store(authority_mode::fresh);
 
     const auto calls_before_invalid_authority_arguments = state->calls.load();

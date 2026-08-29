@@ -113,7 +113,11 @@ owner-local adapter digest, and stable wallet-server status. Every snapshot is
 bound to the same nonzero plan generation and absolute deadline; the plan is
 read again after the other snapshots to detect in-request revision. Missing,
 ambiguous, rolled-back, revised, or cross-boundary evidence makes the method
-unavailable. No public capability-discovery method is added by this milestone.
+unavailable. A single failed or over-deadline authority read terminates the
+status worker for that composition — the bridge never retries or resynchronizes
+transient authority faults, so composing live authorities requires deliberate
+retry or replacement policy at composition time. No public
+capability-discovery method is added by this milestone.
 
 The private processor owns its clock, samples it before request decoding and
 after authority validation, and revalidates the exact session digests, policy revision, state,
@@ -121,7 +125,10 @@ expiry, adapter and server digests, owner-local wallet-server alias, chain
 policy, audit/journal generations, and observation freshness. The authority
 contracts must reject durable generation reuse or rollback. The bridge keeps no
 global high-water state and performs no provider, Sage, P2P, wallet, or network
-call itself.
+call itself. The in-request plan re-read detects revision but does not by itself
+defend against generation-reuse (ABA) by an authority; that rejection belongs to
+the authority contracts and must be covered by adversarial authority tests before
+any live composition is approved.
 
 Responses omit node identifiers, wallet addresses, RPC URLs, peer details,
 signatures, provider errors, session digests, and host paths. The only available

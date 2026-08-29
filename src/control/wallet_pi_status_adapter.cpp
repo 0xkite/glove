@@ -230,7 +230,8 @@ auto wallet_pi_status_adapter::invoke(
         }
         mcp::tool_call_result result{
             .status = mcp::tool_call_status::ok,
-            .content = "Wallet status is available.",
+            .content =
+                status->connected ? "Wallet status is available." : "Wallet is not connected.",
             .structured_json = std::move(*structured),
             .error_message = "",
         };
