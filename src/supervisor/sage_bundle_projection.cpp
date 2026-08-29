@@ -79,10 +79,25 @@ auto materialize_sage_bundle_projection(
     if (directory_fd < 0) {
         return std::unexpected(std::string{"Sage bundle projection directory is invalid"});
     }
-    std::set<std::string> digests;
+    std::set<std::string> unique_digests;
+    std::uint64_t total_bytes = 0;
     for (const auto& projection : projections) {
         const std::string digest{projection.bundle.content_digest()};
-        if (!digests.insert(digest).second) {
+        if (!unique_digests.insert(digest).second) {
+            continue;
+        }
+        const auto size = projection.bundle.size_bytes();
+        if (size > max_sage_bundle_projection_bytes - total_bytes) {
+            return std::unexpected(
+                std::string{"Sage bundle projection exceeds aggregate byte bound"}
+            );
+        }
+        total_bytes += size;
+    }
+    std::set<std::string> materialized_digests;
+    for (const auto& projection : projections) {
+        const std::string digest{projection.bundle.content_digest()};
+        if (!materialized_digests.insert(digest).second) {
             continue;
         }
         if (auto verified = projection.bundle.verify_identity(); !verified) {

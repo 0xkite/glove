@@ -344,10 +344,9 @@ auto validate(const config& value) -> result<void> {
                ))) &&
              apple.sage_guest->policy_schema_version == 1U &&
              apple.sage_guest->library_projection_schema == "sage_bundle_v1");
-        if (!value.session_store || !value.materialization_root || apple.image.empty() ||
-            apple.image.size() > 256U ||
-            apple.image.find_first_of(" \t\r\n") != std::string::npos ||
-            !valid_sha256_digest(apple.image_digest) || !valid_closure_digest || !valid_guest) {
+        if (!value.session_store || !value.materialization_root ||
+            !container::valid_immutable_container_image(apple.image, apple.image_digest) ||
+            !valid_closure_digest || !valid_guest) {
             return std::unexpected(
                 std::string{"Apple Container runtime requires managed-session roots and an exact "
                             "image digest"}

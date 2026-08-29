@@ -183,7 +183,7 @@ auto run() -> int {
     auto apple = managed_plan->service;
     apple.apple_container = apple_container_config{
         .cli = "/usr/local/bin/container",
-        .image = "ghcr.io/sage-protocol/glove-agent-runtime:0.0.1",
+        .image = "ghcr.io/sage-protocol/glove-agent-runtime@sha256:" + std::string(64U, 'a'),
         .image_digest = "sha256:" + std::string(64U, 'a'),
         .harness_closure_digest = "sha256:" + std::string(64U, 'b'),
         .sage_guest = sage_guest_config{
@@ -197,6 +197,9 @@ auto run() -> int {
     REQUIRE(load_config(apple_path) == apple);
     auto invalid_apple = apple;
     invalid_apple.apple_container->image_digest = "sha256:latest";
+    REQUIRE(!validate(invalid_apple).has_value());
+    invalid_apple = apple;
+    invalid_apple.apple_container->image = "ghcr.io/sage-protocol/glove-agent-runtime:latest";
     REQUIRE(!validate(invalid_apple).has_value());
     invalid_apple = apple;
     invalid_apple.apple_container->harness_closure_digest = "sha256:latest";

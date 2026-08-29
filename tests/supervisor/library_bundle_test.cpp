@@ -143,6 +143,39 @@ auto run() -> int {
     REQUIRE((static_cast<unsigned int>(projected_status.st_mode) & 0777U) == 0444U);
     REQUIRE(::chmod(sage_projection_root.c_str(), 0700) == 0);
 
+    std::vector<glove::supervisor::resolved_library_projection_target> oversized_targets;
+    for (std::size_t index = 0; index < 5U; ++index) {
+        std::string contents(
+            static_cast<std::size_t>(glove::supervisor::max_library_bundle_bytes) - 1U,
+            static_cast<char>('a' + index)
+        );
+        const auto content_digest = digest_for(contents);
+        write_bundle(root, contents);
+        oversized_targets.push_back({
+            .projection =
+                {
+                    .projection_id = "large-" + std::to_string(index),
+                    .content_digest = content_digest,
+                    .destination_alias = "sage-bundles",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        });
+    }
+    auto oversized_projections = store->resolve_projections(oversized_targets);
+    REQUIRE(oversized_projections.has_value());
+    const auto oversized_projection_root = temporary.root() / "oversized-sage-bundles";
+    REQUIRE(std::filesystem::create_directory(oversized_projection_root));
+    REQUIRE(::chmod(oversized_projection_root.c_str(), 0700) == 0);
+    const int oversized_projection_fd =
+        ::open(oversized_projection_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    REQUIRE(oversized_projection_fd >= 0);
+    REQUIRE(!glove::supervisor::materialize_sage_bundle_projection(
+                 oversized_projection_fd, *oversized_projections
+    )
+                 .has_value());
+    ::close(oversized_projection_fd);
+    REQUIRE(std::filesystem::is_empty(oversized_projection_root));
+
     constexpr std::string_view codex_canonical =
         R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"}]})";
     const auto codex_digest = digest_for(codex_canonical);

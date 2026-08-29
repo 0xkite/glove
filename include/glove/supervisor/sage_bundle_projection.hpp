@@ -2,6 +2,7 @@
 
 #include "glove/supervisor/library_bundle.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <span>
 #include <string>
@@ -12,6 +13,7 @@ namespace glove::supervisor {
 inline constexpr std::string_view sage_guest_runtime_id = "sage-guest";
 inline constexpr std::string_view sage_bundle_projection_schema = "sage_bundle_v1";
 inline constexpr std::string_view sage_bundle_projection_mount = "sage-bundles";
+inline constexpr std::uint64_t max_sage_bundle_projection_bytes = std::uint64_t{64} * 1024U * 1024U;
 
 [[nodiscard]] auto
 sage_bundle_projection_digest(std::span<const resolved_library_projection> projections)

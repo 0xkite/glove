@@ -2,6 +2,7 @@
 
 #include "glove/audit/event.hpp"
 #include "glove/container/digest.hpp"
+#include "glove/container/image_identity.hpp"
 #include "glove/net/egress_proxy.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 #include "glove/supervisor/sage_bundle_projection.hpp"
@@ -10,6 +11,7 @@
 #include "../container/resource_monitor.hpp"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
@@ -47,6 +49,7 @@ constexpr std::size_t max_command_output_bytes = std::size_t{1024} * 1024U;
 constexpr std::size_t max_idempotency_namespace_bytes = 112U;
 constexpr std::size_t transcript_bytes = std::size_t{4} * 1024U * 1024U;
 constexpr std::uint64_t max_secret_file_bytes = std::uint64_t{1024} * 1024U;
+constexpr std::uint64_t max_command_runtime_ms = 60'000U;
 
 auto current_epoch_ms() -> std::uint64_t {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -161,7 +164,13 @@ public:
         if (!directory_.empty()) {
             std::error_code ignored;
             if (!mount_name_.empty()) {
-                static_cast<void>(::chmod((directory_ / mount_name_).c_str(), 0700));
+                unique_fd mount{::open(
+                    (directory_ / mount_name_).c_str(),
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+                )};
+                if (mount.get() >= 0) {
+                    static_cast<void>(::fchmod(mount.get(), 0700));
+                }
             }
             std::filesystem::remove_all(directory_, ignored);
         }
@@ -192,6 +201,9 @@ auto run_command(const std::filesystem::path& executable, const std::vector<std:
         return std::unexpected(system_error("fork Apple Container command"));
     }
     if (child == 0) {
+        if (::setpgid(0, 0) != 0) {
+            _exit(126);
+        }
         static_cast<void>(::dup2(write_end.get(), STDOUT_FILENO));
         static_cast<void>(::dup2(write_end.get(), STDERR_FILENO));
         static_cast<void>(::close(read_end.get()));
@@ -205,33 +217,76 @@ auto run_command(const std::filesystem::path& executable, const std::vector<std:
         ::execve(executable.c_str(), argv.data(), environ);
         _exit(127);
     }
+    static_cast<void>(::setpgid(child, child));
     static_cast<void>(::close(write_end.release()));
+    const int current_flags = ::fcntl(read_end.get(), F_GETFL, 0);
+    if (current_flags < 0 || ::fcntl(read_end.get(), F_SETFL, current_flags | O_NONBLOCK) != 0) {
+        static_cast<void>(::killpg(child, SIGKILL));
+        static_cast<void>(::waitpid(child, nullptr, 0));
+        return std::unexpected(system_error("protect Apple Container command output"));
+    }
     command_result result;
     std::array<char, 4096> buffer{};
-    for (;;) {
-        const auto count = ::read(read_end.get(), buffer.data(), buffer.size());
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count < 0) {
-            static_cast<void>(::kill(child, SIGKILL));
-            static_cast<void>(::waitpid(child, nullptr, 0));
-            return std::unexpected(system_error("read Apple Container command output"));
-        }
-        if (count == 0) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{max_command_runtime_ms};
+    bool output_closed = false;
+    bool child_finished = false;
+    int status = 0;
+    while (!output_closed || !child_finished) {
+        for (;;) {
+            const auto count = ::read(read_end.get(), buffer.data(), buffer.size());
+            if (count > 0) {
+                if (static_cast<std::size_t>(count) >
+                    max_command_output_bytes - result.output.size()) {
+                    static_cast<void>(::killpg(child, SIGKILL));
+                    static_cast<void>(::waitpid(child, nullptr, 0));
+                    return std::unexpected(
+                        std::string{"Apple Container command output exceeds its bound"}
+                    );
+                }
+                result.output.append(buffer.data(), static_cast<std::size_t>(count));
+                continue;
+            }
+            if (count == 0) {
+                output_closed = true;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                static_cast<void>(::killpg(child, SIGKILL));
+                static_cast<void>(::waitpid(child, nullptr, 0));
+                return std::unexpected(system_error("read Apple Container command output"));
+            }
             break;
         }
-        if (static_cast<std::size_t>(count) > max_command_output_bytes - result.output.size()) {
-            static_cast<void>(::kill(child, SIGKILL));
-            static_cast<void>(::waitpid(child, nullptr, 0));
-            return std::unexpected(std::string{"Apple Container command output exceeds its bound"});
+        if (!child_finished) {
+            const auto waited = ::waitpid(child, &status, WNOHANG);
+            if (waited == child) {
+                child_finished = true;
+            } else if (waited < 0 && errno != EINTR) {
+                return std::unexpected(system_error("wait for Apple Container command"));
+            }
         }
-        result.output.append(buffer.data(), static_cast<std::size_t>(count));
-    }
-    int status = 0;
-    while (::waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) {
-            return std::unexpected(system_error("wait for Apple Container command"));
+        if (output_closed && child_finished) {
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            static_cast<void>(::killpg(child, SIGKILL));
+            if (!child_finished) {
+                static_cast<void>(::waitpid(child, nullptr, 0));
+            }
+            return std::unexpected(std::string{"Apple Container command deadline exceeded"});
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const int wait_ms = static_cast<int>(std::min<std::int64_t>(remaining, 100));
+        pollfd descriptor{.fd = read_end.get(), .events = POLLIN | POLLHUP, .revents = 0};
+        const auto polled =
+            output_closed ? ::poll(nullptr, 0, wait_ms) : ::poll(&descriptor, 1, wait_ms);
+        if (polled < 0 && errno != EINTR) {
+            static_cast<void>(::killpg(child, SIGKILL));
+            if (!child_finished) {
+                static_cast<void>(::waitpid(child, nullptr, 0));
+            }
+            return std::unexpected(system_error("poll Apple Container command output"));
         }
     }
     if (WIFEXITED(status)) {
@@ -240,6 +295,27 @@ auto run_command(const std::filesystem::path& executable, const std::vector<std:
         result.exit_code = 128 + WTERMSIG(status);
     }
     return result;
+}
+
+auto inspect_instance(const apple_container_runtime_config& config, std::string_view instance_id)
+    -> std::expected<std::optional<command_result>, std::string> {
+    auto inspected = run_command(config.container_cli, {"inspect", std::string{instance_id}});
+    if (!inspected) {
+        return std::unexpected(inspected.error());
+    }
+    if (inspected->exit_code == 0) {
+        return std::optional<command_result>{std::move(*inspected)};
+    }
+    while (!inspected->output.empty() &&
+           (inspected->output.back() == '\n' || inspected->output.back() == '\r')) {
+        inspected->output.pop_back();
+    }
+    if (inspected->output == "Error: container not found: " + std::string{instance_id}) {
+        return std::optional<command_result>{};
+    }
+    return std::unexpected(
+        std::string{"inspect Apple Container instance failed: "} + inspected->output
+    );
 }
 
 auto delete_instance_verified(
@@ -253,8 +329,8 @@ auto delete_instance_verified(
                     : removed.error()
         );
     }
-    auto remaining = run_command(config.container_cli, {"inspect", std::string{instance_id}});
-    if (!remaining || remaining->exit_code == 0) {
+    auto remaining = inspect_instance(config, instance_id);
+    if (!remaining || remaining->has_value()) {
         return std::unexpected(
             remaining ? std::string{"Apple Container cleanup could not be verified"}
                       : remaining.error()
@@ -304,8 +380,15 @@ auto remove_owner_only_directory(
         }
         if (S_ISDIR(child_status.st_mode)) {
             const auto mode = static_cast<unsigned int>(child_status.st_mode) & 0777U;
+            unique_fd child{
+                ::open(iterator->path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+            };
+            struct stat opened_status{};
             if (child_status.st_uid != ::geteuid() || (mode != 0700U && mode != 0555U) ||
-                ::chmod(iterator->path().c_str(), 0700) != 0) {
+                child.get() < 0 || ::fstat(child.get(), &opened_status) != 0 ||
+                opened_status.st_dev != child_status.st_dev ||
+                opened_status.st_ino != child_status.st_ino || !S_ISDIR(opened_status.st_mode) ||
+                ::fchmod(child.get(), 0700) != 0) {
                 return std::unexpected(
                     std::string{"Apple Container artifact child directory is unsafe"}
                 );
@@ -749,12 +832,11 @@ auto capabilities() noexcept -> container::resource_enforcement_capabilities {
         .memory = container::enforcement_mechanism::cgroup_v2,
         .pids = container::enforcement_mechanism::rlimit,
         .wall_time = container::enforcement_mechanism::watchdog,
-        // The initial no-projection lane exposes no disk-backed writable
-        // mount. Read-only root plus memory-backed tmpfs is a stricter disk
-        // quota than the admitted nonzero bound.
-        .disk = container::enforcement_mechanism::filesystem_quota,
+        // Apple Container does not yet expose a separately enforceable and
+        // observable aggregate writable-byte quota for its tmpfs mounts.
+        .disk = container::enforcement_mechanism::unavailable,
         .terminal_output = container::enforcement_mechanism::byte_counter,
-        .receipt_schema_version = 1,
+        .receipt_schema_version = 0,
     };
 }
 
@@ -773,15 +855,18 @@ auto projection_receipts(
     std::span<const supervisor::resolved_library_projection> projections,
     std::string_view runtime_id
 ) -> std::vector<container::library_projection_receipt> {
+    if (runtime_id != supervisor::sage_guest_runtime_id) {
+        // Native harness adapters transform bundle entries into SKILL.md trees.
+        // The original bundle target is not an effective guest path and must
+        // not appear in an authenticated receipt.
+        return {};
+    }
     std::vector<container::library_projection_receipt> receipts;
     receipts.reserve(projections.size());
     for (const auto& projection : projections) {
         const std::string target_path =
-            runtime_id == supervisor::sage_guest_runtime_id
-                ? "/run/glove-projections/" +
-                      std::string{supervisor::sage_bundle_projection_mount} + "/" +
-                      std::string{projection.bundle.content_digest()} + ".json"
-                : projection.target_path;
+            "/run/glove-projections/" + std::string{supervisor::sage_bundle_projection_mount} +
+            "/" + std::string{projection.bundle.content_digest()} + ".json";
         receipts.push_back({
             .projection_id = projection.projection_id,
             .destination_alias = projection.destination_alias,
@@ -995,7 +1080,9 @@ private:
             int status = 0;
             while (::waitpid(attach_pid_, &status, 0) < 0) {
                 if (errno != EINTR) {
-                    close_failed(system_error("wait for Apple Container attach process"));
+                    credential_leases_.preserve();
+                    projection_lease_.preserve();
+                    publish_error(system_error("wait for Apple Container attach process"));
                     return;
                 }
             }
@@ -1006,7 +1093,7 @@ private:
             if (!removed) {
                 credential_leases_.preserve();
                 projection_lease_.preserve();
-                close_failed(removed.error());
+                publish_error(removed.error());
                 return;
             }
             const auto finished_at_ms = std::max(current_epoch_ms(), started_at_ms_);
@@ -1139,9 +1226,7 @@ auto lookup(
 auto validate_config(const apple_container_runtime_config& config)
     -> std::expected<void, std::string> {
     if (!config.container_cli.is_absolute() || !config.session_root.is_absolute() ||
-        config.image_reference.empty() || config.image_reference.size() > 256U ||
-        config.image_digest.size() != 71U || !config.image_digest.starts_with("sha256:") ||
-        !valid_digest(std::string_view{config.image_digest}.substr(7)) ||
+        !container::valid_immutable_container_image(config.image_reference, config.image_digest) ||
         config.max_sessions == 0 || config.max_sessions > 1024U) {
         return std::unexpected(std::string{"invalid Apple Container runtime configuration"});
     }
@@ -1302,11 +1387,11 @@ auto apple_container_session_runtime::resource_capabilities() const noexcept
 
 auto apple_container_session_runtime::agent_runtime_adapter_schema_version() const noexcept
     -> std::uint8_t {
-    return state_ && state_->config.harness_closure_digest ? 1 : 0;
+    return lifecycle_operational() && state_ && state_->config.harness_closure_digest ? 1 : 0;
 }
 
 auto apple_container_session_runtime::managed_runtime_ids() const -> std::vector<std::string> {
-    if (!state_ || !state_->config.harness_closure_digest) {
+    if (!lifecycle_operational() || !state_ || !state_->config.harness_closure_digest) {
         return {};
     }
     std::vector<std::string> runtime_ids{"claude-code", "pi", "copilot", "opencode"};
@@ -1335,9 +1420,7 @@ auto apple_container_session_runtime::reconcile(
     session_reconciliation_report report;
     for (const auto& candidate : *candidates) {
         ++report.inspected;
-        auto inspected = run_command(
-            state_->config.container_cli, {"inspect", candidate.runtime_identity.instance_id}
-        );
+        auto inspected = inspect_instance(state_->config, candidate.runtime_identity.instance_id);
         if (!inspected) {
             return std::unexpected(inspected.error());
         }
@@ -1355,7 +1438,7 @@ auto apple_container_session_runtime::reconcile(
             // A terminal receipt is emitted only after verified deletion. A
             // still-present instance contradicts that evidence and must never
             // be touched merely because its bounded name matches.
-            if (inspected->exit_code == 0) {
+            if (inspected->has_value()) {
                 report.identity_mismatch_session_ids.push_back(candidate.session.session_id);
                 report.unresolved_running_session_ids.push_back(candidate.session.session_id);
                 continue;
@@ -1380,8 +1463,8 @@ auto apple_container_session_runtime::reconcile(
             continue;
         }
         auto code = session_failure_code::recovered_without_process;
-        if (inspected->exit_code == 0) {
-            if (inspected->output.find(candidate.runtime_identity.launch_identity_digest) ==
+        if (inspected->has_value()) {
+            if ((*inspected)->output.find(candidate.runtime_identity.launch_identity_digest) ==
                 std::string::npos) {
                 report.identity_mismatch_session_ids.push_back(candidate.session.session_id);
                 report.unresolved_running_session_ids.push_back(candidate.session.session_id);
@@ -1423,6 +1506,12 @@ auto apple_container_session_runtime::reconcile(
             );
         }
         ++report.recovered_failed;
+    }
+    if (!report.unresolved_running_session_ids.empty() ||
+        !report.identity_mismatch_session_ids.empty()) {
+        return std::unexpected(
+            std::string{"Apple Container reconciliation left unresolved instance ownership"}
+        );
     }
     state_->reconciliation = report;
     return report;
@@ -1551,12 +1640,11 @@ auto apple_container_session_runtime::start(
         .instance_id = *instance,
         .launch_identity_digest = *launch,
     };
-    auto existing_container =
-        run_command(state_->config.container_cli, {"inspect", runtime_identity.instance_id});
+    auto existing_container = inspect_instance(state_->config, runtime_identity.instance_id);
     if (!existing_container) {
         return std::unexpected(existing_container.error());
     }
-    if (existing_container->exit_code == 0) {
+    if (existing_container->has_value()) {
         return std::unexpected(
             std::string{"Apple Container instance identity already exists; reconciliation required"}
         );
@@ -1663,16 +1751,17 @@ auto apple_container_session_runtime::start(
     auto created = run_command(state_->config.container_cli, create_arguments);
     if (!created || created->exit_code != 0) {
         auto inspected_after_failure =
-            run_command(state_->config.container_cli, {"inspect", runtime_identity.instance_id});
+            inspect_instance(state_->config, runtime_identity.instance_id);
         std::string cleanup_error;
         if (!inspected_after_failure) {
             credential_leases->preserve();
             projection_lease->preserve();
             cleanup_error =
                 "; partial create state could not be inspected: " + inspected_after_failure.error();
-        } else if (inspected_after_failure->exit_code == 0) {
-            if (inspected_after_failure->output.find(runtime_identity.launch_identity_digest) ==
-                std::string::npos) {
+        } else if (inspected_after_failure->has_value()) {
+            if (inspected_after_failure->value().output.find(
+                    runtime_identity.launch_identity_digest
+                ) == std::string::npos) {
                 credential_leases->preserve();
                 projection_lease->preserve();
                 cleanup_error = "; partial create identity mismatch; instance and leases preserved";
@@ -1701,11 +1790,10 @@ auto apple_container_session_runtime::start(
         }
         return std::nullopt;
     };
-    auto inspected =
-        run_command(state_->config.container_cli, {"inspect", runtime_identity.instance_id});
-    if (!inspected || inspected->exit_code != 0 ||
-        inspected->output.find(state_->config.image_digest) == std::string::npos ||
-        inspected->output.find(runtime_identity.launch_identity_digest) == std::string::npos) {
+    auto inspected = inspect_instance(state_->config, runtime_identity.instance_id);
+    if (!inspected || !inspected->has_value() ||
+        (*inspected)->output.find(state_->config.image_digest) == std::string::npos ||
+        (*inspected)->output.find(runtime_identity.launch_identity_digest) == std::string::npos) {
         auto cleanup_error = remove_created_instance();
         return std::unexpected(
             std::string{"created Apple Container identity proof mismatch"} +
@@ -1948,6 +2036,13 @@ auto apple_container_session_runtime::cleanup(std::string_view session_id)
     if (!found->second->finished()) {
         return std::unexpected(
             std::string{"Apple Container session has not reached terminal state"}
+        );
+    }
+    auto durable = state_->registry->managed_lifecycle_status(session_id);
+    if (!durable || (durable->session.state != session_state::exited &&
+                     durable->session.state != session_state::failed)) {
+        return std::unexpected(
+            std::string{"Apple Container session requires durable recovery before cleanup"}
         );
     }
     state_->sessions.erase(found);

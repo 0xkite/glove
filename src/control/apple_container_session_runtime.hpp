@@ -37,10 +37,10 @@ struct apple_container_runtime_config {
 };
 
 // Apple Silicon implementation of the authenticated managed-session seam.
-// The initial implementation deliberately accepts only no-network,
-// image-contained closures with memory-backed writable state. Host workspace,
-// credential, library, and egress projections are rejected until their
-// separately audited brokers are configured.
+// The implementation is construction-ready but does not advertise the managed
+// lifecycle until Apple Container can prove the shared six-limit receipt
+// contract. Image-contained harness, credential, egress, and library brokers
+// remain independently validated for bounded test and future shipping lanes.
 class apple_container_session_runtime final : public session_runtime {
 public:
     struct implementation;
@@ -68,6 +68,8 @@ public:
     [[nodiscard]] auto backend_id() const noexcept -> std::string_view override {
         return "apple_container";
     }
+
+    [[nodiscard]] auto lifecycle_operational() const noexcept -> bool override { return false; }
 
     [[nodiscard]] auto agent_runtime_adapter_schema_version() const noexcept
         -> std::uint8_t override;

@@ -340,6 +340,17 @@ auto run() -> int {
     }
     REQUIRE(runtime.has_value());
     auto shared_runtime = std::shared_ptr<glove::control::session_runtime>{std::move(*runtime)};
+    if (!shared_runtime->lifecycle_operational()) {
+        REQUIRE(!shared_runtime->resource_capabilities().complete());
+        REQUIRE(shared_runtime->agent_runtime_adapter_schema_version() == 0);
+        REQUIRE(shared_runtime->managed_runtime_ids().empty());
+        std::fprintf(
+            stderr,
+            "Apple managed lifecycle remains gated until the six-limit receipt contract is "
+            "complete\n"
+        );
+        return 0;
+    }
     REQUIRE(shared_runtime->resource_capabilities().complete());
     if (managed_closure) {
         const std::vector<std::string> expected_runtime_ids{
@@ -349,6 +360,7 @@ auto run() -> int {
     } else {
         REQUIRE(shared_runtime->managed_runtime_ids().empty());
     }
+
     auto protocol = glove::control::receipt_audit_protocol::create(
         bootstrap_secret,
         *producer,
