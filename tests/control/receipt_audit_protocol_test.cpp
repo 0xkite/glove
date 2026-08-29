@@ -1,5 +1,6 @@
 #include "glove/container/digest.hpp"
 #include "glove/container/receipt_producer.hpp"
+#include "glove/control/guest_channel.hpp"
 #include "glove/control/receipt_audit_protocol.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/supervisor/library_bundle.hpp"
@@ -475,6 +476,24 @@ auto intent_runtime_digest() -> std::string {
     return glove::supervisor::runtime_launch_template_digest(intent_launch_template()).value_or("");
 }
 
+// Registration example (test fixture): the host owns payload semantics.
+auto intent_channel_host() -> std::shared_ptr<glove::control::channel_host> {
+    auto host = std::make_shared<glove::control::channel_host>();
+    (void)host->register_channel({
+        .channel_id = "test-observation",
+        .schema_id = "sage.glove-observation.v1",
+        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
+        .bounds =
+            {
+                .max_items = 4'096,
+                .max_body_bytes = 8'192,
+                .max_ttl_ms = 600'000,
+                .max_skew_ms = 30'000,
+            },
+    });
+    return host;
+}
+
 auto intent_valid_plan_at(std::uint64_t now_ms) -> std::string {
     return R"({"schema_version":1,"runtime_id":"codex","runtime_template_id":"codex-safe","adapter_command_digest":")" +
            intent_runtime_digest() +
@@ -667,7 +686,11 @@ auto run_observation_intent_control_contract() -> int {
     REQUIRE((*intent_producer)->acknowledge_bootstrap((*intent_producer)->anchor()).has_value());
 
     auto registry = glove::control::session_registry::open_or_create(
-        temp.root() / "intent-sessions.journal", shared_validator, shared_bundle_store
+        temp.root() / "intent-sessions.journal",
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        intent_channel_host()
     );
     REQUIRE(registry.has_value());
     auto shared_sessions =

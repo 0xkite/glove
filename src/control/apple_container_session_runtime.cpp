@@ -199,6 +199,8 @@ struct observation_service_state {
     std::uint64_t channel_generation = 1;
     std::atomic<bool> stop_requested{false};
     std::unique_ptr<observation_intent_unix_server> server;
+    glove::audit::sink* audit = nullptr;
+    std::string audit_channel;
     std::thread worker;
 
     observation_service_state() = default;
@@ -228,20 +230,25 @@ struct observation_service_state {
 class observation_service_bundle {
 public:
     observation_service_bundle() = default;
+
     explicit observation_service_bundle(std::unique_ptr<observation_service_state> state)
         : state_{std::move(state)} {}
+
     observation_service_bundle(const observation_service_bundle&) = delete;
     auto operator=(const observation_service_bundle&) -> observation_service_bundle& = delete;
     observation_service_bundle(observation_service_bundle&&) noexcept = default;
     auto operator=(observation_service_bundle&&) -> observation_service_bundle& = delete;
 
     [[nodiscard]] auto active() const noexcept -> bool { return state_ != nullptr; }
+
     [[nodiscard]] auto commitment_digest() const -> std::optional<std::string> {
         return state_ ? std::optional<std::string>{state_->commitment_digest} : std::nullopt;
     }
+
     [[nodiscard]] auto socket_path() const -> std::filesystem::path {
         return state_ ? state_->socket_path : std::filesystem::path{};
     }
+
     [[nodiscard]] auto token_path() const -> std::filesystem::path {
         return state_ ? state_->token_path : std::filesystem::path{};
     }
@@ -250,7 +257,8 @@ public:
         session_registry& registry,
         const session_start_inputs& inputs,
         std::string_view profile_digest,
-        std::string_view projection_digest
+        std::string_view projection_digest,
+        glove::audit::sink* audit = nullptr
     ) -> std::expected<void, std::string> {
         if (!state_) {
             return {};
@@ -259,6 +267,7 @@ public:
             .socket_path = state_->socket_path,
             .sessions = &registry,
             .session_id = inputs.session.session_id,
+            .runtime_id = inputs.launch.runtime_id,
             .controller_plan_digest = inputs.session.controller_plan_digest,
             .profile_digest = std::string{profile_digest},
             .projection_digest = std::string{projection_digest},
@@ -268,26 +277,52 @@ public:
             .session_expires_at_ms = inputs.session.expires_at_ms,
             .channel_token = state_->token,
             .io_timeout_ms = 5'000,
+            .expected_peer_uid = ::geteuid(),
         });
         if (!created) {
             return std::unexpected(created.error());
         }
         state_->server = std::move(*created);
+        state_->audit = audit;
+        state_->audit_channel = "observation:" + state_->channel_id;
         auto* service = state_.get();
         try {
+            // Transient serve failures are absorbed by the server's bounded
+            // retry ladder. Persistent failures are retried here with an
+            // audit event before the channel is given up, so an fd-pressure
+            // spike no longer permanently kills guest observation ingress.
             state_->worker = std::thread{[service] {
+                constexpr std::size_t failure_audit_threshold = 4;
+                constexpr std::size_t max_consecutive_failures = 32;
+                std::size_t consecutive_failures = 0;
+                bool audited = false;
                 while (!service->stop_requested.load()) {
                     auto served = service->server->serve_one_for(100);
-                    if (!served && !service->stop_requested.load()) {
+                    if (served) {
+                        consecutive_failures = 0;
+                        audited = false;
+                        continue;
+                    }
+                    ++consecutive_failures;
+                    if (!audited && consecutive_failures >= failure_audit_threshold &&
+                        service->audit != nullptr) {
+                        static_cast<void>(service->audit->record({
+                            .what = glove::audit::action::observation,
+                            .tool_name = service->audit_channel + ":serve-failures",
+                            .arguments_json = {},
+                            .status = glove::mcp::tool_call_status::transport_error,
+                            .error_message = served.error(),
+                        }));
+                        audited = true;
+                    }
+                    if (consecutive_failures >= max_consecutive_failures) {
                         service->stop_requested.store(true);
                     }
                 }
             }};
         } catch (const std::system_error& error) {
             state_->server.reset();
-            return std::unexpected(
-                std::string{"start Apple observation service: "} + error.what()
-            );
+            return std::unexpected(std::string{"start Apple observation service: "} + error.what());
         }
         return {};
     }
@@ -690,7 +725,7 @@ auto prepare_observation_service(
                 : system_error("protect Apple service root")
         );
     }
-    struct stat root_status {};
+    struct stat root_status{};
     if (::lstat(root.c_str(), &root_status) != 0 || !S_ISDIR(root_status.st_mode) ||
         root_status.st_uid != ::geteuid() ||
         (static_cast<unsigned int>(root_status.st_mode) & 0777U) != 0700U) {
@@ -700,10 +735,9 @@ auto prepare_observation_service(
     if (!std::filesystem::create_directory(state->directory, filesystem_error) ||
         ::chmod(state->directory.c_str(), 0700) != 0) {
         return std::unexpected(
-            filesystem_error
-                ? std::string{"create Apple observation service lease: "} +
-                      filesystem_error.message()
-                : system_error("protect Apple observation service lease")
+            filesystem_error ? std::string{"create Apple observation service lease: "} +
+                                   filesystem_error.message()
+                             : system_error("protect Apple observation service lease")
         );
     }
     state->socket_path = state->directory / "observation.sock";
@@ -713,21 +747,16 @@ auto prepare_observation_service(
         return std::unexpected(token.error());
     }
     state->token = std::move(*token);
-    unique_fd token_file{
-        ::open(
-            state->token_path.c_str(),
-            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-            0600
-        )
-    };
+    unique_fd token_file{::open(
+        state->token_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600
+    )};
     if (token_file.get() < 0) {
         return std::unexpected(system_error("create Apple observation token"));
     }
     std::size_t written = 0;
     while (written < state->token.size()) {
-        const auto count = ::write(
-            token_file.get(), state->token.data() + written, state->token.size() - written
-        );
+        const auto count =
+            ::write(token_file.get(), state->token.data() + written, state->token.size() - written);
         if (count < 0 && errno == EINTR) {
             continue;
         }
@@ -740,9 +769,8 @@ auto prepare_observation_service(
         return std::unexpected(system_error("sync Apple observation token"));
     }
     const auto* token_bytes = reinterpret_cast<const unsigned char*>(state->token.data());
-    auto token_digest = container::sha256_hex(
-        std::span<const unsigned char>{token_bytes, state->token.size()}
-    );
+    auto token_digest =
+        container::sha256_hex(std::span<const unsigned char>{token_bytes, state->token.size()});
     if (!token_digest) {
         return std::unexpected(token_digest.error());
     }
@@ -2023,10 +2051,7 @@ auto apple_container_session_runtime::start(
         return std::unexpected(projection_lease.error());
     }
     auto observation_service = prepare_observation_service(
-        *inputs,
-        state_->config,
-        *instance,
-        projection_lease->digest_.value_or("")
+        *inputs, state_->config, *instance, projection_lease->digest_.value_or("")
     );
     if (!observation_service) {
         return std::unexpected(observation_service.error());
@@ -2047,7 +2072,8 @@ auto apple_container_session_runtime::start(
             *state_->registry,
             *inputs,
             *profile,
-            projection_lease->digest_.value_or("")
+            projection_lease->digest_.value_or(""),
+            state_->config.egress_audit.get()
         );
         !started_service) {
         return std::unexpected(started_service.error());
@@ -2160,8 +2186,7 @@ auto apple_container_session_runtime::start(
     if (observation_service->active()) {
         create_arguments.push_back("--volume");
         create_arguments.push_back(
-            observation_service->socket_path().string() +
-            ":/run/glove-services/observation.sock"
+            observation_service->socket_path().string() + ":/run/glove-services/observation.sock"
         );
         create_arguments.push_back("--volume");
         create_arguments.push_back(
@@ -2170,11 +2195,11 @@ auto apple_container_session_runtime::start(
         );
         create_arguments.push_back("--env");
         create_arguments.push_back(
-            "SAGE_GLOVE_OBSERVATION_SOCKET=/run/glove-services/observation.sock"
+            "GLOVE_GUEST_OBSERVATION_SOCKET=/run/glove-services/observation.sock"
         );
         create_arguments.push_back("--env");
         create_arguments.push_back(
-            "SAGE_GLOVE_OBSERVATION_TOKEN_FILE=/home/agent/.sage-observation-token"
+            "GLOVE_GUEST_OBSERVATION_TOKEN_FILE=/home/agent/.glove-observation-token"
         );
     }
     for (const auto& environment : inputs->launch.environment) {
@@ -2194,7 +2219,7 @@ auto apple_container_session_runtime::start(
         if (observation_service->active()) {
             create_arguments.push_back("--secret");
             create_arguments.push_back("/run/glove-secrets/observation-channel");
-            create_arguments.push_back("/home/agent/.sage-observation-token");
+            create_arguments.push_back("/home/agent/.glove-observation-token");
         }
         create_arguments.push_back("--");
         create_arguments.insert(
@@ -2530,6 +2555,42 @@ auto apple_container_session_runtime::cleanup(std::string_view session_id)
     }
     state_->sessions.erase(found);
     return {};
+}
+
+auto sage_guest_channel_host() -> std::shared_ptr<const channel_host> {
+    // Harness-owned payload semantics. The bounded observation schema accepts
+    // any well-formed observation identifier; the self-delegation proposal
+    // schema stays closed to its fixed kind, digest, and single item.
+    auto host = std::make_shared<channel_host>();
+    static_cast<void>(host->register_channel({
+        .channel_id = "sage-guest-observation",
+        .schema_id = "sage.glove-observation.v1",
+        .body_validator = [](const glove_observation_body&) { return true; },
+        .bounds = {
+            .max_items = max_observation_items,
+            .max_body_bytes = 8'192U,
+            .max_ttl_ms = 600'000U,
+            .max_skew_ms = 30'000U,
+        },
+    }));
+    static_cast<void>(host->register_channel({
+        .channel_id = "sage-guest-sxxx-proposal",
+        .schema_id = "sage.glove-sxxx-self-delegation-proposal.v1",
+        .body_validator =
+            [](const glove_observation_body& body) {
+                return body.observation == "sxxx-self-delegation" &&
+                       body.value_digest ==
+                           "4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b" &&
+                       body.item_count == 1U;
+            },
+        .bounds = {
+            .max_items = 1U,
+            .max_body_bytes = 1'024U,
+            .max_ttl_ms = 600'000U,
+            .max_skew_ms = 30'000U,
+        },
+    }));
+    return host;
 }
 
 } // namespace glove::control::apple_detail

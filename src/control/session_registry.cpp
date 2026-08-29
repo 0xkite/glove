@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -65,7 +66,8 @@ auto session_registry::open_or_create(
     const std::filesystem::path& path,
     std::shared_ptr<const supervisor::session_plan_validator> validator,
     std::shared_ptr<const supervisor::library_bundle_store> library_bundles,
-    std::uint64_t max_bytes
+    std::uint64_t max_bytes,
+    std::shared_ptr<const channel_host> channels
 ) -> session_registry_result<std::unique_ptr<session_registry>> {
     if (!validator || path.empty() || max_bytes < min_registry_bytes ||
         max_bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
@@ -81,6 +83,7 @@ auto session_registry::open_or_create(
     state->opened = std::move(*opened);
     state->validator = std::move(validator);
     state->library_bundles = std::move(library_bundles);
+    state->channels = std::move(channels);
     state->max_bytes = max_bytes;
     if (state->opened.created) {
         if (auto initialized = initialize_empty(*state); !initialized) {
@@ -2108,17 +2111,28 @@ auto session_registry::enqueue_observation_intent(
     const observation_intent_context& context,
     std::uint64_t now_ms
 ) -> session_registry_result<observation_intent_item> {
-    if (!valid_observation_body(body) || !valid_identifier(context.session_id) ||
-        !valid_digest(context.controller_plan_digest) || !valid_digest(context.profile_digest) ||
-        context.runtime_id != sage_guest_runtime || !valid_digest(context.projection_digest) ||
-        context.policy_revision == 0 || !valid_identifier(context.channel_id) ||
-        context.channel_generation == 0 || context.issued_at_ms == 0 ||
-        context.expires_at_ms <= context.issued_at_ms ||
-        context.expires_at_ms - context.issued_at_ms > max_observation_intent_ttl_ms ||
-        now_ms == 0) {
+    // Host-registered admission is resolved before the lock: the table is
+    // immutable once shared with a registry, so admits() is lock-free safe.
+    const channel_host* channels = state_ ? state_->channels.get() : nullptr;
+    const auto* descriptor = channels == nullptr ? nullptr : channels->admits(body.schema);
+    if (!valid_observation_body_shape(body) || descriptor == nullptr ||
+        !valid_identifier(context.session_id) || !valid_digest(context.controller_plan_digest) ||
+        !valid_digest(context.profile_digest) || !valid_identifier(context.runtime_id) ||
+        !valid_digest(context.projection_digest) || context.policy_revision == 0 ||
+        !valid_identifier(context.channel_id) || context.channel_generation == 0 ||
+        context.issued_at_ms == 0 || context.expires_at_ms <= context.issued_at_ms || now_ms == 0) {
         return std::unexpected(failure(
-            session_registry_error_code::invalid_request, "invalid observation intent request"
+            session_registry_error_code::invalid_request,
+            descriptor == nullptr && channels != nullptr ? "observation schema is not registered"
+                                                         : "invalid observation intent request"
         ));
+    }
+    if (body.item_count > descriptor->bounds.max_items ||
+        observation_body_bytes(body) > descriptor->bounds.max_body_bytes ||
+        !descriptor->body_validator(body)) {
+        return std::unexpected(
+            failure(session_registry_error_code::invalid_request, "observation body rejected")
+        );
     }
     auto intent_digest = hash_observation_intent_body(body);
     auto request_digest = hash_observation_intent_request(body, context);
@@ -2128,89 +2142,103 @@ auto session_registry::enqueue_observation_intent(
 
     const auto key =
         observation_intent_key(context.session_id, context.channel_generation, body.intent_id);
-    const std::scoped_lock lock{state_->mutex};
-    if (state_->poisoned || !verify_identity(*state_)) {
-        return std::unexpected(storage_failure("session registry is poisoned"));
-    }
-    if (const auto replay = state_->observation_intents.find(key);
-        replay != state_->observation_intents.end()) {
-        const auto& record = state_->records[replay->second];
-        if (!record.observation_intent ||
-            record.observation_intent->intent_digest != *intent_digest ||
-            record.request_digest != *request_digest) {
+    std::optional<std::function<void(const observation_intent_item&)>> exchange_hook;
+    auto queued = ([&]() -> session_registry_result<observation_intent_item> {
+        const std::scoped_lock lock{state_->mutex};
+        if (state_->poisoned || !verify_identity(*state_)) {
+            return std::unexpected(storage_failure("session registry is poisoned"));
+        }
+        if (const auto replay = state_->observation_intents.find(key);
+            replay != state_->observation_intents.end()) {
+            const auto& record = state_->records[replay->second];
+            if (!record.observation_intent ||
+                record.observation_intent->intent_digest != *intent_digest ||
+                record.request_digest != *request_digest) {
+                return std::unexpected(failure(
+                    session_registry_error_code::idempotency_conflict,
+                    "observation intent payload changed"
+                ));
+            }
+            return current_observation_item_locked(*state_, key);
+        }
+        if ((context.issued_at_ms > now_ms &&
+             context.issued_at_ms - now_ms > descriptor->bounds.max_skew_ms) ||
+            now_ms >= context.expires_at_ms) {
             return std::unexpected(failure(
-                session_registry_error_code::idempotency_conflict,
-                "observation intent payload changed"
+                session_registry_error_code::invalid_request,
+                "observation intent is expired or outside its host time binding"
             ));
         }
+
+        const auto existing = state_->sessions.find(context.session_id);
+        if (existing == state_->sessions.end()) {
+            return std::unexpected(
+                failure(session_registry_error_code::not_found, "session was not found")
+            );
+        }
+        const auto& prior = state_->records[existing->second];
+        wire::plan_runtime_header runtime;
+        const auto runtime_error =
+            glz::read<partial_read_options>(runtime, prior.canonical_plan_json);
+        if (prior.state != "running" || runtime_error || context.runtime_id != runtime.runtime_id ||
+            context.controller_plan_digest != prior.controller_plan_digest ||
+            context.profile_digest != prior.launch_profile_digest ||
+            context.policy_revision != prior.policy_revision ||
+            context.issued_at_ms < prior.running_at_ms) {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_state,
+                "observation intent does not bind the current running session"
+            ));
+        }
+        if (context.expires_at_ms - context.issued_at_ms > descriptor->bounds.max_ttl_ms) {
+            return std::unexpected(
+                failure(session_registry_error_code::invalid_request, "observation intent ttl")
+            );
+        }
+        if (state_->records.size() >= max_records) {
+            return std::unexpected(failure(
+                session_registry_error_code::capacity, "session registry capacity exhausted"
+            ));
+        }
+
+        wire::persisted_session record = prior;
+        record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+        record.operation = "enqueue_observation_intent_v1";
+        record.idempotency_key = "intent-enqueue:" + *request_digest;
+        record.request_digest = *request_digest;
+        record.previous_hash = state_->records.back().this_hash;
+        record.this_hash.clear();
+        record.observation_intent = wire::persisted_observation_intent{
+            .schema_version = 1,
+            .schema = body.schema,
+            .intent_id = body.intent_id,
+            .observation = body.observation,
+            .value_digest = body.value_digest,
+            .item_count = body.item_count,
+            .intent_digest = *intent_digest,
+            .profile_digest = context.profile_digest,
+            .runtime_id = context.runtime_id,
+            .projection_digest = context.projection_digest,
+            .channel_id = context.channel_id,
+            .channel_generation = context.channel_generation,
+            .issued_at_ms = context.issued_at_ms,
+            .expires_at_ms = context.expires_at_ms,
+            .disposition = "pending",
+            .decided_at_ms = 0,
+        };
+        auto appended = append_record_locked(*state_, std::move(record));
+        if (!appended) {
+            return std::unexpected(appended.error());
+        }
+        if (descriptor->on_exchange) {
+            exchange_hook.emplace(descriptor->on_exchange);
+        }
         return current_observation_item_locked(*state_, key);
+    })();
+    if (queued && exchange_hook) {
+        (*exchange_hook)(*queued);
     }
-    if ((context.issued_at_ms > now_ms &&
-         context.issued_at_ms - now_ms > max_observation_intent_clock_skew_ms) ||
-        now_ms >= context.expires_at_ms) {
-        return std::unexpected(failure(
-            session_registry_error_code::invalid_request,
-            "observation intent is expired or outside its host time binding"
-        ));
-    }
-
-    const auto existing = state_->sessions.find(context.session_id);
-    if (existing == state_->sessions.end()) {
-        return std::unexpected(
-            failure(session_registry_error_code::not_found, "session was not found")
-        );
-    }
-    const auto& prior = state_->records[existing->second];
-    wire::plan_runtime_header runtime;
-    const auto runtime_error =
-        glz::read<partial_read_options>(runtime, prior.canonical_plan_json);
-    if (prior.state != "running" || runtime_error || runtime.runtime_id != sage_guest_runtime ||
-        context.runtime_id != runtime.runtime_id ||
-        context.controller_plan_digest != prior.controller_plan_digest ||
-        context.profile_digest != prior.launch_profile_digest ||
-        context.policy_revision != prior.policy_revision ||
-        context.issued_at_ms < prior.running_at_ms) {
-        return std::unexpected(failure(
-            session_registry_error_code::invalid_state,
-            "observation intent does not bind the current running sage-guest session"
-        ));
-    }
-    if (state_->records.size() >= max_records) {
-        return std::unexpected(
-            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
-        );
-    }
-
-    wire::persisted_session record = prior;
-    record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
-    record.operation = "enqueue_observation_intent_v1";
-    record.idempotency_key = "intent-enqueue:" + *request_digest;
-    record.request_digest = *request_digest;
-    record.previous_hash = state_->records.back().this_hash;
-    record.this_hash.clear();
-    record.observation_intent = wire::persisted_observation_intent{
-        .schema_version = 1,
-        .schema = body.schema,
-        .intent_id = body.intent_id,
-        .observation = body.observation,
-        .value_digest = body.value_digest,
-        .item_count = body.item_count,
-        .intent_digest = *intent_digest,
-        .profile_digest = context.profile_digest,
-        .runtime_id = context.runtime_id,
-        .projection_digest = context.projection_digest,
-        .channel_id = context.channel_id,
-        .channel_generation = context.channel_generation,
-        .issued_at_ms = context.issued_at_ms,
-        .expires_at_ms = context.expires_at_ms,
-        .disposition = "pending",
-        .decided_at_ms = 0,
-    };
-    auto appended = append_record_locked(*state_, std::move(record));
-    if (!appended) {
-        return std::unexpected(appended.error());
-    }
-    return current_observation_item_locked(*state_, key);
+    return queued;
 }
 
 auto session_registry::set_observation_intent_disposition(
@@ -2222,8 +2250,7 @@ auto session_registry::set_observation_intent_disposition(
         intent_disposition_name(disposition.disposition).empty() ||
         disposition.decided_at_ms == 0) {
         return std::unexpected(failure(
-            session_registry_error_code::invalid_request,
-            "invalid observation intent disposition"
+            session_registry_error_code::invalid_request, "invalid observation intent disposition"
         ));
     }
     auto request_digest = hash_observation_intent_disposition(disposition);
@@ -2264,8 +2291,7 @@ auto session_registry::set_observation_intent_disposition(
     if (!original.observation_intent ||
         original.observation_intent->intent_digest != disposition.intent_digest) {
         return std::unexpected(failure(
-            session_registry_error_code::idempotency_conflict,
-            "observation intent digest changed"
+            session_registry_error_code::idempotency_conflict, "observation intent digest changed"
         ));
     }
     const auto& intent = *original.observation_intent;
@@ -2325,8 +2351,7 @@ auto session_registry::pending_observation_intents(
     page.items.reserve(limit);
     for (const auto& record : state_->records) {
         if (record.sequence <= after_sequence ||
-            record.operation != "enqueue_observation_intent_v1" ||
-            !record.observation_intent) {
+            record.operation != "enqueue_observation_intent_v1" || !record.observation_intent) {
             continue;
         }
         const auto& intent = *record.observation_intent;

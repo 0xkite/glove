@@ -1,5 +1,6 @@
 #pragma once
 
+#include "glove/control/guest_channel.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/control/session_registry_wire.hpp"
 
@@ -40,15 +41,6 @@ constexpr std::uint64_t min_registry_bytes = 1'024U;
 constexpr std::size_t max_records = 10'000U;
 constexpr std::size_t max_identifier_bytes = 128U;
 constexpr std::uint64_t max_start_authorization_ttl_ms = 120'000U;
-constexpr std::uint64_t max_observation_intent_ttl_ms = 600'000U;
-constexpr std::uint64_t max_observation_intent_clock_skew_ms = 30'000U;
-constexpr std::string_view glove_observation_schema = "sage.glove-observation.v1";
-constexpr std::string_view glove_sxxx_proposal_schema =
-    "sage.glove-sxxx-self-delegation-proposal.v1";
-constexpr std::string_view glove_sxxx_proposal_kind = "sxxx-self-delegation";
-constexpr std::string_view glove_sxxx_proposal_value_digest =
-    "4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b";
-constexpr std::string_view sage_guest_runtime = "sage-guest";
 constexpr glz::opts partial_read_options{.error_on_unknown_keys = false};
 
 class unique_fd {
@@ -117,6 +109,7 @@ struct session_registry::implementation {
     opened_registry opened;
     std::shared_ptr<const supervisor::session_plan_validator> validator;
     std::shared_ptr<const supervisor::library_bundle_store> library_bundles;
+    std::shared_ptr<const channel_host> channels;
     std::uint64_t max_bytes = 0;
     std::uint64_t durable_bytes = registry_magic.size();
     registry_identity identity;
@@ -184,16 +177,19 @@ inline auto intent_disposition_from_wire(std::string_view value)
     return std::nullopt;
 }
 
-inline auto valid_observation_body(const glove_observation_body& body) noexcept -> bool {
-    const bool observation = body.schema == glove_observation_schema &&
-                             valid_identifier(body.observation) &&
-                             body.item_count <= max_glove_observation_items;
-    const bool proposal =
-        body.schema == glove_sxxx_proposal_schema &&
-        body.observation == glove_sxxx_proposal_kind &&
-        body.value_digest == glove_sxxx_proposal_value_digest && body.item_count == 1U;
+// Encoded body size bound: every field the durable queue commits for one
+// observation payload, so per-channel body bounds stay replay-checkable.
+inline auto observation_body_bytes(const glove_observation_body& body) noexcept -> std::size_t {
+    return body.schema.size() + body.intent_id.size() + body.observation.size() +
+           body.value_digest.size() + sizeof(std::uint64_t);
+}
+
+// Structural invariants the registry owns for every observation body,
+// independent of any registered schema semantics.
+inline auto valid_observation_body_shape(const glove_observation_body& body) noexcept -> bool {
     return valid_identifier(body.intent_id) && valid_identifier(body.observation) &&
-           valid_digest(body.value_digest) && (observation || proposal);
+           valid_digest(body.value_digest) && body.item_count <= max_observation_items &&
+           observation_body_bytes(body) <= max_observation_body_bytes;
 }
 
 inline auto observation_body_from_wire(const wire::persisted_observation_intent& intent)
@@ -546,8 +542,11 @@ inline auto public_record(const wire::persisted_session& record) -> session_reco
     };
 }
 
-inline auto valid_record_shape(const wire::persisted_session& record, std::uint64_t sequence)
-    -> bool {
+inline auto valid_record_shape(
+    const wire::persisted_session& record,
+    std::uint64_t sequence,
+    const channel_host* channels = nullptr
+) -> bool {
     const bool common =
         record.schema_version == 1 && record.sequence == sequence &&
         valid_identifier(record.operation) && valid_identifier(record.idempotency_key) &&
@@ -562,24 +561,37 @@ inline auto valid_record_shape(const wire::persisted_session& record, std::uint6
         return false;
     }
     const bool enqueue_intent = record.operation == "enqueue_observation_intent_v1";
-    const bool set_intent_disposition =
-        record.operation == "set_observation_intent_disposition_v1";
+    const bool set_intent_disposition = record.operation == "set_observation_intent_disposition_v1";
     if (enqueue_intent || set_intent_disposition) {
         if (!record.observation_intent) {
             return false;
         }
         const auto& intent = *record.observation_intent;
         const auto disposition = intent_disposition_from_wire(intent.disposition);
-        const bool valid_intent =
-            intent.schema_version == 1 &&
-            valid_observation_body(observation_body_from_wire(intent)) &&
+        // Structural invariants live in core; body semantics are delegated to
+        // the host-registered admission table and fail closed when the schema
+        // is no longer registered at recovery time.
+        const bool structural =
+            intent.schema_version == 1 && !intent.schema.empty() &&
+            intent.schema.size() <= max_identifier_bytes &&
+            valid_observation_body_shape(observation_body_from_wire(intent)) &&
             valid_digest(intent.intent_digest) && valid_digest(intent.profile_digest) &&
-            intent.runtime_id == sage_guest_runtime && valid_digest(intent.projection_digest) &&
+            valid_identifier(intent.runtime_id) && valid_digest(intent.projection_digest) &&
             valid_identifier(intent.channel_id) && intent.channel_generation != 0 &&
             intent.issued_at_ms != 0 && intent.expires_at_ms > intent.issued_at_ms &&
-            intent.expires_at_ms - intent.issued_at_ms <= max_observation_intent_ttl_ms &&
-            disposition.has_value();
-        if (!valid_intent) {
+            intent.expires_at_ms - intent.issued_at_ms <= max_observation_intent_ttl_ms;
+        if (!structural || !disposition.has_value() || channels == nullptr) {
+            return false;
+        }
+        const auto* descriptor = channels->admits(intent.schema);
+        if (descriptor == nullptr) {
+            return false;
+        }
+        const auto body = observation_body_from_wire(intent);
+        if (body.item_count > descriptor->bounds.max_items ||
+            observation_body_bytes(body) > descriptor->bounds.max_body_bytes ||
+            intent.expires_at_ms - intent.issued_at_ms > descriptor->bounds.max_ttl_ms ||
+            !descriptor->body_validator(body)) {
             return false;
         }
         if (enqueue_intent) {

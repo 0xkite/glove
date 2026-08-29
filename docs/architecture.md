@@ -216,20 +216,30 @@ The launch binding and terminal receipt commit the projection identifier,
 destination, target, and digest. Bundle expansion into harness-native prompt
 directories is not implemented; `prompt_ref` remains rejected.
 
-## Sage guest proposal channel
+## Guest specialized-channel admission
 
-The authenticated per-session queue accepts two closed logical schemas. The
-existing observation schema carries bounded non-signing observations. The
+The durable per-session queue is schema-generic: Glove core enforces only
+structural invariants (identifier charset, digest hex, TTL/skew arithmetic,
+capacity, idempotency) and delegates body semantics to a host-registered
+admission table (`channel_descriptor{channel_id, schema_id, body_validator,
+bounds, on_exchange}` registered through a `channel_host` at registry
+construction). Schema strings never appear in core; a host registers the
+payload contracts its guests use, and replay of a durable intent whose schema
+is no longer registered fails closed.
+
+The Sage guest adapter registers two closed logical schemas. The observation
+schema carries bounded non-signing observations. The
 `sage.glove-sxxx-self-delegation-proposal.v1` schema carries only a proposal
 identifier, the fixed `sxxx-self-delegation` kind, one constant value digest,
 and `item_count = 1`. It carries no wallet, profile, chain, token, calldata,
 fee, nonce, Remote Procedure Call endpoint, credential, or operator proof.
 
-Both schemas use the same channel token and authoritative session context, but
-their body contracts are distinct. Glove commits either body with the same
-length-prefixed digest algorithm and preserves its exact schema in the durable
-queue. Sage decides whether to build a final host intent. Glove never signs or
-broadcasts a transaction.
+Both registered schemas use the same channel token and authoritative session
+context, but their body contracts are distinct. Glove commits either body with
+the same length-prefixed digest algorithm and preserves its exact schema in
+the durable queue. Sage decides whether to build a final host intent. Glove
+never signs or broadcasts a transaction. Intents bind to the session's parsed
+`runtime_id`, so any managed guest runtime can carry a registered payload.
 
 ## Persistence
 

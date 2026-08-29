@@ -1,5 +1,6 @@
 #include "glove/container/digest.hpp"
 #include "glove/container/receipt_producer.hpp"
+#include "glove/control/guest_channel.hpp"
 #include "glove/control/observation_intent_unix_server.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/supervisor/library_bundle.hpp"
@@ -7,15 +8,16 @@
 #include "glove/supervisor/session_plan.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <glaze/glaze.hpp>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-#include <fcntl.h>
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -161,12 +163,18 @@ auto valid_plan_at(std::uint64_t now_ms) -> std::string {
 auto sage_guest_plan_at(std::uint64_t now_ms) -> std::string {
     auto plan = valid_plan_at(now_ms);
     for (const auto& [from, to] : {
-             std::pair{std::string_view{"\"runtime_id\":\"codex\""},
-                       std::string_view{"\"runtime_id\":\"sage-guest\""}},
-             std::pair{std::string_view{"\"runtime_template_id\":\"codex-safe\""},
-                       std::string_view{"\"runtime_template_id\":\"sage-guest-safe\""}},
-             std::pair{std::string_view{"\"secret_handles\":[\"codex-token\"]"},
-                       std::string_view{"\"secret_handles\":[]"}},
+             std::pair{
+                 std::string_view{"\"runtime_id\":\"codex\""},
+                 std::string_view{"\"runtime_id\":\"sage-guest\""}
+             },
+             std::pair{
+                 std::string_view{"\"runtime_template_id\":\"codex-safe\""},
+                 std::string_view{"\"runtime_template_id\":\"sage-guest-safe\""}
+             },
+             std::pair{
+                 std::string_view{"\"secret_handles\":[\"codex-token\"]"},
+                 std::string_view{"\"secret_handles\":[]"}
+             },
          }) {
         const auto offset = plan.find(from);
         if (offset != std::string::npos) {
@@ -174,6 +182,23 @@ auto sage_guest_plan_at(std::uint64_t now_ms) -> std::string {
         }
     }
     return plan;
+}
+
+// Registration example (test fixture): the host owns payload semantics.
+auto test_channel_host() -> std::shared_ptr<glove::control::channel_host> {
+    auto host = std::make_shared<glove::control::channel_host>();
+    (void)host->register_channel({
+        .channel_id = "test-observation",
+        .schema_id = "sage.glove-observation.v1",
+        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
+        .bounds = {
+            .max_items = 4'096,
+            .max_body_bytes = 8'192,
+            .max_ttl_ms = 600'000,
+            .max_skew_ms = 30'000,
+        },
+    });
+    return host;
 }
 
 auto validator_for(const std::filesystem::path& source)
@@ -359,7 +384,11 @@ auto open_running_session(std::uint64_t start_ms) -> std::optional<running_sessi
     fixture.producer = *producer;
 
     auto registry = glove::control::session_registry::open_or_create(
-        fixture.temp.root() / "sessions.journal", shared_validator, shared_bundle_store
+        fixture.temp.root() / "sessions.journal",
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
     );
     if (!registry) {
         return std::nullopt;
@@ -438,7 +467,8 @@ auto make_enqueue_request(
     std::string_view token,
     std::string_view intent_id = "intent-1",
     std::string_view observation = "guest-capability-inventory",
-    std::string_view value_digest = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    std::string_view value_digest =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     std::uint64_t item_count = 4,
     std::optional<std::string_view> extra_field = std::nullopt
 ) -> std::string {
@@ -584,6 +614,7 @@ auto server_config_for(
         .socket_path = socket_path,
         .sessions = fixture.registry.get(),
         .session_id = fixture.session_id,
+        .runtime_id = "sage-guest",
         .controller_plan_digest = std::string{controller_digest},
         .profile_digest = fixture.profile_digest,
         .projection_digest = fixture.projection_digest,
@@ -593,6 +624,7 @@ auto server_config_for(
         .session_expires_at_ms = session_expires_at_ms,
         .channel_token = std::string{channel_token},
         .io_timeout_ms = io_timeout_ms,
+        .expected_peer_uid = ::geteuid(),
     };
 }
 
@@ -618,6 +650,19 @@ auto serve_in_background(
 }
 
 auto run() -> int {
+    // F5: transient accept-boundary errors are retryable; fatal config and
+    // descriptor-state errors are not.
+    REQUIRE(glove::control::observation_transient_accept_error(EINTR));
+    REQUIRE(glove::control::observation_transient_accept_error(EAGAIN));
+    REQUIRE(glove::control::observation_transient_accept_error(ECONNABORTED));
+    REQUIRE(glove::control::observation_transient_accept_error(EMFILE));
+    REQUIRE(glove::control::observation_transient_accept_error(ENFILE));
+    REQUIRE(glove::control::observation_transient_accept_error(ENOBUFS));
+    REQUIRE(glove::control::observation_transient_accept_error(ENOMEM));
+    REQUIRE(!glove::control::observation_transient_accept_error(EBADF));
+    REQUIRE(!glove::control::observation_transient_accept_error(EINVAL));
+    REQUIRE(!glove::control::observation_transient_accept_error(EACCES));
+
     const auto now_ms = []() -> std::uint64_t {
         using namespace std::chrono;
         const auto ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
@@ -673,7 +718,9 @@ auto run() -> int {
     server_thread = serve_in_background(**server, 1, serve_error);
     auto conflict_response = transact(
         socket_path,
-        make_enqueue_request(channel_token, "intent-1", "guest-capability-inventory", std::string(64, 'e'))
+        make_enqueue_request(
+            channel_token, "intent-1", "guest-capability-inventory", std::string(64, 'e')
+        )
     );
     server_thread.join();
     REQUIRE(!serve_error.has_value());
@@ -687,9 +734,8 @@ auto run() -> int {
     const auto count_before_bad_token = fixture->registry->record_count();
     serve_error.reset();
     server_thread = serve_in_background(**server, 1, serve_error);
-    auto bad_token_response = transact(
-        socket_path, make_enqueue_request(std::string(64, 'f'), "intent-2")
-    );
+    auto bad_token_response =
+        transact(socket_path, make_enqueue_request(std::string(64, 'f'), "intent-2"));
     server_thread.join();
     REQUIRE(!serve_error.has_value());
     REQUIRE(bad_token_response.has_value());
@@ -702,7 +748,14 @@ auto run() -> int {
     server_thread = serve_in_background(**server, 1, serve_error);
     auto unknown_field_response = transact(
         socket_path,
-        make_enqueue_request(channel_token, "intent-3", "guest-capability-inventory", std::string(64, 'b'), 4, "issued_at_ms")
+        make_enqueue_request(
+            channel_token,
+            "intent-3",
+            "guest-capability-inventory",
+            std::string(64, 'b'),
+            4,
+            "issued_at_ms"
+        )
     );
     server_thread.join();
     REQUIRE(!serve_error.has_value());
@@ -808,31 +861,33 @@ auto run() -> int {
     REQUIRE(::chmod(fixture->temp.root().c_str(), 0755) == 0);
     REQUIRE(
         !glove::control::observation_intent_unix_server::create(
-               server_config_for(*fixture, fixture->temp.root() / "unsafe.sock", start_ms + 120'000U)
+             server_config_for(*fixture, fixture->temp.root() / "unsafe.sock", start_ms + 120'000U)
         )
-            .has_value()
+             .has_value()
     );
     REQUIRE(::chmod(fixture->temp.root().c_str(), 0700) == 0);
 
     REQUIRE(write_owner_only(socket_path, "not-a-socket"));
-    REQUIRE(
-        !glove::control::observation_intent_unix_server::create(
-               server_config_for(*fixture, socket_path, start_ms + 120'000U)
-        )
-            .has_value()
-    );
+    REQUIRE(!glove::control::observation_intent_unix_server::create(
+                 server_config_for(*fixture, socket_path, start_ms + 120'000U)
+    )
+                 .has_value());
     std::filesystem::remove(socket_path);
 
-    auto mismatched_config = server_config_for(*fixture, fixture->temp.root() / "mismatch.sock", start_ms + 120'000U);
+    auto mismatched_config =
+        server_config_for(*fixture, fixture->temp.root() / "mismatch.sock", start_ms + 120'000U);
     mismatched_config.profile_digest = std::string(64, 'f');
-    auto mismatch_server = glove::control::observation_intent_unix_server::create(mismatched_config);
+    auto mismatch_server =
+        glove::control::observation_intent_unix_server::create(mismatched_config);
     REQUIRE(mismatch_server.has_value());
     const auto count_before_mismatch = fixture->registry->record_count();
     serve_error.reset();
     server_thread = serve_in_background(**mismatch_server, 1, serve_error);
     auto mismatch_response = transact(
         mismatch_server->get()->socket_path(),
-        make_enqueue_request(channel_token, "intent-mismatch", "guest-capability-inventory", std::string(64, '9'))
+        make_enqueue_request(
+            channel_token, "intent-mismatch", "guest-capability-inventory", std::string(64, '9')
+        )
     );
     server_thread.join();
     REQUIRE(!serve_error.has_value());
@@ -850,7 +905,9 @@ auto run() -> int {
     server_thread = serve_in_background(**expired_server, 1, serve_error);
     auto expired_response = transact(
         expired_server->get()->socket_path(),
-        make_enqueue_request(channel_token, "intent-expired", "guest-capability-inventory", std::string(64, '8'))
+        make_enqueue_request(
+            channel_token, "intent-expired", "guest-capability-inventory", std::string(64, '8')
+        )
     );
     server_thread.join();
     REQUIRE(!serve_error.has_value());
@@ -859,7 +916,156 @@ auto run() -> int {
     REQUIRE(expired_error.has_value());
     REQUIRE(expired_error->code == "intent_expired");
 
-    auto cleanup_config = server_config_for(*fixture, fixture->temp.root() / "cleanup.sock", start_ms + 120'000U);
+    // F3: peer-credential enforcement. A server configured with an expected
+    // uid that cannot match the (same-uid) test client rejects connections
+    // before any frame is read, and the registry stays untouched.
+    {
+        auto guarded_config =
+            server_config_for(*fixture, fixture->temp.root() / "guarded.sock", start_ms + 120'000U);
+        guarded_config.expected_peer_uid = ::geteuid() + 1U;
+        auto guarded_server =
+            glove::control::observation_intent_unix_server::create(guarded_config);
+        REQUIRE(guarded_server.has_value());
+        const auto count_before_guard = fixture->registry->record_count();
+        serve_error.reset();
+        server_thread = serve_in_background(**guarded_server, 1, serve_error);
+        auto guarded_response = transact(
+            guarded_server->get()->socket_path(),
+            make_enqueue_request(channel_token, "intent-guarded")
+        );
+        server_thread.join();
+        REQUIRE(!serve_error.has_value());
+        // The peer is rejected without a response frame.
+        REQUIRE(!guarded_response.has_value());
+        REQUIRE(fixture->registry->record_count() == count_before_guard);
+    }
+
+    // F4: replay-cache eviction (LRU) keeps the channel alive past the
+    // cache capacity instead of returning capacity_exhausted forever.
+    {
+        auto bounded_config =
+            server_config_for(*fixture, fixture->temp.root() / "bounded.sock", start_ms + 120'000U);
+        bounded_config.replay_cache_capacity = 2U;
+        auto bounded_server =
+            glove::control::observation_intent_unix_server::create(bounded_config);
+        REQUIRE(bounded_server.has_value());
+        const auto bounded_socket = bounded_server->get()->socket_path();
+        const auto count_before_lru = fixture->registry->record_count();
+
+        // One serve iteration per transact below.
+        serve_error.reset();
+        server_thread = serve_in_background(**bounded_server, 6, serve_error);
+
+        auto lru_first =
+            decode_success(*transact(bounded_socket, make_enqueue_request(channel_token, "lru-1")));
+        REQUIRE(lru_first.has_value());
+        auto lru_second =
+            decode_success(*transact(bounded_socket, make_enqueue_request(channel_token, "lru-2")));
+        REQUIRE(lru_second.has_value());
+        auto lru_third =
+            decode_success(*transact(bounded_socket, make_enqueue_request(channel_token, "lru-3")));
+        REQUIRE(lru_third.has_value());
+
+        // The cached tail still replays through the cache.
+        auto lru_cached_replay =
+            transact(bounded_socket, make_enqueue_request(channel_token, "lru-3"));
+        auto cached_replay = decode_success(*lru_cached_replay);
+        REQUIRE(cached_replay.has_value());
+        REQUIRE(cached_replay->sequence == lru_third->sequence);
+
+        // The evicted head replays through the durable registry: either an
+        // exact replay (same host-stamped millisecond) or a drifted
+        // idempotency_conflict — never capacity_exhausted, and the channel
+        // stays live.
+        auto lru_evicted_replay =
+            transact(bounded_socket, make_enqueue_request(channel_token, "lru-1"));
+        auto evicted_success = decode_success(*lru_evicted_replay);
+        auto evicted_error = decode_error(*lru_evicted_replay);
+        REQUIRE(
+            evicted_success.has_value() ||
+            (evicted_error.has_value() && evicted_error->code == "idempotency_conflict")
+        );
+
+        // New intents keep flowing past the old 1024-cap behavior.
+        auto lru_fourth = transact(bounded_socket, make_enqueue_request(channel_token, "lru-4"));
+        REQUIRE(decode_success(*lru_fourth).has_value());
+        server_thread.join();
+        REQUIRE(!serve_error.has_value());
+        REQUIRE(fixture->registry->record_count() == count_before_lru + 4U);
+    }
+
+    // F5: a transient accept failure (real fd exhaustion) is retried with a
+    // bounded backoff and must not permanently kill the channel.
+    {
+        auto retry_config =
+            server_config_for(*fixture, fixture->temp.root() / "retry.sock", start_ms + 120'000U);
+        auto retry_server = glove::control::observation_intent_unix_server::create(retry_config);
+        REQUIRE(retry_server.has_value());
+        const auto retry_socket = retry_server->get()->socket_path();
+
+        auto held = connect_to(retry_socket);
+        REQUIRE(held.get() >= 0);
+        const auto held_request = make_enqueue_request(channel_token, "intent-retry");
+        const auto held_size = htonl(static_cast<std::uint32_t>(held_request.size()));
+        REQUIRE(write_exact(held.get(), &held_size, sizeof(held_size)));
+        REQUIRE(write_exact(held.get(), held_request.data(), held_request.size()));
+
+        // Genuinely exhaust descriptors so the next accept() fails with
+        // EMFILE where the platform enforces it at allocation time.
+        std::vector<int> exhausted;
+        bool exhausted_descriptors = false;
+        for (;;) {
+            const int descriptor = ::dup(0);
+            if (descriptor < 0) {
+                exhausted_descriptors = errno == EMFILE;
+                break;
+            }
+            exhausted.push_back(descriptor);
+            if (exhausted.size() > 4096U) {
+                break;
+            }
+        }
+        if (exhausted_descriptors) {
+            REQUIRE(!(*retry_server)->serve_one_for(2'000).has_value());
+            for (const int descriptor : exhausted) {
+                ::close(descriptor);
+            }
+            // The channel recovers: both the queued connection and the new
+            // recovery request are accepted and processed.
+            const auto count_before_retry = fixture->registry->record_count();
+            serve_error.reset();
+            server_thread = serve_in_background(**retry_server, 2, serve_error);
+            auto retry_response = transact(
+                retry_socket, make_enqueue_request(channel_token, "intent-retry-recovered")
+            );
+            server_thread.join();
+            REQUIRE(!serve_error.has_value());
+            REQUIRE(retry_response.has_value());
+            REQUIRE(decode_success(*retry_response).has_value());
+            REQUIRE(fixture->registry->record_count() == count_before_retry + 2U);
+        } else {
+            // macOS keeps new allocations below its high-water mark, so the
+            // accept may simply succeed; the channel must still stay healthy
+            // and process both the queued and a fresh request.
+            for (const int descriptor : exhausted) {
+                ::close(descriptor);
+            }
+            const auto count_before_retry = fixture->registry->record_count();
+            serve_error.reset();
+            server_thread = serve_in_background(**retry_server, 2, serve_error);
+            auto retry_response = transact(
+                retry_socket, make_enqueue_request(channel_token, "intent-retry-recovered")
+            );
+            server_thread.join();
+            REQUIRE(!serve_error.has_value());
+            REQUIRE(retry_response.has_value());
+            REQUIRE(decode_success(*retry_response).has_value());
+            REQUIRE(fixture->registry->record_count() >= count_before_retry + 1U);
+        }
+    }
+
+    auto cleanup_config =
+        server_config_for(*fixture, fixture->temp.root() / "cleanup.sock", start_ms + 120'000U);
     auto cleanup_server = glove::control::observation_intent_unix_server::create(cleanup_config);
     REQUIRE(cleanup_server.has_value());
     struct stat created_socket{};

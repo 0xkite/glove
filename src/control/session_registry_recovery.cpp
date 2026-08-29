@@ -2,20 +2,27 @@
 
 namespace glove::control {
 
-namespace {
-
-auto same_session_snapshot(
-    wire::persisted_session left, wire::persisted_session right
-) -> bool {
+// Recovery compares a frozen intent/disposition record against the session
+// record it was bound to. Lifecycle progression mutates `state` and
+// `running_at_ms`, and policy revisions may advance without changing the
+// session's durable identity, so those three fields are neutralized before
+// the comparison. Everything else must still match exactly: any other
+// mismatch is a genuine binding crossing, not lifecycle progression.
+auto same_session_snapshot(wire::persisted_session left, wire::persisted_session right) -> bool {
     left.sequence = right.sequence = 0;
     left.operation = right.operation = {};
     left.idempotency_key = right.idempotency_key = {};
     left.request_digest = right.request_digest = {};
     left.previous_hash = right.previous_hash = {};
     left.this_hash = right.this_hash = {};
+    left.state = right.state = {};
+    left.running_at_ms = right.running_at_ms = 0;
+    left.policy_revision = right.policy_revision = 0;
     left.observation_intent = right.observation_intent = std::nullopt;
     return left == right;
 }
+
+namespace {
 
 auto same_observation_intent_binding(
     wire::persisted_observation_intent left, wire::persisted_observation_intent right
@@ -81,14 +88,13 @@ auto accept_recovered_record(
     std::string_view previous_hash
 ) -> std::expected<void, std::string> {
     const auto sequence = static_cast<std::uint64_t>(state.records.size()) + 1U;
-    if (!valid_record_shape(record, sequence) || record.previous_hash != previous_hash ||
-        state.requests.contains(record.idempotency_key)) {
+    if (!valid_record_shape(record, sequence, state.channels.get()) ||
+        record.previous_hash != previous_hash || state.requests.contains(record.idempotency_key)) {
         return std::unexpected(std::string{"session registry record is invalid"});
     }
     const auto existing = state.sessions.find(record.session_id);
     const bool enqueue_intent = record.operation == "enqueue_observation_intent_v1";
-    const bool set_intent_disposition =
-        record.operation == "set_observation_intent_disposition_v1";
+    const bool set_intent_disposition = record.operation == "set_observation_intent_disposition_v1";
     if (enqueue_intent || set_intent_disposition) {
         if (existing == state.sessions.end() || !record.observation_intent) {
             return std::unexpected(std::string{"session registry observation intent is orphaned"});
@@ -100,8 +106,7 @@ auto accept_recovered_record(
             );
         }
         const auto body = observation_body_from_wire(*record.observation_intent);
-        const auto context =
-            observation_context_from_wire(record, *record.observation_intent);
+        const auto context = observation_context_from_wire(record, *record.observation_intent);
         auto body_digest = hash_observation_intent_body(body);
         const auto key = observation_intent_key(
             record.session_id,
@@ -121,7 +126,7 @@ auto accept_recovered_record(
             if (!request_digest || *request_digest != record.request_digest ||
                 record.idempotency_key != "intent-enqueue:" + record.request_digest ||
                 state.observation_intents.contains(key) || current_session.state != "running" ||
-                runtime_error || runtime.runtime_id != sage_guest_runtime ||
+                runtime_error || runtime.runtime_id != record.observation_intent->runtime_id ||
                 record.observation_intent->profile_digest !=
                     current_session.launch_profile_digest ||
                 record.observation_intent->issued_at_ms < current_session.running_at_ms) {

@@ -650,7 +650,8 @@ auto hash_observation_intent_body(const glove_observation_body& body)
     -> std::expected<std::string, std::string> {
     std::vector<unsigned char> material;
     material.reserve(512U);
-    constexpr std::string_view domain = "sage.glove-observation.v1";
+    // Opaque, harness-neutral hash domain for observation body commitments.
+    constexpr std::string_view domain = "glove.observation-body.v1";
     if (!append_string(material, domain)) {
         return std::unexpected(std::string{"observation intent hash domain is invalid"});
     }
@@ -701,9 +702,8 @@ auto hash_observation_intent_request(
     return container::sha256_hex(material);
 }
 
-auto hash_observation_intent_disposition(
-    const observation_intent_disposition& disposition
-) -> std::expected<std::string, std::string> {
+auto hash_observation_intent_disposition(const observation_intent_disposition& disposition)
+    -> std::expected<std::string, std::string> {
     std::vector<unsigned char> material;
     material.reserve(512U);
     constexpr std::string_view domain = "glove.observation-intent-disposition.v1";

@@ -519,6 +519,20 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         return std::unexpected(instance_lock.error());
     }
     std::shared_ptr<glove::control::session_registry> sessions;
+    // Guest payload admission is host-registered, never compiled into Glove
+    // core: the Apple managed-session host registers its guest schemas when
+    // managed-session storage is configured. Registries opened without an
+    // admission table fail closed on observation intents.
+    const auto guest_channel_host = [&]() -> std::shared_ptr<const glove::control::channel_host> {
+#if defined(__APPLE__)
+        if (configured.apple_container) {
+            return glove::control::apple_detail::sage_guest_channel_host();
+        }
+#else
+        (void)configured;
+#endif
+        return nullptr;
+    };
     if (configured.session_store) {
         std::shared_ptr<const glove::supervisor::library_bundle_store> library_bundles;
         if (configured.library_bundle_root) {
@@ -531,7 +545,11 @@ auto run(const options& configured) -> std::expected<void, std::string> {
                 std::make_shared<const glove::supervisor::library_bundle_store>(std::move(*opened));
         }
         auto opened = glove::control::session_registry::open_or_create(
-            *configured.session_store, plan_validator, std::move(library_bundles)
+            *configured.session_store,
+            plan_validator,
+            std::move(library_bundles),
+            glove::control::default_session_registry_bytes,
+            guest_channel_host()
         );
         if (!opened) {
             return std::unexpected(std::string{"open session store: "} + opened.error().message);

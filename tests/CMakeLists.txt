@@ -176,7 +176,7 @@ target_include_directories(control_remote_session_runtime_test PRIVATE
 add_test(NAME control_remote_session_runtime COMMAND control_remote_session_runtime_test)
 
 add_executable(control_session_registry_test control/session_registry_test.cpp)
-target_link_libraries(control_session_registry_test PRIVATE glove_control)
+target_link_libraries(control_session_registry_test PRIVATE glove_control glaze::glaze)
 target_include_directories(control_session_registry_test PRIVATE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
 )

@@ -1,10 +1,12 @@
 #include "glove/container/digest.hpp"
+#include "glove/control/guest_channel.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/path_alias.hpp"
 #include "glove/supervisor/session_plan.hpp"
 
 #include "session_reconciliation.hpp"
+#include "session_registry_recovery.hpp"
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -77,9 +79,7 @@ auto replace_after_marker(
         return false;
     }
     std::ifstream input{path, std::ios::binary};
-    std::string bytes(
-        static_cast<std::size_t>(std::filesystem::file_size(path)), '\0'
-    );
+    std::string bytes(static_cast<std::size_t>(std::filesystem::file_size(path)), '\0');
     input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     if (!input.good()) {
         return false;
@@ -150,12 +150,18 @@ auto valid_plan_at(std::uint64_t now_ms) -> std::string {
 auto sage_guest_plan_at(std::uint64_t now_ms) -> std::string {
     auto plan = valid_plan_at(now_ms);
     for (const auto& [from, to] : {
-             std::pair{std::string_view{"\"runtime_id\":\"codex\""},
-                       std::string_view{"\"runtime_id\":\"sage-guest\""}},
-             std::pair{std::string_view{"\"runtime_template_id\":\"codex-safe\""},
-                       std::string_view{"\"runtime_template_id\":\"sage-guest-safe\""}},
-             std::pair{std::string_view{"\"secret_handles\":[\"codex-token\"]"},
-                       std::string_view{"\"secret_handles\":[]"}},
+             std::pair{
+                 std::string_view{"\"runtime_id\":\"codex\""},
+                 std::string_view{"\"runtime_id\":\"sage-guest\""}
+             },
+             std::pair{
+                 std::string_view{"\"runtime_template_id\":\"codex-safe\""},
+                 std::string_view{"\"runtime_template_id\":\"sage-guest-safe\""}
+             },
+             std::pair{
+                 std::string_view{"\"secret_handles\":[\"codex-token\"]"},
+                 std::string_view{"\"secret_handles\":[]"}
+             },
          }) {
         const auto offset = plan.find(from);
         if (offset != std::string::npos) {
@@ -262,6 +268,61 @@ auto filesystem_identity() -> glove::control::linux_filesystem_recovery_identity
         .disk_limit_bytes = 2'097'152,
         .partitions = {{.alias = "workspace", .quota_bytes = 1'048'576}},
     };
+}
+
+constexpr std::string_view test_observation_schema = "sage.glove-observation.v1";
+constexpr std::string_view test_proposal_schema = "sage.glove-sxxx-self-delegation-proposal.v1";
+
+// Registration example: the host owns payload semantics; Glove core only
+// enforces structural invariants and the registered bounds.
+auto test_channel_host() -> std::shared_ptr<const glove::control::channel_host> {
+    auto host = std::make_shared<glove::control::channel_host>();
+    (void)host->register_channel({
+        .channel_id = "test-observation",
+        .schema_id = std::string{test_observation_schema},
+        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
+        .bounds = {
+            .max_items = 4'096,
+            .max_body_bytes = 8'192,
+            .max_ttl_ms = 600'000,
+            .max_skew_ms = 30'000,
+        },
+    });
+    (void)host->register_channel({
+        .channel_id = "test-proposal",
+        .schema_id = std::string{test_proposal_schema},
+        .body_validator =
+            [](const glove::control::glove_observation_body& body) {
+                return body.observation == "sxxx-self-delegation" &&
+                       body.value_digest ==
+                           "4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b" &&
+                       body.item_count == 1U;
+            },
+        .bounds = {
+            .max_items = 1,
+            .max_body_bytes = 1'024,
+            .max_ttl_ms = 600'000,
+            .max_skew_ms = 30'000,
+        },
+    });
+    return host;
+}
+
+// Tight bounds to exercise descriptor-level rejection paths.
+auto tight_channel_host() -> std::shared_ptr<const glove::control::channel_host> {
+    auto host = std::make_shared<glove::control::channel_host>();
+    (void)host->register_channel({
+        .channel_id = "tight-observation",
+        .schema_id = std::string{test_observation_schema},
+        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
+        .bounds = {
+            .max_items = 1,
+            .max_body_bytes = 512,
+            .max_ttl_ms = 50'000,
+            .max_skew_ms = 1'000,
+        },
+    });
+    return host;
 }
 
 auto validator_for(
@@ -1374,13 +1435,18 @@ auto run_intent_queue_contract() -> int {
 
     const auto store_path = temp.root() / "intent-sessions.journal";
     auto registry = glove::control::session_registry::open_or_create(
-        store_path, shared_validator, shared_bundle_store
+        store_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
     );
     REQUIRE(registry.has_value());
 
     const auto start_session =
-        [&](std::string session_id, std::uint64_t start_ms, std::uint32_t pid, char profile_byte)
-        -> std::expected<glove::control::session_running_commitment, std::string> {
+        [&](
+            std::string session_id, std::uint64_t start_ms, std::uint32_t pid, char profile_byte
+        ) -> std::expected<glove::control::session_running_commitment, std::string> {
         auto created = (*registry)->create(
             session_id,
             controller_digest,
@@ -1437,8 +1503,9 @@ auto run_intent_queue_contract() -> int {
             .process_identity = process_identity(pid),
             .filesystem_identity = binding.filesystem_identity,
         };
-        auto marked =
-            (*registry)->mark_running(running, *reservation, "running-" + session_id, start_ms + 4U);
+        auto marked = (*registry)->mark_running(
+            running, *reservation, "running-" + session_id, start_ms + 4U
+        );
         if (!marked) {
             return std::unexpected(marked.error().message);
         }
@@ -1477,7 +1544,7 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(enqueued->disposition == glove::control::intent_disposition::pending);
     REQUIRE(
         enqueued->intent_digest ==
-        "2e0f904912ae266f55d2760ce10230eeea05807b352608b4e6e8d1cd17861865"
+        "3b6597eb187f1883063a3316272cb2622b1bf0bc5e33dc17253ba16fac145c2e"
     );
     const auto count_after_enqueue = (*registry)->record_count();
 
@@ -1570,20 +1637,17 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(first_page->items.size() == 2U);
     REQUIRE(first_page->items[0].sequence < first_page->items[1].sequence);
     REQUIRE(first_page->next_after_sequence.has_value());
-    auto second_page = (*registry)->pending_observation_intents(
-        *first_page->next_after_sequence, 2, 30'004
-    );
+    auto second_page =
+        (*registry)->pending_observation_intents(*first_page->next_after_sequence, 2, 30'004);
     REQUIRE(second_page.has_value());
     REQUIRE(!second_page->items.empty());
     REQUIRE(second_page->items.front().sequence > first_page->items.back().sequence);
     REQUIRE(!(*registry)->pending_observation_intents(0, 0, 30'004).has_value());
-    REQUIRE(
-        !(*registry)
-             ->pending_observation_intents(
-                 0, glove::control::max_pending_intent_page_size + 1U, 30'004
-             )
-             .has_value()
-    );
+    REQUIRE(!(*registry)
+                 ->pending_observation_intents(
+                     0, glove::control::max_pending_intent_page_size + 1U, 30'004
+                 )
+                 .has_value());
 
     const glove::control::observation_intent_disposition accepted{
         .session_id = context_a.session_id,
@@ -1679,7 +1743,7 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(proposed.has_value());
     REQUIRE(
         proposed->intent_digest ==
-        "b9a9d7f648ee24502d1dd2d54164dd952dec18befe7d0d8e5793ebc5d1b7430c"
+        "0720ddf91b535e5a2db6badf0079d687e1bc239b41af7330bd9ee200cd6038c4"
     );
     auto altered_proposal = sxxx_proposal;
     altered_proposal.item_count = 2;
@@ -1708,7 +1772,11 @@ auto run_intent_queue_contract() -> int {
 
     registry->reset();
     registry = glove::control::session_registry::open_or_create(
-        store_path, shared_validator, shared_bundle_store
+        store_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
     );
     REQUIRE(registry.has_value());
     auto recovered_page = (*registry)->pending_observation_intents(0, 16, 30'103);
@@ -1717,6 +1785,79 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(recovered_page->items[0].sequence < recovered_page->items[1].sequence);
     REQUIRE((*registry)->set_observation_intent_disposition(accepted) == accepted_result);
     REQUIRE((*registry)->set_observation_intent_disposition(expired) == expired_result);
+
+    // Generalized admission: enqueue on a non-sage runtime binds to the
+    // session's parsed runtime_id instead of a hardcoded guest identity.
+    {
+        auto created = (*registry)->create(
+            "codex-session", controller_digest, valid_plan_at(40'000), "create-codex", 40'000
+        );
+        if (!created) {
+            std::fprintf(stderr, "codex create error: %s\n", created.error().message.c_str());
+        }
+        REQUIRE(created.has_value());
+        const glove::control::session_start_authorization codex_authorization{
+            .schema_version = 1,
+            .authorization_id = "approval-codex-session",
+            .session_id = "codex-session",
+            .controller_plan_digest = std::string{controller_digest},
+            .plan_content_digest = created->plan_content_digest,
+            .approved_at_ms = 40'001,
+            .expires_at_ms = 100'000,
+        };
+        REQUIRE(
+            (*registry)->reserve_start(codex_authorization, "reserve-codex", 40'002).has_value()
+        );
+        const glove::control::session_execution_binding codex_binding{
+            .schema_version = 1,
+            .session_id = "codex-session",
+            .controller_plan_digest = std::string{controller_digest},
+            .plan_content_digest = created->plan_content_digest,
+            .authorization_id = codex_authorization.authorization_id,
+            .profile_digest = std::string(64, '7'),
+            .cgroup_identity = cgroup_identity(7001),
+            .filesystem_identity = filesystem_identity(),
+        };
+        auto codex_reservation = (*producer)->reserve_terminal(
+            codex_binding.session_id,
+            codex_binding.controller_plan_digest,
+            codex_binding.profile_digest
+        );
+        REQUIRE(codex_reservation.has_value());
+        REQUIRE((*registry)
+                    ->mark_starting(codex_binding, *codex_reservation, "starting-codex", 40'003)
+                    .has_value());
+        const glove::control::session_running_commitment codex_running{
+            .schema_version = 1,
+            .session_id = "codex-session",
+            .controller_plan_digest = codex_binding.controller_plan_digest,
+            .plan_content_digest = codex_binding.plan_content_digest,
+            .authorization_id = codex_binding.authorization_id,
+            .profile_digest = codex_binding.profile_digest,
+            .process_identity = process_identity(7001),
+            .filesystem_identity = filesystem_identity(),
+        };
+        REQUIRE((*registry)
+                    ->mark_running(codex_running, *codex_reservation, "running-codex", 40'004)
+                    .has_value());
+        const glove::control::observation_intent_context codex_context{
+            .session_id = "codex-session",
+            .controller_plan_digest = codex_binding.controller_plan_digest,
+            .profile_digest = codex_binding.profile_digest,
+            .runtime_id = "codex",
+            .projection_digest = std::string(64, 'c'),
+            .policy_revision = 7,
+            .channel_id = "codex-session-observation-v1",
+            .channel_generation = 1,
+            .issued_at_ms = 40'010,
+            .expires_at_ms = 40'100,
+        };
+        auto codex_enqueued = (*registry)->enqueue_observation_intent(body, codex_context, 40'010);
+        REQUIRE(codex_enqueued.has_value());
+        auto wrong_runtime = codex_context;
+        wrong_runtime.runtime_id = "other-guest";
+        REQUIRE(!(*registry)->enqueue_observation_intent(body, wrong_runtime, 40'011).has_value());
+    }
 
     const auto legacy_store = temp.root() / "legacy-observation-intent-sessions.journal";
     std::string legacy_plan_digest;
@@ -1761,7 +1902,11 @@ auto run_intent_queue_contract() -> int {
         "sage.glove-observation.v2"
     ));
     REQUIRE(!glove::control::session_registry::open_or_create(
-                 hash_corrupted_schema_store, shared_validator, shared_bundle_store
+                 hash_corrupted_schema_store,
+                 shared_validator,
+                 shared_bundle_store,
+                 glove::control::default_session_registry_bytes,
+                 test_channel_host()
     )
                  .has_value());
 
@@ -1775,7 +1920,11 @@ auto run_intent_queue_contract() -> int {
         "sage-session-b"
     ));
     REQUIRE(!glove::control::session_registry::open_or_create(
-                 hash_corrupted_session_store, shared_validator, shared_bundle_store
+                 hash_corrupted_session_store,
+                 shared_validator,
+                 shared_bundle_store,
+                 glove::control::default_session_registry_bytes,
+                 test_channel_host()
     )
                  .has_value());
 
@@ -1787,7 +1936,11 @@ auto run_intent_queue_contract() -> int {
         output.put('x');
     }
     REQUIRE(!glove::control::session_registry::open_or_create(
-                 torn_store, shared_validator, shared_bundle_store
+                 torn_store,
+                 shared_validator,
+                 shared_bundle_store,
+                 glove::control::default_session_registry_bytes,
+                 test_channel_host()
     )
                  .has_value());
 
@@ -1800,7 +1953,9 @@ auto run_intent_queue_contract() -> int {
         .profile_digest = running_a->profile_digest,
         .code = glove::control::session_failure_code::supervisor_error,
     };
-    REQUIRE((*registry)->mark_failed(terminal_failure, "terminal-sage-session-a", 30'060).has_value());
+    REQUIRE(
+        (*registry)->mark_failed(terminal_failure, "terminal-sage-session-a", 30'060).has_value()
+    );
     auto terminal_body = body;
     terminal_body.intent_id = "intent-after-terminal";
     REQUIRE(!(*registry)->enqueue_observation_intent(terminal_body, context_a, 30'061).has_value());
@@ -1808,7 +1963,7 @@ auto run_intent_queue_contract() -> int {
     registry->reset();
     const auto durable_size = std::filesystem::file_size(store_path);
     registry = glove::control::session_registry::open_or_create(
-        store_path, shared_validator, shared_bundle_store, durable_size
+        store_path, shared_validator, shared_bundle_store, durable_size, test_channel_host()
     );
     REQUIRE(registry.has_value());
     auto capacity_body = body;
@@ -1821,6 +1976,372 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(!capacity.has_value());
     REQUIRE(capacity.error().code == glove::control::session_registry_error_code::capacity);
 
+    // Descriptor bounds: ttl, skew, and item count beyond the registered
+    // channel bounds are rejected even when inside core ceilings.
+    {
+        auto tight = glove::control::session_registry::open_or_create(
+            temp.root() / "tight-sessions.journal",
+            shared_validator,
+            shared_bundle_store,
+            glove::control::default_session_registry_bytes,
+            tight_channel_host()
+        );
+        REQUIRE(tight.has_value());
+        auto created = (*tight)->create(
+            "tight-session", controller_digest, sage_guest_plan_at(60'000), "create-tight", 60'000
+        );
+        REQUIRE(created.has_value());
+        const glove::control::session_start_authorization tight_authorization{
+            .schema_version = 1,
+            .authorization_id = "approval-tight",
+            .session_id = "tight-session",
+            .controller_plan_digest = std::string{controller_digest},
+            .plan_content_digest = created->plan_content_digest,
+            .approved_at_ms = 60'001,
+            .expires_at_ms = 160'000,
+        };
+        REQUIRE((*tight)->reserve_start(tight_authorization, "reserve-tight", 60'002).has_value());
+        const glove::control::session_execution_binding tight_binding{
+            .schema_version = 1,
+            .session_id = "tight-session",
+            .controller_plan_digest = std::string{controller_digest},
+            .plan_content_digest = created->plan_content_digest,
+            .authorization_id = tight_authorization.authorization_id,
+            .profile_digest = std::string(64, '8'),
+            .cgroup_identity = cgroup_identity(7201),
+            .filesystem_identity = filesystem_identity(),
+        };
+        auto tight_reservation = (*producer)->reserve_terminal(
+            tight_binding.session_id,
+            tight_binding.controller_plan_digest,
+            tight_binding.profile_digest
+        );
+        REQUIRE(tight_reservation.has_value());
+        REQUIRE((*tight)
+                    ->mark_starting(tight_binding, *tight_reservation, "starting-tight", 60'003)
+                    .has_value());
+        const glove::control::session_running_commitment tight_running{
+            .schema_version = 1,
+            .session_id = "tight-session",
+            .controller_plan_digest = tight_binding.controller_plan_digest,
+            .plan_content_digest = tight_binding.plan_content_digest,
+            .authorization_id = tight_binding.authorization_id,
+            .profile_digest = tight_binding.profile_digest,
+            .process_identity = process_identity(7201),
+            .filesystem_identity = filesystem_identity(),
+        };
+        REQUIRE((*tight)
+                    ->mark_running(tight_running, *tight_reservation, "running-tight", 60'004)
+                    .has_value());
+        const glove::control::observation_intent_context tight_context{
+            .session_id = "tight-session",
+            .controller_plan_digest = tight_binding.controller_plan_digest,
+            .profile_digest = tight_binding.profile_digest,
+            .runtime_id = "sage-guest",
+            .projection_digest = std::string(64, 'c'),
+            .policy_revision = 7,
+            .channel_id = "tight-observation",
+            .channel_generation = 1,
+            .issued_at_ms = 60'010,
+            .expires_at_ms = 60'050,
+        };
+        // Within the tight bounds: accepted (body respects max_items=1).
+        auto tight_body = body;
+        tight_body.item_count = 1;
+        REQUIRE(
+            (*tight)->enqueue_observation_intent(tight_body, tight_context, 60'010).has_value()
+        );
+        // Beyond the registered ttl bound (but inside the core ceiling).
+        auto long_ttl = tight_context;
+        long_ttl.issued_at_ms = 60'060;
+        long_ttl.expires_at_ms = 60'060 + 600'000U;
+        REQUIRE(!(*tight)->enqueue_observation_intent(tight_body, long_ttl, 60'060).has_value());
+        // Beyond the registered skew bound.
+        auto skew_body = tight_body;
+        skew_body.intent_id = "tight-skew";
+        skew_body.value_digest = std::string(64, 'b');
+        auto skewed = tight_context;
+        skewed.issued_at_ms = 60'010 + 2'000U;
+        skewed.expires_at_ms = skewed.issued_at_ms + 1'000U;
+        REQUIRE(!(*tight)->enqueue_observation_intent(skew_body, skewed, 60'010).has_value());
+        // Beyond the registered item bound (2 items against max_items=1).
+        auto multi_body = tight_body;
+        multi_body.intent_id = "tight-items";
+        multi_body.value_digest = std::string(64, 'd');
+        multi_body.item_count = 2;
+        REQUIRE(
+            !(*tight)->enqueue_observation_intent(multi_body, tight_context, 60'012).has_value()
+        );
+    }
+
+    // Fail closed: replay of a store carrying intents must reject when no
+    // admission table is registered, and when the schema is missing from it.
+    const auto unadmitted_store = temp.root() / "unadmitted-copy.journal";
+    REQUIRE(std::filesystem::copy_file(store_path, unadmitted_store));
+    REQUIRE(::chmod(unadmitted_store.c_str(), 0600) == 0);
+    REQUIRE(!glove::control::session_registry::open_or_create(
+                 unadmitted_store, shared_validator, shared_bundle_store
+    )
+                 .has_value());
+    REQUIRE(!glove::control::session_registry::open_or_create(
+                 unadmitted_store,
+                 shared_validator,
+                 shared_bundle_store,
+                 glove::control::default_session_registry_bytes,
+                 tight_channel_host()
+    )
+                 .has_value());
+
+    // Unregistered schema enqueue fails closed.
+    auto unregistered_body = body;
+    unregistered_body.schema = "sage.glove-observation.v2";
+    REQUIRE(
+        !(*registry)->enqueue_observation_intent(unregistered_body, context_a, 30'080).has_value()
+    );
+
+    return 0;
+}
+
+// F1/HIGH regression: durable intent and disposition records embed a frozen
+// full session snapshot. Lifecycle progression (running -> stopping ->
+// exited) and policy revision bumps must never read as a binding crossing on
+// recovery, while any other frozen-field difference still must.
+auto run_intent_recovery_transitions() -> int {
+    using glove::control::wire::persisted_session;
+
+    // Snapshot-identity unit test: lifecycle-mutable fields are neutralized;
+    // everything else remains a binding crossing.
+    const persisted_session identity{
+        .schema_version = 1,
+        .sequence = 4,
+        .operation = "mark_running",
+        .idempotency_key = "running-session-1",
+        .session_id = "session-1",
+        .controller_plan_digest = std::string(64, 'c'),
+        .request_digest = std::string(64, 'a'),
+        .plan_content_digest = std::string(64, 'b'),
+        .state = "running",
+        .policy_revision = 7,
+        .expires_at_ms = 61'000,
+        .created_at_ms = 1'000,
+        .authorization_id = {},
+        .authorized_at_ms = 1'001,
+        .authorization_expires_at_ms = 2'001,
+        .launch_profile_digest = std::string(64, 'e'),
+        .starting_at_ms = 1'003,
+        .running_at_ms = 1'004,
+        .stopping_at_ms = 0,
+        .process_identity_schema_version = 0,
+        .process_pid = 0,
+        .process_boot_id = {},
+        .process_start_time_ticks = 0,
+        .process_cgroup_device = 0,
+        .process_cgroup_inode = 0,
+        .process_cgroup_path_digest = {},
+        .cgroup_identity = std::nullopt,
+        .filesystem_identity = std::nullopt,
+        .managed_runtime_identity = std::nullopt,
+        .failure_code = {},
+        .finished_at_ms = 0,
+        .receipt_started_at_ms = 0,
+        .receipt_key_id = {},
+        .receipt_sequence = 0,
+        .receipt_digest = {},
+        .receipt_previous_hmac = {},
+        .receipt_hmac = {},
+        .termination_cause = {},
+        .exit_code = std::nullopt,
+        .canonical_plan_json = {},
+        .previous_hash = {},
+        .this_hash = {},
+        .observation_intent = std::nullopt,
+    };
+    auto transitioned = identity;
+    transitioned.state = "exited";
+    transitioned.running_at_ms = 9'999;
+    transitioned.policy_revision = 99;
+    transitioned.stopping_at_ms = 5'000;
+    transitioned.finished_at_ms = 6'000;
+    // state/running_at_ms/policy_revision neutralization is intentional; a
+    // frozen snapshot with additional transition markers (stopping_at_ms,
+    // finished_at_ms) still crosses, so journal order stays authoritative.
+    REQUIRE(
+        glove::control::same_session_snapshot(transitioned, identity) ==
+        (transitioned.stopping_at_ms == 0 && transitioned.finished_at_ms == 0)
+    );
+    auto crossed = transitioned;
+    crossed.stopping_at_ms = 0;
+    crossed.finished_at_ms = 0;
+    REQUIRE(glove::control::same_session_snapshot(crossed, identity));
+    auto tampered = identity;
+    tampered.launch_profile_digest = std::string(64, 'f');
+    REQUIRE(!glove::control::same_session_snapshot(tampered, identity));
+    auto crossed_session = identity;
+    crossed_session.session_id = "session-2";
+    REQUIRE(!glove::control::same_session_snapshot(crossed_session, identity));
+
+    // End-to-end: enqueue -> stopping -> exited -> destroy -> reopen must
+    // recover, per state transition.
+    temporary_directory temp;
+    REQUIRE(!temp.root().empty());
+    const auto source = temp.root() / "source";
+    REQUIRE(std::filesystem::create_directory(source));
+    auto validator = validator_for(source);
+    REQUIRE(validator.has_value());
+    auto shared_validator =
+        std::make_shared<const glove::supervisor::session_plan_validator>(std::move(*validator));
+    const auto bundle_root = temp.root() / "library-bundles";
+    REQUIRE(std::filesystem::create_directory(bundle_root));
+    REQUIRE(::chmod(bundle_root.c_str(), 0700) == 0);
+    const auto bundle_path = bundle_root / (library_bundle_digest() + ".json");
+    {
+        std::ofstream output{bundle_path, std::ios::binary};
+        output.write(library_bundle.data(), static_cast<std::streamsize>(library_bundle.size()));
+    }
+    REQUIRE(::chmod(bundle_path.c_str(), 0600) == 0);
+    auto opened_bundle_store = glove::supervisor::library_bundle_store::open(bundle_root);
+    REQUIRE(opened_bundle_store.has_value());
+    auto shared_bundle_store = std::make_shared<const glove::supervisor::library_bundle_store>(
+        std::move(*opened_bundle_store)
+    );
+    const auto audit_key_path = temp.root() / "transition-receipt.key";
+    {
+        std::ofstream output{audit_key_path, std::ios::binary | std::ios::trunc};
+        output << audit_key << '\n';
+    }
+    REQUIRE(::chmod(audit_key_path.c_str(), 0600) == 0);
+    auto producer = glove::container::receipt_audit_producer::initialize({
+        .key_path = audit_key_path,
+        .journal_path = temp.root() / "transition-receipts.journal",
+    });
+    REQUIRE(producer.has_value());
+    REQUIRE((*producer)->acknowledge_bootstrap((*producer)->anchor()).has_value());
+
+    const auto store_path = temp.root() / "transition-sessions.journal";
+    auto registry = glove::control::session_registry::open_or_create(
+        store_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
+    );
+    REQUIRE(registry.has_value());
+
+    const std::uint64_t start_ms = 10'000;
+    const std::string session_id = "recovery-transition-session";
+    auto created = (*registry)->create(
+        session_id, controller_digest, sage_guest_plan_at(start_ms), "create-transition", start_ms
+    );
+    REQUIRE(created.has_value());
+    const glove::control::session_start_authorization authorization{
+        .schema_version = 1,
+        .authorization_id = "approval-transition",
+        .session_id = session_id,
+        .controller_plan_digest = std::string{controller_digest},
+        .plan_content_digest = created->plan_content_digest,
+        .approved_at_ms = start_ms + 1U,
+        .expires_at_ms = start_ms + 60'000U,
+    };
+    REQUIRE(
+        (*registry)->reserve_start(authorization, "reserve-transition", start_ms + 2U).has_value()
+    );
+    const glove::control::session_execution_binding binding{
+        .schema_version = 1,
+        .session_id = session_id,
+        .controller_plan_digest = std::string{controller_digest},
+        .plan_content_digest = created->plan_content_digest,
+        .authorization_id = authorization.authorization_id,
+        .profile_digest = std::string(64, 'a'),
+        .cgroup_identity = cgroup_identity(7101),
+        .filesystem_identity = filesystem_identity(),
+    };
+    auto reservation = (*producer)->reserve_terminal(
+        binding.session_id, binding.controller_plan_digest, binding.profile_digest
+    );
+    REQUIRE(reservation.has_value());
+    REQUIRE((*registry)
+                ->mark_starting(binding, *reservation, "starting-transition", start_ms + 3U)
+                .has_value());
+    const glove::control::session_running_commitment running{
+        .schema_version = 1,
+        .session_id = session_id,
+        .controller_plan_digest = binding.controller_plan_digest,
+        .plan_content_digest = binding.plan_content_digest,
+        .authorization_id = binding.authorization_id,
+        .profile_digest = binding.profile_digest,
+        .process_identity = process_identity(7101),
+        .filesystem_identity = binding.filesystem_identity,
+    };
+    REQUIRE((*registry)
+                ->mark_running(running, *reservation, "running-transition", start_ms + 4U)
+                .has_value());
+
+    const glove::control::glove_observation_body body{
+        .schema = "sage.glove-observation.v1",
+        .intent_id = "transition-intent-1",
+        .observation = "guest-capability-inventory",
+        .value_digest = std::string(64, 'a'),
+        .item_count = 4,
+    };
+    const glove::control::observation_intent_context context{
+        .session_id = session_id,
+        .controller_plan_digest = running.controller_plan_digest,
+        .profile_digest = running.profile_digest,
+        .runtime_id = "sage-guest",
+        .projection_digest = std::string(64, 'c'),
+        .policy_revision = 7,
+        .channel_id = "recovery-transition-observation-v1",
+        .channel_generation = 1,
+        .issued_at_ms = start_ms + 10U,
+        .expires_at_ms = start_ms + 30'000U,
+    };
+    auto enqueued = (*registry)->enqueue_observation_intent(body, context, start_ms + 10U);
+    REQUIRE(enqueued.has_value());
+
+    // Transition 1: running -> stopping with the intent still pending.
+    REQUIRE((*registry)->mark_stopping(running, "stopping-transition", start_ms + 20U).has_value());
+    registry->reset();
+    registry = glove::control::session_registry::open_or_create(
+        store_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
+    );
+    REQUIRE(registry.has_value());
+
+    // Transition 2: stopping -> exited with the intent still pending.
+    auto terminal = (*producer)->commit_terminal(
+        std::move(*reservation),
+        binding.session_id,
+        binding.controller_plan_digest,
+        terminal_receipt(binding.profile_digest, start_ms + 3U, start_ms + 30U)
+    );
+    REQUIRE(terminal.has_value());
+    REQUIRE((*registry)->mark_exited(*terminal, **producer, "exited-transition").has_value());
+
+    // A late host disposition decided after exit freezes the exited snapshot.
+    const glove::control::observation_intent_disposition accepted{
+        .session_id = session_id,
+        .channel_generation = 1,
+        .intent_id = body.intent_id,
+        .intent_digest = enqueued->intent_digest,
+        .disposition = glove::control::intent_disposition::accepted,
+        .decided_at_ms = start_ms + 40U,
+    };
+    REQUIRE((*registry)->set_observation_intent_disposition(accepted).has_value());
+
+    registry->reset();
+    registry = glove::control::session_registry::open_or_create(
+        store_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
+    );
+    REQUIRE(registry.has_value());
+    REQUIRE((*registry)->set_observation_intent_disposition(accepted).has_value());
+
     return 0;
 }
 
@@ -1831,6 +2352,9 @@ int main() {
         return result;
     }
     if (const auto result = run_intent_queue_contract(); result != 0) {
+        return result;
+    }
+    if (const auto result = run_intent_recovery_transitions(); result != 0) {
         return result;
     }
     return run_managed_runtime_registry();

@@ -18,7 +18,15 @@ namespace glove::control {
 
 inline constexpr std::uint64_t default_session_registry_bytes = std::uint64_t{64} * 1024U * 1024U;
 inline constexpr std::size_t max_pending_intent_page_size = 256U;
-inline constexpr std::uint64_t max_glove_observation_items = 4'096U;
+inline constexpr std::size_t max_observation_items = 4'096U;
+inline constexpr std::size_t max_observation_body_bytes = 65'536U;
+inline constexpr std::uint64_t max_observation_intent_ttl_ms = 600'000U;
+inline constexpr std::uint64_t max_observation_intent_clock_skew_ms = 30'000U;
+
+// Host-registered guest payload admission. Defined in guest_channel.hpp;
+// forward-declared here so registries can be opened without an admission
+// table (observation intents then fail closed).
+class channel_host;
 
 struct glove_observation_body {
     std::string schema;
@@ -104,7 +112,7 @@ struct session_record {
     auto operator==(const session_record&) const -> bool = default;
 };
 
-// Sage-issued, local-channel start authorization. This contains no opaque
+// Host-issued, local-channel start authorization. This contains no opaque
 // operator proof. Direct-write plans therefore remain structurally ineligible
 // until Glove has a separately authenticated local-consent verifier.
 struct session_start_authorization {
@@ -444,11 +452,15 @@ public:
     auto operator=(session_registry&&) -> session_registry& = delete;
     ~session_registry();
 
+    // `channels` is the host-registered guest payload admission table. When
+    // absent, observation intent enqueue is rejected and durable replay of
+    // any observation intent record fails closed.
     [[nodiscard]] static auto open_or_create(
         const std::filesystem::path& path,
         std::shared_ptr<const supervisor::session_plan_validator> validator,
         std::shared_ptr<const supervisor::library_bundle_store> library_bundles = nullptr,
-        std::uint64_t max_bytes = default_session_registry_bytes
+        std::uint64_t max_bytes = default_session_registry_bytes,
+        std::shared_ptr<const channel_host> channels = nullptr
     ) -> session_registry_result<std::unique_ptr<session_registry>>;
 
     [[nodiscard]] auto create(
@@ -575,9 +587,9 @@ public:
         const observation_intent_context& context,
         std::uint64_t now_ms
     ) -> session_registry_result<observation_intent_item>;
-    [[nodiscard]] auto set_observation_intent_disposition(
-        const observation_intent_disposition& disposition
-    ) -> session_registry_result<observation_intent_item>;
+    [[nodiscard]] auto
+    set_observation_intent_disposition(const observation_intent_disposition& disposition)
+        -> session_registry_result<observation_intent_item>;
     [[nodiscard]] auto pending_observation_intents(
         std::uint64_t after_sequence, std::size_t limit, std::uint64_t now_ms
     ) const -> session_registry_result<pending_intent_page>;

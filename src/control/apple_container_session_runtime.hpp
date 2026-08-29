@@ -1,6 +1,7 @@
 #pragma once
 
 #include "glove/audit/sink.hpp"
+#include "glove/control/guest_channel.hpp"
 #include "glove/control/session_runtime.hpp"
 
 #include <cstddef>
@@ -132,5 +133,11 @@ public:
 private:
     std::unique_ptr<implementation> state_;
 };
+
+// Host-side registration of the Sage guest payload schemas (bounded guest
+// observations plus the closed self-delegation proposal envelope). Glove core
+// never learns these schema strings; the harness adapter registers them with
+// the session registry at daemon construction.
+[[nodiscard]] auto sage_guest_channel_host() -> std::shared_ptr<const channel_host>;
 
 } // namespace glove::control::apple_detail

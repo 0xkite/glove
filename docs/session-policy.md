@@ -418,10 +418,17 @@ that lane alongside the filesystem and environment SBPL probes. Linux keeps
 the privileged Docker workflow lane for namespace, cgroup, receipt, cleanup,
 and no-network assertions.
 
-## Sage guest proposals
+## Guest observation channels and Sage guest proposals
 
-The guest service channel accepts a self-delegation proposal only when every
-body field matches the closed schema:
+The guest service channel is schema-generic: Glove core enforces structural
+invariants (identifier charset, digest hex, TTL/skew arithmetic, capacity,
+idempotency) and delegates body semantics to the host-registered admission
+table. Schemas are registered by the host at registry construction, never
+compiled into core; replay of a durable intent whose schema is no longer
+registered fails closed.
+
+The Sage guest adapter registers a self-delegation proposal schema that is
+accepted only when every body field matches its closed contract:
 
 - schema: `sage.glove-sxxx-self-delegation-proposal.v1`;
 - observation: `sxxx-self-delegation`;
@@ -431,8 +438,17 @@ body field matches the closed schema:
 - a bounded canonical proposal identifier.
 
 Any altered field fails before enqueue. The proposal grants no execution or
-wallet authority. Glove adds the running session context and persists the
-proposal digest. Only the host can resolve it into a final intent.
+wallet authority. Glove adds the running session context — bound to the
+session's parsed `runtime_id` — and persists the proposal digest. Only the
+host can resolve it into a final intent.
+
+The per-session observation socket additionally verifies the connecting
+peer's uid (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS) against the
+configured expectation before reading any frame. The in-container channel
+environment is generic — `GLOVE_GUEST_OBSERVATION_SOCKET` and
+`GLOVE_GUEST_OBSERVATION_TOKEN_FILE` with the token materialized at
+`/home/agent/.glove-observation-token` — so any guest harness consumes the
+same ingress contract.
 
 ## Receipts and recovery
 

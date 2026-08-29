@@ -1,4 +1,5 @@
 add_library(glove_control STATIC
+    guest_channel.cpp
     receipt_audit_protocol.cpp
     receipt_audit_unix_server.cpp
     observation_intent_unix_server.cpp
