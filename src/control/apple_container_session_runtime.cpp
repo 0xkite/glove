@@ -1545,6 +1545,9 @@ public:
         if (!error_.empty()) {
             return std::unexpected(error_);
         }
+        if (!result_.has_value()) {
+            return std::unexpected(std::string{"internal error"});
+        }
         return *result_;
     }
 
@@ -1705,15 +1708,30 @@ private:
             // This fallback is deliberately non-reporting: constructing a
             // diagnostic here could throw inside noexcept. The unavailable
             // lifecycle preserves every lease and leaves durable recovery as
-            // the only future activation path.
+            // the only future activation path. The sampler must not outlive
+            // finalization even on this path (bad_alloc in the pre-join
+            // waitpid-error branch can land here), and wait() must observe a
+            // well-formed terminal state, so a static error string is set
+            // when allocation permits.
+            try {
+                sampler_.request_stop();
+                if (sampler_.joinable()) {
+                    sampler_.join();
+                }
+            } catch (...) {}
             credential_leases_.preserve();
             egress_broker_.preserve();
             projection_lease_.preserve();
             try {
                 std::lock_guard lock{state_mutex_};
+                error_ = "internal error";
                 finished_ = true;
                 state_changed_.notify_all();
-            } catch (...) {}
+            } catch (...) {
+                std::lock_guard lock{state_mutex_};
+                finished_ = true;
+                state_changed_.notify_all();
+            }
         }
     }
 
