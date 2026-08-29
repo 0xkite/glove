@@ -2142,7 +2142,6 @@ auto session_registry::enqueue_observation_intent(
 
     const auto key =
         observation_intent_key(context.session_id, context.channel_generation, body.intent_id);
-    std::optional<std::function<void(const observation_intent_item&)>> exchange_hook;
     auto queued = ([&]() -> session_registry_result<observation_intent_item> {
         const std::scoped_lock lock{state_->mutex};
         if (state_->poisoned || !verify_identity(*state_)) {
@@ -2230,14 +2229,8 @@ auto session_registry::enqueue_observation_intent(
         if (!appended) {
             return std::unexpected(appended.error());
         }
-        if (descriptor->on_exchange) {
-            exchange_hook.emplace(descriptor->on_exchange);
-        }
         return current_observation_item_locked(*state_, key);
     })();
-    if (queued && exchange_hook) {
-        (*exchange_hook)(*queued);
-    }
     return queued;
 }
 

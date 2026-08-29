@@ -9,7 +9,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <vector>
 
 namespace glove::control {
 
@@ -29,25 +28,14 @@ struct channel_bounds {
 // host from harness configuration — never compiled into Glove core.
 // `schema_id` is opaque to core; `body_validator` carries all payload
 // semantics (kind, digest constants, item contracts); `bounds` replace the
-// former per-schema limits; `on_exchange` (optional) is invoked once after
-// an intent bound to this channel is durably enqueued. The callback must be
-// non-blocking and must not re-enter the session registry.
+// former per-schema limits.
 struct channel_descriptor {
+    // Registration metadata only: registry admission matches by `schema_id`,
+    // never by `channel_id`.
     std::string channel_id;
     std::string schema_id;
     std::function<bool(const glove_observation_body&)> body_validator;
     channel_bounds bounds{};
-    std::function<void(const observation_intent_item&)> on_exchange = {};
-};
-
-// Read-only capability-discovery entry surfaced by channel_host::catalog().
-// Hosts authorize catalog reads like every other host-control operation.
-struct channel_catalog_entry {
-    std::string channel_id;
-    std::string schema_id;
-    channel_bounds bounds{};
-
-    auto operator==(const channel_catalog_entry&) const -> bool = default;
 };
 
 // Host-registered schema admission table, one per managed session. The
@@ -67,7 +55,6 @@ public:
         -> std::expected<void, std::string>;
     // Returns nullptr when the schema is not registered (fail closed).
     [[nodiscard]] auto admits(std::string_view schema_id) const -> const channel_descriptor*;
-    [[nodiscard]] auto catalog() const -> std::vector<channel_catalog_entry>;
 
 private:
     std::unordered_map<std::string, channel_descriptor> descriptors_;

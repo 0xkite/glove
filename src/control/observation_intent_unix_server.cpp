@@ -6,6 +6,8 @@
 
 #include "glove/control/observation_intent_unix_server.hpp"
 
+#include "channel_identifier_grammar.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
@@ -182,19 +184,13 @@ auto constant_time_equal(std::string_view left, std::string_view right) noexcept
     return difference == 0U;
 }
 
-auto valid_identifier(std::string_view value) noexcept -> bool {
-    return !value.empty() && value.size() <= 128U &&
-           std::ranges::all_of(value, [](unsigned char byte) {
-               return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' || byte == ':' ||
-                      byte == '.';
-           });
-}
+// Identifier and digest admission grammar is shared with guest_channel and
+// the session registry via channel_identifier_grammar.hpp; the rules are
+// identical (128-byte bounded charset, 64 lowercase hex).
+using detail::valid_identifier;
 
-auto valid_hex(std::string_view value) noexcept -> bool {
-    return value.size() == 64U && std::ranges::all_of(value, [](unsigned char byte) {
-               return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-           });
+inline auto valid_hex(std::string_view value) noexcept -> bool {
+    return detail::valid_digest(value);
 }
 
 auto system_error(std::string_view operation, int code = errno) -> std::string {
@@ -450,6 +446,10 @@ struct observation_intent_unix_server::implementation {
             if (replay->body != request.body) {
                 return encode(enqueue_error_v1{.code = "idempotency_conflict"});
             }
+            // Cached replays return the frozen enqueue response captured at
+            // first accept; post-eviction replays resolve through the durable
+            // registry and return the intent's current disposition. Documented
+            // divergence — the registry remains the authoritative layer.
             return encode(replay->response);
         }
         const auto ttl_ceiling =

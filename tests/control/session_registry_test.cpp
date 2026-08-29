@@ -2342,6 +2342,27 @@ auto run_intent_recovery_transitions() -> int {
     REQUIRE(registry.has_value());
     REQUIRE((*registry)->set_observation_intent_disposition(accepted).has_value());
 
+    // Fail-closed recovery regression: reopening a store holding durable
+    // observation intents must fail without the registered schema table.
+    // Neither a null channel host nor an empty one (no registered schemas)
+    // can admit the frozen intents, so recovery is refused outright.
+    REQUIRE(!glove::control::session_registry::open_or_create(
+                 store_path,
+                 shared_validator,
+                 shared_bundle_store,
+                 glove::control::default_session_registry_bytes,
+                 nullptr
+    )
+                 .has_value());
+    REQUIRE(!glove::control::session_registry::open_or_create(
+                 store_path,
+                 shared_validator,
+                 shared_bundle_store,
+                 glove::control::default_session_registry_bytes,
+                 std::make_shared<const glove::control::channel_host>()
+    )
+                 .has_value());
+
     return 0;
 }
 

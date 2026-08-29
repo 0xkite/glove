@@ -4,6 +4,8 @@
 #include "glove/control/session_registry.hpp"
 #include "glove/control/session_registry_wire.hpp"
 
+#include "channel_identifier_grammar.hpp"
+
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <sys/file.h>
@@ -124,20 +126,11 @@ struct session_registry::implementation {
 
 using namespace wire;
 
-inline auto valid_identifier(std::string_view value) noexcept -> bool {
-    return !value.empty() && value.size() <= max_identifier_bytes &&
-           std::ranges::all_of(value, [](unsigned char byte) {
-               return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' || byte == ':' ||
-                      byte == '.';
-           });
-}
-
-inline auto valid_digest(std::string_view value) noexcept -> bool {
-    return value.size() == digest_hex_bytes && std::ranges::all_of(value, [](unsigned char byte) {
-               return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-           });
-}
+// Identifier and digest admission grammar is shared with guest_channel and
+// the observation intent unix server via channel_identifier_grammar.hpp; the
+// rules are identical (128-byte bounded charset, 64 lowercase hex).
+using detail::valid_digest;
+using detail::valid_identifier;
 
 inline auto observation_intent_key(
     std::string_view session_id, std::uint64_t channel_generation, std::string_view intent_id

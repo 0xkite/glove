@@ -222,8 +222,8 @@ The durable per-session queue is schema-generic: Glove core enforces only
 structural invariants (identifier charset, digest hex, TTL/skew arithmetic,
 capacity, idempotency) and delegates body semantics to a host-registered
 admission table (`channel_descriptor{channel_id, schema_id, body_validator,
-bounds, on_exchange}` registered through a `channel_host` at registry
-construction). Schema strings never appear in core; a host registers the
+bounds}` registered through a `channel_host` at registry construction).
+Schema strings never appear in core; a host registers the
 payload contracts its guests use, and replay of a durable intent whose schema
 is no longer registered fails closed.
 
