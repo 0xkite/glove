@@ -15,6 +15,7 @@ enum class action : std::uint8_t {
     agent_launch,
     agent_exit,
     egress,
+    observation,
 };
 
 // One observed agent interaction. Recorded after the inner call returns so

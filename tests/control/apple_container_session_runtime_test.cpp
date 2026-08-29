@@ -366,6 +366,55 @@ auto run() -> int {
         REQUIRE(!shared_runtime->resource_capabilities().complete());
         REQUIRE(shared_runtime->agent_runtime_adapter_schema_version() == 0);
         REQUIRE(shared_runtime->managed_runtime_ids().empty());
+        // Lifecycle-disabled denial: every session control method must refuse
+        // before any side effect, and the guest observation service (which
+        // only constructs inside a lifecycle-gated start) never materializes.
+        auto gated_protocol = glove::control::receipt_audit_protocol::create(
+            bootstrap_secret,
+            *producer,
+            shared_validator,
+            shared_registry,
+            shared_runtime,
+            {},
+            session_root.string()
+        );
+        REQUIRE(gated_protocol.has_value());
+        const auto gated_now_ms = epoch_ms();
+        const auto gated_start_session = std::string{
+            R"({"authorization":{"schema_version":1,"authorization_id":"gated-approval",)"
+            R"("session_id":"gated-session","controller_plan_digest":")" +
+            std::string(64, 'a') + R"(","plan_content_digest":")" + std::string(64, 'b') +
+            R"(","approved_at_ms":1,"expires_at_ms":2}})"
+        };
+        const auto records_before_gated_start = shared_registry->record_count();
+        auto gated_frame = (*gated_protocol)
+                               ->handle_frame(
+                                   make_request(
+                                       "gated-start",
+                                       "start_session",
+                                       gated_start_session,
+                                       "gated-start",
+                                       gated_now_ms + 1'000U
+                                   ),
+                                   gated_now_ms
+                               )
+                               .value_or(std::string{});
+        REQUIRE(gated_frame.find("\"method_not_found\"") != std::string::npos);
+        REQUIRE(shared_registry->record_count() == records_before_gated_start);
+        auto gated_stop_frame = (*gated_protocol)
+                                    ->handle_frame(
+                                        make_request(
+                                            "gated-stop",
+                                            "stop_session",
+                                            "{\"session_id\":\"gated-session\"}",
+                                            "gated-stop",
+                                            gated_now_ms + 2'000U
+                                        ),
+                                        gated_now_ms
+                                    )
+                                    .value_or(std::string{});
+        REQUIRE(gated_stop_frame.find("\"method_not_found\"") != std::string::npos);
+        REQUIRE(shared_registry->record_count() == records_before_gated_start);
         std::fprintf(
             stderr,
             "Apple managed lifecycle remains gated until the six-limit receipt contract is "

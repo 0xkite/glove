@@ -1,7 +1,10 @@
 #pragma once
 
+#include "glove/control/guest_channel.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/control/session_registry_wire.hpp"
+
+#include "channel_identifier_grammar.hpp"
 
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
@@ -108,6 +111,7 @@ struct session_registry::implementation {
     opened_registry opened;
     std::shared_ptr<const supervisor::session_plan_validator> validator;
     std::shared_ptr<const supervisor::library_bundle_store> library_bundles;
+    std::shared_ptr<const channel_host> channels;
     std::uint64_t max_bytes = 0;
     std::uint64_t durable_bytes = registry_magic.size();
     registry_identity identity;
@@ -115,24 +119,123 @@ struct session_registry::implementation {
     std::vector<wire::persisted_session> records;
     std::unordered_map<std::string, std::size_t> sessions;
     std::unordered_map<std::string, std::size_t> requests;
+    std::unordered_map<std::string, std::size_t> observation_intents;
+    std::unordered_map<std::string, std::size_t> observation_dispositions;
     mutable std::mutex mutex;
 };
 
 using namespace wire;
 
-inline auto valid_identifier(std::string_view value) noexcept -> bool {
-    return !value.empty() && value.size() <= max_identifier_bytes &&
-           std::ranges::all_of(value, [](unsigned char byte) {
-               return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' || byte == ':' ||
-                      byte == '.';
-           });
+// Identifier and digest admission grammar is shared with guest_channel and
+// the observation intent unix server via channel_identifier_grammar.hpp; the
+// rules are identical (128-byte bounded charset, 64 lowercase hex).
+using detail::valid_digest;
+using detail::valid_identifier;
+
+inline auto observation_intent_key(
+    std::string_view session_id, std::uint64_t channel_generation, std::string_view intent_id
+) -> std::string {
+    return std::string{session_id} + "\n" + std::to_string(channel_generation) + "\n" +
+           std::string{intent_id};
 }
 
-inline auto valid_digest(std::string_view value) noexcept -> bool {
-    return value.size() == digest_hex_bytes && std::ranges::all_of(value, [](unsigned char byte) {
-               return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-           });
+inline auto intent_disposition_name(intent_disposition disposition) noexcept -> std::string_view {
+    switch (disposition) {
+    case intent_disposition::pending:
+        return "pending";
+    case intent_disposition::accepted:
+        return "accepted";
+    case intent_disposition::rejected:
+        return "rejected";
+    case intent_disposition::expired:
+        return "expired";
+    }
+    return {};
+}
+
+inline auto intent_disposition_from_wire(std::string_view value)
+    -> std::optional<intent_disposition> {
+    if (value == "pending") {
+        return intent_disposition::pending;
+    }
+    if (value == "accepted") {
+        return intent_disposition::accepted;
+    }
+    if (value == "rejected") {
+        return intent_disposition::rejected;
+    }
+    if (value == "expired") {
+        return intent_disposition::expired;
+    }
+    return std::nullopt;
+}
+
+// Encoded body size bound: every field the durable queue commits for one
+// observation payload, so per-channel body bounds stay replay-checkable.
+inline auto observation_body_bytes(const glove_observation_body& body) noexcept -> std::size_t {
+    return body.schema.size() + body.intent_id.size() + body.observation.size() +
+           body.value_digest.size() + sizeof(std::uint64_t);
+}
+
+// Structural invariants the registry owns for every observation body,
+// independent of any registered schema semantics.
+inline auto valid_observation_body_shape(const glove_observation_body& body) noexcept -> bool {
+    return valid_identifier(body.intent_id) && valid_identifier(body.observation) &&
+           valid_digest(body.value_digest) && body.item_count <= max_observation_items &&
+           observation_body_bytes(body) <= max_observation_body_bytes;
+}
+
+inline auto observation_body_from_wire(const wire::persisted_observation_intent& intent)
+    -> glove_observation_body {
+    return {
+        .schema = intent.schema,
+        .intent_id = intent.intent_id,
+        .observation = intent.observation,
+        .value_digest = intent.value_digest,
+        .item_count = intent.item_count,
+    };
+}
+
+inline auto observation_context_from_wire(
+    const wire::persisted_session& record, const wire::persisted_observation_intent& intent
+) -> observation_intent_context {
+    return {
+        .session_id = record.session_id,
+        .controller_plan_digest = record.controller_plan_digest,
+        .profile_digest = intent.profile_digest,
+        .runtime_id = intent.runtime_id,
+        .projection_digest = intent.projection_digest,
+        .policy_revision = record.policy_revision,
+        .channel_id = intent.channel_id,
+        .channel_generation = intent.channel_generation,
+        .issued_at_ms = intent.issued_at_ms,
+        .expires_at_ms = intent.expires_at_ms,
+    };
+}
+
+inline auto observation_item_from_wire(const wire::persisted_session& record)
+    -> session_registry_result<observation_intent_item> {
+    if (!record.observation_intent) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "session registry record has no observation intent"
+        ));
+    }
+    const auto disposition = intent_disposition_from_wire(record.observation_intent->disposition);
+    if (!disposition) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "session registry observation disposition is invalid"
+        ));
+    }
+    return observation_intent_item{
+        .sequence = record.sequence,
+        .body = observation_body_from_wire(*record.observation_intent),
+        .context = observation_context_from_wire(record, *record.observation_intent),
+        .intent_digest = record.observation_intent->intent_digest,
+        .disposition = *disposition,
+        .decided_at_ms = record.observation_intent->decided_at_ms,
+    };
 }
 
 inline auto refinement_plan(std::string_view canonical_plan_json) -> bool {
@@ -432,8 +535,11 @@ inline auto public_record(const wire::persisted_session& record) -> session_reco
     };
 }
 
-inline auto valid_record_shape(const wire::persisted_session& record, std::uint64_t sequence)
-    -> bool {
+inline auto valid_record_shape(
+    const wire::persisted_session& record,
+    std::uint64_t sequence,
+    const channel_host* channels = nullptr
+) -> bool {
     const bool common =
         record.schema_version == 1 && record.sequence == sequence &&
         valid_identifier(record.operation) && valid_identifier(record.idempotency_key) &&
@@ -445,6 +551,52 @@ inline auto valid_record_shape(const wire::persisted_session& record, std::uint6
         record.canonical_plan_json.size() <= max_record_payload_bytes &&
         valid_digest(record.previous_hash) && valid_digest(record.this_hash);
     if (!common) {
+        return false;
+    }
+    const bool enqueue_intent = record.operation == "enqueue_observation_intent_v1";
+    const bool set_intent_disposition = record.operation == "set_observation_intent_disposition_v1";
+    if (enqueue_intent || set_intent_disposition) {
+        if (!record.observation_intent) {
+            return false;
+        }
+        const auto& intent = *record.observation_intent;
+        const auto disposition = intent_disposition_from_wire(intent.disposition);
+        // Structural invariants live in core; body semantics are delegated to
+        // the host-registered admission table and fail closed when the schema
+        // is no longer registered at recovery time.
+        const bool structural =
+            intent.schema_version == 1 && !intent.schema.empty() &&
+            intent.schema.size() <= max_identifier_bytes &&
+            valid_observation_body_shape(observation_body_from_wire(intent)) &&
+            valid_digest(intent.intent_digest) && valid_digest(intent.profile_digest) &&
+            valid_identifier(intent.runtime_id) && valid_digest(intent.projection_digest) &&
+            valid_identifier(intent.channel_id) && intent.channel_generation != 0 &&
+            intent.issued_at_ms != 0 && intent.expires_at_ms > intent.issued_at_ms &&
+            intent.expires_at_ms - intent.issued_at_ms <= max_observation_intent_ttl_ms;
+        if (!structural || !disposition.has_value() || channels == nullptr) {
+            return false;
+        }
+        const auto* descriptor = channels->admits(intent.schema);
+        if (descriptor == nullptr) {
+            return false;
+        }
+        const auto body = observation_body_from_wire(intent);
+        if (body.item_count > descriptor->bounds.max_items ||
+            observation_body_bytes(body) > descriptor->bounds.max_body_bytes ||
+            intent.expires_at_ms - intent.issued_at_ms > descriptor->bounds.max_ttl_ms ||
+            !descriptor->body_validator(body)) {
+            return false;
+        }
+        if (enqueue_intent) {
+            return *disposition == intent_disposition::pending && intent.decided_at_ms == 0;
+        }
+        const bool expired = *disposition == intent_disposition::expired;
+        return *disposition != intent_disposition::pending &&
+               intent.decided_at_ms >= intent.issued_at_ms &&
+               (expired ? intent.decided_at_ms >= intent.expires_at_ms
+                        : intent.decided_at_ms < intent.expires_at_ms);
+    }
+    if (record.observation_intent) {
         return false;
     }
     const bool no_terminal_receipt =

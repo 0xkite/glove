@@ -545,7 +545,23 @@ auto append_record_locked(session_registry::implementation& state, wire::persist
     const auto index = state.records.size();
     state.durable_bytes += encoded->size();
     state.identity = *identity;
-    state.sessions.insert_or_assign(record.session_id, index);
+    if (record.operation == "enqueue_observation_intent_v1" && record.observation_intent) {
+        const auto& intent = *record.observation_intent;
+        state.observation_intents.emplace(
+            observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id),
+            index
+        );
+    } else if (
+        record.operation == "set_observation_intent_disposition_v1" && record.observation_intent
+    ) {
+        const auto& intent = *record.observation_intent;
+        state.observation_dispositions.emplace(
+            observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id),
+            index
+        );
+    } else {
+        state.sessions.insert_or_assign(record.session_id, index);
+    }
     state.requests.emplace(record.idempotency_key, index);
     state.records.push_back(std::move(record));
     return public_record(state.records.back());

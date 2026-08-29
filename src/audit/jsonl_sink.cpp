@@ -87,6 +87,8 @@ auto action_name(action a) -> std::string_view {
         return "agent_exit";
     case action::egress:
         return "egress";
+    case action::observation:
+        return "observation";
     }
     return "unknown";
 }

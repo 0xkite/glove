@@ -5,6 +5,7 @@
 
 #include <glaze/glaze.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
@@ -20,6 +21,10 @@ namespace glove::control::receipt_handlers {
 namespace {
 
 constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
+constexpr glz::opts strict_complete_read_options{
+    .error_on_unknown_keys = true,
+    .error_on_missing_keys = true,
+};
 
 template<typename Value>
 auto encode_json(const Value& value) -> std::expected<std::string, std::string> {
@@ -42,6 +47,15 @@ auto decode_strict(std::string_view input) -> std::expected<Value, std::string> 
     return value;
 }
 
+template<typename Value>
+auto decode_strict_complete(std::string_view input) -> std::expected<Value, std::string> {
+    Value value{};
+    if (const auto error = glz::read<strict_complete_read_options>(value, input); error) {
+        return std::unexpected(glz::format_error(error, input));
+    }
+    return value;
+}
+
 auto mutation_payload_digest(std::string_view method, std::string_view payload)
     -> std::expected<std::string, std::string> {
     std::vector<unsigned char> material;
@@ -56,17 +70,28 @@ auto mutation_payload_digest(std::string_view method, std::string_view payload)
     return container::sha256_hex(std::span<const unsigned char>{material});
 }
 
+auto valid_digest(std::string_view value) noexcept -> bool {
+    return value.size() == 64U && std::ranges::all_of(value, [](unsigned char byte) {
+               return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+           });
+}
+
 } // namespace
 
 using wire::attach_request;
 using wire::create_session_request;
 using wire::detach_request;
+using wire::observation_intent_disposition_result;
+using wire::observation_intent_queue_item_wire;
+using wire::page_observation_intents_request;
+using wire::page_observation_intents_result;
 using wire::resize_request;
 using wire::rpc_params;
 using wire::session_cursor_result;
 using wire::session_mutation_result;
 using wire::session_record_result;
 using wire::session_status_request;
+using wire::set_observation_intent_disposition_request;
 using wire::signal_request;
 using wire::start_session_request;
 using wire::stop_session_request;
@@ -211,6 +236,228 @@ auto registry_error_response(std::string_view request_id, const session_registry
         return error_response(request_id, "session_storage_failed", "session storage failed");
     }
     return error_response(request_id, "session_storage_failed", "session storage failed");
+}
+
+auto observation_disposition_from_wire(std::string_view value)
+    -> std::optional<intent_disposition> {
+    if (value == "accepted") {
+        return intent_disposition::accepted;
+    }
+    if (value == "rejected") {
+        return intent_disposition::rejected;
+    }
+    if (value == "expired") {
+        return intent_disposition::expired;
+    }
+    return std::nullopt;
+}
+
+auto observation_disposition_wire_name(intent_disposition disposition) -> std::string {
+    switch (disposition) {
+    case intent_disposition::pending:
+        return "pending";
+    case intent_disposition::accepted:
+        return "accepted";
+    case intent_disposition::rejected:
+        return "rejected";
+    case intent_disposition::expired:
+        return "expired";
+    }
+    return {};
+}
+
+auto observation_item_wire(const observation_intent_item& item)
+    -> observation_intent_queue_item_wire {
+    return observation_intent_queue_item_wire{
+        .sequence = item.sequence,
+        .body =
+            {
+                .schema = item.body.schema,
+                .intent_id = item.body.intent_id,
+                .observation = item.body.observation,
+                .value_digest = item.body.value_digest,
+                .item_count = item.body.item_count,
+            },
+        .context =
+            {
+                .session_id = item.context.session_id,
+                .controller_plan_digest = item.context.controller_plan_digest,
+                .profile_digest = item.context.profile_digest,
+                .runtime_id = item.context.runtime_id,
+                .projection_digest = item.context.projection_digest,
+                .policy_revision = item.context.policy_revision,
+                .channel_id = item.context.channel_id,
+                .channel_generation = item.context.channel_generation,
+                .issued_at_ms = item.context.issued_at_ms,
+                .expires_at_ms = item.context.expires_at_ms,
+            },
+        .intent_digest = item.intent_digest,
+        .disposition = observation_disposition_wire_name(item.disposition),
+        .decided_at_ms = item.decided_at_ms,
+    };
+}
+
+auto observation_registry_error_response(
+    std::string_view request_id, const session_registry_error& error
+) -> std::expected<std::string, std::string> {
+    switch (error.code) {
+    case session_registry_error_code::invalid_request:
+        return error_response(request_id, "invalid_request", "invalid observation intent request");
+    case session_registry_error_code::idempotency_conflict:
+        return error_response(request_id, "idempotency_conflict", "idempotency payload changed");
+    case session_registry_error_code::invalid_state:
+        return error_response(
+            request_id, "invalid_observation_intent_state", "observation intent state was rejected"
+        );
+    case session_registry_error_code::not_found:
+        return error_response(
+            request_id, "observation_intent_not_found", "observation intent was not found"
+        );
+    case session_registry_error_code::capacity:
+        return error_response(
+            request_id, "observation_intent_capacity", "observation intent capacity is unavailable"
+        );
+    case session_registry_error_code::invalid_plan:
+    case session_registry_error_code::invalid_authorization:
+    case session_registry_error_code::session_conflict:
+    case session_registry_error_code::storage:
+        break;
+    }
+    return error_response(
+        request_id, "observation_intent_storage_failed", "observation intent storage failed"
+    );
+}
+
+auto handle_page_observation_intents(
+    const receipt_audit_protocol::implementation& state,
+    std::string_view request_id,
+    const rpc_params& params,
+    std::uint64_t now_ms
+) -> std::expected<std::string, std::string> {
+    if (!state.sessions) {
+        return error_response(request_id, "method_not_found", "control method is unavailable");
+    }
+    if (params.idempotency_key.has_value()) {
+        return error_response(
+            request_id,
+            "invalid_request",
+            "read-only observation intent paging forbids idempotency keys"
+        );
+    }
+    auto payload = decode_strict_complete<page_observation_intents_request>(params.payload.str);
+    if (!payload || payload->limit == 0 || payload->limit > max_pending_intent_page_size) {
+        return error_response(
+            request_id, "invalid_request", "invalid observation intent page request"
+        );
+    }
+    auto page = state.sessions->pending_observation_intents(
+        payload->after_sequence, payload->limit, now_ms
+    );
+    if (!page) {
+        return observation_registry_error_response(request_id, page.error());
+    }
+    page_observation_intents_result result{
+        .schema_version = 1,
+        .items = {},
+        .next_after_sequence = std::nullopt,
+    };
+    result.items.reserve(page->items.size());
+    for (const auto& item : page->items) {
+        result.items.push_back(observation_item_wire(item));
+    }
+    result.next_after_sequence = page->next_after_sequence;
+    auto encoded = encode_json(result);
+    if (!encoded) {
+        return std::unexpected(encoded.error());
+    }
+    return success_response(request_id, std::move(*encoded));
+}
+
+auto handle_set_observation_intent_disposition(
+    receipt_audit_protocol::implementation& state,
+    std::string_view request_id,
+    const rpc_params& params,
+    std::uint64_t now_ms
+) -> std::expected<std::string, std::string> {
+    if (!state.sessions) {
+        return error_response(request_id, "method_not_found", "control method is unavailable");
+    }
+    const auto idempotency_key = params.idempotency_key.value_or(std::string{});
+    if (!valid_identifier(idempotency_key)) {
+        return error_response(
+            request_id, "invalid_request", "observation intent disposition requires idempotency"
+        );
+    }
+    auto payload =
+        decode_strict_complete<set_observation_intent_disposition_request>(params.payload.str);
+    if (!payload || !valid_identifier(payload->session_id) || payload->channel_generation == 0 ||
+        !valid_identifier(payload->intent_id) || !valid_digest(payload->intent_digest) ||
+        payload->decided_at_ms == 0 || payload->decided_at_ms > now_ms) {
+        return error_response(
+            request_id, "invalid_request", "invalid observation intent disposition request"
+        );
+    }
+    const auto disposition = observation_disposition_from_wire(payload->disposition);
+    if (!disposition) {
+        return error_response(
+            request_id, "invalid_request", "invalid observation intent disposition request"
+        );
+    }
+    auto payload_digest =
+        mutation_payload_digest("set_observation_intent_disposition", params.payload.str);
+    if (!payload_digest) {
+        return error_response(
+            request_id,
+            "observation_intent_control_failed",
+            "observation intent disposition could not be authorized"
+        );
+    }
+    const std::scoped_lock lock{state.session_mutation_mutex};
+    if (const auto existing = state.session_mutation_records.find(std::string{idempotency_key});
+        existing != state.session_mutation_records.end()) {
+        if (existing->second.method != "set_observation_intent_disposition" ||
+            existing->second.payload_digest != *payload_digest) {
+            return error_response(
+                request_id, "idempotency_conflict", "idempotency payload changed"
+            );
+        }
+        return success_response(request_id, existing->second.result_json);
+    }
+    if (state.session_mutation_records.size() >= max_idempotency_records) {
+        return error_response(
+            request_id, "idempotency_capacity", "idempotency capacity is unavailable"
+        );
+    }
+    const observation_intent_disposition registry_disposition{
+        .session_id = payload->session_id,
+        .channel_generation = payload->channel_generation,
+        .intent_id = payload->intent_id,
+        .intent_digest = payload->intent_digest,
+        .disposition = *disposition,
+        .decided_at_ms = payload->decided_at_ms,
+    };
+    auto updated = state.sessions->set_observation_intent_disposition(registry_disposition);
+    if (!updated) {
+        return observation_registry_error_response(request_id, updated.error());
+    }
+    auto encoded = encode_json(
+        observation_intent_disposition_result{
+            .schema_version = 1,
+            .item = observation_item_wire(*updated),
+        }
+    );
+    if (!encoded) {
+        return std::unexpected(encoded.error());
+    }
+    state.session_mutation_records.emplace(
+        std::string{idempotency_key},
+        session_mutation_record{
+            .method = "set_observation_intent_disposition",
+            .payload_digest = std::move(*payload_digest),
+            .result_json = *encoded,
+        }
+    );
+    return success_response(request_id, std::move(*encoded));
 }
 
 auto handle_create_session(
