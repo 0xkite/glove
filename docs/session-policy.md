@@ -418,6 +418,22 @@ that lane alongside the filesystem and environment SBPL probes. Linux keeps
 the privileged Docker workflow lane for namespace, cgroup, receipt, cleanup,
 and no-network assertions.
 
+## Sage guest proposals
+
+The guest service channel accepts a self-delegation proposal only when every
+body field matches the closed schema:
+
+- schema: `sage.glove-sxxx-self-delegation-proposal.v1`;
+- observation: `sxxx-self-delegation`;
+- value digest:
+  `4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b`;
+- item count: `1`; and
+- a bounded canonical proposal identifier.
+
+Any altered field fails before enqueue. The proposal grants no execution or
+wallet authority. Glove adds the running session context and persists the
+proposal digest. Only the host can resolve it into a final intent.
+
 ## Receipts and recovery
 
 Terminal resource receipts are HMAC-SHA-256 authenticated and chained to Sage's
