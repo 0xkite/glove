@@ -4,6 +4,7 @@
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/session_plan.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -16,6 +17,69 @@
 namespace glove::control {
 
 inline constexpr std::uint64_t default_session_registry_bytes = std::uint64_t{64} * 1024U * 1024U;
+inline constexpr std::size_t max_pending_intent_page_size = 256U;
+inline constexpr std::uint64_t max_glove_observation_items = 4'096U;
+
+struct glove_observation_body {
+    std::string schema;
+    std::string intent_id;
+    std::string observation;
+    std::string value_digest;
+    std::uint64_t item_count = 0;
+
+    auto operator==(const glove_observation_body&) const -> bool = default;
+};
+
+struct observation_intent_context {
+    std::string session_id;
+    std::string controller_plan_digest;
+    std::string profile_digest;
+    std::string runtime_id;
+    std::string projection_digest;
+    std::uint64_t policy_revision = 0;
+    std::string channel_id;
+    std::uint64_t channel_generation = 0;
+    std::uint64_t issued_at_ms = 0;
+    std::uint64_t expires_at_ms = 0;
+
+    auto operator==(const observation_intent_context&) const -> bool = default;
+};
+
+enum class intent_disposition : std::uint8_t {
+    pending,
+    accepted,
+    rejected,
+    expired,
+};
+
+struct observation_intent_item {
+    std::uint64_t sequence = 0;
+    glove_observation_body body;
+    observation_intent_context context;
+    std::string intent_digest;
+    intent_disposition disposition = intent_disposition::pending;
+    std::uint64_t decided_at_ms = 0;
+
+    auto operator==(const observation_intent_item&) const -> bool = default;
+};
+
+struct observation_intent_disposition {
+    std::string session_id;
+    std::uint64_t channel_generation = 0;
+    std::string intent_id;
+    std::string intent_digest;
+    intent_disposition disposition = intent_disposition::pending;
+    std::uint64_t decided_at_ms = 0;
+
+    auto operator==(const observation_intent_disposition&) const -> bool = default;
+};
+
+struct pending_intent_page {
+    std::vector<observation_intent_item> items;
+    std::optional<std::uint64_t> next_after_sequence;
+
+    auto operator==(const pending_intent_page&) const -> bool = default;
+};
 
 enum class session_state : std::uint8_t {
     created,
@@ -506,6 +570,17 @@ public:
         -> session_registry_result<std::vector<session_recovery_record>>;
     [[nodiscard]] auto canonical_plan(std::string_view session_id) const
         -> session_registry_result<std::string>;
+    [[nodiscard]] auto enqueue_observation_intent(
+        const glove_observation_body& body,
+        const observation_intent_context& context,
+        std::uint64_t now_ms
+    ) -> session_registry_result<observation_intent_item>;
+    [[nodiscard]] auto set_observation_intent_disposition(
+        const observation_intent_disposition& disposition
+    ) -> session_registry_result<observation_intent_item>;
+    [[nodiscard]] auto pending_observation_intents(
+        std::uint64_t after_sequence, std::size_t limit, std::uint64_t now_ms
+    ) const -> session_registry_result<pending_intent_page>;
     [[nodiscard]] auto record_count() const -> std::uint64_t;
     [[nodiscard]] auto library_projections_available() const noexcept -> bool;
 

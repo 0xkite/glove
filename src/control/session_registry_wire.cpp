@@ -7,6 +7,24 @@
 
 namespace glove::control::wire {
 
+namespace {
+
+auto disposition_name(intent_disposition disposition) noexcept -> std::string_view {
+    switch (disposition) {
+    case intent_disposition::pending:
+        return "pending";
+    case intent_disposition::accepted:
+        return "accepted";
+    case intent_disposition::rejected:
+        return "rejected";
+    case intent_disposition::expired:
+        return "expired";
+    }
+    return {};
+}
+
+} // namespace
+
 auto append_u32(std::vector<unsigned char>& output, std::uint32_t value) -> void {
     output.push_back(static_cast<unsigned char>((value >> 24U) & 0xffU));
     output.push_back(static_cast<unsigned char>((value >> 16U) & 0xffU));
@@ -197,6 +215,38 @@ auto record_material(const persisted_session& record)
         if (record.exit_code) {
             append_u32(material, static_cast<std::uint32_t>(*record.exit_code));
         }
+    }
+    if (record.observation_intent) {
+        constexpr std::string_view extension_domain =
+            "glove.session-registry.observation-intent.v1";
+        if (!append_string(material, extension_domain)) {
+            return std::unexpected(std::string{"observation intent hash domain is invalid"});
+        }
+        const auto& intent = *record.observation_intent;
+        material.push_back(intent.schema_version);
+        for (const auto value : {
+                 std::string_view{intent.schema},
+                 std::string_view{intent.intent_id},
+                 std::string_view{intent.observation},
+                 std::string_view{intent.value_digest},
+                 std::string_view{intent.intent_digest},
+                 std::string_view{intent.profile_digest},
+                 std::string_view{intent.runtime_id},
+                 std::string_view{intent.projection_digest},
+                 std::string_view{intent.channel_id},
+                 std::string_view{intent.disposition},
+             }) {
+            if (!append_string(material, value)) {
+                return std::unexpected(
+                    std::string{"session registry observation intent exceeds its hash bound"}
+                );
+            }
+        }
+        append_u64(material, intent.item_count);
+        append_u64(material, intent.channel_generation);
+        append_u64(material, intent.issued_at_ms);
+        append_u64(material, intent.expires_at_ms);
+        append_u64(material, intent.decided_at_ms);
     }
     if (!append_string(material, record.canonical_plan_json) ||
         !append_string(material, record.previous_hash)) {
@@ -593,6 +643,87 @@ auto hash_failure_commitment(const session_failure_commitment& failure)
             return std::unexpected(std::string{"failure commitment field exceeds its bound"});
         }
     }
+    return container::sha256_hex(material);
+}
+
+auto hash_observation_intent_body(const glove_observation_body& body)
+    -> std::expected<std::string, std::string> {
+    std::vector<unsigned char> material;
+    material.reserve(512U);
+    constexpr std::string_view domain = "sage.glove-observation.v1";
+    if (!append_string(material, domain)) {
+        return std::unexpected(std::string{"observation intent hash domain is invalid"});
+    }
+    for (const auto value : {
+             std::string_view{body.schema},
+             std::string_view{body.intent_id},
+             std::string_view{body.observation},
+             std::string_view{body.value_digest},
+         }) {
+        if (!append_string(material, value)) {
+            return std::unexpected(std::string{"observation intent field exceeds its hash bound"});
+        }
+    }
+    append_u64(material, body.item_count);
+    return container::sha256_hex(material);
+}
+
+auto hash_observation_intent_request(
+    const glove_observation_body& body, const observation_intent_context& context
+) -> std::expected<std::string, std::string> {
+    std::vector<unsigned char> material;
+    material.reserve(768U);
+    constexpr std::string_view domain = "glove.observation-intent-enqueue.v1";
+    if (!append_string(material, domain)) {
+        return std::unexpected(std::string{"observation enqueue hash domain is invalid"});
+    }
+    for (const auto value : {
+             std::string_view{body.schema},
+             std::string_view{body.intent_id},
+             std::string_view{body.observation},
+             std::string_view{body.value_digest},
+             std::string_view{context.session_id},
+             std::string_view{context.controller_plan_digest},
+             std::string_view{context.profile_digest},
+             std::string_view{context.runtime_id},
+             std::string_view{context.projection_digest},
+             std::string_view{context.channel_id},
+         }) {
+        if (!append_string(material, value)) {
+            return std::unexpected(std::string{"observation enqueue field exceeds its hash bound"});
+        }
+    }
+    append_u64(material, body.item_count);
+    append_u64(material, context.policy_revision);
+    append_u64(material, context.channel_generation);
+    append_u64(material, context.issued_at_ms);
+    append_u64(material, context.expires_at_ms);
+    return container::sha256_hex(material);
+}
+
+auto hash_observation_intent_disposition(
+    const observation_intent_disposition& disposition
+) -> std::expected<std::string, std::string> {
+    std::vector<unsigned char> material;
+    material.reserve(512U);
+    constexpr std::string_view domain = "glove.observation-intent-disposition.v1";
+    if (!append_string(material, domain)) {
+        return std::unexpected(std::string{"observation disposition hash domain is invalid"});
+    }
+    for (const auto value : {
+             std::string_view{disposition.session_id},
+             std::string_view{disposition.intent_id},
+             std::string_view{disposition.intent_digest},
+             disposition_name(disposition.disposition),
+         }) {
+        if (!append_string(material, value)) {
+            return std::unexpected(
+                std::string{"observation disposition field exceeds its hash bound"}
+            );
+        }
+    }
+    append_u64(material, disposition.channel_generation);
+    append_u64(material, disposition.decided_at_ms);
     return container::sha256_hex(material);
 }
 

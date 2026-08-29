@@ -19,6 +19,27 @@ inline constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
 
 // Wire representation of a persisted session registry record. This must stay
 // byte-for-byte stable with the on-disk registry format.
+struct persisted_observation_intent {
+    std::uint8_t schema_version = 0;
+    std::string schema;
+    std::string intent_id;
+    std::string observation;
+    std::string value_digest;
+    std::uint64_t item_count = 0;
+    std::string intent_digest;
+    std::string profile_digest;
+    std::string runtime_id;
+    std::string projection_digest;
+    std::string channel_id;
+    std::uint64_t channel_generation = 0;
+    std::uint64_t issued_at_ms = 0;
+    std::uint64_t expires_at_ms = 0;
+    std::string disposition;
+    std::uint64_t decided_at_ms = 0;
+
+    auto operator==(const persisted_observation_intent&) const -> bool = default;
+};
+
 struct persisted_session {
     std::uint8_t schema_version = 0;
     std::uint64_t sequence = 0;
@@ -62,9 +83,13 @@ struct persisted_session {
     std::string canonical_plan_json;
     std::string previous_hash;
     std::string this_hash;
+    std::optional<persisted_observation_intent> observation_intent;
+
+    auto operator==(const persisted_session&) const -> bool = default;
 };
 
 struct plan_runtime_header {
+    std::string runtime_id;
     std::string runtime_template_id;
 };
 
@@ -135,6 +160,14 @@ auto failure_code_name(session_failure_code code) -> std::string_view;
 auto failure_code_from_wire(std::string_view value) -> std::optional<session_failure_code>;
 auto hash_failure_commitment(const session_failure_commitment& failure)
     -> std::expected<std::string, std::string>;
+auto hash_observation_intent_body(const glove_observation_body& body)
+    -> std::expected<std::string, std::string>;
+auto hash_observation_intent_request(
+    const glove_observation_body& body, const observation_intent_context& context
+) -> std::expected<std::string, std::string>;
+auto hash_observation_intent_disposition(
+    const observation_intent_disposition& disposition
+) -> std::expected<std::string, std::string>;
 auto state_from_wire(std::string_view state) -> std::optional<session_state>;
 
 auto encode_record(const persisted_session& record)

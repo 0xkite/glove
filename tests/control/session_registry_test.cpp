@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -65,6 +67,52 @@ auto library_bundle_digest() -> std::string {
     return glove::container::sha256_hex(std::span{bytes, library_bundle.size()}).value_or("");
 }
 
+auto replace_after_marker(
+    const std::filesystem::path& path,
+    std::string_view marker,
+    std::string_view from,
+    std::string_view to
+) -> bool {
+    if (from.size() != to.size()) {
+        return false;
+    }
+    std::ifstream input{path, std::ios::binary};
+    std::string bytes(
+        static_cast<std::size_t>(std::filesystem::file_size(path)), '\0'
+    );
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!input.good()) {
+        return false;
+    }
+    const auto marker_offset = bytes.find(marker);
+    const auto value_offset =
+        marker_offset == std::string::npos ? std::string::npos : bytes.find(from, marker_offset);
+    if (value_offset == std::string::npos) {
+        return false;
+    }
+    std::fstream output{path, std::ios::binary | std::ios::in | std::ios::out};
+    output.seekp(static_cast<std::streamoff>(value_offset));
+    output.write(to.data(), static_cast<std::streamsize>(to.size()));
+    output.flush();
+    return output.good();
+}
+
+auto file_contains(
+    const std::filesystem::path& path, std::string_view needle, std::size_t max_bytes = 1U << 20U
+) -> bool {
+    if (needle.empty()) {
+        return true;
+    }
+    std::ifstream input{path, std::ios::binary};
+    if (!input) {
+        return false;
+    }
+    std::string bytes(max_bytes, '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    bytes.resize(static_cast<std::size_t>(input.gcount()));
+    return bytes.find(needle) != std::string::npos;
+}
+
 auto launch_template() -> glove::supervisor::runtime_launch_template {
     return {
         .runtime_discovery = {},
@@ -95,6 +143,24 @@ auto valid_plan_at(std::uint64_t now_ms) -> std::string {
     const auto offset = plan.find(original);
     if (offset != std::string::npos) {
         plan.replace(offset, original.size(), replacement);
+    }
+    return plan;
+}
+
+auto sage_guest_plan_at(std::uint64_t now_ms) -> std::string {
+    auto plan = valid_plan_at(now_ms);
+    for (const auto& [from, to] : {
+             std::pair{std::string_view{"\"runtime_id\":\"codex\""},
+                       std::string_view{"\"runtime_id\":\"sage-guest\""}},
+             std::pair{std::string_view{"\"runtime_template_id\":\"codex-safe\""},
+                       std::string_view{"\"runtime_template_id\":\"sage-guest-safe\""}},
+             std::pair{std::string_view{"\"secret_handles\":[\"codex-token\"]"},
+                       std::string_view{"\"secret_handles\":[]"}},
+         }) {
+        const auto offset = plan.find(from);
+        if (offset != std::string::npos) {
+            plan.replace(offset, from.size(), to);
+        }
     }
     return plan;
 }
@@ -240,6 +306,16 @@ auto validator_for(
                     runtime_template_policy{
                         .runtime_template_id = "codex-safe",
                         .runtime_id = "codex",
+                        .adapter_command_digest = runtime_digest(),
+                        .backend = backend,
+                        .allowed_path_aliases = {"workspace"},
+                        .allowed_projection_destinations = {"libraries"},
+                        .launch = launch_template(),
+                        .adoption = std::nullopt,
+                    },
+                    runtime_template_policy{
+                        .runtime_template_id = "sage-guest-safe",
+                        .runtime_id = "sage-guest",
                         .adapter_command_digest = runtime_digest(),
                         .backend = backend,
                         .allowed_path_aliases = {"workspace"},
@@ -1258,10 +1334,466 @@ auto run_managed_runtime_registry() -> int {
     return 0;
 }
 
+auto run_intent_queue_contract() -> int {
+    temporary_directory temp;
+    REQUIRE(!temp.root().empty());
+    const auto source = temp.root() / "source";
+    REQUIRE(std::filesystem::create_directory(source));
+    auto validator = validator_for(source);
+    REQUIRE(validator.has_value());
+    auto shared_validator =
+        std::make_shared<const glove::supervisor::session_plan_validator>(std::move(*validator));
+
+    const auto bundle_root = temp.root() / "library-bundles";
+    REQUIRE(std::filesystem::create_directory(bundle_root));
+    REQUIRE(::chmod(bundle_root.c_str(), 0700) == 0);
+    const auto bundle_path = bundle_root / (library_bundle_digest() + ".json");
+    {
+        std::ofstream output{bundle_path, std::ios::binary};
+        output.write(library_bundle.data(), static_cast<std::streamsize>(library_bundle.size()));
+    }
+    REQUIRE(::chmod(bundle_path.c_str(), 0600) == 0);
+    auto opened_bundle_store = glove::supervisor::library_bundle_store::open(bundle_root);
+    REQUIRE(opened_bundle_store.has_value());
+    auto shared_bundle_store = std::make_shared<const glove::supervisor::library_bundle_store>(
+        std::move(*opened_bundle_store)
+    );
+
+    const auto audit_key_path = temp.root() / "intent-receipt.key";
+    {
+        std::ofstream output{audit_key_path, std::ios::binary | std::ios::trunc};
+        output << audit_key << '\n';
+    }
+    REQUIRE(::chmod(audit_key_path.c_str(), 0600) == 0);
+    auto producer = glove::container::receipt_audit_producer::initialize({
+        .key_path = audit_key_path,
+        .journal_path = temp.root() / "intent-receipts.journal",
+    });
+    REQUIRE(producer.has_value());
+    REQUIRE((*producer)->acknowledge_bootstrap((*producer)->anchor()).has_value());
+
+    const auto store_path = temp.root() / "intent-sessions.journal";
+    auto registry = glove::control::session_registry::open_or_create(
+        store_path, shared_validator, shared_bundle_store
+    );
+    REQUIRE(registry.has_value());
+
+    const auto start_session =
+        [&](std::string session_id, std::uint64_t start_ms, std::uint32_t pid, char profile_byte)
+        -> std::expected<glove::control::session_running_commitment, std::string> {
+        auto created = (*registry)->create(
+            session_id,
+            controller_digest,
+            sage_guest_plan_at(start_ms),
+            "create-" + session_id,
+            start_ms
+        );
+        if (!created) {
+            return std::unexpected(created.error().message);
+        }
+        const glove::control::session_start_authorization authorization{
+            .schema_version = 1,
+            .authorization_id = "approval-" + session_id,
+            .session_id = session_id,
+            .controller_plan_digest = std::string{controller_digest},
+            .plan_content_digest = created->plan_content_digest,
+            .approved_at_ms = start_ms + 1U,
+            .expires_at_ms = start_ms + 60'000U,
+        };
+        auto reserved =
+            (*registry)->reserve_start(authorization, "reserve-" + session_id, start_ms + 2U);
+        if (!reserved) {
+            return std::unexpected(reserved.error().message);
+        }
+        const glove::control::session_execution_binding binding{
+            .schema_version = 1,
+            .session_id = session_id,
+            .controller_plan_digest = std::string{controller_digest},
+            .plan_content_digest = created->plan_content_digest,
+            .authorization_id = authorization.authorization_id,
+            .profile_digest = std::string(64, profile_byte),
+            .cgroup_identity = cgroup_identity(pid),
+            .filesystem_identity = filesystem_identity(),
+        };
+        auto reservation = (*producer)->reserve_terminal(
+            binding.session_id, binding.controller_plan_digest, binding.profile_digest
+        );
+        if (!reservation) {
+            return std::unexpected(reservation.error());
+        }
+        auto starting = (*registry)->mark_starting(
+            binding, *reservation, "starting-" + session_id, start_ms + 3U
+        );
+        if (!starting) {
+            return std::unexpected(starting.error().message);
+        }
+        glove::control::session_running_commitment running{
+            .schema_version = 1,
+            .session_id = session_id,
+            .controller_plan_digest = binding.controller_plan_digest,
+            .plan_content_digest = binding.plan_content_digest,
+            .authorization_id = binding.authorization_id,
+            .profile_digest = binding.profile_digest,
+            .process_identity = process_identity(pid),
+            .filesystem_identity = binding.filesystem_identity,
+        };
+        auto marked =
+            (*registry)->mark_running(running, *reservation, "running-" + session_id, start_ms + 4U);
+        if (!marked) {
+            return std::unexpected(marked.error().message);
+        }
+        return running;
+    };
+
+    auto running_a = start_session("sage-session-a", 10'000, 6001, 'a');
+    auto running_b = start_session("sage-session-b", 20'000, 6002, 'b');
+    REQUIRE(running_a.has_value());
+    REQUIRE(running_b.has_value());
+
+    const glove::control::glove_observation_body body{
+        .schema = "sage.glove-observation.v1",
+        .intent_id = "intent-1",
+        .observation = "guest-capability-inventory",
+        .value_digest = std::string(64, 'a'),
+        .item_count = 4,
+    };
+    const glove::control::observation_intent_context context_a{
+        .session_id = running_a->session_id,
+        .controller_plan_digest = running_a->controller_plan_digest,
+        .profile_digest = running_a->profile_digest,
+        .runtime_id = "sage-guest",
+        .projection_digest = std::string(64, 'c'),
+        .policy_revision = 7,
+        .channel_id = "sage-session-a-observation-v1",
+        .channel_generation = 1,
+        .issued_at_ms = 30'000,
+        .expires_at_ms = 40'000,
+    };
+
+    auto enqueued = (*registry)->enqueue_observation_intent(body, context_a, 30'000);
+    REQUIRE(enqueued.has_value());
+    REQUIRE(enqueued->body == body);
+    REQUIRE(enqueued->context == context_a);
+    REQUIRE(enqueued->disposition == glove::control::intent_disposition::pending);
+    REQUIRE(enqueued->intent_digest.size() == 64U);
+    const auto count_after_enqueue = (*registry)->record_count();
+
+    auto replayed = (*registry)->enqueue_observation_intent(body, context_a, 30'001);
+    REQUIRE(replayed == enqueued);
+    REQUIRE((*registry)->record_count() == count_after_enqueue);
+    auto replayed_after_expiry =
+        (*registry)->enqueue_observation_intent(body, context_a, context_a.expires_at_ms);
+    REQUIRE(replayed_after_expiry == enqueued);
+    REQUIRE((*registry)->record_count() == count_after_enqueue);
+
+    auto changed_body = body;
+    changed_body.item_count = 5;
+    auto body_conflict = (*registry)->enqueue_observation_intent(changed_body, context_a, 30'001);
+    REQUIRE(!body_conflict.has_value());
+    REQUIRE(
+        body_conflict.error().code ==
+        glove::control::session_registry_error_code::idempotency_conflict
+    );
+    auto body_conflict_after_expiry = (*registry)->enqueue_observation_intent(
+        changed_body, context_a, context_a.expires_at_ms + 1U
+    );
+    REQUIRE(!body_conflict_after_expiry.has_value());
+    REQUIRE(
+        body_conflict_after_expiry.error().code ==
+        glove::control::session_registry_error_code::idempotency_conflict
+    );
+
+    auto cross_session = context_a;
+    cross_session.session_id = running_b->session_id;
+    cross_session.profile_digest = running_b->profile_digest;
+    cross_session.channel_id = "sage-session-b-observation-v1";
+    auto enqueued_cross_session =
+        (*registry)->enqueue_observation_intent(body, cross_session, 30'001);
+    REQUIRE(enqueued_cross_session.has_value());
+    REQUIRE(enqueued_cross_session->sequence != enqueued->sequence);
+    REQUIRE(enqueued_cross_session->context.session_id == running_b->session_id);
+
+    auto next_generation = context_a;
+    next_generation.channel_generation = 2;
+    next_generation.channel_id = "sage-session-a-observation-v2";
+    auto enqueued_next_generation =
+        (*registry)->enqueue_observation_intent(body, next_generation, 30'002);
+    REQUIRE(enqueued_next_generation.has_value());
+    REQUIRE(enqueued_next_generation->sequence != enqueued->sequence);
+
+    auto invalid_body = body;
+    invalid_body.schema = "sage.glove-observation.v2";
+    REQUIRE(!(*registry)->enqueue_observation_intent(invalid_body, context_a, 30'002).has_value());
+    invalid_body = body;
+    invalid_body.intent_id = std::string(129, 'i');
+    REQUIRE(!(*registry)->enqueue_observation_intent(invalid_body, context_a, 30'002).has_value());
+    invalid_body = body;
+    invalid_body.value_digest = "not-a-digest";
+    REQUIRE(!(*registry)->enqueue_observation_intent(invalid_body, context_a, 30'002).has_value());
+    invalid_body = body;
+    invalid_body.item_count = 4'097;
+    REQUIRE(!(*registry)->enqueue_observation_intent(invalid_body, context_a, 30'002).has_value());
+
+    auto mismatched_context = context_a;
+    mismatched_context.profile_digest = std::string(64, 'f');
+    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    mismatched_context = context_a;
+    mismatched_context.runtime_id = "codex";
+    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    mismatched_context = context_a;
+    mismatched_context.policy_revision = 8;
+    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    mismatched_context = context_a;
+    mismatched_context.channel_generation = 0;
+    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    mismatched_context = context_a;
+    mismatched_context.expires_at_ms = mismatched_context.issued_at_ms + 600'001U;
+    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    mismatched_context = context_a;
+    mismatched_context.expires_at_ms = 29'999;
+    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+
+    auto second_body = body;
+    second_body.intent_id = "intent-2";
+    second_body.value_digest = std::string(64, 'd');
+    auto second_context = context_a;
+    second_context.issued_at_ms = 30'003;
+    second_context.expires_at_ms = 30'100;
+    auto second = (*registry)->enqueue_observation_intent(second_body, second_context, 30'003);
+    REQUIRE(second.has_value());
+
+    auto first_page = (*registry)->pending_observation_intents(0, 2, 30'004);
+    REQUIRE(first_page.has_value());
+    REQUIRE(first_page->items.size() == 2U);
+    REQUIRE(first_page->items[0].sequence < first_page->items[1].sequence);
+    REQUIRE(first_page->next_after_sequence.has_value());
+    auto second_page = (*registry)->pending_observation_intents(
+        *first_page->next_after_sequence, 2, 30'004
+    );
+    REQUIRE(second_page.has_value());
+    REQUIRE(!second_page->items.empty());
+    REQUIRE(second_page->items.front().sequence > first_page->items.back().sequence);
+    REQUIRE(!(*registry)->pending_observation_intents(0, 0, 30'004).has_value());
+    REQUIRE(
+        !(*registry)
+             ->pending_observation_intents(
+                 0, glove::control::max_pending_intent_page_size + 1U, 30'004
+             )
+             .has_value()
+    );
+
+    const glove::control::observation_intent_disposition accepted{
+        .session_id = context_a.session_id,
+        .channel_generation = context_a.channel_generation,
+        .intent_id = body.intent_id,
+        .intent_digest = enqueued->intent_digest,
+        .disposition = glove::control::intent_disposition::accepted,
+        .decided_at_ms = 30'005,
+    };
+    auto accepted_result = (*registry)->set_observation_intent_disposition(accepted);
+    REQUIRE(accepted_result.has_value());
+    REQUIRE(accepted_result->disposition == glove::control::intent_disposition::accepted);
+    const auto count_after_accept = (*registry)->record_count();
+    REQUIRE((*registry)->set_observation_intent_disposition(accepted) == accepted_result);
+    REQUIRE((*registry)->record_count() == count_after_accept);
+    auto changed_disposition = accepted;
+    changed_disposition.disposition = glove::control::intent_disposition::rejected;
+    auto disposition_conflict =
+        (*registry)->set_observation_intent_disposition(changed_disposition);
+    REQUIRE(!disposition_conflict.has_value());
+    REQUIRE(
+        disposition_conflict.error().code ==
+        glove::control::session_registry_error_code::idempotency_conflict
+    );
+
+    const glove::control::observation_intent_disposition rejected{
+        .session_id = cross_session.session_id,
+        .channel_generation = cross_session.channel_generation,
+        .intent_id = body.intent_id,
+        .intent_digest = enqueued_cross_session->intent_digest,
+        .disposition = glove::control::intent_disposition::rejected,
+        .decided_at_ms = 30'006,
+    };
+    REQUIRE((*registry)->set_observation_intent_disposition(rejected).has_value());
+
+    auto expiring_body = body;
+    expiring_body.intent_id = "intent-expired";
+    expiring_body.value_digest = std::string(64, 'e');
+    auto expiring_context = context_a;
+    expiring_context.issued_at_ms = 30'007;
+    expiring_context.expires_at_ms = 30'020;
+    auto expiring =
+        (*registry)->enqueue_observation_intent(expiring_body, expiring_context, 30'007);
+    REQUIRE(expiring.has_value());
+    const glove::control::observation_intent_disposition accepted_at_expiry{
+        .session_id = expiring_context.session_id,
+        .channel_generation = expiring_context.channel_generation,
+        .intent_id = expiring_body.intent_id,
+        .intent_digest = expiring->intent_digest,
+        .disposition = glove::control::intent_disposition::accepted,
+        .decided_at_ms = expiring_context.expires_at_ms,
+    };
+    REQUIRE(!(*registry)->set_observation_intent_disposition(accepted_at_expiry).has_value());
+    auto accepted_after_expiry = accepted_at_expiry;
+    accepted_after_expiry.decided_at_ms = expiring_context.expires_at_ms + 1U;
+    REQUIRE(!(*registry)->set_observation_intent_disposition(accepted_after_expiry).has_value());
+    auto rejected_at_expiry = accepted_at_expiry;
+    rejected_at_expiry.disposition = glove::control::intent_disposition::rejected;
+    REQUIRE(!(*registry)->set_observation_intent_disposition(rejected_at_expiry).has_value());
+    auto rejected_after_expiry = rejected_at_expiry;
+    rejected_after_expiry.decided_at_ms = expiring_context.expires_at_ms + 1U;
+    REQUIRE(!(*registry)->set_observation_intent_disposition(rejected_after_expiry).has_value());
+    auto expired_before_expiry = accepted_at_expiry;
+    expired_before_expiry.disposition = glove::control::intent_disposition::expired;
+    expired_before_expiry.decided_at_ms = expiring_context.expires_at_ms - 1U;
+    REQUIRE(!(*registry)->set_observation_intent_disposition(expired_before_expiry).has_value());
+
+    const glove::control::observation_intent_disposition expired{
+        .session_id = expiring_context.session_id,
+        .channel_generation = expiring_context.channel_generation,
+        .intent_id = expiring_body.intent_id,
+        .intent_digest = expiring->intent_digest,
+        .disposition = glove::control::intent_disposition::expired,
+        .decided_at_ms = expiring_context.expires_at_ms,
+    };
+    auto expired_result = (*registry)->set_observation_intent_disposition(expired);
+    REQUIRE(expired_result.has_value());
+    REQUIRE(expired_result->disposition == glove::control::intent_disposition::expired);
+    REQUIRE((*registry)->set_observation_intent_disposition(expired) == expired_result);
+
+    auto pending_after_terminal_dispositions =
+        (*registry)->pending_observation_intents(0, 16, 30'101);
+    REQUIRE(pending_after_terminal_dispositions.has_value());
+    REQUIRE(std::ranges::none_of(pending_after_terminal_dispositions->items, [](const auto& item) {
+        return item.disposition != glove::control::intent_disposition::pending ||
+               item.body.intent_id == "intent-2";
+    }));
+
+    registry->reset();
+    registry = glove::control::session_registry::open_or_create(
+        store_path, shared_validator, shared_bundle_store
+    );
+    REQUIRE(registry.has_value());
+    auto recovered_page = (*registry)->pending_observation_intents(0, 16, 30'050);
+    REQUIRE(recovered_page.has_value());
+    REQUIRE(recovered_page->items.size() == 2U);
+    REQUIRE(recovered_page->items[0].sequence < recovered_page->items[1].sequence);
+    REQUIRE((*registry)->set_observation_intent_disposition(accepted) == accepted_result);
+    REQUIRE((*registry)->set_observation_intent_disposition(expired) == expired_result);
+
+    const auto legacy_store = temp.root() / "legacy-observation-intent-sessions.journal";
+    std::string legacy_plan_digest;
+    {
+        auto legacy_registry = glove::control::session_registry::open_or_create(
+            legacy_store, shared_validator, shared_bundle_store
+        );
+        REQUIRE(legacy_registry.has_value());
+        auto legacy_created = (*legacy_registry)
+                                  ->create(
+                                      "legacy-session",
+                                      controller_digest,
+                                      valid_plan_at(50'000),
+                                      "create-legacy-session",
+                                      50'000
+                                  );
+        REQUIRE(legacy_created.has_value());
+        legacy_plan_digest = legacy_created->plan_content_digest;
+        legacy_registry->reset();
+    }
+    REQUIRE(!file_contains(legacy_store, "observation_intent"));
+    auto reopened_legacy = glove::control::session_registry::open_or_create(
+        legacy_store, shared_validator, shared_bundle_store
+    );
+    REQUIRE(reopened_legacy.has_value());
+    auto legacy_status = (*reopened_legacy)->status("legacy-session");
+    REQUIRE(legacy_status.has_value());
+    REQUIRE(legacy_status->session_id == "legacy-session");
+    REQUIRE(legacy_status->controller_plan_digest == controller_digest);
+    REQUIRE(legacy_status->plan_content_digest == legacy_plan_digest);
+    REQUIRE(legacy_status->state == glove::control::session_state::created);
+    REQUIRE(legacy_status->created_at_ms == 50'000);
+
+    // Raw byte mutation only validates hash-corruption rejection, not semantic recovery behavior.
+    const auto hash_corrupted_schema_store = temp.root() / "hash-corrupted-schema.journal";
+    REQUIRE(std::filesystem::copy_file(store_path, hash_corrupted_schema_store));
+    REQUIRE(::chmod(hash_corrupted_schema_store.c_str(), 0600) == 0);
+    REQUIRE(replace_after_marker(
+        hash_corrupted_schema_store,
+        R"("operation":"enqueue_observation_intent_v1")",
+        "sage.glove-observation.v1",
+        "sage.glove-observation.v2"
+    ));
+    REQUIRE(!glove::control::session_registry::open_or_create(
+                 hash_corrupted_schema_store, shared_validator, shared_bundle_store
+    )
+                 .has_value());
+
+    const auto hash_corrupted_session_store = temp.root() / "hash-corrupted-session.journal";
+    REQUIRE(std::filesystem::copy_file(store_path, hash_corrupted_session_store));
+    REQUIRE(::chmod(hash_corrupted_session_store.c_str(), 0600) == 0);
+    REQUIRE(replace_after_marker(
+        hash_corrupted_session_store,
+        R"("operation":"enqueue_observation_intent_v1")",
+        "sage-session-a",
+        "sage-session-b"
+    ));
+    REQUIRE(!glove::control::session_registry::open_or_create(
+                 hash_corrupted_session_store, shared_validator, shared_bundle_store
+    )
+                 .has_value());
+
+    const auto torn_store = temp.root() / "torn-intent-sessions.journal";
+    REQUIRE(std::filesystem::copy_file(store_path, torn_store));
+    REQUIRE(::chmod(torn_store.c_str(), 0600) == 0);
+    {
+        std::ofstream output{torn_store, std::ios::binary | std::ios::app};
+        output.put('x');
+    }
+    REQUIRE(!glove::control::session_registry::open_or_create(
+                 torn_store, shared_validator, shared_bundle_store
+    )
+                 .has_value());
+
+    const glove::control::session_failure_commitment terminal_failure{
+        .schema_version = 1,
+        .session_id = running_a->session_id,
+        .controller_plan_digest = running_a->controller_plan_digest,
+        .plan_content_digest = running_a->plan_content_digest,
+        .authorization_id = running_a->authorization_id,
+        .profile_digest = running_a->profile_digest,
+        .code = glove::control::session_failure_code::supervisor_error,
+    };
+    REQUIRE((*registry)->mark_failed(terminal_failure, "terminal-sage-session-a", 30'060).has_value());
+    auto terminal_body = body;
+    terminal_body.intent_id = "intent-after-terminal";
+    REQUIRE(!(*registry)->enqueue_observation_intent(terminal_body, context_a, 30'061).has_value());
+
+    registry->reset();
+    const auto durable_size = std::filesystem::file_size(store_path);
+    registry = glove::control::session_registry::open_or_create(
+        store_path, shared_validator, shared_bundle_store, durable_size
+    );
+    REQUIRE(registry.has_value());
+    auto capacity_body = body;
+    capacity_body.intent_id = "intent-capacity";
+    auto capacity_context = cross_session;
+    capacity_context.issued_at_ms = 30'070;
+    capacity_context.expires_at_ms = 30'170;
+    auto capacity =
+        (*registry)->enqueue_observation_intent(capacity_body, capacity_context, 30'070);
+    REQUIRE(!capacity.has_value());
+    REQUIRE(capacity.error().code == glove::control::session_registry_error_code::capacity);
+
+    return 0;
+}
+
 } // namespace
 
 int main() {
     if (const auto result = run(); result != 0) {
+        return result;
+    }
+    if (const auto result = run_intent_queue_contract(); result != 0) {
         return result;
     }
     return run_managed_runtime_registry();

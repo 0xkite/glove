@@ -30,7 +30,29 @@
 
 namespace glove::control {
 
-namespace {} // namespace
+namespace {
+
+auto current_observation_item_locked(
+    const session_registry::implementation& state, std::string_view key
+) -> session_registry_result<observation_intent_item> {
+    const auto enqueued = state.observation_intents.find(std::string{key});
+    if (enqueued == state.observation_intents.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "observation intent was not found")
+        );
+    }
+    const auto disposition = state.observation_dispositions.find(std::string{key});
+    const auto& current = disposition == state.observation_dispositions.end()
+                              ? state.records[enqueued->second]
+                              : state.records[disposition->second];
+    auto item = observation_item_from_wire(current);
+    if (item) {
+        item->sequence = state.records[enqueued->second].sequence;
+    }
+    return item;
+}
+
+} // namespace
 
 session_registry::session_registry(
     [[maybe_unused]] construction_token token, std::unique_ptr<implementation> state
@@ -185,6 +207,7 @@ auto session_registry::create(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     return append_record_locked(*state_, std::move(record));
 }
@@ -348,6 +371,7 @@ auto session_registry::reserve_start(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     auto reserved = append_record_locked(*state_, std::move(record));
     if (!reserved) {
@@ -618,6 +642,7 @@ auto session_registry::mark_starting(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     auto appended = append_record_locked(*state_, std::move(record));
     if (!appended) {
@@ -805,6 +830,7 @@ auto session_registry::mark_running(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     auto appended = append_record_locked(*state_, std::move(record));
     if (!appended) {
@@ -952,6 +978,7 @@ auto session_registry::mark_stopping(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     auto appended = append_record_locked(*state_, std::move(record));
     if (!appended) {
@@ -1122,6 +1149,7 @@ auto session_registry::mark_exited(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     auto appended = append_record_locked(*state_, std::move(record));
     if (!appended) {
@@ -1423,6 +1451,7 @@ auto session_registry::mark_failed(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     auto appended = append_record_locked(*state_, std::move(record));
     if (!appended) {
@@ -1587,6 +1616,7 @@ auto session_registry::mark_managed_starting(
         .previous_hash = state_->records.empty() ? std::string(digest_hex_bytes, '0')
                                                  : state_->records.back().this_hash,
         .this_hash = {},
+        .observation_intent = std::nullopt,
     };
     auto appended = append_record_locked(*state_, std::move(record));
     if (!appended) {
@@ -2071,6 +2101,251 @@ auto session_registry::canonical_plan(std::string_view session_id) const
         );
     }
     return state_->records[existing->second].canonical_plan_json;
+}
+
+auto session_registry::enqueue_observation_intent(
+    const glove_observation_body& body,
+    const observation_intent_context& context,
+    std::uint64_t now_ms
+) -> session_registry_result<observation_intent_item> {
+    if (!valid_observation_body(body) || !valid_identifier(context.session_id) ||
+        !valid_digest(context.controller_plan_digest) || !valid_digest(context.profile_digest) ||
+        context.runtime_id != sage_guest_runtime || !valid_digest(context.projection_digest) ||
+        context.policy_revision == 0 || !valid_identifier(context.channel_id) ||
+        context.channel_generation == 0 || context.issued_at_ms == 0 ||
+        context.expires_at_ms <= context.issued_at_ms ||
+        context.expires_at_ms - context.issued_at_ms > max_observation_intent_ttl_ms ||
+        now_ms == 0) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request, "invalid observation intent request"
+        ));
+    }
+    auto intent_digest = hash_observation_intent_body(body);
+    auto request_digest = hash_observation_intent_request(body, context);
+    if (!intent_digest || !request_digest) {
+        return std::unexpected(storage_failure("hash observation intent failed"));
+    }
+
+    const auto key =
+        observation_intent_key(context.session_id, context.channel_generation, body.intent_id);
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    if (const auto replay = state_->observation_intents.find(key);
+        replay != state_->observation_intents.end()) {
+        const auto& record = state_->records[replay->second];
+        if (!record.observation_intent ||
+            record.observation_intent->intent_digest != *intent_digest ||
+            record.request_digest != *request_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::idempotency_conflict,
+                "observation intent payload changed"
+            ));
+        }
+        return current_observation_item_locked(*state_, key);
+    }
+    if ((context.issued_at_ms > now_ms &&
+         context.issued_at_ms - now_ms > max_observation_intent_clock_skew_ms) ||
+        now_ms >= context.expires_at_ms) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "observation intent is expired or outside its host time binding"
+        ));
+    }
+
+    const auto existing = state_->sessions.find(context.session_id);
+    if (existing == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    const auto& prior = state_->records[existing->second];
+    wire::plan_runtime_header runtime;
+    const auto runtime_error =
+        glz::read<partial_read_options>(runtime, prior.canonical_plan_json);
+    if (prior.state != "running" || runtime_error || runtime.runtime_id != sage_guest_runtime ||
+        context.runtime_id != runtime.runtime_id ||
+        context.controller_plan_digest != prior.controller_plan_digest ||
+        context.profile_digest != prior.launch_profile_digest ||
+        context.policy_revision != prior.policy_revision ||
+        context.issued_at_ms < prior.running_at_ms) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state,
+            "observation intent does not bind the current running sage-guest session"
+        ));
+    }
+    if (state_->records.size() >= max_records) {
+        return std::unexpected(
+            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+        );
+    }
+
+    wire::persisted_session record = prior;
+    record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+    record.operation = "enqueue_observation_intent_v1";
+    record.idempotency_key = "intent-enqueue:" + *request_digest;
+    record.request_digest = *request_digest;
+    record.previous_hash = state_->records.back().this_hash;
+    record.this_hash.clear();
+    record.observation_intent = wire::persisted_observation_intent{
+        .schema_version = 1,
+        .schema = body.schema,
+        .intent_id = body.intent_id,
+        .observation = body.observation,
+        .value_digest = body.value_digest,
+        .item_count = body.item_count,
+        .intent_digest = *intent_digest,
+        .profile_digest = context.profile_digest,
+        .runtime_id = context.runtime_id,
+        .projection_digest = context.projection_digest,
+        .channel_id = context.channel_id,
+        .channel_generation = context.channel_generation,
+        .issued_at_ms = context.issued_at_ms,
+        .expires_at_ms = context.expires_at_ms,
+        .disposition = "pending",
+        .decided_at_ms = 0,
+    };
+    auto appended = append_record_locked(*state_, std::move(record));
+    if (!appended) {
+        return std::unexpected(appended.error());
+    }
+    return current_observation_item_locked(*state_, key);
+}
+
+auto session_registry::set_observation_intent_disposition(
+    const observation_intent_disposition& disposition
+) -> session_registry_result<observation_intent_item> {
+    if (!valid_identifier(disposition.session_id) || disposition.channel_generation == 0 ||
+        !valid_identifier(disposition.intent_id) || !valid_digest(disposition.intent_digest) ||
+        disposition.disposition == intent_disposition::pending ||
+        intent_disposition_name(disposition.disposition).empty() ||
+        disposition.decided_at_ms == 0) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid observation intent disposition"
+        ));
+    }
+    auto request_digest = hash_observation_intent_disposition(disposition);
+    if (!request_digest) {
+        return std::unexpected(storage_failure(request_digest.error()));
+    }
+
+    const auto key = observation_intent_key(
+        disposition.session_id, disposition.channel_generation, disposition.intent_id
+    );
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    const auto enqueued = state_->observation_intents.find(key);
+    if (enqueued == state_->observation_intents.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "observation intent was not found")
+        );
+    }
+    if (const auto replay = state_->observation_dispositions.find(key);
+        replay != state_->observation_dispositions.end()) {
+        const auto& record = state_->records[replay->second];
+        if (!record.observation_intent ||
+            record.observation_intent->intent_digest != disposition.intent_digest ||
+            record.observation_intent->disposition !=
+                intent_disposition_name(disposition.disposition) ||
+            record.observation_intent->decided_at_ms != disposition.decided_at_ms ||
+            record.request_digest != *request_digest) {
+            return std::unexpected(failure(
+                session_registry_error_code::idempotency_conflict,
+                "observation intent disposition changed"
+            ));
+        }
+        return current_observation_item_locked(*state_, key);
+    }
+    const auto& original = state_->records[enqueued->second];
+    if (!original.observation_intent ||
+        original.observation_intent->intent_digest != disposition.intent_digest) {
+        return std::unexpected(failure(
+            session_registry_error_code::idempotency_conflict,
+            "observation intent digest changed"
+        ));
+    }
+    const auto& intent = *original.observation_intent;
+    const bool expired = disposition.disposition == intent_disposition::expired;
+    if (disposition.decided_at_ms < intent.issued_at_ms ||
+        (expired && disposition.decided_at_ms < intent.expires_at_ms) ||
+        (!expired && disposition.decided_at_ms >= intent.expires_at_ms)) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "observation intent disposition is outside its validity window"
+        ));
+    }
+    const auto session = state_->sessions.find(disposition.session_id);
+    if (session == state_->sessions.end()) {
+        return std::unexpected(
+            failure(session_registry_error_code::not_found, "session was not found")
+        );
+    }
+    if (state_->records.size() >= max_records) {
+        return std::unexpected(
+            failure(session_registry_error_code::capacity, "session registry capacity exhausted")
+        );
+    }
+
+    wire::persisted_session record = state_->records[session->second];
+    record.sequence = static_cast<std::uint64_t>(state_->records.size()) + 1U;
+    record.operation = "set_observation_intent_disposition_v1";
+    record.idempotency_key = "intent-disposition:" + *request_digest;
+    record.request_digest = *request_digest;
+    record.previous_hash = state_->records.back().this_hash;
+    record.this_hash.clear();
+    record.observation_intent = intent;
+    record.observation_intent->disposition =
+        std::string{intent_disposition_name(disposition.disposition)};
+    record.observation_intent->decided_at_ms = disposition.decided_at_ms;
+    auto appended = append_record_locked(*state_, std::move(record));
+    if (!appended) {
+        return std::unexpected(appended.error());
+    }
+    return current_observation_item_locked(*state_, key);
+}
+
+auto session_registry::pending_observation_intents(
+    std::uint64_t after_sequence, std::size_t limit, std::uint64_t now_ms
+) const -> session_registry_result<pending_intent_page> {
+    if (limit == 0 || limit > max_pending_intent_page_size || now_ms == 0) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid pending observation intent page request"
+        ));
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    pending_intent_page page;
+    page.items.reserve(limit);
+    for (const auto& record : state_->records) {
+        if (record.sequence <= after_sequence ||
+            record.operation != "enqueue_observation_intent_v1" ||
+            !record.observation_intent) {
+            continue;
+        }
+        const auto& intent = *record.observation_intent;
+        const auto key =
+            observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id);
+        if (state_->observation_dispositions.contains(key) || now_ms >= intent.expires_at_ms) {
+            continue;
+        }
+        if (page.items.size() == limit) {
+            page.next_after_sequence = page.items.back().sequence;
+            break;
+        }
+        auto item = observation_item_from_wire(record);
+        if (!item) {
+            return std::unexpected(item.error());
+        }
+        page.items.push_back(std::move(*item));
+    }
+    return page;
 }
 
 auto session_registry::record_count() const -> std::uint64_t {
