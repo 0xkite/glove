@@ -1475,7 +1475,10 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(enqueued->body == body);
     REQUIRE(enqueued->context == context_a);
     REQUIRE(enqueued->disposition == glove::control::intent_disposition::pending);
-    REQUIRE(enqueued->intent_digest.size() == 64U);
+    REQUIRE(
+        enqueued->intent_digest ==
+        "2e0f904912ae266f55d2760ce10230eeea05807b352608b4e6e8d1cd17861865"
+    );
     const auto count_after_enqueue = (*registry)->record_count();
 
     auto replayed = (*registry)->enqueue_observation_intent(body, context_a, 30'001);
@@ -1661,8 +1664,40 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(expired_result->disposition == glove::control::intent_disposition::expired);
     REQUIRE((*registry)->set_observation_intent_disposition(expired) == expired_result);
 
+    const glove::control::glove_observation_body sxxx_proposal{
+        .schema = "sage.glove-sxxx-self-delegation-proposal.v1",
+        .intent_id = "proposal-1",
+        .observation = "sxxx-self-delegation",
+        .value_digest = "4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b",
+        .item_count = 1,
+    };
+    auto proposal_context = context_a;
+    proposal_context.issued_at_ms = 30'101;
+    proposal_context.expires_at_ms = 30'201;
+    auto proposed =
+        (*registry)->enqueue_observation_intent(sxxx_proposal, proposal_context, 30'101);
+    REQUIRE(proposed.has_value());
+    REQUIRE(
+        proposed->intent_digest ==
+        "b9a9d7f648ee24502d1dd2d54164dd952dec18befe7d0d8e5793ebc5d1b7430c"
+    );
+    auto altered_proposal = sxxx_proposal;
+    altered_proposal.item_count = 2;
+    REQUIRE(!(*registry)
+                 ->enqueue_observation_intent(altered_proposal, proposal_context, 30'101)
+                 .has_value());
+    const glove::control::observation_intent_disposition proposal_accepted{
+        .session_id = proposal_context.session_id,
+        .channel_generation = proposal_context.channel_generation,
+        .intent_id = sxxx_proposal.intent_id,
+        .intent_digest = proposed->intent_digest,
+        .disposition = glove::control::intent_disposition::accepted,
+        .decided_at_ms = 30'102,
+    };
+    REQUIRE((*registry)->set_observation_intent_disposition(proposal_accepted).has_value());
+
     auto pending_after_terminal_dispositions =
-        (*registry)->pending_observation_intents(0, 16, 30'101);
+        (*registry)->pending_observation_intents(0, 16, 30'103);
     REQUIRE(pending_after_terminal_dispositions.has_value());
     REQUIRE(std::ranges::all_of(pending_after_terminal_dispositions->items, [](const auto& item) {
         return item.disposition == glove::control::intent_disposition::pending;
@@ -1676,7 +1711,7 @@ auto run_intent_queue_contract() -> int {
         store_path, shared_validator, shared_bundle_store
     );
     REQUIRE(registry.has_value());
-    auto recovered_page = (*registry)->pending_observation_intents(0, 16, 30'050);
+    auto recovered_page = (*registry)->pending_observation_intents(0, 16, 30'103);
     REQUIRE(recovered_page.has_value());
     REQUIRE(recovered_page->items.size() == 2U);
     REQUIRE(recovered_page->items[0].sequence < recovered_page->items[1].sequence);
