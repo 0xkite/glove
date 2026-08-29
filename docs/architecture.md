@@ -96,6 +96,52 @@ For `glove run`:
 Malformed frames, unknown tools, policy failures, transport errors, and audit
 append failures fail closed.
 
+## Wallet status bridge construction boundary
+
+Glove contains a construction-only, status-only wallet bridge protocol. It is
+not registered as a general MCP extension and is not wired into `gloved` or a
+managed Pi launch. The host must supply an already-open per-session Unix socket
+as an inherited descriptor; the bridge never discovers or connects a Sage,
+Glove, P2P, provider, or wallet endpoint.
+
+The private protocol processor accepts only `wallet_status` with a 64-KiB
+frame limit, an absolute receive-inclusive deadline, strict unknown-field
+rejection, and a host-derived running-session binding. The guest cannot submit
+session or plan digests. The processor owns four private authority interfaces
+for the current plan/session/policy, audit/journal and containment readiness,
+owner-local adapter digest, and stable wallet-server status. Every snapshot is
+bound to the same nonzero plan generation and absolute deadline; the plan is
+read again after the other snapshots to detect in-request revision. Missing,
+ambiguous, rolled-back, revised, or cross-boundary evidence makes the method
+unavailable. No public capability-discovery method is added by this milestone.
+
+The private processor owns its clock, samples it before request decoding and
+after authority validation, and revalidates the exact session digests, policy revision, state,
+expiry, adapter and server digests, owner-local wallet-server alias, chain
+policy, audit/journal generations, and observation freshness. The authority
+contracts must reject durable generation reuse or rollback. The bridge keeps no
+global high-water state and performs no provider, Sage, P2P, wallet, or network
+call itself.
+
+Responses omit node identifiers, wallet addresses, RPC URLs, peer details,
+signatures, provider errors, session digests, and host paths. The only available
+action is `status`; the mutating-action list is structurally empty. Stale,
+future, mismatched, missing, failed, stopped, revised, or expired observations
+return no cached status.
+
+This module is synthetic integration infrastructure, not activation evidence.
+Before typed Glaze decoding, a bounded recursive structural scan rejects
+malformed JSON, more than 64 nested containers, and repeated decoded object
+keys at every level. This includes equivalent escaped keys and keys inside the
+raw result object. A dedicated 64-KiB fuzz target and adversarial corpus keep
+that precondition exercised. Only deterministic offline authority fakes exist
+in this milestone. A future runtime composition must implement the interfaces
+with concrete protected registry, policy, audit/journal, adapter-digest, and
+status objects; create and close the socketpair correctly; preserve the same
+absolute deadline; and prove descriptor containment before capability discovery
+may expose schema version 1. Live Sage/P2P/wallet connection remains a separate
+operator gate.
+
 `glove exec` bypasses the MCP kernel. It is intended for agents that manage
 their own tool protocol, so its security boundary is the OS sandbox and explicit
 filesystem/environment exposure.

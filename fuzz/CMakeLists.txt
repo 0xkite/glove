@@ -173,3 +173,27 @@ target_include_directories(glove_apple_container_stats_fuzzer PRIVATE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
 )
 glove_configure_fuzzer(glove_apple_container_stats_fuzzer)
+
+add_library(glove_wallet_status_json_fuzz_support STATIC
+    ${CMAKE_SOURCE_DIR}/src/control/wallet_status_bridge.cpp
+    ${CMAKE_SOURCE_DIR}/src/control/wallet_status_json.cpp
+)
+target_link_libraries(glove_wallet_status_json_fuzz_support PUBLIC glove_options)
+target_link_libraries(glove_wallet_status_json_fuzz_support PRIVATE glaze::glaze)
+target_include_directories(glove_wallet_status_json_fuzz_support
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+)
+target_compile_options(glove_wallet_status_json_fuzz_support PRIVATE -fsanitize=fuzzer-no-link)
+
+add_executable(glove_wallet_status_json_fuzzer wallet_status_json_fuzzer.cpp)
+target_link_libraries(
+    glove_wallet_status_json_fuzzer
+    PRIVATE glove_wallet_status_json_fuzz_support
+)
+target_include_directories(glove_wallet_status_json_fuzzer PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>
+)
+glove_configure_fuzzer(glove_wallet_status_json_fuzzer)

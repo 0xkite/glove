@@ -14,6 +14,9 @@ add_library(glove_control STATIC
     session_registry_recovery.cpp
     session_registry_replay.cpp
     session_registry_wire.cpp
+    wallet_status_bridge.cpp
+    wallet_status_channel.cpp
+    wallet_status_json.cpp
 )
 add_library(glove::control ALIAS glove_control)
 

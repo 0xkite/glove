@@ -216,12 +216,20 @@ manifest_fuzz_corpus="${fuzz_workspace}/change_manifest"
 session_plan_fuzz_corpus="${fuzz_workspace}/session_plan"
 journal_fuzz_corpus="${fuzz_workspace}/change_apply_journal"
 bundle_fuzz_corpus="${fuzz_workspace}/library_bundle"
+wallet_status_fuzz_corpus="${fuzz_workspace}/wallet_status_json"
 cp -R fuzz/corpus/mcp_codec "${mcp_fuzz_corpus}"
 cp -R fuzz/corpus/policy_jsonpath "${policy_fuzz_corpus}"
 cp -R fuzz/corpus/change_manifest "${manifest_fuzz_corpus}"
 cp -R fuzz/corpus/session_plan "${session_plan_fuzz_corpus}"
 cp -R fuzz/corpus/change_apply_journal "${journal_fuzz_corpus}"
 cp -R fuzz/corpus/library_bundle "${bundle_fuzz_corpus}"
+cp -R fuzz/corpus/wallet_status_json "${wallet_status_fuzz_corpus}"
+python3 - "${wallet_status_fuzz_corpus}/maximum-frame.json" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_bytes(b'"' + (b'a' * (65_536 - 2)) + b'"')
+PY
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     build/fuzz/fuzz/glove_mcp_codec_fuzzer \
@@ -258,6 +266,12 @@ UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${bundle_fuzz_corpus}/" \
         "${bundle_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    build/fuzz/fuzz/glove_wallet_status_json_fuzzer \
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${wallet_status_fuzz_corpus}/" \
+        "${wallet_status_fuzz_corpus}"
 ok "asan ok"
 
 # 5. tsan -------------------------------------------------------------------
