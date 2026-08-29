@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace glove::control::apple_detail {
 
@@ -36,11 +38,26 @@ struct apple_container_runtime_config {
     std::size_t max_sessions = 64;
 };
 
+struct apple_container_stats_observation {
+    std::uint64_t cpu_usage_usec = 0;
+    std::uint64_t memory_usage_bytes = 0;
+    std::uint64_t memory_limit_bytes = 0;
+    std::uint32_t num_processes = 0;
+    std::uint64_t block_write_bytes = 0;
+
+    auto operator==(const apple_container_stats_observation&) const -> bool = default;
+};
+
+[[nodiscard]] auto
+parse_apple_container_stats(std::string_view json, std::string_view expected_instance_id)
+    -> std::expected<apple_container_stats_observation, std::string>;
+
+[[nodiscard]] auto apple_container_tmpfs_sizes(std::uint64_t disk_bytes)
+    -> std::expected<std::pair<std::uint64_t, std::uint64_t>, std::string>;
+
 // Apple Silicon implementation of the authenticated managed-session seam.
-// The implementation is construction-ready but does not advertise the managed
-// lifecycle until Apple Container can prove the shared six-limit receipt
-// contract. Image-contained harness, credential, egress, and library brokers
-// remain independently validated for bounded test and future shipping lanes.
+// Creation verifies the pinned Apple Container 1.3 runtime before this object
+// advertises the managed lifecycle and its complete receipt contract.
 class apple_container_session_runtime final : public session_runtime {
 public:
     struct implementation;
@@ -69,7 +86,7 @@ public:
         return "apple_container";
     }
 
-    [[nodiscard]] auto lifecycle_operational() const noexcept -> bool override { return false; }
+    [[nodiscard]] auto lifecycle_operational() const noexcept -> bool override;
 
     [[nodiscard]] auto agent_runtime_adapter_schema_version() const noexcept
         -> std::uint8_t override;

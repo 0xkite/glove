@@ -147,6 +147,28 @@ auto make_request(
 }
 
 auto run() -> int {
+    const auto parsed = glove::control::apple_detail::parse_apple_container_stats(
+        R"([{"id":"apple-unit","memoryUsageBytes":4096,"memoryLimitBytes":8192,"cpuUsageUsec":2500,"networkRxBytes":0,"networkTxBytes":0,"blockReadBytes":64,"blockWriteBytes":128,"numProcesses":3}])",
+        "apple-unit"
+    );
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->cpu_usage_usec == 2'500U);
+    REQUIRE(parsed->memory_usage_bytes == 4'096U);
+    REQUIRE(parsed->memory_limit_bytes == 8'192U);
+    REQUIRE(parsed->num_processes == 3U);
+    REQUIRE(parsed->block_write_bytes == 128U);
+    REQUIRE(!glove::control::apple_detail::parse_apple_container_stats("[]", "apple-unit"));
+    REQUIRE(!glove::control::apple_detail::parse_apple_container_stats(
+        R"([{"id":"other","memoryUsageBytes":1,"memoryLimitBytes":2,"cpuUsageUsec":3,"networkRxBytes":0,"networkTxBytes":0,"blockReadBytes":0,"blockWriteBytes":0,"numProcesses":1}])",
+        "apple-unit"
+    ));
+    const auto tmpfs = glove::control::apple_detail::apple_container_tmpfs_sizes(101U);
+    REQUIRE(tmpfs.has_value());
+    REQUIRE(tmpfs->first == 50U);
+    REQUIRE(tmpfs->second == 51U);
+    REQUIRE(tmpfs->first + tmpfs->second == 101U);
+    REQUIRE(!glove::control::apple_detail::apple_container_tmpfs_sizes(1U));
+
     const char* image = std::getenv("GLOVE_APPLE_CONTAINER_IMAGE");
     const char* image_digest = std::getenv("GLOVE_APPLE_CONTAINER_IMAGE_DIGEST");
     if (image == nullptr || *image == '\0' || image_digest == nullptr || *image_digest == '\0') {

@@ -11,6 +11,7 @@
 #include "../container/resource_monitor.hpp"
 
 #include <fcntl.h>
+#include <glaze/glaze.hpp>
 #include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
@@ -28,6 +29,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <new>
@@ -50,6 +52,8 @@ constexpr std::size_t max_idempotency_namespace_bytes = 112U;
 constexpr std::size_t transcript_bytes = std::size_t{4} * 1024U * 1024U;
 constexpr std::uint64_t max_secret_file_bytes = std::uint64_t{1024} * 1024U;
 constexpr std::uint64_t max_command_runtime_ms = 60'000U;
+constexpr std::uint64_t stats_command_runtime_ms = 5'000U;
+constexpr auto stats_sample_interval = std::chrono::milliseconds{100};
 
 auto current_epoch_ms() -> std::uint64_t {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -188,8 +192,11 @@ struct command_result {
     std::string output;
 };
 
-auto run_command(const std::filesystem::path& executable, const std::vector<std::string>& arguments)
-    -> std::expected<command_result, std::string> {
+auto run_command(
+    const std::filesystem::path& executable,
+    const std::vector<std::string>& arguments,
+    std::uint64_t timeout_ms = max_command_runtime_ms
+) -> std::expected<command_result, std::string> {
     std::array<int, 2> descriptors = {-1, -1};
     if (::pipe(descriptors.data()) != 0) {
         return std::unexpected(system_error("create Apple Container command pipe"));
@@ -227,8 +234,7 @@ auto run_command(const std::filesystem::path& executable, const std::vector<std:
     }
     command_result result;
     std::array<char, 4096> buffer{};
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds{max_command_runtime_ms};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
     bool output_closed = false;
     bool child_finished = false;
     int status = 0;
@@ -295,6 +301,88 @@ auto run_command(const std::filesystem::path& executable, const std::vector<std:
         result.exit_code = 128 + WTERMSIG(status);
     }
     return result;
+}
+
+struct apple_container_stats {
+    std::string id;
+    std::uint64_t memoryUsageBytes = 0;
+    std::uint64_t memoryLimitBytes = 0;
+    std::uint64_t cpuUsageUsec = 0;
+    std::uint64_t networkRxBytes = 0;
+    std::uint64_t networkTxBytes = 0;
+    std::uint64_t blockReadBytes = 0;
+    std::uint64_t blockWriteBytes = 0;
+    std::uint64_t numProcesses = 0;
+
+    struct glaze {
+        using T = apple_container_stats;
+        static constexpr auto value = glz::object(
+            "id",
+            &T::id,
+            "memoryUsageBytes",
+            &T::memoryUsageBytes,
+            "memoryLimitBytes",
+            &T::memoryLimitBytes,
+            "cpuUsageUsec",
+            &T::cpuUsageUsec,
+            "networkRxBytes",
+            &T::networkRxBytes,
+            "networkTxBytes",
+            &T::networkTxBytes,
+            "blockReadBytes",
+            &T::blockReadBytes,
+            "blockWriteBytes",
+            &T::blockWriteBytes,
+            "numProcesses",
+            &T::numProcesses
+        );
+    };
+};
+
+auto sample_resource_usage(
+    const apple_container_runtime_config& config,
+    std::string_view instance_id,
+    std::uint64_t expected_memory_limit
+) -> std::expected<container::resource_usage, std::string> {
+    auto sampled = run_command(
+        config.container_cli,
+        {"stats", "--format", "json", "--no-stream", std::string{instance_id}},
+        stats_command_runtime_ms
+    );
+    if (!sampled || sampled->exit_code != 0) {
+        return std::unexpected(
+            sampled ? std::string{"sample Apple Container resources: "} + sampled->output
+                    : sampled.error()
+        );
+    }
+    auto decoded = parse_apple_container_stats(sampled->output, instance_id);
+    if (!decoded) {
+        return std::unexpected(decoded.error());
+    }
+    if (decoded->memory_limit_bytes != expected_memory_limit) {
+        return std::unexpected(std::string{"Apple Container memory limit observation mismatch"});
+    }
+    return container::resource_usage{
+        .cpu_time_ms = decoded->cpu_usage_usec / 1'000U,
+        .peak_memory_bytes = decoded->memory_usage_bytes,
+        .peak_pids = decoded->num_processes,
+        .wall_time_ms = 0,
+        // Apple Container exposes cumulative block writes rather than live
+        // tmpfs occupancy. The read-only root and bounded tmpfs capacities
+        // enforce disk_bytes; this field records the available aggregate I/O
+        // observation without pretending it is filesystem occupancy.
+        .disk_bytes = decoded->block_write_bytes,
+        .terminal_output_bytes = 0,
+    };
+}
+
+void merge_resource_sample(
+    container::resource_usage& aggregate, const container::resource_usage& sample
+) noexcept {
+    aggregate.cpu_time_ms = std::max(aggregate.cpu_time_ms, sample.cpu_time_ms);
+    aggregate.peak_memory_bytes = std::max(aggregate.peak_memory_bytes, sample.peak_memory_bytes);
+    aggregate.peak_pids = std::max(aggregate.peak_pids, sample.peak_pids);
+    aggregate.disk_bytes = std::max(aggregate.disk_bytes, sample.disk_bytes);
 }
 
 auto inspect_instance(const apple_container_runtime_config& config, std::string_view instance_id)
@@ -832,11 +920,9 @@ auto capabilities() noexcept -> container::resource_enforcement_capabilities {
         .memory = container::enforcement_mechanism::cgroup_v2,
         .pids = container::enforcement_mechanism::rlimit,
         .wall_time = container::enforcement_mechanism::watchdog,
-        // Apple Container does not yet expose a separately enforceable and
-        // observable aggregate writable-byte quota for its tmpfs mounts.
-        .disk = container::enforcement_mechanism::unavailable,
+        .disk = container::enforcement_mechanism::filesystem_quota,
         .terminal_output = container::enforcement_mechanism::byte_counter,
-        .receipt_schema_version = 0,
+        .receipt_schema_version = 1,
     };
 }
 
@@ -884,6 +970,41 @@ auto registry_error(std::string_view operation, const session_registry_error& er
 
 } // namespace
 
+auto parse_apple_container_stats(std::string_view json, std::string_view expected_instance_id)
+    -> std::expected<apple_container_stats_observation, std::string> {
+    std::vector<apple_container_stats> decoded;
+    if (const auto error = glz::read_json(decoded, json); error) {
+        return std::unexpected(
+            std::string{"decode Apple Container resource sample: "} + glz::format_error(error, json)
+        );
+    }
+    if (decoded.size() != 1U || decoded.front().id != expected_instance_id ||
+        decoded.front().numProcesses > std::numeric_limits<std::uint32_t>::max()) {
+        return std::unexpected(std::string{"Apple Container resource sample identity is invalid"});
+    }
+    return apple_container_stats_observation{
+        .cpu_usage_usec = decoded.front().cpuUsageUsec,
+        .memory_usage_bytes = decoded.front().memoryUsageBytes,
+        .memory_limit_bytes = decoded.front().memoryLimitBytes,
+        .num_processes = static_cast<std::uint32_t>(decoded.front().numProcesses),
+        .block_write_bytes = decoded.front().blockWriteBytes,
+    };
+}
+
+auto apple_container_tmpfs_sizes(std::uint64_t disk_bytes)
+    -> std::expected<std::pair<std::uint64_t, std::uint64_t>, std::string> {
+    if (disk_bytes < 2U) {
+        return std::unexpected(
+            std::string{
+                "Apple Container writable-byte limit is too small for isolated tmpfs mounts"
+            }
+        );
+    }
+    const auto temp_bytes = disk_bytes / 2U;
+    const auto home_bytes = disk_bytes - temp_bytes;
+    return std::pair{temp_bytes, home_bytes};
+}
+
 class apple_live_session final {
 public:
     apple_live_session(
@@ -897,6 +1018,7 @@ public:
         std::shared_ptr<container::detail::wall_output_monitor> monitor,
         ::pid_t attach_pid,
         supervisor::resource_limits limits,
+        container::resource_usage initial_resource_usage,
         std::uint64_t started_at_ms,
         std::string idempotency_namespace,
         credential_lease_bundle credential_leases,
@@ -914,6 +1036,7 @@ public:
           monitor_{std::move(monitor)},
           attach_pid_{attach_pid},
           limits_{limits},
+          resource_usage_{initial_resource_usage},
           started_at_ms_{started_at_ms},
           idempotency_namespace_{std::move(idempotency_namespace)},
           credential_leases_{std::move(credential_leases)},
@@ -1077,15 +1200,39 @@ private:
 
     void finalize() noexcept {
         try {
+            std::atomic<bool> stop_sampling{false};
+            std::thread sampler{[this, &stop_sampling] {
+                try {
+                    while (!stop_sampling.load()) {
+                        auto sample = sample_resource_usage(
+                            config_, running_.runtime_identity.instance_id, limits_.memory_bytes
+                        );
+                        if (sample) {
+                            merge_resource_sample(resource_usage_, *sample);
+                        }
+                        for (int count = 0; count < 10 && !stop_sampling.load(); ++count) {
+                            std::this_thread::sleep_for(stats_sample_interval / 10);
+                        }
+                    }
+                } catch (...) {
+                    // The required initial sample already proved observation
+                    // availability. A later sampler allocation failure cannot
+                    // erase that evidence or escape the worker thread.
+                }
+            }};
             int status = 0;
             while (::waitpid(attach_pid_, &status, 0) < 0) {
                 if (errno != EINTR) {
+                    stop_sampling.store(true);
+                    sampler.join();
                     credential_leases_.preserve();
                     projection_lease_.preserve();
                     publish_error(system_error("wait for Apple Container attach process"));
                     return;
                 }
             }
+            stop_sampling.store(true);
+            sampler.join();
             monitor_->finish();
             static_cast<void>(channel_->finish_draining());
             const auto snapshot = monitor_->snapshot();
@@ -1114,11 +1261,11 @@ private:
                 .mechanisms = capabilities(),
                 .observed =
                     {
-                        .cpu_time_ms = 0,
-                        .peak_memory_bytes = 0,
-                        .peak_pids = 0,
+                        .cpu_time_ms = resource_usage_.cpu_time_ms,
+                        .peak_memory_bytes = resource_usage_.peak_memory_bytes,
+                        .peak_pids = resource_usage_.peak_pids,
                         .wall_time_ms = snapshot.wall_time_ms,
-                        .disk_bytes = 0,
+                        .disk_bytes = resource_usage_.disk_bytes,
                         .terminal_output_bytes = snapshot.terminal_output_bytes,
                     },
                 .termination_cause = cause,
@@ -1184,6 +1331,7 @@ private:
     std::shared_ptr<container::detail::wall_output_monitor> monitor_;
     ::pid_t attach_pid_ = -1;
     supervisor::resource_limits limits_;
+    container::resource_usage resource_usage_;
     std::uint64_t started_at_ms_ = 0;
     std::string idempotency_namespace_;
     credential_lease_bundle credential_leases_;
@@ -1383,6 +1531,10 @@ auto apple_container_session_runtime::create(
 auto apple_container_session_runtime::resource_capabilities() const noexcept
     -> container::resource_enforcement_capabilities {
     return capabilities();
+}
+
+auto apple_container_session_runtime::lifecycle_operational() const noexcept -> bool {
+    return state_ != nullptr && capabilities().receipt_schema_version == 1U;
 }
 
 auto apple_container_session_runtime::agent_runtime_adapter_schema_version() const noexcept
@@ -1657,6 +1809,18 @@ auto apple_container_session_runtime::start(
             std::string{"reserve Apple Container terminal receipt: "} + reservation.error()
         );
     }
+    auto tmpfs_sizes = apple_container_tmpfs_sizes(inputs->launch.limits.disk_bytes);
+    if (!tmpfs_sizes) {
+        return std::unexpected(tmpfs_sizes.error());
+    }
+    const auto [temp_bytes, home_bytes] = *tmpfs_sizes;
+    constexpr std::uint64_t mebibyte = std::uint64_t{1024} * 1024U;
+    if (inputs->launch.limits.cpu_time_ms % 1'000U != 0U ||
+        inputs->launch.limits.memory_bytes % mebibyte != 0U) {
+        return std::unexpected(
+            std::string{"Apple Container CPU and memory limits exceed native granularity"}
+        );
+    }
     const auto cpu_seconds =
         std::max<std::uint64_t>(1U, (inputs->launch.limits.cpu_time_ms + 999U) / 1'000U);
     std::vector<std::string> create_arguments{
@@ -1682,9 +1846,9 @@ auto apple_container_session_runtime::start(
         "nproc=" + std::to_string(inputs->launch.limits.pids) + ":" +
             std::to_string(inputs->launch.limits.pids),
         "--tmpfs",
-        "/tmp",
+        "/tmp:size=" + std::to_string(temp_bytes) + ",mode=1777",
         "--tmpfs",
-        "/home/agent",
+        "/home/agent:size=" + std::to_string(home_bytes) + ",mode=0700",
     };
     if (!managed_closure) {
         create_arguments.push_back("--uid");
@@ -1864,6 +2028,28 @@ auto apple_container_session_runtime::start(
     }
     const auto attach_pid = attached->first;
     attach_owner->store(attach_pid);
+    std::optional<container::resource_usage> initial_resource_usage;
+    std::string resource_sample_error;
+    const auto sample_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (!initial_resource_usage && std::chrono::steady_clock::now() < sample_deadline) {
+        auto sample = sample_resource_usage(
+            state_->config, runtime_identity.instance_id, inputs->launch.limits.memory_bytes
+        );
+        if (sample) {
+            initial_resource_usage = *sample;
+            break;
+        }
+        resource_sample_error = sample.error();
+        std::this_thread::sleep_for(stats_sample_interval);
+    }
+    if (!initial_resource_usage) {
+        static_cast<void>(::killpg(attach_pid, SIGKILL));
+        static_cast<void>(::waitpid(attach_pid, nullptr, 0));
+        auto cleanup_error = remove_created_instance();
+        return close_starting_failure(
+            resource_sample_error + (cleanup_error ? "; " + *cleanup_error : "")
+        );
+    }
     const managed_session_running_commitment running{
         .schema_version = 1,
         .session_id = binding.session_id,
@@ -1907,6 +2093,7 @@ auto apple_container_session_runtime::start(
         std::move(*monitor),
         attach_pid,
         inputs->launch.limits,
+        *initial_resource_usage,
         starting->starting_at_ms,
         std::string{idempotency_namespace},
         std::move(*credential_leases),
