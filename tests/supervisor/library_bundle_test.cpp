@@ -2,6 +2,7 @@
 #include "glove/supervisor/codex_runtime_adapter.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
+#include "glove/supervisor/sage_bundle_projection.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -116,6 +117,31 @@ auto run() -> int {
     REQUIRE(projections->front().target_path == "/opt/sage/library-bundles/" + digest + ".json");
     REQUIRE(projections->front().bundle.content_digest() == digest);
     REQUIRE(projections->front().bundle.verify_identity().has_value());
+
+    auto sage_projection_digest = glove::supervisor::sage_bundle_projection_digest(*projections);
+    REQUIRE(sage_projection_digest.has_value());
+    REQUIRE(sage_projection_digest->size() == 64U);
+    const auto sage_projection_root = temporary.root() / "sage-bundles";
+    REQUIRE(std::filesystem::create_directory(sage_projection_root));
+    REQUIRE(::chmod(sage_projection_root.c_str(), 0700) == 0);
+    const int sage_projection_fd =
+        ::open(sage_projection_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    REQUIRE(sage_projection_fd >= 0);
+    REQUIRE(
+        glove::supervisor::materialize_sage_bundle_projection(sage_projection_fd, *projections)
+            .has_value()
+    );
+    ::close(sage_projection_fd);
+    const auto projected_bundle = sage_projection_root / (digest + ".json");
+    std::ifstream projected_input{projected_bundle, std::ios::binary};
+    const std::string projected_contents{
+        std::istreambuf_iterator<char>{projected_input}, std::istreambuf_iterator<char>{}
+    };
+    REQUIRE(projected_contents == canonical);
+    struct stat projected_status{};
+    REQUIRE(::lstat(projected_bundle.c_str(), &projected_status) == 0);
+    REQUIRE((static_cast<unsigned int>(projected_status.st_mode) & 0777U) == 0444U);
+    REQUIRE(::chmod(sage_projection_root.c_str(), 0700) == 0);
 
     constexpr std::string_view codex_canonical =
         R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"}]})";

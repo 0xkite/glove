@@ -330,6 +330,7 @@ auto run() -> int {
             .image_digest = image_digest,
             .harness_closure_digest =
                 managed_closure ? std::optional<std::string>{closure_digest} : std::nullopt,
+            .sage_guest = std::nullopt,
             .egress_audit = glove::audit::make_memory_sink(),
             .session_root = session_root,
         }

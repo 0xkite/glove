@@ -28,11 +28,21 @@ struct directories {
     std::filesystem::path runtime;
 };
 
+struct sage_guest_config {
+    std::string binary_digest;
+    std::string source_revision;
+    std::uint8_t policy_schema_version = 0;
+    std::string library_projection_schema;
+
+    auto operator==(const sage_guest_config&) const -> bool = default;
+};
+
 struct apple_container_config {
     std::filesystem::path cli;
     std::string image;
     std::string image_digest;
     std::optional<std::string> harness_closure_digest;
+    std::optional<sage_guest_config> sage_guest;
 
     auto operator==(const apple_container_config&) const -> bool = default;
 };

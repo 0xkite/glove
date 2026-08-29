@@ -617,6 +617,25 @@ auto run(const options& configured) -> std::expected<void, std::string> {
                 .image_reference = configured.apple_container->image,
                 .image_digest = configured.apple_container->image_digest,
                 .harness_closure_digest = configured.apple_container->harness_closure_digest,
+                .sage_guest =
+                    configured.apple_container->sage_guest
+                        ? std::optional<
+                              glove::control::apple_detail::
+                                  sage_guest_runtime_identity>{glove::control::apple_detail::sage_guest_runtime_identity{
+                              .binary_digest = configured.apple_container
+                                                   ->sage_guest
+                                                   ->binary_digest,
+                              .source_revision = configured.apple_container
+                                                     ->sage_guest
+                                                     ->source_revision,
+                              .policy_schema_version = configured.apple_container
+                                                           ->sage_guest
+                                                           ->policy_schema_version,
+                              .library_projection_schema = configured.apple_container
+                                                               ->sage_guest
+                                                               ->library_projection_schema,
+                          }}
+                        : std::nullopt,
                 .egress_audit = std::move(*audit),
                 .session_root = *configured.materialization_root,
             }

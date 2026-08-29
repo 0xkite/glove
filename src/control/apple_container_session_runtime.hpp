@@ -4,6 +4,7 @@
 #include "glove/control/session_runtime.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <memory>
@@ -11,6 +12,15 @@
 #include <string>
 
 namespace glove::control::apple_detail {
+
+struct sage_guest_runtime_identity {
+    std::string binary_digest;
+    std::string source_revision;
+    std::uint8_t policy_schema_version = 0;
+    std::string library_projection_schema;
+
+    auto operator==(const sage_guest_runtime_identity&) const -> bool = default;
+};
 
 struct apple_container_runtime_config {
     std::filesystem::path container_cli;
@@ -20,6 +30,7 @@ struct apple_container_runtime_config {
     // Exact sha256 digest of the package lock embedded in Glove's managed
     // harness image. Empty retains the restricted image-contained probe lane.
     std::optional<std::string> harness_closure_digest;
+    std::optional<sage_guest_runtime_identity> sage_guest;
     std::shared_ptr<audit::sink> egress_audit;
     std::filesystem::path session_root;
     std::size_t max_sessions = 64;

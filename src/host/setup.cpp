@@ -71,6 +71,10 @@ struct apple_container_runtime {
     std::string image_digest;
     std::string harness_closure_digest;
     std::uint8_t agent_runtime_adapter_schema_version = 0;
+    std::string sage_guest_binary_digest;
+    std::string sage_guest_source_revision;
+    std::uint8_t sage_guest_policy_schema_version = 0;
+    std::string library_projection_schema;
 };
 
 struct runtime_pair {
@@ -144,11 +148,44 @@ auto installed_apple_container_runtime() -> result<std::optional<apple_container
             std::string{"installed Apple runtime adapter schema is unsupported"}
         );
     }
+    const auto valid_digest = [](std::string_view value) {
+        return value.size() == 71U && value.starts_with("sha256:") &&
+               std::ranges::all_of(value.substr(7), [](char byte) {
+                   return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+               });
+    };
+    const auto& runtime = *pair.apple_container_runtime;
+    const bool has_guest_identity = !runtime.sage_guest_binary_digest.empty() ||
+                                    !runtime.sage_guest_source_revision.empty() ||
+                                    runtime.sage_guest_policy_schema_version != 0U ||
+                                    !runtime.library_projection_schema.empty();
+    if (has_guest_identity && (!valid_digest(runtime.sage_guest_binary_digest) ||
+                               (runtime.sage_guest_source_revision != "unknown" &&
+                                (runtime.sage_guest_source_revision.size() != 40U ||
+                                 !std::ranges::all_of(
+                                     runtime.sage_guest_source_revision,
+                                     [](char byte) {
+                                         return (byte >= '0' && byte <= '9') ||
+                                                (byte >= 'a' && byte <= 'f');
+                                     }
+                                 ))) ||
+                               runtime.sage_guest_policy_schema_version != 1U ||
+                               runtime.library_projection_schema != "sage_bundle_v1")) {
+        return std::unexpected(std::string{"installed Sage guest identity is unsupported"});
+    }
     return std::optional<apple_container_config>{apple_container_config{
         .cli = "/usr/local/bin/container",
-        .image = pair.apple_container_runtime->image_reference,
-        .image_digest = pair.apple_container_runtime->image_digest,
-        .harness_closure_digest = pair.apple_container_runtime->harness_closure_digest,
+        .image = runtime.image_reference,
+        .image_digest = runtime.image_digest,
+        .harness_closure_digest = runtime.harness_closure_digest,
+        .sage_guest = has_guest_identity
+                          ? std::optional<sage_guest_config>{sage_guest_config{
+                                .binary_digest = runtime.sage_guest_binary_digest,
+                                .source_revision = runtime.sage_guest_source_revision,
+                                .policy_schema_version = runtime.sage_guest_policy_schema_version,
+                                .library_projection_schema = runtime.library_projection_schema,
+                            }}
+                          : std::nullopt,
     }};
 }
 
@@ -1167,10 +1204,8 @@ auto plan_setup_cleanup(const std::filesystem::path& config_path) -> result<setu
                     scheduled_removals.push_back(resource->path);
                 }
             }
-        } else if (
-            !S_ISDIR(metadata.st_mode) || metadata.st_uid != ::geteuid() ||
-            (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0700U
-        ) {
+        } else if (!S_ISDIR(metadata.st_mode) || metadata.st_uid != ::geteuid() ||
+                   (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0700U) {
             item.reason = "directory identity or ownership changed";
         } else {
             std::error_code error;

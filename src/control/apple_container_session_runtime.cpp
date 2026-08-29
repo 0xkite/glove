@@ -4,6 +4,7 @@
 #include "glove/container/digest.hpp"
 #include "glove/net/egress_proxy.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
+#include "glove/supervisor/sage_bundle_projection.hpp"
 
 #include "../container/linux/pty_session_channel.hpp"
 #include "../container/resource_monitor.hpp"
@@ -159,6 +160,9 @@ public:
     ~projection_lease_bundle() {
         if (!directory_.empty()) {
             std::error_code ignored;
+            if (!mount_name_.empty()) {
+                static_cast<void>(::chmod((directory_ / mount_name_).c_str(), 0700));
+            }
             std::filesystem::remove_all(directory_, ignored);
         }
     }
@@ -166,6 +170,7 @@ public:
     void preserve() noexcept { directory_.clear(); }
 
     std::filesystem::path directory_;
+    std::string mount_name_;
     std::optional<std::string> digest_;
 };
 
@@ -290,6 +295,28 @@ auto remove_owner_only_directory(
         );
     }
     std::error_code filesystem_error;
+    for (std::filesystem::directory_iterator iterator{directory, filesystem_error}, end;
+         !filesystem_error && iterator != end;
+         iterator.increment(filesystem_error)) {
+        struct stat child_status{};
+        if (::lstat(iterator->path().c_str(), &child_status) != 0) {
+            return std::unexpected(system_error("inspect Apple Container artifact child"));
+        }
+        if (S_ISDIR(child_status.st_mode)) {
+            const auto mode = static_cast<unsigned int>(child_status.st_mode) & 0777U;
+            if (child_status.st_uid != ::geteuid() || (mode != 0700U && mode != 0555U) ||
+                ::chmod(iterator->path().c_str(), 0700) != 0) {
+                return std::unexpected(
+                    std::string{"Apple Container artifact child directory is unsafe"}
+                );
+            }
+        }
+    }
+    if (filesystem_error) {
+        return std::unexpected(
+            std::string{"inspect Apple Container artifact lease: "} + filesystem_error.message()
+        );
+    }
     const auto removed = std::filesystem::remove_all(directory, filesystem_error);
     if (filesystem_error || removed == 0U) {
         return std::unexpected(
@@ -543,22 +570,41 @@ auto resolve_projection_lease(
     if (inputs.library_projections.empty()) {
         return result;
     }
-    if (!adapter || inputs.launch.runtime_id == "codex") {
-        return std::unexpected(
-            std::string{"Apple Container library projection requires a managed harness adapter"}
+    const bool sage_guest = inputs.launch.runtime_id == supervisor::sage_guest_runtime_id;
+    std::optional<supervisor::native_skill_runtime_projection> native_projection;
+    if (sage_guest) {
+        if (!config.sage_guest || config.sage_guest->library_projection_schema !=
+                                      supervisor::sage_bundle_projection_schema) {
+            return std::unexpected(
+                std::string{"Apple Container Sage guest projection identity is unavailable"}
+            );
+        }
+        auto digest = supervisor::sage_bundle_projection_digest(inputs.library_projections);
+        if (!digest) {
+            return std::unexpected(digest.error());
+        }
+        result.digest_ = std::move(*digest);
+        result.mount_name_ = supervisor::sage_bundle_projection_mount;
+    } else {
+        if (!adapter || inputs.launch.runtime_id == "codex") {
+            return std::unexpected(
+                std::string{"Apple Container library projection requires a managed harness adapter"}
+            );
+        }
+        auto projection = supervisor::resolve_native_skill_runtime_projection(
+            *adapter, inputs.library_projections
         );
+        if (!projection) {
+            return std::unexpected(projection.error());
+        }
+        auto digest = supervisor::native_skill_runtime_projection_digest(*adapter, *projection);
+        if (!digest) {
+            return std::unexpected(digest.error());
+        }
+        result.digest_ = std::move(*digest);
+        result.mount_name_ = "home";
+        native_projection = std::move(*projection);
     }
-    auto projection =
-        supervisor::resolve_native_skill_runtime_projection(*adapter, inputs.library_projections);
-    if (!projection) {
-        return std::unexpected(projection.error());
-    }
-    auto projection_digest =
-        supervisor::native_skill_runtime_projection_digest(*adapter, *projection);
-    if (!projection_digest) {
-        return std::unexpected(projection_digest.error());
-    }
-    result.digest_ = std::move(*projection_digest);
     const auto root = config.session_root / ".projections";
     std::error_code filesystem_error;
     const bool root_created = std::filesystem::create_directory(root, filesystem_error);
@@ -577,28 +623,37 @@ auto resolve_projection_lease(
         return std::unexpected(std::string{"Apple projection root is not owner-only"});
     }
     result.directory_ = root / std::string{instance_id};
-    const auto home = result.directory_ / "home";
+    const auto projection_root = result.directory_ / result.mount_name_;
     if (!std::filesystem::create_directory(result.directory_, filesystem_error) ||
         ::chmod(result.directory_.c_str(), 0700) != 0 ||
-        !std::filesystem::create_directory(home, filesystem_error) ||
-        ::chmod(home.c_str(), 0700) != 0) {
+        !std::filesystem::create_directory(projection_root, filesystem_error) ||
+        ::chmod(projection_root.c_str(), 0700) != 0) {
         return std::unexpected(
             filesystem_error
                 ? std::string{"create Apple projection lease: "} + filesystem_error.message()
                 : system_error("protect Apple projection lease")
         );
     }
-    unique_fd home_descriptor{
-        ::open(home.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+    unique_fd projection_descriptor{
+        ::open(projection_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
     };
-    if (home_descriptor.get() < 0) {
-        return std::unexpected(system_error("open Apple projection home"));
+    if (projection_descriptor.get() < 0) {
+        return std::unexpected(system_error("open Apple projection directory"));
     }
-    if (auto materialized = supervisor::materialize_native_skill_runtime_projection(
-            home_descriptor.get(), *adapter, *projection
-        );
-        !materialized) {
-        return std::unexpected(materialized.error());
+    if (sage_guest) {
+        if (auto materialized = supervisor::materialize_sage_bundle_projection(
+                projection_descriptor.get(), inputs.library_projections
+            );
+            !materialized) {
+            return std::unexpected(materialized.error());
+        }
+    } else {
+        if (auto materialized = supervisor::materialize_native_skill_runtime_projection(
+                projection_descriptor.get(), *adapter, *native_projection
+            );
+            !materialized) {
+            return std::unexpected(materialized.error());
+        }
     }
     return result;
 }
@@ -620,6 +675,16 @@ auto profile_digest(
         !append_string(material, inputs.launch.egress_policy_id) ||
         !append_string(material, projection_digest.value_or(""))) {
         return std::unexpected(std::string{"Apple Container profile field exceeds its bound"});
+    }
+    if (inputs.launch.runtime_id == supervisor::sage_guest_runtime_id) {
+        if (!config.sage_guest || !append_string(material, config.sage_guest->binary_digest) ||
+            !append_string(material, config.sage_guest->source_revision) ||
+            !append_string(material, config.sage_guest->library_projection_schema)) {
+            return std::unexpected(
+                std::string{"Apple Container Sage guest profile identity is unavailable"}
+            );
+        }
+        append_u64(material, config.sage_guest->policy_schema_version);
     }
     append_u64(material, credentials.size());
     for (const auto& credential : credentials) {
@@ -704,15 +769,23 @@ auto converted_limits(const supervisor::resource_limits& limits) -> container::r
     };
 }
 
-auto projection_receipts(std::span<const supervisor::resolved_library_projection> projections)
-    -> std::vector<container::library_projection_receipt> {
+auto projection_receipts(
+    std::span<const supervisor::resolved_library_projection> projections,
+    std::string_view runtime_id
+) -> std::vector<container::library_projection_receipt> {
     std::vector<container::library_projection_receipt> receipts;
     receipts.reserve(projections.size());
     for (const auto& projection : projections) {
+        const std::string target_path =
+            runtime_id == supervisor::sage_guest_runtime_id
+                ? "/run/glove-projections/" +
+                      std::string{supervisor::sage_bundle_projection_mount} + "/" +
+                      std::string{projection.bundle.content_digest()} + ".json"
+                : projection.target_path;
         receipts.push_back({
             .projection_id = projection.projection_id,
             .destination_alias = projection.destination_alias,
-            .target_path = projection.target_path,
+            .target_path = target_path,
             .content_digest = std::string{projection.bundle.content_digest()},
         });
     }
@@ -1078,6 +1151,23 @@ auto validate_config(const apple_container_runtime_config& config)
          !valid_digest(std::string_view{*config.harness_closure_digest}.substr(7)))) {
         return std::unexpected(std::string{"invalid Apple Container harness closure digest"});
     }
+    if (config.sage_guest &&
+        (!config.harness_closure_digest || config.sage_guest->binary_digest.size() != 71U ||
+         !config.sage_guest->binary_digest.starts_with("sha256:") ||
+         !valid_digest(std::string_view{config.sage_guest->binary_digest}.substr(7)) ||
+         (config.sage_guest->source_revision != "unknown" &&
+          (config.sage_guest->source_revision.size() != 40U ||
+           !std::ranges::all_of(
+               config.sage_guest->source_revision,
+               [](char byte) {
+                   return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+               }
+           ))) ||
+         config.sage_guest->policy_schema_version != 1U ||
+         config.sage_guest->library_projection_schema !=
+             supervisor::sage_bundle_projection_schema)) {
+        return std::unexpected(std::string{"invalid Apple Container Sage guest identity"});
+    }
     struct stat cli_status{};
     struct stat root_status{};
     if (::stat(config.container_cli.c_str(), &cli_status) != 0 || !S_ISREG(cli_status.st_mode) ||
@@ -1096,9 +1186,30 @@ auto validate_config(const apple_container_runtime_config& config)
         (inspected &&
          inspected->output.find("dev.sage.glove.harness-closure-schema\" : \"1\"") !=
              std::string::npos &&
-         inspected->output.find(config.harness_closure_digest->substr(7)) != std::string::npos);
+         inspected->output.find(
+             "\"dev.sage.glove.harness-closure-digest\" : \"" +
+             config.harness_closure_digest->substr(7) + "\""
+         ) != std::string::npos);
+    const bool sage_guest_matches =
+        !config.sage_guest ||
+        (inspected &&
+         inspected->output.find(
+             "\"dev.sage.glove.sage-guest-binary-digest\" : \"" + config.sage_guest->binary_digest +
+             "\""
+         ) != std::string::npos &&
+         inspected->output.find(
+             "\"dev.sage.glove.sage-source-revision\" : \"" + config.sage_guest->source_revision +
+             "\""
+         ) != std::string::npos &&
+         inspected->output.find("\"dev.sage.glove.sage-guest-policy-schema\" : \"1\"") !=
+             std::string::npos &&
+         inspected->output.find(
+             "\"dev.sage.glove.library-projection-schema\" : \"sage_bundle_v1\""
+         ) != std::string::npos);
     if (!inspected || inspected->exit_code != 0 ||
-        inspected->output.find(config.image_digest) == std::string::npos || !closure_matches) {
+        inspected->output.find("\"digest\" : \"" + config.image_digest + "\"") ==
+            std::string::npos ||
+        !closure_matches || !sage_guest_matches) {
         return std::unexpected(
             inspected ? std::string{"reviewed Apple Container image digest is unavailable"}
                       : inspected.error()
@@ -1198,7 +1309,11 @@ auto apple_container_session_runtime::managed_runtime_ids() const -> std::vector
     if (!state_ || !state_->config.harness_closure_digest) {
         return {};
     }
-    return {"claude-code", "pi", "copilot", "opencode"};
+    std::vector<std::string> runtime_ids{"claude-code", "pi", "copilot", "opencode"};
+    if (state_->config.sage_guest) {
+        runtime_ids.emplace_back(supervisor::sage_guest_runtime_id);
+    }
+    return runtime_ids;
 }
 
 auto apple_container_session_runtime::reconcile(
@@ -1367,8 +1482,24 @@ auto apple_container_session_runtime::start(
         supervisor::native_skill_runtime_adapter_for(inputs->launch.runtime_id);
     const bool managed_closure = state_->config.harness_closure_digest &&
                                  ((managed_adapter && inputs->launch.runtime_id != "codex") ||
-                                  inputs->launch.runtime_id == "glove-egress-probe");
+                                  inputs->launch.runtime_id == "glove-egress-probe" ||
+                                  (inputs->launch.runtime_id == supervisor::sage_guest_runtime_id &&
+                                   state_->config.sage_guest));
     const bool online = !inputs->launch.egress_targets.empty();
+    const bool sage_guest = inputs->launch.runtime_id == supervisor::sage_guest_runtime_id;
+    if (sage_guest &&
+        (online || inputs->launch.egress_policy_id != "no-network" ||
+         !inputs->launch.secret_mounts.empty() || !inputs->launch.environment.empty() ||
+         inputs->launch.argv.size() != 1U || inputs->library_projections.empty() ||
+         inputs->adoption ||
+         !std::ranges::all_of(inputs->library_projections, [](const auto& projection) {
+             return projection.destination_alias == supervisor::sage_bundle_projection_mount;
+         }))) {
+        return std::unexpected(
+            std::string{"Apple Container Sage guest requires fixed read-only bundles without "
+                        "arguments, environment, secrets, adoption, or egress"}
+        );
+    }
     if (inputs->launch.backend != supervisor::sandbox_backend::apple_container ||
         (online ? (!managed_closure || inputs->launch.egress_policy_id == "no-network")
                 : inputs->launch.egress_policy_id != "no-network") ||
@@ -1402,7 +1533,8 @@ auto apple_container_session_runtime::start(
     if (!projection_lease) {
         return std::unexpected(projection_lease.error());
     }
-    auto library_projections = projection_receipts(inputs->library_projections);
+    auto library_projections =
+        projection_receipts(inputs->library_projections, inputs->launch.runtime_id);
     auto profile = profile_digest(
         *inputs, state_->config, credential_leases->commitments_, projection_lease->digest_
     );
@@ -1499,7 +1631,8 @@ auto apple_container_session_runtime::start(
     if (projection_lease->digest_) {
         create_arguments.push_back("--volume");
         create_arguments.push_back(
-            (projection_lease->directory_ / "home").string() + ":/run/glove-projections/home:ro"
+            (projection_lease->directory_ / projection_lease->mount_name_).string() +
+            ":/run/glove-projections/" + projection_lease->mount_name_ + ":ro"
         );
     }
     for (const auto& environment : inputs->launch.environment) {
