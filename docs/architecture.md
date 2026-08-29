@@ -161,6 +161,21 @@ connection remains a separate operator gate. Authority callbacks may request
 session close, but they must not destroy the session owner from its worker
 thread; live composition requires an independently owned lifetime.
 
+A third private construction-only adapter projects that status into a minimal
+Pi-shaped tool descriptor and result. It defaults disabled, owns only a
+single-operation fake status channel, and re-attests through the existing host
+bridge on every listing and invocation. Disabled, stale, unavailable,
+mismatched, malformed, cancelled, or expired evidence yields no advertised
+tool; invocation rechecks and reports only generic absence. A cancellable,
+deadline-aware transaction gate covers lock acquisition, exchange, strict
+decoding, and result construction. The accepted tool has an exact empty-object
+schema, read-only/idempotent/closed-world annotations,
+and emits only the sanitized v1 status fields with `available_actions` fixed to
+`["status"]` and an empty `mutating_actions` array. The adapter is not a kernel
+extension and is absent from Pi settings, native runtime registration, `gloved`,
+production factories, and capability discovery. Its fake-channel tests do not
+constitute child descriptor mapping or a live contained-Pi integration.
+
 `glove exec` bypasses the MCP kernel. It is intended for agents that manage
 their own tool protocol, so its security boundary is the OS sandbox and explicit
 filesystem/environment exposure.

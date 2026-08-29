@@ -162,6 +162,17 @@ target_include_directories(control_wallet_status_managed_session_test PRIVATE
 add_test(NAME control_wallet_status_managed_session COMMAND control_wallet_status_managed_session_test)
 set_tests_properties(control_wallet_status_managed_session PROPERTIES TIMEOUT 10)
 
+add_executable(
+    control_wallet_pi_status_adapter_test
+    control/wallet_pi_status_adapter_test.cpp
+)
+target_link_libraries(control_wallet_pi_status_adapter_test PRIVATE glove_control)
+target_include_directories(control_wallet_pi_status_adapter_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+)
+add_test(NAME control_wallet_pi_status_adapter COMMAND control_wallet_pi_status_adapter_test)
+set_tests_properties(control_wallet_pi_status_adapter PROPERTIES TIMEOUT 10)
+
 add_executable(control_remote_validation_test control/remote_validation_test.cpp)
 target_link_libraries(control_remote_validation_test PRIVATE glove_control)
 add_test(NAME control_remote_validation COMMAND control_remote_validation_test)
