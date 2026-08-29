@@ -16,16 +16,20 @@
 
 namespace glove::control {
 
-// Private construction-only channel. It has one operation and cannot name or
-// connect to a server, invoke another tool, or pass through MCP/CLI/IPC calls.
-class wallet_pi_status_channel {
+// Harness-neutral construction-only channel seam: one operation, and it can
+// neither name nor connect to a server, invoke another tool, or pass through
+// MCP/CLI/IPC calls. Any guest harness may implement it; the concrete adapter
+// below is the private Pi-shaped projection.
+class wallet_status_projection_channel {
 public:
-    wallet_pi_status_channel() = default;
-    wallet_pi_status_channel(const wallet_pi_status_channel&) = delete;
-    auto operator=(const wallet_pi_status_channel&) -> wallet_pi_status_channel& = delete;
-    wallet_pi_status_channel(wallet_pi_status_channel&&) = delete;
-    auto operator=(wallet_pi_status_channel&&) -> wallet_pi_status_channel& = delete;
-    virtual ~wallet_pi_status_channel() = default;
+    wallet_status_projection_channel() = default;
+    wallet_status_projection_channel(const wallet_status_projection_channel&) = delete;
+    auto operator=(const wallet_status_projection_channel&)
+        -> wallet_status_projection_channel& = delete;
+    wallet_status_projection_channel(wallet_status_projection_channel&&) = delete;
+    auto operator=(wallet_status_projection_channel&&)
+        -> wallet_status_projection_channel& = delete;
+    virtual ~wallet_status_projection_channel() = default;
 
     // Implementations must enforce both the absolute deadline and stop token;
     // returning after either is never authority for advertisement.
@@ -36,7 +40,7 @@ public:
     ) -> std::expected<std::string, std::string> = 0;
 };
 
-struct wallet_pi_status_adapter_options {
+struct wallet_status_projection_options {
     bool enabled = false;
     std::chrono::milliseconds request_timeout{0};
 };
@@ -46,7 +50,8 @@ struct wallet_pi_status_adapter_options {
 class wallet_pi_status_adapter final {
 public:
     wallet_pi_status_adapter(
-        std::unique_ptr<wallet_pi_status_channel> channel, wallet_pi_status_adapter_options options
+        std::unique_ptr<wallet_status_projection_channel> channel,
+        wallet_status_projection_options options
     );
 
     wallet_pi_status_adapter(const wallet_pi_status_adapter&) = delete;
@@ -75,8 +80,8 @@ private:
     probe_status(std::chrono::steady_clock::time_point deadline, const std::stop_token& stop)
         -> std::expected<wallet_status_bridge_response, std::string>;
 
-    std::unique_ptr<wallet_pi_status_channel> channel_;
-    wallet_pi_status_adapter_options options_;
+    std::unique_ptr<wallet_status_projection_channel> channel_;
+    wallet_status_projection_options options_;
     std::timed_mutex transaction_mutex_;
     std::uint64_t next_request_id_ = 0;
     bool constructed_ = false;

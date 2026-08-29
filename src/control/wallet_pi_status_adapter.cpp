@@ -113,7 +113,8 @@ acquire_transaction(std::timed_mutex& mutex, steady_time deadline, const std::st
 } // namespace
 
 wallet_pi_status_adapter::wallet_pi_status_adapter(
-    std::unique_ptr<wallet_pi_status_channel> channel, wallet_pi_status_adapter_options options
+    std::unique_ptr<wallet_status_projection_channel> channel,
+    wallet_status_projection_options options
 )
     : channel_(std::move(channel)),
       options_(options),

@@ -185,7 +185,7 @@ private:
     );
 }
 
-class fake_channel final : public glove::control::wallet_pi_status_channel {
+class fake_channel final : public glove::control::wallet_status_projection_channel {
 public:
     explicit fake_channel(std::shared_ptr<fake_state> state)
         : state_(std::move(state)), bridge_(make_bridge(state_)) {}
@@ -268,7 +268,7 @@ private:
     std::unique_ptr<glove::control::wallet_status_bridge> bridge_;
 };
 
-[[nodiscard]] auto enabled_options() -> glove::control::wallet_pi_status_adapter_options {
+[[nodiscard]] auto enabled_options() -> glove::control::wallet_status_projection_options {
     return {
         .enabled = true,
         .request_timeout = std::chrono::milliseconds{250},
@@ -277,7 +277,7 @@ private:
 
 [[nodiscard]] auto make_adapter(
     const std::shared_ptr<fake_state>& state,
-    glove::control::wallet_pi_status_adapter_options options = enabled_options()
+    glove::control::wallet_status_projection_options options = enabled_options()
 ) -> std::unique_ptr<glove::control::wallet_pi_status_adapter> {
     return std::make_unique<glove::control::wallet_pi_status_adapter>(
         std::make_unique<fake_channel>(state), options
