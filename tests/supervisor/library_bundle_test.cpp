@@ -13,9 +13,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -74,6 +76,70 @@ auto read_descriptor(int descriptor, std::size_t size) -> std::string {
         return {};
     }
     return contents;
+}
+
+struct bundle_test_entry {
+    std::string key;
+    std::string kind;
+    std::string content;
+    std::optional<std::string> content_digest;
+};
+
+auto test_entry(
+    std::string key,
+    std::string kind,
+    std::string content,
+    std::optional<std::string> content_digest = std::nullopt
+) -> bundle_test_entry {
+    return {
+        .key = std::move(key),
+        .kind = std::move(kind),
+        .content = std::move(content),
+        .content_digest = std::move(content_digest),
+    };
+}
+
+auto json_string(std::string_view value) -> std::string {
+    std::string encoded{"\""};
+    for (const char character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        switch (byte) {
+        case '\0':
+            encoded += "\\u0000";
+            break;
+        case '\n':
+            encoded += "\\n";
+            break;
+        case '\\':
+            encoded += "\\\\";
+            break;
+        case '"':
+            encoded += "\\\"";
+            break;
+        default:
+            encoded.push_back(static_cast<char>(byte));
+            break;
+        }
+    }
+    encoded.push_back('"');
+    return encoded;
+}
+
+auto bundle_json(const std::vector<bundle_test_entry>& entries) -> std::string {
+    std::string encoded =
+        R"({"schema_version":1,"source_library_ref":"bafy-test","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[)";
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        if (index != 0U) {
+            encoded.push_back(',');
+        }
+        encoded += "{\"key\":" + json_string(entry.key) + ",\"kind\":" + json_string(entry.kind) +
+                   ",\"content_digest\":" +
+                   json_string(entry.content_digest.value_or(digest_for(entry.content))) +
+                   ",\"content\":" + json_string(entry.content) + "}";
+    }
+    encoded += "]}";
+    return encoded;
 }
 
 auto run() -> int {
@@ -151,6 +217,94 @@ auto run() -> int {
     reordered_codex.skills.front().content = "# changed\n";
     REQUIRE(!glove::supervisor::codex_runtime_projection_digest(reordered_codex).has_value());
 
+    const auto rejects_bundle_json = [&](std::string projection_id, const std::string& contents) {
+        write_bundle(root, contents);
+        auto candidate = store->resolve_projections({{
+            .projection =
+                {
+                    .projection_id = std::move(projection_id),
+                    .content_digest = digest_for(contents),
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        }});
+        return candidate.has_value() &&
+               !glove::supervisor::resolve_codex_runtime_projection(*candidate).has_value();
+    };
+    const auto insert_json_member =
+        [](std::string document, std::string_view before, std::string_view member) {
+            const auto position = document.find(before);
+            if (position == std::string::npos) {
+                return std::string{};
+            }
+            document.insert(position, member);
+            return document;
+        };
+    const auto duplicate_member_base = bundle_json({
+        test_entry("trusted-key", "skill", "trusted content"),
+    });
+
+    REQUIRE(rejects_bundle_json(
+        "duplicate-top-plain",
+        insert_json_member(duplicate_member_base, R"("entries":)", R"("entries":[],)")
+    ));
+    REQUIRE(rejects_bundle_json(
+        "duplicate-top-escaped",
+        insert_json_member(duplicate_member_base, R"("entries":)", R"("entr\u0069es":[],)")
+    ));
+
+    struct duplicate_entry_member_case {
+        std::string_view name;
+        std::string_view marker;
+        std::string_view plain_member;
+        std::string_view escaped_member;
+    };
+
+    const std::array duplicate_entry_member_cases{
+        duplicate_entry_member_case{
+            "key",
+            R"("key":)",
+            R"("key":"other-key",)",
+            R"("k\u0065y":"other-key",)",
+        },
+        duplicate_entry_member_case{
+            "kind",
+            R"("kind":)",
+            R"("kind":"prompt",)",
+            R"("ki\u006ed":"prompt",)",
+        },
+        duplicate_entry_member_case{
+            "content",
+            R"("content":)",
+            R"("content":"altered content",)",
+            R"("cont\u0065nt":"altered content",)",
+        },
+        duplicate_entry_member_case{
+            "content-digest",
+            R"("content_digest":)",
+            R"("content_digest":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",)",
+            R"("content_dig\u0065st":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",)",
+        },
+    };
+    for (const auto& duplicate : duplicate_entry_member_cases) {
+        REQUIRE(rejects_bundle_json(
+            "duplicate-entry-plain-" + std::string{duplicate.name},
+            insert_json_member(duplicate_member_base, duplicate.marker, duplicate.plain_member)
+        ));
+        REQUIRE(rejects_bundle_json(
+            "duplicate-entry-escaped-" + std::string{duplicate.name},
+            insert_json_member(duplicate_member_base, duplicate.marker, duplicate.escaped_member)
+        ));
+    }
+
+    std::string excessive_nesting =
+        R"({"schema_version":1,"source_library_ref":"bafy-test","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":)";
+    excessive_nesting.append(65U, '[');
+    excessive_nesting += "null";
+    excessive_nesting.append(65U, ']');
+    excessive_nesting.push_back('}');
+    REQUIRE(rejects_bundle_json("excessive-json-nesting", excessive_nesting));
+
     // A skill directory is a single filesystem component. Reject an otherwise
     // syntactically valid projection before materialization rather than letting
     // a host filesystem limit decide the launch result.
@@ -170,8 +324,13 @@ auto run() -> int {
     ::close(oversized_home_fd);
     REQUIRE(std::filesystem::is_empty(oversized_home));
 
-    constexpr std::string_view mixed_codex_canonical =
-        R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"sage-core","kind":"skill","content_digest":"a8095aa5472d84253e87441d7438235d2b13c13e09de63cbb88609931b8b8947","content":"# Sage core\n"},{"key":"selected-prompt","kind":"prompt","content_digest":"3514cf816e5407a39cb7a1c1e1243f176dda121e06398a8934edb1dc426b0b34","content":"ignored"},{"key":"review-cycle","kind":"behavior","content_digest":"a5a24850efa7c6221289d949e66ab2d82d1b31e1e9969ff2b6f96324b85e8007","content":"behavior graph\n"}]})";
+    const auto mixed_codex_canonical = bundle_json({
+        test_entry("sage-core", "skill", "# Sage core\n"),
+        test_entry("selected-prompt", "prompt", "prompt body\n"),
+        test_entry("review-cycle", "behavior", "behavior graph\n"),
+        test_entry("issue-template", "template", "template body\n"),
+        test_entry("release-workflow", "workflow", "workflow body\n"),
+    });
     const auto mixed_codex_digest = digest_for(mixed_codex_canonical);
     write_bundle(root, mixed_codex_canonical);
     std::vector<glove::supervisor::resolved_library_projection_target> mixed_codex_targets;
@@ -186,10 +345,53 @@ auto run() -> int {
     });
     auto mixed_codex_projections = store->resolve_projections(mixed_codex_targets);
     REQUIRE(mixed_codex_projections.has_value());
-    auto mixed_codex = glove::supervisor::resolve_codex_runtime_projection(*mixed_codex_projections);
+    auto mixed_codex =
+        glove::supervisor::resolve_codex_runtime_projection(*mixed_codex_projections);
     REQUIRE(mixed_codex.has_value());
     REQUIRE(mixed_codex->skills.size() == 1U);
     REQUIRE(mixed_codex->skills.front().key == "sage-core");
+    REQUIRE(mixed_codex->unmaterialized_entries.size() == 4U);
+    REQUIRE(mixed_codex->unmaterialized_entries[0].key == "issue-template");
+    REQUIRE(mixed_codex->unmaterialized_entries[0].kind == "template");
+    REQUIRE(mixed_codex->unmaterialized_entries[1].kind == "workflow");
+    REQUIRE(mixed_codex->unmaterialized_entries[2].kind == "behavior");
+    REQUIRE(mixed_codex->unmaterialized_entries[3].kind == "prompt");
+    auto mixed_projection_digest = glove::supervisor::codex_runtime_projection_digest(*mixed_codex);
+    REQUIRE(mixed_projection_digest.has_value());
+    REQUIRE(*mixed_projection_digest != *codex_projection_digest);
+    auto changed_metadata = *mixed_codex;
+    changed_metadata.unmaterialized_entries.front().kind = "workflow";
+    auto changed_metadata_digest =
+        glove::supervisor::codex_runtime_projection_digest(changed_metadata);
+    REQUIRE(changed_metadata_digest.has_value());
+    REQUIRE(*changed_metadata_digest != *mixed_projection_digest);
+    auto duplicate_across_kinds = *mixed_codex;
+    duplicate_across_kinds.unmaterialized_entries.front().key = "sage-core";
+    REQUIRE(!glove::supervisor::codex_runtime_projection_digest(duplicate_across_kinds));
+
+    const auto all_non_skill_canonical = bundle_json({
+        test_entry("behavior", "behavior", "behavior"),
+        test_entry("prompt", "prompt", "prompt"),
+        test_entry("template", "template", "template"),
+        test_entry("workflow", "workflow", "workflow"),
+    });
+    write_bundle(root, all_non_skill_canonical);
+    auto all_non_skill_projections = store->resolve_projections({{
+        .projection =
+            {
+                .projection_id = "all-non-skill",
+                .content_digest = digest_for(all_non_skill_canonical),
+                .destination_alias = "libraries",
+            },
+        .target_path = "/opt/sage/library-bundles",
+    }});
+    REQUIRE(all_non_skill_projections.has_value());
+    auto all_non_skill =
+        glove::supervisor::resolve_codex_runtime_projection(*all_non_skill_projections);
+    REQUIRE(all_non_skill.has_value());
+    REQUIRE(all_non_skill->skills.empty());
+    REQUIRE(all_non_skill->unmaterialized_entries.size() == 4U);
+    REQUIRE(glove::supervisor::codex_runtime_projection_digest(*all_non_skill).has_value());
 
     constexpr std::string_view unknown_codex_canonical =
         R"({"schema_version":1,"source_library_ref":"bafy-codex","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"selected-prompt","kind":"skill_v2","content_digest":"3514cf816e5407a39cb7a1c1e1243f176dda121e06398a8934edb1dc426b0b34","content":"ignored"}]})";
@@ -208,6 +410,195 @@ auto run() -> int {
     auto unknown_codex_projections = store->resolve_projections(unknown_codex_targets);
     REQUIRE(unknown_codex_projections.has_value());
     REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*unknown_codex_projections));
+
+    const auto rejects_entry = [&](std::string projection_id, bundle_test_entry entry) {
+        const auto contents = bundle_json({std::move(entry)});
+        write_bundle(root, contents);
+        auto candidate = store->resolve_projections({{
+            .projection =
+                {
+                    .projection_id = std::move(projection_id),
+                    .content_digest = digest_for(contents),
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        }});
+        return candidate.has_value() &&
+               !glove::supervisor::resolve_codex_runtime_projection(*candidate).has_value();
+    };
+    REQUIRE(rejects_entry("empty-entry", test_entry("empty", "prompt", "")));
+    REQUIRE(rejects_entry("nul-entry", test_entry("nul", "workflow", std::string{"x\0y", 3U})));
+    REQUIRE(rejects_entry(
+        "digest-mismatch", test_entry("mismatch", "template", "content", std::string(64U, 'f'))
+    ));
+    REQUIRE(rejects_entry(
+        "oversized-entry", test_entry("large", "behavior", std::string(1024U * 1024U + 1U, 'x'))
+    ));
+    constexpr std::string_view malformed_known_entry =
+        R"({"schema_version":1,"source_library_ref":"bafy-test","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[{"key":"missing-content","kind":"prompt","content_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]})";
+    write_bundle(root, malformed_known_entry);
+    auto malformed_known_projection = store->resolve_projections({{
+        .projection =
+            {
+                .projection_id = "malformed-known",
+                .content_digest = digest_for(malformed_known_entry),
+                .destination_alias = "libraries",
+            },
+        .target_path = "/opt/sage/library-bundles",
+    }});
+    REQUIRE(malformed_known_projection.has_value());
+    REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*malformed_known_projection));
+
+    std::vector<bundle_test_entry> maximum_entries;
+    maximum_entries.reserve(4'096U);
+    for (std::size_t index = 0; index < 4'096U; ++index) {
+        maximum_entries.push_back(test_entry("key-" + std::to_string(index), "prompt", "x"));
+    }
+    const auto maximum_entries_bundle = bundle_json(maximum_entries);
+    const auto one_more_entry_bundle = bundle_json({
+        test_entry("one-more", "workflow", "x"),
+    });
+    write_bundle(root, maximum_entries_bundle);
+    write_bundle(root, one_more_entry_bundle);
+    auto too_many_entries = store->resolve_projections({
+        {
+            .projection =
+                {
+                    .projection_id = "entry-bound-a",
+                    .content_digest = digest_for(maximum_entries_bundle),
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        },
+        {
+            .projection =
+                {
+                    .projection_id = "entry-bound-b",
+                    .content_digest = digest_for(one_more_entry_bundle),
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        },
+    });
+    REQUIRE(too_many_entries.has_value());
+    REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*too_many_entries));
+
+    std::vector<glove::supervisor::resolved_library_projection_target> byte_bound_targets;
+    for (std::size_t index = 0; index < 17U; ++index) {
+        const auto contents = bundle_json({test_entry(
+            "large-" + std::to_string(index),
+            "prompt",
+            std::string(1024U * 1024U, static_cast<char>('a' + index))
+        )});
+        const auto content_digest = digest_for(contents);
+        write_bundle(root, contents);
+        byte_bound_targets.push_back({
+            .projection =
+                {
+                    .projection_id = "byte-bound-" + std::to_string(index),
+                    .content_digest = content_digest,
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        });
+    }
+    auto too_many_bytes = store->resolve_projections(byte_bound_targets);
+    REQUIRE(too_many_bytes.has_value());
+    REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*too_many_bytes));
+
+    const auto duplicate_first = bundle_json({
+        test_entry("same-key", "skill", "skill"),
+    });
+    const auto duplicate_second = bundle_json({
+        test_entry("same-key", "prompt", "prompt"),
+    });
+    write_bundle(root, duplicate_first);
+    write_bundle(root, duplicate_second);
+    auto duplicate_across_bundles = store->resolve_projections({
+        {
+            .projection =
+                {
+                    .projection_id = "duplicate-projection",
+                    .content_digest = digest_for(duplicate_first),
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        },
+        {
+            .projection =
+                {
+                    .projection_id = "duplicate-projection",
+                    .content_digest = digest_for(duplicate_second),
+                    .destination_alias = "libraries",
+                },
+            .target_path = "/opt/sage/library-bundles",
+        },
+    });
+    REQUIRE(duplicate_across_bundles.has_value());
+    REQUIRE(!glove::supervisor::resolve_codex_runtime_projection(*duplicate_across_bundles));
+    const auto duplicate_across_kinds_bundle = bundle_json({
+        test_entry("same-key", "skill", "skill"),
+        test_entry("same-key", "workflow", "workflow"),
+    });
+    write_bundle(root, duplicate_across_kinds_bundle);
+    auto duplicate_across_kinds_projection = store->resolve_projections({{
+        .projection =
+            {
+                .projection_id = "duplicate-kinds",
+                .content_digest = digest_for(duplicate_across_kinds_bundle),
+                .destination_alias = "libraries",
+            },
+        .target_path = "/opt/sage/library-bundles",
+    }});
+    REQUIRE(duplicate_across_kinds_projection.has_value());
+    REQUIRE(
+        !glove::supervisor::resolve_codex_runtime_projection(*duplicate_across_kinds_projection)
+    );
+
+    auto order_targets = std::vector<glove::supervisor::resolved_library_projection_target>{
+        codex_targets.front(), mixed_codex_targets.front()
+    };
+    auto forward_order = store->resolve_projections(order_targets);
+    std::ranges::reverse(order_targets);
+    auto reverse_order = store->resolve_projections(order_targets);
+    REQUIRE(forward_order.has_value());
+    REQUIRE(reverse_order.has_value());
+    auto forward_projection = glove::supervisor::resolve_codex_runtime_projection(*forward_order);
+    auto reverse_projection = glove::supervisor::resolve_codex_runtime_projection(*reverse_order);
+    REQUIRE(forward_projection.has_value());
+    REQUIRE(reverse_projection.has_value());
+    REQUIRE(
+        glove::supervisor::codex_runtime_projection_digest(*forward_projection) ==
+        glove::supervisor::codex_runtime_projection_digest(*reverse_projection)
+    );
+
+    const auto admission_adapter =
+        glove::supervisor::native_skill_runtime_adapter_for("claude-code");
+    REQUIRE(admission_adapter.has_value());
+    auto native_mixed = glove::supervisor::resolve_native_skill_runtime_projection(
+        *admission_adapter, *mixed_codex_projections
+    );
+    REQUIRE(native_mixed.has_value());
+    REQUIRE(native_mixed->unmaterialized_entries.size() == 4U);
+    REQUIRE(glove::supervisor::native_skill_runtime_projection_requires_raw_bundle(*native_mixed));
+    auto native_mixed_digest = glove::supervisor::native_skill_runtime_projection_digest(
+        *admission_adapter, *native_mixed
+    );
+    REQUIRE(native_mixed_digest.has_value());
+    auto native_metadata_removed = *native_mixed;
+    native_metadata_removed.unmaterialized_entries.clear();
+    auto native_metadata_removed_digest = glove::supervisor::native_skill_runtime_projection_digest(
+        *admission_adapter, native_metadata_removed
+    );
+    REQUIRE(native_metadata_removed_digest.has_value());
+    REQUIRE(*native_metadata_removed_digest != *native_mixed_digest);
+    auto native_skill_only = glove::supervisor::resolve_native_skill_runtime_projection(
+        *admission_adapter, *codex_projections
+    );
+    REQUIRE(native_skill_only.has_value());
+    REQUIRE(
+        !glove::supervisor::native_skill_runtime_projection_requires_raw_bundle(*native_skill_only)
+    );
 
     // Every built-in harness consumes the same verified Agent Skills bundle,
     // but receives it in an adapter-owned private-home layout. This proves the

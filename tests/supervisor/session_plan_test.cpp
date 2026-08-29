@@ -94,9 +94,15 @@ auto policy_json(const std::filesystem::path& source) -> std::string {
 auto validator_for(
     const std::filesystem::path& source,
     bool with_launch = true,
-    std::shared_ptr<const glove::supervisor::path_exposure_registry> exposures = {}
+    std::shared_ptr<const glove::supervisor::path_exposure_registry> exposures = {},
+    std::optional<glove::supervisor::runtime_launch_template> launch_override = std::nullopt
 ) -> glove::supervisor::result<glove::supervisor::session_plan_validator> {
     using namespace glove::supervisor;
+    const auto selected_launch = launch_override.value_or(launch_template());
+    auto selected_launch_digest = runtime_launch_template_digest(selected_launch);
+    if (!selected_launch_digest) {
+        return std::unexpected(selected_launch_digest.error());
+    }
     path_alias_policy path{
         .alias = "workspace",
         .host_path = std::filesystem::canonical(source).string(),
@@ -125,12 +131,12 @@ auto validator_for(
                     runtime_template_policy{
                         .runtime_template_id = "codex-safe",
                         .runtime_id = "codex",
-                        .adapter_command_digest = launch_digest(),
+                        .adapter_command_digest = *selected_launch_digest,
                         .backend = sandbox_backend::linux_production,
                         .allowed_path_aliases = {"workspace"},
                         .allowed_projection_destinations = {"libraries"},
                         .launch = with_launch
-                                      ? std::optional<runtime_launch_template>{launch_template()}
+                                      ? std::optional<runtime_launch_template>{selected_launch}
                                       : std::nullopt,
                         .adoption = std::nullopt,
                     },
@@ -370,6 +376,102 @@ auto run() -> int {
                             "--dangerously-bypass-approvals-and-sandbox",
                         })
     );
+
+    const auto resolve_codex_arguments =
+        [&](std::vector<std::string> arguments,
+            std::string executable = "/usr/bin/true") -> result<std::vector<std::string>> {
+        auto custom_launch = launch_template();
+        custom_launch.executable_path = std::move(executable);
+        custom_launch.arguments = std::move(arguments);
+        auto custom_digest = runtime_launch_template_digest(custom_launch);
+        if (!custom_digest) {
+            return std::unexpected(custom_digest.error());
+        }
+        auto custom_validator = validator_for(source, true, {}, custom_launch);
+        if (!custom_validator) {
+            return std::unexpected(custom_validator.error());
+        }
+        const auto custom_plan = replace_once(valid_plan(), launch_digest(), *custom_digest);
+        auto custom_projection = custom_validator->resolve_runtime_launch_json(custom_plan, 1'000);
+        if (!custom_projection) {
+            return std::unexpected(custom_projection.error());
+        }
+        return custom_projection->argv;
+    };
+    const auto exec_launch = resolve_codex_arguments({"exec", "PROMPT"});
+    REQUIRE(exec_launch.has_value());
+    REQUIRE(
+        *exec_launch == std::vector<std::string>({
+                            "/usr/bin/true",
+                            "exec",
+                            "--dangerously-bypass-approvals-and-sandbox",
+                            "PROMPT",
+                        })
+    );
+    const auto global_exec_launch =
+        resolve_codex_arguments({"--model", "gpt-5", "--cd=/workspace", "exec", "PROMPT"});
+    REQUIRE(global_exec_launch.has_value());
+    REQUIRE(
+        *global_exec_launch == std::vector<std::string>({
+                                   "/usr/bin/true",
+                                   "--model",
+                                   "gpt-5",
+                                   "--cd=/workspace",
+                                   "exec",
+                                   "--dangerously-bypass-approvals-and-sandbox",
+                                   "PROMPT",
+                               })
+    );
+    REQUIRE(!resolve_codex_arguments({"--model", "gpt-5"}).has_value());
+    REQUIRE(!resolve_codex_arguments({"exec", "PROMPT", "exec"}).has_value());
+    REQUIRE(!resolve_codex_arguments({"--cd", "exec", "exec", "PROMPT"}).has_value());
+    REQUIRE(!resolve_codex_arguments({"--cd=exec", "exec", "PROMPT"}).has_value());
+    REQUIRE(!resolve_codex_arguments({"--", "exec", "PROMPT"}).has_value());
+    REQUIRE(
+        !resolve_codex_arguments({"exec", "--dangerously-bypass-approvals-and-sandbox", "PROMPT"})
+             .has_value()
+    );
+    const auto legacy_info_launch = resolve_codex_arguments({"--version"});
+    REQUIRE(legacy_info_launch.has_value());
+    REQUIRE(
+        *legacy_info_launch == std::vector<std::string>({
+                                   "/usr/bin/true",
+                                   "--version",
+                                   "--dangerously-bypass-approvals-and-sandbox",
+                               })
+    );
+    const auto wrapped_info_launch =
+        resolve_codex_arguments({"/opt/codex/bin/codex.js", "--version"}, "/usr/bin/node");
+    REQUIRE(wrapped_info_launch.has_value());
+    REQUIRE(
+        *wrapped_info_launch == std::vector<std::string>({
+                                    "/usr/bin/node",
+                                    "/opt/codex/bin/codex.js",
+                                    "--version",
+                                    "--dangerously-bypass-approvals-and-sandbox",
+                                })
+    );
+    const auto wrapped_exec_launch =
+        resolve_codex_arguments({"/opt/codex/bin/codex.js", "exec", "PROMPT"}, "/usr/bin/node");
+    REQUIRE(wrapped_exec_launch.has_value());
+    REQUIRE(
+        *wrapped_exec_launch == std::vector<std::string>({
+                                    "/usr/bin/node",
+                                    "/opt/codex/bin/codex.js",
+                                    "exec",
+                                    "--dangerously-bypass-approvals-and-sandbox",
+                                    "PROMPT",
+                                })
+    );
+    REQUIRE(
+        !resolve_codex_arguments({"relative/codex.js", "--version"}, "/usr/bin/node").has_value()
+    );
+    REQUIRE(!resolve_codex_arguments({"/opt/codex/bin/other.js", "--version"}, "/usr/bin/node")
+                 .has_value());
+    REQUIRE(!resolve_codex_arguments({"exec", "PROMPT"}, "/usr/bin/node").has_value());
+    REQUIRE(!resolve_codex_arguments({"--future-global", "exec", "PROMPT"}).has_value());
+    REQUIRE(!resolve_codex_arguments({"resume", "session-id"}).has_value());
+
     REQUIRE(launch->environment == launch_template().environment);
     REQUIRE(launch->limits.cpu_time_ms == 1'000);
     REQUIRE(launch->egress_policy_id == "no-network");

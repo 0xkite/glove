@@ -261,7 +261,24 @@ auto resolve_native_skill_runtime_projection(
             .content = skill.content,
         });
     }
+    projection.unmaterialized_entries.reserve(codex_projection->unmaterialized_entries.size());
+    for (const auto& entry : codex_projection->unmaterialized_entries) {
+        projection.unmaterialized_entries.push_back({
+            .projection_id = entry.projection_id,
+            .bundle_content_digest = entry.bundle_content_digest,
+            .key = entry.key,
+            .kind = entry.kind,
+            .content_digest = entry.content_digest,
+            .content_size = entry.content_size,
+        });
+    }
     return projection;
+}
+
+auto native_skill_runtime_projection_requires_raw_bundle(
+    const native_skill_runtime_projection& projection
+) noexcept -> bool {
+    return !projection.unmaterialized_entries.empty();
 }
 
 auto native_skill_runtime_projection_digest(
@@ -287,13 +304,24 @@ auto native_skill_runtime_projection_digest(
             .content = skill.content,
         });
     }
+    canonical.unmaterialized_entries.reserve(projection.unmaterialized_entries.size());
+    for (const auto& entry : projection.unmaterialized_entries) {
+        canonical.unmaterialized_entries.push_back({
+            .projection_id = entry.projection_id,
+            .bundle_content_digest = entry.bundle_content_digest,
+            .key = entry.key,
+            .kind = entry.kind,
+            .content_digest = entry.content_digest,
+            .content_size = entry.content_size,
+        });
+    }
     auto skill_digest = codex_runtime_projection_digest(canonical);
     if (!skill_digest) {
         return std::unexpected(skill_digest.error());
     }
     canonical_encoder encoder;
     for (const std::string_view value : {
-             std::string_view{"glove.native-skill-runtime-projection-v2"},
+             std::string_view{"glove.native-skill-runtime-projection.v3"},
              std::string_view{adapter.runtime_id},
              std::string_view{adapter.executable_name},
              std::string_view{adapter.home_mount_alias},

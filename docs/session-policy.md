@@ -450,10 +450,13 @@ codes. Ambiguous transactions are never retried or terminalized automatically.
 
 ## Remaining boundary
 
-Glove's Codex adapter expands only exact `skill` bundle entries into the
-private home. Known inert kinds (`behavior`, `prompt`, `template`,
-`workflow`) stay in the mounted dest bundle and are not written as
-`SKILL.md`. Unknown kinds fail closed. Other harnesses do not inherit
+Glove's native adapters expand only exact `skill` bundle entries into a
+private-home `SKILL.md` layout. `behavior`, `prompt`, `template`, and
+`workflow` are admitted only as known non-skill entries: they remain in the
+verified raw bundle and make that raw bundle a required launch input rather
+than being interpreted as skills. Apple Container rejects any projection
+that contains a known non-skill entry because its launch path cannot preserve
+the required raw bundle. Unknown kinds fail closed. Harnesses do not inherit
 Codex's layout, and `prompt_ref` remains rejected. Live direct host writes
 are outside v2.
 Applying a retained stage remains unavailable until Glove verifies an
