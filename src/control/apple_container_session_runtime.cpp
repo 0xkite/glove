@@ -1056,9 +1056,33 @@ public:
 
     auto start_finalizer() -> std::expected<void, std::string> {
         try {
+            stop_sampling_.store(false);
+            sampler_ = std::thread{[this] {
+                try {
+                    while (!stop_sampling_.load()) {
+                        auto sample = sample_resource_usage(
+                            config_, running_.runtime_identity.instance_id, limits_.memory_bytes
+                        );
+                        if (sample) {
+                            merge_resource_sample(resource_usage_, *sample);
+                        }
+                        for (int count = 0; count < 10 && !stop_sampling_.load(); ++count) {
+                            std::this_thread::sleep_for(stats_sample_interval / 10);
+                        }
+                    }
+                } catch (...) {
+                    // The required initial sample already proved observation
+                    // availability. A later sampler allocation failure cannot
+                    // erase that evidence or escape the worker thread.
+                }
+            }};
             finalizer_ = std::thread{[this] { finalize(); }};
             return {};
         } catch (const std::system_error& error) {
+            stop_sampling_.store(true);
+            if (sampler_.joinable()) {
+                sampler_.join();
+            }
             return std::unexpected(
                 std::string{"start Apple Container session finalizer: "} + error.what()
             );
@@ -1200,39 +1224,23 @@ private:
 
     void finalize() noexcept {
         try {
-            std::atomic<bool> stop_sampling{false};
-            std::thread sampler{[this, &stop_sampling] {
-                try {
-                    while (!stop_sampling.load()) {
-                        auto sample = sample_resource_usage(
-                            config_, running_.runtime_identity.instance_id, limits_.memory_bytes
-                        );
-                        if (sample) {
-                            merge_resource_sample(resource_usage_, *sample);
-                        }
-                        for (int count = 0; count < 10 && !stop_sampling.load(); ++count) {
-                            std::this_thread::sleep_for(stats_sample_interval / 10);
-                        }
-                    }
-                } catch (...) {
-                    // The required initial sample already proved observation
-                    // availability. A later sampler allocation failure cannot
-                    // erase that evidence or escape the worker thread.
-                }
-            }};
             int status = 0;
             while (::waitpid(attach_pid_, &status, 0) < 0) {
                 if (errno != EINTR) {
-                    stop_sampling.store(true);
-                    sampler.join();
+                    stop_sampling_.store(true);
+                    if (sampler_.joinable()) {
+                        sampler_.join();
+                    }
                     credential_leases_.preserve();
                     projection_lease_.preserve();
                     publish_error(system_error("wait for Apple Container attach process"));
                     return;
                 }
             }
-            stop_sampling.store(true);
-            sampler.join();
+            stop_sampling_.store(true);
+            if (sampler_.joinable()) {
+                sampler_.join();
+            }
             monitor_->finish();
             static_cast<void>(channel_->finish_draining());
             const auto snapshot = monitor_->snapshot();
@@ -1344,6 +1352,8 @@ private:
     bool finished_ = false;
     std::optional<session_terminal_record> result_;
     std::string error_;
+    std::atomic<bool> stop_sampling_{false};
+    std::thread sampler_;
     std::thread finalizer_;
 };
 
