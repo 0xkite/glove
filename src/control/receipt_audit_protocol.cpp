@@ -48,7 +48,7 @@ auto receipt_audit_protocol::create(
     state->producer = std::move(producer);
     state->plan_validator = std::move(plan_validator);
     state->sessions = std::move(sessions);
-    state->session_runtime = std::move(session_runtime);
+    state->runtime = std::move(session_runtime);
     state->local_services = std::move(local_services);
     state->path_exposures = std::move(path_exposures);
     state->materialization_root = std::move(materialization_root);
@@ -82,7 +82,7 @@ auto receipt_audit_protocol::create(
     state->producer_config = std::move(producer_config);
     state->plan_validator = std::move(plan_validator);
     state->sessions = std::move(sessions);
-    state->session_runtime = std::move(session_runtime);
+    state->runtime = std::move(session_runtime);
     state->local_services = std::move(local_services);
     state->path_exposures = std::move(path_exposures);
     state->materialization_root = std::move(materialization_root);
@@ -91,7 +91,13 @@ auto receipt_audit_protocol::create(
 
 auto receipt_audit_protocol::handle_frame(std::string_view frame, std::uint64_t now_ms)
     -> std::expected<std::string, std::string> {
-    return receipt_handlers::handle_frame(*state_, frame, now_ms);
+    return handle_frame(frame, now_ms, nullptr);
+}
+
+auto receipt_audit_protocol::handle_frame(
+    std::string_view frame, std::uint64_t now_ms, receipt_control_outcome* outcome
+) -> std::expected<std::string, std::string> {
+    return receipt_handlers::handle_frame(*state_, frame, now_ms, outcome);
 }
 
 } // namespace glove::control

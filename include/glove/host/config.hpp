@@ -13,6 +13,13 @@ namespace glove::host {
 template<typename Value> using result = std::expected<Value, std::string>;
 
 inline constexpr std::string_view local_service_audit_filename = "local-service-audit.jsonl";
+inline constexpr std::string_view control_audit_filename = "control-audit.jsonl";
+
+// Hard cap for the derived owner-only control-audit.jsonl journal. The journal
+// records connection-scoped control delivery failures and is best-effort by
+// policy (receipt-chain audit guarantees stay fatal and unbounded-safe); the
+// sink truncates its oldest records when this cap would be exceeded.
+inline constexpr std::uint64_t control_audit_max_file_bytes = std::uint64_t{4} * 1024U * 1024U;
 
 struct environment {
     std::optional<std::string> home;

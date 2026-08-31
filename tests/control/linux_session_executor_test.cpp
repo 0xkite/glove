@@ -607,6 +607,10 @@ auto run() -> int {
     REQUIRE(reconciliation->recovered_exited == 0);
     REQUIRE(reconciliation->recovered_terminated == 0);
     REQUIRE((*session_runtime_result)->reconcile(**producer, epoch_ms() + 2U) == reconciliation);
+    // Release this runtime (and its registry reference) before the
+    // interactive section; every registry lock holder must be gone before
+    // any later independent registry reopen below.
+    (*session_runtime_result).reset();
     auto recovered_failure = shared_registry->failed_status("session-starting-crash");
     REQUIRE(recovered_failure.has_value());
     REQUIRE(
@@ -1016,6 +1020,17 @@ auto run() -> int {
     REQUIRE(durable_interactive->finished_at_ms == interactive_exited->finished_at_ms);
     REQUIRE(durable_interactive->receipt_digest == interactive_exited->receipt_digest);
     REQUIRE(durable_interactive->termination_cause == interactive_exited->termination_cause);
+
+    // Degrade-path invariant (Workflow #218): the stop path durably marks the
+    // session stopping (linux_session_executor stop: mark_stopping before
+    // any child release) and the transition must survive an independent
+    // registry reopen. The control delivery degradation path tears a guest
+    // down through exactly this stop path after a broken control pipe, so
+    // the durable stopping ordering is asserted here, not inferred. The
+    // reopen is deferred until every registry lock holder (runtime, protocol,
+    // registry) has been destroyed: open_or_create takes a nonblocking
+    // exclusive flock, so a reopen while the runtime/protocol still hold
+    // shared registry ownership would fail instead of proving durability.
     const auto cleanup_payload = "{\"session_id\":\"" + interactive_created->session_id + "\"}";
     auto cleanup_frame = (*protocol)->handle_frame(
         make_request(
@@ -1055,16 +1070,51 @@ auto run() -> int {
     REQUIRE(session_runtime->list()->empty());
     REQUIRE(!session_runtime->stop(interactive_created->session_id).has_value());
     REQUIRE(
-        session_runtime->start(
-            *shared_producer,
-            interactive_authorization,
-            "execute-session-interactive",
-            interactive_now_ms + 3U
-        ) == interactive_exited->session
+        session_runtime
+            ->start(
+                *shared_producer,
+                interactive_authorization,
+                "execute-session-interactive",
+                interactive_now_ms + 3U
+            )
+            .value()
+            .record == interactive_exited->session
     );
+    // The start after cleanup is a registry replay of the committed start
+    // (the reservation exists and the session is no longer preparing): the
+    // runtime must report the explicit replay disposition, not a fresh
+    // launch.
+    REQUIRE(!session_runtime
+                 ->start(
+                     *shared_producer,
+                     interactive_authorization,
+                     "execute-session-interactive",
+                     interactive_now_ms + 3U
+                 )
+                 .value()
+                 .fresh_launch);
     REQUIRE(shared_producer->anchor().sequence == 2);
     REQUIRE(std::filesystem::is_empty(materializations));
     REQUIRE(std::filesystem::exists(source / "tracked.txt"));
+
+    // Independent registry reopen: every registry lock holder (runtime,
+    // protocol, registry) is destroyed first so the nonblocking exclusive
+    // flock in open_or_create can be acquired and the durable journal is
+    // re-read from scratch.
+    (*protocol).reset();
+    session_runtime.reset();
+    shared_registry.reset();
+    auto replayed_registry_result = glove::control::session_registry::open_or_create(
+        tree.root() / "sessions.journal", shared_validator
+    );
+    REQUIRE(replayed_registry_result.has_value());
+    auto replayed_registry =
+        std::shared_ptr<glove::control::session_registry>{std::move(*replayed_registry_result)};
+    auto replayed_interactive = replayed_registry->exited_status("session-interactive");
+    REQUIRE(replayed_interactive.has_value());
+    REQUIRE(replayed_interactive->session == durable_interactive->session);
+    REQUIRE(replayed_interactive->stopping_at_ms >= replayed_interactive->running_at_ms);
+    REQUIRE(replayed_interactive->stopping_at_ms == stopping_at_ms);
 
     const auto capability_bundle_root = tree.root() / "capability-bundles";
     REQUIRE(std::filesystem::create_directory(capability_bundle_root));

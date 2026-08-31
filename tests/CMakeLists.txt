@@ -89,7 +89,7 @@ target_link_libraries(audit_client_test PRIVATE glove_kernel)
 add_test(NAME audit_client COMMAND audit_client_test)
 
 add_executable(audit_jsonl_sink_test audit/jsonl_sink_test.cpp)
-target_link_libraries(audit_jsonl_sink_test PRIVATE glove_kernel)
+target_link_libraries(audit_jsonl_sink_test PRIVATE glove_kernel glaze::glaze)
 add_test(NAME audit_jsonl_sink COMMAND audit_jsonl_sink_test)
 
 add_executable(container_profile_test container/profile_test.cpp)

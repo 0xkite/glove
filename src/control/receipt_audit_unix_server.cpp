@@ -1,8 +1,10 @@
 #include "glove/control/receipt_audit_unix_server.hpp"
 
+#include "glove/audit/event.hpp"
 #include "glove/control/receipt_audit_protocol.hpp"
 
 #include "receipt_audit_unix_server_detail.hpp"
+#include "receipt_wire.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -18,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <expected>
 #include <filesystem>
@@ -413,6 +416,98 @@ auto verify_peer_owner(int descriptor, ::uid_t expected_owner) -> std::expected<
     return verify_peer_owner_impl(descriptor, expected_owner);
 }
 
+namespace {
+
+auto record_control_delivery_audit(
+    const std::shared_ptr<audit::sink>& control_audit,
+    std::string_view method,
+    std::string_view session_id,
+    bool replay,
+    std::string_view transport_error
+) -> void {
+    if (!control_audit) {
+        return;
+    }
+    std::string subject{method};
+    if (replay) {
+        subject += ":replay";
+    }
+    if (!session_id.empty()) {
+        subject += ':';
+        subject += session_id;
+    }
+    const audit::event record{
+        .what = audit::action::control,
+        .tool_name = std::move(subject),
+        .arguments_json = {},
+        .status = mcp::tool_call_status::transport_error,
+        .error_message = std::string{transport_error},
+    };
+    // Control-audit recording is best-effort by policy (unlike the
+    // receipt-chain audit, which stays fail-closed): a sink write failure is
+    // surfaced as a structured operator log instead of being silently
+    // discarded, and it must never turn a connection-scoped delivery failure
+    // into a daemon-fatal error.
+    if (auto recorded = control_audit->record(record); !recorded) {
+        std::fprintf(
+            stderr,
+            "gloved: control audit event %s was not recorded: %s\n",
+            record.tool_name.c_str(),
+            recorded.error().c_str()
+        );
+    }
+}
+
+} // namespace
+
+auto degrade_failed_delivery(
+    const receipt_audit_unix_server_config& config,
+    const receipt_control_outcome& outcome,
+    std::string_view transport_error
+) -> void {
+    // The outcome metadata was produced by the real dispatch in handle_frame.
+    // The raw frame is never re-decoded here: re-decoding carries no
+    // authentication, schema, deadline, or application evidence, so it can
+    // never grant teardown authority.
+    record_control_delivery_audit(
+        config.control_audit, outcome.method, outcome.session_id, outcome.replay, transport_error
+    );
+
+    // A guest launched by a genuinely fresh, applied start_session would
+    // outlive its vanished controller connection. Tear it down through the
+    // normal idempotent stop path, which preserves the pending-before-release
+    // audit guarantees and produces the authenticated terminal receipt. Every
+    // other outcome — wrong secret, unauthenticated peer, expired deadline,
+    // schema mismatch, rejected start, an idempotent start replay (the
+    // already-running guest was launched by an earlier, delivered request),
+    // or a non-start method — gets no stop attempt: only the
+    // connection-scoped audit event above. Stop failures are recorded and
+    // logged, never fatal: integrity failures cannot reach this path because
+    // handle_frame applied the request and only the transport write failed.
+    const bool degradable = outcome.authenticated && outcome.applied && outcome.response_success &&
+                            outcome.method == "start_session" && !outcome.session_id.empty();
+    if (!degradable || !config.runtime || !config.runtime->lifecycle_operational()) {
+        return;
+    }
+    if (auto stopped = config.runtime->stop(outcome.session_id); !stopped) {
+        std::fprintf(
+            stderr,
+            "gloved: degraded session %s after control delivery failure: %s\n",
+            outcome.session_id.c_str(),
+            stopped.error().c_str()
+        );
+        record_control_delivery_audit(
+            config.control_audit, "degrade_stop", outcome.session_id, false, stopped.error()
+        );
+        return;
+    }
+    std::fprintf(
+        stderr,
+        "gloved: degraded session %s after control delivery failure: guest stopped\n",
+        outcome.session_id.c_str()
+    );
+}
+
 } // namespace detail
 
 struct receipt_audit_unix_server::implementation {
@@ -478,15 +573,21 @@ auto receipt_audit_unix_server::create(receipt_audit_unix_server_config config)
     if (!secret) {
         return std::unexpected(secret.error());
     }
+    // The session runtime is shared, not moved: the protocol needs it to
+    // dispatch start_session, and the degrade path below needs the SAME live
+    // pointer after construction to tear a guest down when the response write
+    // to its controller fails. Moving it into the protocol would leave the
+    // stored config with an empty pointer, silently disabling guest teardown
+    // forever after construction.
     auto protocol = receipt_audit_protocol::create(
         secret->value(),
         config.producer,
-        std::move(config.plan_validator),
-        std::move(config.sessions),
-        std::move(config.session_runtime),
-        std::move(config.path_exposures),
+        config.plan_validator,
+        config.sessions,
+        config.runtime,
+        config.path_exposures,
         std::move(config.materialization_root),
-        std::move(config.local_services)
+        config.local_services
     );
     if (!protocol) {
         return std::unexpected(protocol.error());
@@ -529,7 +630,8 @@ auto receipt_audit_unix_server::create(receipt_audit_unix_server_config config)
     return std::make_unique<receipt_audit_unix_server>(construction_token{}, std::move(state));
 }
 
-auto receipt_audit_unix_server::serve_one() -> std::expected<void, std::string> {
+auto receipt_audit_unix_server::serve_one()
+    -> std::expected<receipt_audit_serve_outcome, std::string> {
     const std::scoped_lock lock{state_->serve_mutex};
     int accepted = -1;
     do {
@@ -566,28 +668,44 @@ auto receipt_audit_unix_server::serve_one() -> std::expected<void, std::string> 
     if (auto read = read_exact(connection.get(), frame.data(), frame.size()); !read) {
         return std::unexpected(read.error());
     }
-    auto response = state_->protocol->handle_frame(frame, epoch_milliseconds());
-    wipe(frame);
+    // Structured authenticated/applied outcome metadata from the real
+    // dispatch. This — never a re-decode of the raw frame — is the only
+    // input the degrade path may act on.
+    receipt_control_outcome request_outcome;
+    auto response = state_->protocol->handle_frame(frame, epoch_milliseconds(), &request_outcome);
     if (!response) {
+        wipe(frame);
         return std::unexpected(response.error());
     }
     if (response->empty() || response->size() > max_control_frame_bytes ||
         response->size() > std::numeric_limits<std::uint32_t>::max()) {
+        wipe(frame);
         return std::unexpected(std::string{"invalid control response size"});
     }
     const auto response_size = encode_frame_size(static_cast<std::uint32_t>(response->size()));
+    // From here the only possible failure is a transport-level write to the
+    // already-authenticated connection: the client vanished (broken pipe) or
+    // stopped reading. That failure is scoped to this connection. Degrade the
+    // request's session (structured audit event, guest teardown) and keep the
+    // daemon serving; audit-chain and integrity failures cannot reach this
+    // path because handle_frame already applied and validated everything.
     if (auto sent = send_exact(connection.get(), response_size.data(), response_size.size());
         !sent) {
-        return std::unexpected(sent.error());
+        detail::degrade_failed_delivery(state_->config, request_outcome, sent.error());
+        wipe(frame);
+        return receipt_audit_serve_outcome::connection_failed;
     }
     if (auto sent = send_exact(connection.get(), response->data(), response->size()); !sent) {
-        return std::unexpected(sent.error());
+        detail::degrade_failed_delivery(state_->config, request_outcome, sent.error());
+        wipe(frame);
+        return receipt_audit_serve_outcome::connection_failed;
     }
-    return {};
+    wipe(frame);
+    return receipt_audit_serve_outcome::served;
 }
 
 auto receipt_audit_unix_server::serve_one_for(std::uint64_t accept_timeout_ms)
-    -> std::expected<bool, std::string> {
+    -> std::expected<std::optional<receipt_audit_serve_outcome>, std::string> {
     if (accept_timeout_ms == 0 || accept_timeout_ms > max_io_timeout_ms) {
         return std::unexpected(std::string{"control accept timeout is invalid"});
     }
@@ -599,22 +717,19 @@ auto receipt_audit_unix_server::serve_one_for(std::uint64_t accept_timeout_ms)
     };
     const auto result = ::poll(&readiness, 1, static_cast<int>(accept_timeout_ms));
     if (result < 0 && errno == EINTR) {
-        return false;
+        return std::nullopt;
     }
     if (result < 0) {
         return std::unexpected(system_error("poll control listener"));
     }
     if (result == 0) {
-        return false;
+        return std::nullopt;
     }
     const auto ready_events = static_cast<unsigned short>(readiness.revents);
     if ((ready_events & static_cast<unsigned short>(POLLIN)) == 0U) {
         return std::unexpected(std::string{"control listener became unavailable"});
     }
-    if (auto served = serve_one(); !served) {
-        return std::unexpected(served.error());
-    }
-    return true;
+    return serve_one();
 }
 
 } // namespace glove::control

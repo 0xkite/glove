@@ -54,7 +54,11 @@ struct session_status_request {
     std::string session_id;
 };
 
-struct params {
+// Named `rpc_params`, not `params`: a member declaration sharing its type's
+// name changes the meaning of that name in this scope, which GCC 14 rejects
+// (-Wchanges-meaning) where clang accepts it. Member names stay untouched so
+// the JSON wire keys are unchanged.
+struct rpc_params {
     std::uint8_t schema_version = 1;
     std::string bootstrap_secret;
     std::uint64_t deadline_ms = 0;
@@ -66,7 +70,7 @@ struct request {
     std::string jsonrpc = "2.0";
     std::string id;
     std::string method;
-    params params;
+    rpc_params params;
 };
 
 struct rpc_error {
@@ -81,7 +85,11 @@ struct response {
     std::optional<rpc_error> error;
 };
 
-struct exposure {
+// Named `exposure_record`, not `exposure`: the member `exposure` in
+// `exposure_result` below would otherwise shadow the type name, which GCC 14
+// rejects (-Wchanges-meaning). Member names stay untouched so the JSON wire
+// keys are unchanged.
+struct exposure_record {
     std::uint8_t schema_version = 0;
     std::string exposure_id;
     std::uint64_t generation = 0;
@@ -95,12 +103,12 @@ struct exposure {
 
 struct exposure_result {
     std::uint8_t schema_version = 0;
-    exposure exposure;
+    exposure_record exposure;
 };
 
 struct exposure_list_result {
     std::uint8_t schema_version = 0;
-    std::vector<exposure> exposures;
+    std::vector<exposure_record> exposures;
 };
 
 struct session_result {

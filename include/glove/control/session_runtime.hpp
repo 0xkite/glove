@@ -50,6 +50,18 @@ enum class session_signal : std::uint8_t {
     hangup,
 };
 
+// Result of an authenticated session start, with the explicit fresh-launch
+// vs replay disposition required by the outcome contract. A replay returns
+// the existing durable record without launching; it is a success response
+// but never a freshly applied launch, so protocol callers must not grant
+// connection-scoped teardown authority for it.
+struct session_start_result {
+    session_record record;
+    bool fresh_launch = false;
+
+    auto operator==(const session_start_result&) const -> bool = default;
+};
+
 struct session_reconciliation_report {
     std::size_t inspected = 0;
     std::size_t recovered_exited = 0;
@@ -103,7 +115,7 @@ public:
         const session_start_authorization& authorization,
         std::string_view idempotency_namespace,
         std::uint64_t now_ms
-    ) -> std::expected<session_record, std::string> = 0;
+    ) -> std::expected<session_start_result, std::string> = 0;
     [[nodiscard]] virtual auto
     reconcile(container::receipt_audit_producer& receipt_producer, std::uint64_t now_ms)
         -> std::expected<session_reconciliation_report, std::string> = 0;

@@ -17,6 +17,7 @@ enum class action : std::uint8_t {
     egress,
     observation,
     local_service,
+    control,
 };
 
 // One observed agent interaction. Recorded after the inner call returns so

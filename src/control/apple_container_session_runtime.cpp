@@ -2429,7 +2429,7 @@ auto apple_container_session_runtime::start(
     const session_start_authorization& authorization,
     std::string_view idempotency_namespace,
     std::uint64_t now_ms
-) -> std::expected<session_record, std::string> {
+) -> std::expected<session_start_result, std::string> {
     if (!lifecycle_operational()) {
         return std::unexpected(std::string{lifecycle_unavailable_error});
     }
@@ -2456,7 +2456,9 @@ auto apple_container_session_runtime::start(
         );
     }
     if (current->state != session_state::preparing) {
-        return *current;
+        // Idempotent replay of an already-committed start: the durable
+        // record without launching, and never a fresh-launch disposition.
+        return session_start_result{.record = *current, .fresh_launch = false};
     }
     {
         std::lock_guard lock{state_->sessions_mutex};
@@ -2934,7 +2936,7 @@ auto apple_container_session_runtime::start(
         std::lock_guard lock{state_->sessions_mutex};
         state_->sessions.emplace(authorization.session_id, session);
     }
-    return running_record->session;
+    return session_start_result{.record = running_record->session, .fresh_launch = true};
 }
 
 auto apple_container_session_runtime::list() const

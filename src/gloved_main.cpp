@@ -768,6 +768,13 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         return std::unexpected(handlers.error());
     }
 
+    auto control_audit = glove::audit::make_jsonl_sink(
+        configured.journal.parent_path() / glove::host::control_audit_filename,
+        {.max_file_bytes = glove::host::control_audit_max_file_bytes}
+    );
+    if (!control_audit) {
+        return std::unexpected(std::string{"open control audit journal: "} + control_audit.error());
+    }
     glove::control::receipt_audit_unix_server_config server_config{
         .socket_path = configured.runtime_directory / socket_name,
         .bootstrap_secret_path = configured.runtime_directory / secret_name,
@@ -778,13 +785,14 @@ auto run(const options& configured) -> std::expected<void, std::string> {
             },
         .plan_validator = std::move(plan_validator),
         .sessions = std::move(sessions),
-        .session_runtime = std::move(session_runtime),
+        .runtime = std::move(session_runtime),
         .local_services = std::move(local_service_capability),
         .path_exposures = std::move(path_exposures),
         .materialization_root = configured.materialization_root
                                     ? configured.materialization_root->string()
                                     : std::string{},
         .io_timeout_ms = connection_timeout_ms,
+        .control_audit = std::move(*control_audit),
     };
     auto server = glove::control::receipt_audit_unix_server::create(std::move(server_config));
     if (!server) {
@@ -793,8 +801,14 @@ auto run(const options& configured) -> std::expected<void, std::string> {
     while (shutdown_requested == 0) {
         auto served = (*server)->serve_one_for(accept_poll_ms);
         if (!served) {
+            // Listener, authentication, frame-integrity, and audit-chain
+            // failures fail closed: the daemon must not keep running in a
+            // state it cannot prove.
             return std::unexpected(served.error());
         }
+        // A connection-scoped delivery failure (broken control pipe after a
+        // client vanished) is already degraded and audited by the server; the
+        // daemon keeps serving subsequent connections.
     }
     return {};
 }
