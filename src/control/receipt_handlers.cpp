@@ -2,6 +2,10 @@
 
 #include "receipt_audit_wire.hpp"
 
+#if defined(__linux__)
+#    include "glove/control/local_service_proxy.hpp"
+#endif
+
 #include <glaze/glaze.hpp>
 
 #include <algorithm>
@@ -231,6 +235,16 @@ auto handle_capabilities(
                 lifecycle_operational
                     ? state.session_runtime->refinement_evaluation_protocol_schema_version()
                     : std::uint8_t{0},
+#if defined(__linux__)
+            .observation_intent_channel_schema_version =
+                state.local_services && state.local_services->operational_for(
+                                            state.session_runtime.get(), state.sessions.get()
+                                        )
+                    ? std::uint8_t{1}
+                    : std::uint8_t{0},
+#else
+            .observation_intent_channel_schema_version = 0,
+#endif
             .backends = {
                 backend_capabilities{
                     .backend = "linux_production",
@@ -310,7 +324,6 @@ auto handle_page(
             request_id, "audit_reconciliation_failed", "receipt audit producer bootstrap failed"
         );
     }
-#if defined(__linux__)
     if (state.session_runtime && state.session_runtime->lifecycle_operational() &&
         (*producer)->bootstrap_reconciled()) {
         if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
@@ -321,9 +334,6 @@ auto handle_page(
             );
         }
     }
-#else
-    static_cast<void>(now_ms);
-#endif
     auto page = (*producer)->page_after(payload->sage_anchor, effective_limit);
     if (!page) {
         return error_response(
@@ -388,7 +398,6 @@ auto handle_acknowledgement(
             request_id, "audit_reconciliation_failed", "receipt audit head was not accepted"
         );
     }
-#if defined(__linux__)
     if (state.session_runtime && state.session_runtime->lifecycle_operational()) {
         if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
             return error_response(
@@ -398,9 +407,6 @@ auto handle_acknowledgement(
             );
         }
     }
-#else
-    static_cast<void>(now_ms);
-#endif
     auto result = encode_json(
         acknowledgement_result{
             .acknowledged_anchor = payload->anchor,
@@ -519,6 +525,14 @@ auto handle_frame(
 
     if (request->method == "acknowledge_audit_chain") {
         return handle_acknowledgement(state, request->id, *params, now_ms);
+    }
+
+    if (request->method == "page_observation_intents") {
+        return handle_page_observation_intents(state, request->id, *params, now_ms);
+    }
+
+    if (request->method == "set_observation_intent_disposition") {
+        return handle_set_observation_intent_disposition(state, request->id, *params, now_ms);
     }
 
     return error_response(request->id, "method_not_found", "control method is unavailable");

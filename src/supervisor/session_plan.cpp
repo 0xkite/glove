@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <string>
@@ -262,6 +263,108 @@ auto valid_environment_name(std::string_view name) -> bool {
         return (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
                (byte >= '0' && byte <= '9') || byte == '_';
     });
+}
+
+auto codex_exec_managed_argument_offset(
+    const std::filesystem::path& executable, const std::vector<std::string>& arguments
+) -> std::expected<std::size_t, std::string> {
+    std::size_t index = 0;
+    if (executable.filename() == "node") {
+        if (arguments.empty()) {
+            return std::unexpected(std::string{"Codex Node wrapper has no script"});
+        }
+        const std::filesystem::path wrapper{arguments.front()};
+        if (!wrapper.is_absolute() || wrapper.filename() != "codex.js") {
+            return std::unexpected(std::string{"Codex Node wrapper script is not owner-bound"});
+        }
+        index = 1;
+    }
+    if (index + 1U == arguments.size() && arguments[index] == "--version") {
+        return arguments.size();
+    }
+    constexpr std::array<std::string_view, 3> global_flags = {
+        "--no-alt-screen", "--oss", "--search"
+    };
+    constexpr std::array<std::string_view, 17> global_options = {
+        "--add-dir",
+        "--ask-for-approval",
+        "--cd",
+        "--config",
+        "--disable",
+        "--enable",
+        "--image",
+        "--local-provider",
+        "--model",
+        "--profile",
+        "--sandbox",
+        "-C",
+        "-a",
+        "-c",
+        "-m",
+        "-p",
+        "-s",
+    };
+    const auto reject_later_exec =
+        [&](std::size_t exec_index) -> std::expected<std::size_t, std::string> {
+        for (std::size_t index = exec_index + 1U; index < arguments.size(); ++index) {
+            if (arguments[index] == "exec") {
+                return std::unexpected(std::string{"Codex launch contains a later literal exec"});
+            }
+        }
+        return exec_index + 1U;
+    };
+
+    while (index < arguments.size()) {
+        const std::string_view token = arguments[index];
+        if (token == "exec") {
+            return reject_later_exec(index);
+        }
+        if (token == "--") {
+            return std::unexpected(
+                std::string{"Codex end-of-options delimiter precedes the exec subcommand"}
+            );
+        }
+        if (std::ranges::find(global_flags, token) != global_flags.end()) {
+            ++index;
+            continue;
+        }
+
+        bool consumed_option = false;
+        for (const auto option : global_options) {
+            if (token == option) {
+                if (index + 1U >= arguments.size()) {
+                    return std::unexpected(
+                        std::string{"Codex global option requires a value: "} + std::string{option}
+                    );
+                }
+                if (arguments[index + 1U] == "exec") {
+                    return std::unexpected(
+                        std::string{"Codex global option value cannot be literal exec"}
+                    );
+                }
+                index += 2U;
+                consumed_option = true;
+                break;
+            }
+            if (option.starts_with("--") && token.starts_with(option) &&
+                token.size() > option.size() && token[option.size()] == '=') {
+                const auto value = token.substr(option.size() + 1U);
+                if (value.empty() || value == "exec") {
+                    return std::unexpected(std::string{"Codex global option value is invalid"});
+                }
+                ++index;
+                consumed_option = true;
+                break;
+            }
+        }
+        if (!consumed_option) {
+            return std::unexpected(
+                std::string{"Codex launch has an unsupported token before exec: "} +
+                std::string{token}
+            );
+        }
+    }
+    return std::unexpected(std::string{"Codex launch has no exec subcommand"});
 }
 
 auto path_within(const std::filesystem::path& candidate, const std::filesystem::path& root) -> bool;
@@ -1607,12 +1710,22 @@ auto session_plan_validator::resolve_runtime_launch_json(
             std::string{"runtime launch conflicts with managed adapter arguments"}
         );
     }
+    std::optional<std::size_t> managed_argument_offset;
+    if (adapter && !adapter->managed_arguments.empty()) {
+        auto offset = codex_exec_managed_argument_offset(*executable, launch.arguments);
+        if (!offset) {
+            return std::unexpected(offset.error());
+        }
+        managed_argument_offset = *offset;
+    }
     argv.reserve(launch.arguments.size() + 1U + (adapter ? adapter->managed_arguments.size() : 0U));
     argv.push_back(std::move(*executable));
     argv.insert(argv.end(), launch.arguments.begin(), launch.arguments.end());
-    if (adapter) {
+    if (adapter && managed_argument_offset) {
         argv.insert(
-            argv.end(), adapter->managed_arguments.begin(), adapter->managed_arguments.end()
+            argv.begin() + static_cast<std::ptrdiff_t>(*managed_argument_offset + 1U),
+            adapter->managed_arguments.begin(),
+            adapter->managed_arguments.end()
         );
     }
     std::vector<egress_target_policy> egress_targets;

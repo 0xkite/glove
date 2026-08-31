@@ -2,6 +2,38 @@
 
 namespace glove::control {
 
+// Recovery compares a frozen intent/disposition record against the session
+// record it was bound to. Lifecycle progression mutates `state` and
+// `running_at_ms`, and policy revisions may advance without changing the
+// session's durable identity, so those three fields are neutralized before
+// the comparison. Everything else must still match exactly: any other
+// mismatch is a genuine binding crossing, not lifecycle progression.
+auto same_session_snapshot(wire::persisted_session left, wire::persisted_session right) -> bool {
+    left.sequence = right.sequence = 0;
+    left.operation = right.operation = {};
+    left.idempotency_key = right.idempotency_key = {};
+    left.request_digest = right.request_digest = {};
+    left.previous_hash = right.previous_hash = {};
+    left.this_hash = right.this_hash = {};
+    left.state = right.state = {};
+    left.running_at_ms = right.running_at_ms = 0;
+    left.policy_revision = right.policy_revision = 0;
+    left.observation_intent = right.observation_intent = std::nullopt;
+    return left == right;
+}
+
+namespace {
+
+auto same_observation_intent_binding(
+    wire::persisted_observation_intent left, wire::persisted_observation_intent right
+) -> bool {
+    left.disposition = right.disposition = {};
+    left.decided_at_ms = right.decided_at_ms = 0;
+    return left == right;
+}
+
+} // namespace
+
 auto initialize_empty(session_registry::implementation& state) -> std::expected<void, std::string> {
     auto written = write_at(state.opened.file.get(), registry_magic, 0);
     if (!written) {
@@ -60,8 +92,109 @@ auto accept_recovered_record(
         state.requests.contains(record.idempotency_key)) {
         return std::unexpected(std::string{"session registry record is invalid"});
     }
+    auto plan_digest = hash_plan(record.canonical_plan_json);
+    auto record_hash = hash_record(record);
+    if (!plan_digest || !record_hash || *plan_digest != record.plan_content_digest ||
+        *record_hash != record.this_hash) {
+        return std::unexpected(std::string{"session registry content commitment mismatch"});
+    }
     const auto existing = state.sessions.find(record.session_id);
-    if (record.state == "created") {
+    const bool enqueue_intent = record.operation == "enqueue_observation_intent_v1";
+    const bool set_intent_disposition = record.operation == "set_observation_intent_disposition_v1";
+    std::string observation_key;
+    std::optional<observation_quarantine_reason> quarantine_reason;
+    bool quarantined_disposition = false;
+    if (enqueue_intent || set_intent_disposition) {
+        if (existing == state.sessions.end() || !record.observation_intent) {
+            return std::unexpected(std::string{"session registry observation intent is orphaned"});
+        }
+        const auto& current_session = state.records[existing->second];
+        if (!same_session_snapshot(record, current_session)) {
+            return std::unexpected(
+                std::string{"session registry observation intent crossed its session binding"}
+            );
+        }
+        const auto body = observation_body_from_wire(*record.observation_intent);
+        const auto context = observation_context_from_wire(record, *record.observation_intent);
+        auto body_digest = hash_observation_intent_body(body);
+        observation_key = observation_intent_key(
+            record.session_id,
+            record.observation_intent->channel_generation,
+            record.observation_intent->intent_id
+        );
+        if (!body_digest || *body_digest != record.observation_intent->intent_digest) {
+            return std::unexpected(
+                std::string{"session registry observation body commitment mismatch"}
+            );
+        }
+        if (enqueue_intent) {
+            auto request_digest = hash_observation_intent_request(body, context);
+            wire::plan_runtime_header runtime;
+            const auto runtime_error =
+                glz::read<partial_read_options>(runtime, current_session.canonical_plan_json);
+            if (!request_digest || *request_digest != record.request_digest ||
+                record.idempotency_key != "intent-enqueue:" + record.request_digest ||
+                state.observation_intents.contains(observation_key) ||
+                state.quarantined_observation_intents.contains(observation_key) ||
+                current_session.state != "running" || runtime_error ||
+                runtime.runtime_id != record.observation_intent->runtime_id ||
+                record.observation_intent->profile_digest !=
+                    current_session.launch_profile_digest ||
+                record.observation_intent->issued_at_ms < current_session.running_at_ms) {
+                return std::unexpected(
+                    std::string{"session registry observation enqueue commitment mismatch"}
+                );
+            }
+            quarantine_reason = historical_observation_quarantine_reason(
+                state.channels.get(),
+                body,
+                record.observation_intent->expires_at_ms - record.observation_intent->issued_at_ms
+            );
+        } else {
+            const auto enqueued = state.observation_intents.find(observation_key);
+            const auto quarantined = state.quarantined_observation_intents.find(observation_key);
+            const bool active_original = enqueued != state.observation_intents.end();
+            const bool quarantined_original =
+                quarantined != state.quarantined_observation_intents.end();
+            if (active_original == quarantined_original ||
+                state.observation_dispositions.contains(observation_key) ||
+                (quarantined_original && quarantined->second.disposition_index.has_value())) {
+                return std::unexpected(
+                    std::string{"session registry observation disposition is orphaned"}
+                );
+            }
+            quarantined_disposition = quarantined_original;
+            const auto original_index =
+                active_original ? enqueued->second : quarantined->second.enqueue_index;
+            const auto& original = state.records[original_index];
+            if (!original.observation_intent ||
+                !same_observation_intent_binding(
+                    *record.observation_intent, *original.observation_intent
+                )) {
+                return std::unexpected(
+                    std::string{"session registry observation disposition crossed its binding"}
+                );
+            }
+            const auto disposition =
+                intent_disposition_from_wire(record.observation_intent->disposition);
+            const observation_intent_disposition update{
+                .session_id = record.session_id,
+                .channel_generation = record.observation_intent->channel_generation,
+                .intent_id = record.observation_intent->intent_id,
+                .intent_digest = record.observation_intent->intent_digest,
+                .disposition = disposition.value_or(intent_disposition::pending),
+                .decided_at_ms = record.observation_intent->decided_at_ms,
+            };
+            auto request_digest = hash_observation_intent_disposition(update);
+            if (!disposition || *disposition == intent_disposition::pending || !request_digest ||
+                *request_digest != record.request_digest ||
+                record.idempotency_key != "intent-disposition:" + record.request_digest) {
+                return std::unexpected(
+                    std::string{"session registry observation disposition commitment mismatch"}
+                );
+            }
+        }
+    } else if (record.state == "created") {
         if (existing != state.sessions.end()) {
             return std::unexpected(std::string{"session registry create transition is invalid"});
         }
@@ -358,14 +491,29 @@ auto accept_recovered_record(
             return std::unexpected(std::string{"session registry failure commitment mismatch"});
         }
     }
-    auto plan_digest = hash_plan(record.canonical_plan_json);
-    auto record_hash = hash_record(record);
-    if (!plan_digest || !record_hash || *plan_digest != record.plan_content_digest ||
-        *record_hash != record.this_hash) {
-        return std::unexpected(std::string{"session registry content commitment mismatch"});
-    }
     const auto index = state.records.size();
-    state.sessions.insert_or_assign(record.session_id, index);
+    if (enqueue_intent) {
+        if (quarantine_reason) {
+            state.quarantined_observation_intents.emplace(
+                observation_key,
+                quarantined_observation_state{
+                    .enqueue_index = index,
+                    .disposition_index = std::nullopt,
+                    .reason = *quarantine_reason,
+                }
+            );
+        } else {
+            state.observation_intents.emplace(observation_key, index);
+        }
+    } else if (set_intent_disposition) {
+        if (quarantined_disposition) {
+            state.quarantined_observation_intents.at(observation_key).disposition_index = index;
+        } else {
+            state.observation_dispositions.emplace(observation_key, index);
+        }
+    } else {
+        state.sessions.insert_or_assign(record.session_id, index);
+    }
     state.requests.emplace(record.idempotency_key, index);
     state.records.push_back(std::move(record));
     return {};

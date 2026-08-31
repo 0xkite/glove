@@ -38,6 +38,9 @@ struct session_mount {
     // runtime identity are committed; source paths and secret bytes are not.
     std::optional<std::string> secret_handle;
     std::optional<std::string> secret_runtime_id;
+    // Canonical identity of a factory-owned ephemeral local service catalog.
+    // It is launch-only evidence and is never persisted in registry formats.
+    std::optional<std::string> service_proxy_manifest_digest;
     bool writable = false;
     bool directory = false;
 };

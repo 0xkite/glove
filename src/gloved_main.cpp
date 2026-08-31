@@ -8,9 +8,12 @@
 #include "glove/supervisor/session_plan.hpp"
 #include "glove/version.hpp"
 
+#include "adapters/sage/guest_channel.hpp"
 #include "control/remote_session_runtime.hpp"
 
 #if defined(__linux__)
+#    include "glove/control/local_service_proxy.hpp"
+
 #    include "linux_session_executor.hpp"
 #    include "linux_session_preparation.hpp"
 #elif defined(__APPLE__)
@@ -30,6 +33,7 @@
 #    include <sys/random.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -39,6 +43,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -108,6 +113,7 @@ struct options {
     std::optional<std::filesystem::path> path_exposure_journal;
     std::optional<glove::host::apple_container_config> apple_container;
     std::optional<glove::host::remote_backend_config> remote_backend;
+    std::optional<glove::host::local_service_proxy_config> local_service_proxy;
 };
 
 auto parse_options(int argc, char** argv) -> std::expected<options, std::string> {
@@ -128,6 +134,7 @@ auto parse_options(int argc, char** argv) -> std::expected<options, std::string>
             .path_exposure_journal = configured->path_exposure_journal,
             .apple_container = configured->apple_container,
             .remote_backend = configured->remote_backend,
+            .local_service_proxy = configured->local_service_proxy,
         };
     }
     if (argc < 7 || argc > 19 || argc % 2 == 0) {
@@ -519,6 +526,35 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         return std::unexpected(instance_lock.error());
     }
     std::shared_ptr<glove::control::session_registry> sessions;
+    std::shared_ptr<const glove::control::channel_host> guest_channel_catalog;
+#if defined(__linux__)
+    std::shared_ptr<const glove::control::guest_channel_adapter_binding> guest_channel_adapter;
+    if (configured.local_service_proxy && configured.local_service_proxy->guest_channel_adapter) {
+        const auto& binding = *configured.local_service_proxy->guest_channel_adapter;
+        auto resolved = glove::adapters::sage::resolve_guest_channel_adapter(
+            binding.adapter_id, binding.channel_schema_id
+        );
+        if (!resolved) {
+            return std::unexpected(
+                std::string{"resolve guest channel adapter: "} + resolved.error()
+            );
+        }
+        guest_channel_adapter = std::move(*resolved);
+        guest_channel_catalog = guest_channel_adapter->channels;
+    }
+#elif defined(__APPLE__)
+    // Apple keeps registry admission for its explicit guest adapter, but G6
+    // local-service capability and socket composition remain Linux-only.
+    if (configured.apple_container && configured.apple_container->sage_guest) {
+        auto built = glove::adapters::sage::guest_channel_host();
+        if (!built) {
+            return std::unexpected(
+                std::string{"compose Sage guest channel catalog: "} + built.error()
+            );
+        }
+        guest_channel_catalog = std::move(*built);
+    }
+#endif
     if (configured.session_store) {
         std::shared_ptr<const glove::supervisor::library_bundle_store> library_bundles;
         if (configured.library_bundle_root) {
@@ -531,7 +567,11 @@ auto run(const options& configured) -> std::expected<void, std::string> {
                 std::make_shared<const glove::supervisor::library_bundle_store>(std::move(*opened));
         }
         auto opened = glove::control::session_registry::open_or_create(
-            *configured.session_store, plan_validator, std::move(library_bundles)
+            *configured.session_store,
+            plan_validator,
+            std::move(library_bundles),
+            glove::control::default_session_registry_bytes,
+            guest_channel_catalog
         );
         if (!opened) {
             return std::unexpected(std::string{"open session store: "} + opened.error().message);
@@ -539,6 +579,8 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         sessions = std::shared_ptr<glove::control::session_registry>{std::move(*opened)};
     }
     std::shared_ptr<glove::control::session_runtime> session_runtime;
+    std::shared_ptr<const glove::control::linux_detail::local_service_proxy_capability>
+        local_service_capability;
     if (configured.remote_backend) {
         if (!sessions) {
             return std::unexpected(std::string{"remote runtime requires managed-session storage"});
@@ -569,7 +611,44 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         session_runtime = std::move(*runtime);
     }
 #if defined(__linux__)
-    std::optional<glove::control::linux_detail::linux_session_preparer> session_preparer;
+    std::shared_ptr<glove::control::linux_detail::local_service_proxy_factory>
+        local_service_factory;
+    if (configured.local_service_proxy) {
+        auto audit = glove::audit::make_jsonl_sink(
+            configured.journal.parent_path() / glove::host::local_service_audit_filename
+        );
+        if (!audit) {
+            return std::unexpected(
+                std::string{"open local service audit journal: "} + audit.error()
+            );
+        }
+        glove::control::linux_detail::local_service_proxy_options proxy_options{
+            .runtime_root = configured.runtime_directory,
+            .io_timeout_ms = configured.local_service_proxy->io_timeout_ms,
+            .max_concurrency = configured.local_service_proxy->max_concurrency,
+            .endpoints = {},
+            .audit = std::move(*audit),
+            .guest_channel_adapter = guest_channel_adapter,
+        };
+        proxy_options.endpoints.reserve(configured.local_service_proxy->endpoints.size());
+        for (const auto& endpoint : configured.local_service_proxy->endpoints) {
+            proxy_options.endpoints.push_back({
+                .alias = endpoint.alias,
+                .socket_path = endpoint.socket_path,
+                .runtime_ids = endpoint.runtime_ids,
+            });
+        }
+        auto factory = glove::control::linux_detail::local_service_proxy_factory::create(
+            std::move(proxy_options), sessions
+        );
+        if (!factory) {
+            return std::unexpected(
+                std::string{"create local service proxy factory: "} + factory.error()
+            );
+        }
+        local_service_factory = std::move(*factory);
+    }
+    std::shared_ptr<glove::control::linux_detail::linux_session_preparer> session_preparer;
     if (configured.materialization_root && !configured.remote_backend) {
         if (auto valid = validate_materialization_root(*configured.materialization_root); !valid) {
             return std::unexpected(valid.error());
@@ -580,23 +659,43 @@ auto run(const options& configured) -> std::expected<void, std::string> {
             return std::unexpected(std::string{"open egress audit journal: "} + audit.error());
         }
         auto prepared = glove::control::linux_detail::linux_session_preparer::create(
-            configured.materialization_root->string(), std::move(*audit)
+            configured.materialization_root->string(), std::move(*audit), local_service_factory
         );
         if (!prepared) {
             return std::unexpected(
                 std::string{"prepare Linux session runtime: "} + prepared.error()
             );
         }
-        session_preparer.emplace(std::move(*prepared));
+        try {
+            session_preparer =
+                std::make_shared<glove::control::linux_detail::linux_session_preparer>(
+                    std::move(*prepared)
+                );
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(std::string{"allocate Linux session preparer"});
+        }
         auto runtime = glove::control::linux_detail::linux_session_runtime::create(
-            *sessions, *session_preparer, {}
+            sessions, session_preparer, {}
         );
         if (!runtime) {
             return std::unexpected(std::string{"create Linux session runtime: "} + runtime.error());
         }
-        session_runtime = std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
-            std::move(*runtime)
+        auto concrete_runtime =
+            std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
+                std::move(*runtime)
         };
+        if (local_service_factory) {
+            auto sealed = local_service_factory->try_seal(concrete_runtime);
+            if (!sealed) {
+                return std::unexpected(
+                    std::string{"construct local service proxy capability: "} + sealed.error()
+                );
+            }
+            if (*sealed) {
+                local_service_capability = std::move(**sealed);
+            }
+        }
+        session_runtime = std::move(concrete_runtime);
     }
 #elif defined(__APPLE__)
     if (configured.apple_container) {
@@ -617,6 +716,25 @@ auto run(const options& configured) -> std::expected<void, std::string> {
                 .image_reference = configured.apple_container->image,
                 .image_digest = configured.apple_container->image_digest,
                 .harness_closure_digest = configured.apple_container->harness_closure_digest,
+                .sage_guest =
+                    configured.apple_container->sage_guest
+                        ? std::optional<
+                              glove::control::apple_detail::
+                                  sage_guest_runtime_identity>{glove::control::apple_detail::sage_guest_runtime_identity{
+                              .binary_digest = configured.apple_container
+                                                   ->sage_guest
+                                                   ->binary_digest,
+                              .source_revision = configured.apple_container
+                                                     ->sage_guest
+                                                     ->source_revision,
+                              .policy_schema_version = configured.apple_container
+                                                           ->sage_guest
+                                                           ->policy_schema_version,
+                              .library_projection_schema = configured.apple_container
+                                                               ->sage_guest
+                                                               ->library_projection_schema,
+                          }}
+                        : std::nullopt,
                 .egress_audit = std::move(*audit),
                 .session_root = *configured.materialization_root,
             }
@@ -629,7 +747,7 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         session_runtime =
             std::shared_ptr<glove::control::apple_detail::apple_container_session_runtime>{
                 std::move(*runtime)
-            };
+        };
     } else if (configured.materialization_root) {
         return std::unexpected(
             std::string{"managed session launch requires Apple Container configuration"}
@@ -661,6 +779,7 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         .plan_validator = std::move(plan_validator),
         .sessions = std::move(sessions),
         .session_runtime = std::move(session_runtime),
+        .local_services = std::move(local_service_capability),
         .path_exposures = std::move(path_exposures),
         .materialization_root = configured.materialization_root
                                     ? configured.materialization_root->string()

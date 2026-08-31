@@ -322,6 +322,7 @@ auto run() -> int {
         .plan_validator = {},
         .sessions = {},
         .session_runtime = {},
+        .local_services = {},
         .path_exposures = {},
         .materialization_root = {},
         .io_timeout_ms = 100,

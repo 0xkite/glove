@@ -148,6 +148,7 @@ struct mount_projection_state {
     std::optional<std::string> runtime_context_digest;
     std::optional<std::string> runtime_adoption_manifest_digest;
     std::optional<std::string> runtime_adoption_snapshot_digest;
+    std::optional<std::string> service_proxy_manifest_digest;
 };
 
 auto valid_mount_source_identity(const supervisor::linux_detail::session_mount& mount) -> bool {
@@ -203,15 +204,16 @@ auto validate_secret_mount(const supervisor::linux_detail::session_mount& mount)
         !valid_mount_source_identity(mount) || mount.source_content_digest || mount.projection_id ||
         mount.projection_destination_alias || mount.runtime_adapter_id ||
         mount.runtime_context_digest || mount.runtime_adoption_manifest_digest ||
-        mount.runtime_adoption_snapshot_digest || !mount.quota_partition.empty() ||
-        mount.quota_bytes != 0 || mount.directory) {
+        mount.runtime_adoption_snapshot_digest || mount.service_proxy_manifest_digest ||
+        !mount.quota_partition.empty() || mount.quota_bytes != 0 || mount.directory) {
         return std::unexpected(std::string{"invalid managed launch secret projection"});
     }
     return {};
 }
 
-auto validate_read_only_mount(const supervisor::linux_detail::session_mount& mount)
-    -> std::expected<void, std::string> {
+auto validate_read_only_mount(
+    const supervisor::linux_detail::session_mount& mount, mount_projection_state& state
+) -> std::expected<void, std::string> {
     if (!mount.quota_partition.empty() || mount.quota_bytes != 0 ||
         !valid_mount_source_identity(mount) || mount.runtime_adapter_id ||
         mount.runtime_context_digest || mount.runtime_adoption_manifest_digest ||
@@ -221,6 +223,18 @@ auto validate_read_only_mount(const supervisor::linux_detail::session_mount& mou
     const bool has_secret = mount.secret_handle.has_value() || mount.secret_runtime_id.has_value();
     if (has_secret) {
         return validate_secret_mount(mount);
+    }
+    if (mount.service_proxy_manifest_digest) {
+        const auto mode = static_cast<mode_t>(mount.source_identity->mode);
+        if (state.service_proxy_manifest_digest ||
+            !valid_digest(*mount.service_proxy_manifest_digest) ||
+            mount.alias != "local-services" || mount.target_path != "/run/glove-services/local" ||
+            !mount.directory || !S_ISDIR(mode) || mount.source_content_digest ||
+            mount.projection_id || mount.projection_destination_alias) {
+            return std::unexpected(std::string{"invalid managed local service projection"});
+        }
+        state.service_proxy_manifest_digest = *mount.service_proxy_manifest_digest;
+        return {};
     }
     const bool has_projection_evidence = mount.source_content_digest.has_value() ||
                                          mount.projection_id.has_value() ||
@@ -251,7 +265,7 @@ auto validate_writable_mount(
         return std::unexpected(std::string{"invalid managed launch writable projection"});
     }
     if (mount.source_content_digest || mount.projection_id || mount.projection_destination_alias ||
-        mount.secret_handle || mount.secret_runtime_id) {
+        mount.secret_handle || mount.secret_runtime_id || mount.service_proxy_manifest_digest) {
         return std::unexpected(
             std::string{"writable managed launch projection has content digest"}
         );
@@ -319,7 +333,8 @@ auto validate_mount_projection_entry(
     if (auto reserved = reserve_mount_projection(mount, state); !reserved) {
         return reserved;
     }
-    return mount.writable ? validate_writable_mount(mount, state) : validate_read_only_mount(mount);
+    return mount.writable ? validate_writable_mount(mount, state)
+                          : validate_read_only_mount(mount, state);
 }
 
 auto validate_mount_projection(
@@ -487,6 +502,18 @@ auto bind_managed_launch_projection_from_fd(
     if (auto valid = validate_mount_projection(mounts, limits, checked->managed_home_dir); !valid) {
         return std::unexpected(valid.error());
     }
+    constexpr std::string_view local_service_environment =
+        "GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local";
+    const auto service_mounts = std::ranges::count_if(mounts, [](const auto& mount) {
+        return mount.service_proxy_manifest_digest.has_value();
+    });
+    const auto service_environment =
+        std::ranges::count(checked->environment, local_service_environment);
+    if (service_mounts != service_environment || service_mounts > 1) {
+        return std::unexpected(
+            std::string{"managed local service mount and environment must be paired"}
+        );
+    }
     if (checked->work_dir && std::ranges::none_of(mounts, [&](const auto& mount) {
             return path_within(
                 std::filesystem::path{mount.target_path}, std::filesystem::path{*checked->work_dir}
@@ -576,6 +603,10 @@ auto bind_managed_launch_projection_from_fd(
             encoder.append_string(*mount.secret_handle);
             encoder.append_string(*mount.secret_runtime_id);
         }
+        if (mount.service_proxy_manifest_digest) {
+            encoder.append_string("glove.managed-launch-local-service");
+            encoder.append_string(*mount.service_proxy_manifest_digest);
+        }
     }
     // Preserve the version-1 digest for offline launches while binding the
     // exact ephemeral proxy capability whenever egress is present. This
@@ -596,7 +627,11 @@ auto bind_managed_launch_projection_from_fd(
         return std::unexpected(digest.error());
     }
     std::vector<library_projection_receipt> library_projections;
+    std::optional<std::string> service_proxy_manifest_digest;
     for (const auto& mount : ordered_mounts) {
+        if (mount.service_proxy_manifest_digest) {
+            service_proxy_manifest_digest = mount.service_proxy_manifest_digest;
+        }
         if (mount.source_content_digest) {
             library_projections.push_back({
                 .projection_id = *mount.projection_id,
@@ -610,6 +645,7 @@ auto bind_managed_launch_projection_from_fd(
         .controller_plan_digest = std::string{controller_plan_digest},
         .profile_digest = std::move(*digest),
         .library_projections = std::move(library_projections),
+        .service_proxy_manifest_digest = std::move(service_proxy_manifest_digest),
     };
 }
 

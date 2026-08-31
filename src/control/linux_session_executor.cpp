@@ -3,6 +3,7 @@
 #include "linux_process_identity.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +25,9 @@ namespace glove::control::linux_detail {
 namespace {
 
 constexpr std::size_t max_idempotency_namespace_bytes = 112U;
+constexpr std::array<std::string_view, 5> managed_runtime_catalog{
+    "codex", "claude-code", "pi", "copilot", "opencode"
+};
 
 auto valid_identifier(std::string_view value, std::size_t max_bytes = 128U) -> bool {
     return !value.empty() && value.size() <= max_bytes &&
@@ -193,6 +197,7 @@ struct linux_pty_session::implementation {
     std::optional<session_running_commitment> running_commitment;
     std::unique_ptr<container::linux_detail::managed_pty_session> managed;
     std::unique_ptr<net::egress_proxy> egress_proxy;
+    std::unique_ptr<local_service_proxy_session> local_service_proxy;
     std::mutex transition_mutex;
     std::mutex state_mutex;
     std::condition_variable state_changed;
@@ -212,19 +217,19 @@ struct linux_pty_session_index::implementation {
 
 struct linux_session_runtime::implementation {
     implementation(
-        session_registry& session_registry,
-        linux_session_preparer& session_preparer,
+        std::shared_ptr<session_registry> session_registry,
+        std::shared_ptr<linux_session_preparer> session_preparer,
         container::linux_detail::managed_pty_session_options pty_options,
         std::unique_ptr<linux_pty_session_index> live_sessions
     )
-        : registry{&session_registry},
-          preparer{&session_preparer},
-          options{pty_options},
+        : registry{std::move(session_registry)},
+          preparer{std::move(session_preparer)},
+          options{std::move(pty_options)},
           sessions{std::move(live_sessions)},
-          refinement_available{session_registry.library_projections_available()} {}
+          refinement_available{registry->library_projections_available()} {}
 
-    session_registry* registry = nullptr;
-    linux_session_preparer* preparer = nullptr;
+    std::shared_ptr<session_registry> registry;
+    std::shared_ptr<linux_session_preparer> preparer;
     container::linux_detail::managed_pty_session_options options;
     std::unique_ptr<linux_pty_session_index> sessions;
     std::optional<session_reconciliation_report> reconciliation;
@@ -545,22 +550,52 @@ linux_session_runtime::linux_session_runtime(
 linux_session_runtime::~linux_session_runtime() = default;
 
 auto linux_session_runtime::create(
-    session_registry& registry,
-    linux_session_preparer& preparer,
+    std::shared_ptr<session_registry> registry,
+    std::shared_ptr<linux_session_preparer> preparer,
     container::linux_detail::managed_pty_session_options options,
     std::size_t max_sessions
 ) -> std::expected<std::unique_ptr<linux_session_runtime>, std::string> {
+    if (!registry || !preparer) {
+        return std::unexpected(std::string{"invalid Linux session runtime ownership"});
+    }
     auto sessions = linux_pty_session_index::create(max_sessions);
     if (!sessions) {
         return std::unexpected(sessions.error());
     }
     try {
-        auto state =
-            std::make_unique<implementation>(registry, preparer, options, std::move(*sessions));
+        auto state = std::make_unique<implementation>(
+            std::move(registry), std::move(preparer), std::move(options), std::move(*sessions)
+        );
         return std::make_unique<linux_session_runtime>(construction_token{}, std::move(state));
     } catch (const std::bad_alloc&) {
         return std::unexpected(std::string{"allocate Linux session runtime"});
     }
+}
+
+auto linux_session_runtime::local_service_factory() const noexcept
+    -> const local_service_proxy_factory* {
+    return state_ && state_->preparer ? state_->preparer->local_service_factory() : nullptr;
+}
+
+auto linux_session_runtime::registry_identity() const noexcept -> const session_registry* {
+    return state_ ? state_->registry.get() : nullptr;
+}
+
+auto linux_session_runtime::managed_runtime_ids() const -> std::vector<std::string> {
+    std::vector<std::string> runtime_ids;
+    runtime_ids.reserve(managed_runtime_catalog.size());
+    for (const auto runtime_id : managed_runtime_catalog) {
+        runtime_ids.emplace_back(runtime_id);
+    }
+    return runtime_ids;
+}
+
+auto linux_session_runtime::local_service_runtime_intersection(
+    const local_service_proxy_factory& factory
+) const noexcept -> bool {
+    return std::ranges::any_of(managed_runtime_catalog, [&](const auto runtime_id) {
+        return factory.adapter_manages_runtime(runtime_id);
+    });
 }
 
 auto linux_session_runtime::resource_capabilities() const noexcept
@@ -847,6 +882,7 @@ auto start_linux_pty_session(
         return std::unexpected(std::string{"allocate Linux PTY session owner"});
     }
     owner->state_->egress_proxy = std::move(prepared->egress_proxy);
+    owner->state_->local_service_proxy = std::move(prepared->local_service_proxy);
     auto starting = registry.mark_starting(
         prepared->execution_binding(), owner->state_->reservation, starting_key, transition_time()
     );

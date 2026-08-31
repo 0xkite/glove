@@ -12,6 +12,19 @@
 
 namespace glove::container::linux_detail {
 
+enum class linux_session_prerequisite : std::uint8_t {
+    available,
+    user_namespace_unavailable,
+    cgroup_v2_unavailable,
+    cgroup_controllers_unavailable,
+    cgroup_delegation_unavailable,
+};
+
+// Read-only host probe for tests and diagnostics. Only a returned unavailable
+// state is suitable for an environment skip; probe errors remain failures.
+[[nodiscard]] auto probe_linux_session_prerequisite()
+    -> std::expected<linux_session_prerequisite, std::string>;
+
 struct cgroup_observation {
     std::uint64_t cpu_time_ms = 0;
     std::uint64_t peak_memory_bytes = 0;

@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -48,6 +49,223 @@ constexpr std::size_t max_bundle_entries = 4'096U;
 constexpr std::size_t max_entry_bytes = 1024U * 1024U;
 constexpr std::size_t max_projection_bytes = 16U * 1024U * 1024U;
 constexpr std::size_t max_skill_directory_bytes = 255U;
+constexpr std::size_t max_json_nesting = 64U;
+
+class unique_member_json_parser {
+public:
+    explicit unique_member_json_parser(std::string_view input) : input_(input) {}
+
+    [[nodiscard]] auto parse() -> bool {
+        skip_whitespace();
+        if (!parse_value(0U)) {
+            return false;
+        }
+        skip_whitespace();
+        return position_ == input_.size();
+    }
+
+private:
+    auto skip_whitespace() -> void {
+        while (position_ < input_.size()) {
+            const auto byte = input_.at(position_);
+            if (byte != ' ' && byte != '\t' && byte != '\n' && byte != '\r') {
+                return;
+            }
+            ++position_;
+        }
+    }
+
+    [[nodiscard]] auto consume(char expected) -> bool {
+        const auto matches = position_ < input_.size() && input_.at(position_) == expected;
+        if (matches) {
+            ++position_;
+        }
+        return matches;
+    }
+
+    [[nodiscard]] auto consume_literal(std::string_view literal) -> bool {
+        const auto matches = input_.substr(position_, literal.size()) == literal;
+        if (matches) {
+            position_ += literal.size();
+        }
+        return matches;
+    }
+
+    [[nodiscard]] auto parse_string() -> std::optional<std::string_view> {
+        if (!consume('"')) {
+            return std::nullopt;
+        }
+        const auto start = position_ - 1U;
+        while (position_ < input_.size()) {
+            const auto byte = static_cast<unsigned char>(input_.at(position_++));
+            if (byte == static_cast<unsigned char>('"')) {
+                return input_.substr(start, position_ - start);
+            }
+            if (byte < 0x20U) {
+                return std::nullopt;
+            }
+            if (byte == static_cast<unsigned char>('\\')) {
+                if (position_ >= input_.size()) {
+                    return std::nullopt;
+                }
+                ++position_;
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] static auto is_digit(char byte) -> bool { return byte >= '0' && byte <= '9'; }
+
+    [[nodiscard]] auto consume_digits() -> bool {
+        const auto start = position_;
+        while (position_ < input_.size() && is_digit(input_.at(position_))) {
+            ++position_;
+        }
+        return position_ != start;
+    }
+
+    [[nodiscard]] auto parse_integer_part() -> bool {
+        if (position_ >= input_.size()) {
+            return false;
+        }
+        if (input_.at(position_) == '0') {
+            ++position_;
+            return position_ >= input_.size() || !is_digit(input_.at(position_));
+        }
+        const auto first = input_.at(position_);
+        return first >= '1' && first <= '9' && consume_digits();
+    }
+
+    [[nodiscard]] auto parse_fraction() -> bool {
+        if (position_ >= input_.size() || input_.at(position_) != '.') {
+            return true;
+        }
+        ++position_;
+        return consume_digits();
+    }
+
+    [[nodiscard]] auto parse_exponent() -> bool {
+        if (position_ >= input_.size()) {
+            return true;
+        }
+        const auto marker = input_.at(position_);
+        if (marker != 'e' && marker != 'E') {
+            return true;
+        }
+        ++position_;
+        if (position_ < input_.size()) {
+            const auto sign = input_.at(position_);
+            if (sign == '+' || sign == '-') {
+                ++position_;
+            }
+        }
+        return consume_digits();
+    }
+
+    [[nodiscard]] auto parse_number() -> bool {
+        if (position_ < input_.size() && input_.at(position_) == '-') {
+            ++position_;
+        }
+        return parse_integer_part() && parse_fraction() && parse_exponent();
+    }
+
+    [[nodiscard]] auto parse_object(std::size_t depth) -> bool {
+        if (depth >= max_json_nesting || !consume('{')) {
+            return false;
+        }
+        skip_whitespace();
+        if (consume('}')) {
+            return true;
+        }
+
+        std::set<std::string, std::less<>> keys;
+        while (true) {
+            const auto raw_key = parse_string();
+            if (!raw_key) {
+                return false;
+            }
+            auto key = glz::read_json<std::string>(*raw_key);
+            if (!key || !keys.emplace(std::move(*key)).second) {
+                return false;
+            }
+            skip_whitespace();
+            if (!consume(':')) {
+                return false;
+            }
+            skip_whitespace();
+            if (!parse_value(depth + 1U)) {
+                return false;
+            }
+            skip_whitespace();
+            if (consume('}')) {
+                return true;
+            }
+            if (!consume(',')) {
+                return false;
+            }
+            skip_whitespace();
+        }
+    }
+
+    [[nodiscard]] auto parse_array(std::size_t depth) -> bool {
+        if (depth >= max_json_nesting || !consume('[')) {
+            return false;
+        }
+        skip_whitespace();
+        if (consume(']')) {
+            return true;
+        }
+        while (true) {
+            if (!parse_value(depth + 1U)) {
+                return false;
+            }
+            skip_whitespace();
+            if (consume(']')) {
+                return true;
+            }
+            if (!consume(',')) {
+                return false;
+            }
+            skip_whitespace();
+        }
+    }
+
+    [[nodiscard]] auto parse_value(std::size_t depth) -> bool {
+        if (position_ >= input_.size()) {
+            return false;
+        }
+        switch (input_.at(position_)) {
+        case '{':
+            return parse_object(depth);
+        case '[':
+            return parse_array(depth);
+        case '"':
+            return parse_string().has_value();
+        case 't':
+            return consume_literal("true");
+        case 'f':
+            return consume_literal("false");
+        case 'n':
+            return consume_literal("null");
+        default:
+            return parse_number();
+        }
+    }
+
+    std::string_view input_;
+    std::size_t position_ = 0;
+};
+
+[[nodiscard]] auto has_unique_json_object_members(std::string_view input) noexcept -> bool {
+    if (input.empty() || input.size() > max_library_bundle_bytes) {
+        return false;
+    }
+    try {
+        return unique_member_json_parser{input}.parse();
+    } catch (...) {
+        return false;
+    }
+}
 
 auto valid_digest(std::string_view value) -> bool {
     return value.size() == 64U && std::ranges::all_of(value, [](char character) {
@@ -75,6 +293,10 @@ auto valid_skill_directory_name(std::string_view projection_id, std::string_view
     return projection_id.size() <= max_skill_directory_bytes &&
            key.size() < max_skill_directory_bytes &&
            projection_id.size() <= max_skill_directory_bytes - key.size() - 1U;
+}
+
+auto known_unmaterialized_bundle_kind(std::string_view kind) -> bool {
+    return kind == "behavior" || kind == "prompt" || kind == "template" || kind == "workflow";
 }
 
 auto read_bundle(const resolved_library_bundle& bundle) -> std::expected<std::string, std::string> {
@@ -106,6 +328,9 @@ auto decode_bundle(const resolved_library_bundle& bundle)
     if (!bytes) {
         return std::unexpected(bytes.error());
     }
+    if (!has_unique_json_object_members(*bytes)) {
+        return std::unexpected(std::string{"Codex bundle JSON is invalid"});
+    }
     wire::bundle_document document;
     std::string parse_buffer{*bytes};
     if (const auto error = glz::read<strict_read_options>(document, parse_buffer); error) {
@@ -113,6 +338,7 @@ auto decode_bundle(const resolved_library_bundle& bundle)
     }
     if (document.schema_version != 1 || document.source_library_ref.empty() ||
         document.source_library_ref.size() > 512U ||
+        document.source_library_ref.find('\0') != std::string::npos ||
         !valid_digest(document.source_manifest_digest) ||
         document.entries.size() > max_bundle_entries) {
         return std::unexpected(std::string{"Codex bundle schema is invalid"});
@@ -182,6 +408,7 @@ auto resolve_codex_runtime_projection(const std::vector<resolved_library_project
     -> std::expected<codex_runtime_projection, std::string> {
     codex_runtime_projection projection;
     std::set<std::pair<std::string, std::string>> identities;
+    std::size_t total_entries = 0;
     std::size_t total_bytes = 0;
     for (const auto& bundle_projection : bundles) {
         if (!valid_projection_id(bundle_projection.projection_id) ||
@@ -193,8 +420,12 @@ auto resolve_codex_runtime_projection(const std::vector<resolved_library_project
             return std::unexpected(document.error());
         }
         for (const auto& entry : document->entries) {
-            if (entry.kind != "skill" || !valid_skill_key(entry.key) ||
-                !valid_skill_directory_name(bundle_projection.projection_id, entry.key) ||
+            const bool materialize = entry.kind == "skill";
+            if (total_entries == max_bundle_entries ||
+                (!materialize && !known_unmaterialized_bundle_kind(entry.kind)) ||
+                !valid_skill_key(entry.key) ||
+                (materialize &&
+                 !valid_skill_directory_name(bundle_projection.projection_id, entry.key)) ||
                 !valid_digest(entry.content_digest) || entry.content.empty() ||
                 entry.content.size() > max_entry_bytes ||
                 entry.content.find('\0') != std::string::npos ||
@@ -207,46 +438,71 @@ auto resolve_codex_runtime_projection(const std::vector<resolved_library_project
                 entry.content.size() > max_projection_bytes - total_bytes) {
                 return std::unexpected(std::string{"Codex bundle entry digest or size is invalid"});
             }
+
+            ++total_entries;
             total_bytes += entry.content.size();
-            projection.skills.push_back({
-                .projection_id = bundle_projection.projection_id,
-                .bundle_content_digest = std::string{bundle_projection.bundle.content_digest()},
-                .key = entry.key,
-                .content_digest = entry.content_digest,
-                .content = entry.content,
-            });
+            if (materialize) {
+                projection.skills.push_back({
+                    .projection_id = bundle_projection.projection_id,
+                    .bundle_content_digest = std::string{bundle_projection.bundle.content_digest()},
+                    .key = entry.key,
+                    .content_digest = entry.content_digest,
+                    .content = entry.content,
+                });
+            } else {
+                projection.unmaterialized_entries.push_back({
+                    .projection_id = bundle_projection.projection_id,
+                    .bundle_content_digest = std::string{bundle_projection.bundle.content_digest()},
+                    .key = entry.key,
+                    .kind = entry.kind,
+                    .content_digest = entry.content_digest,
+                    .content_size = entry.content.size(),
+                });
+            }
         }
     }
-    std::ranges::sort(projection.skills, [](const auto& left, const auto& right) {
+    const auto by_identity = [](const auto& left, const auto& right) {
         return std::tie(left.projection_id, left.key) < std::tie(right.projection_id, right.key);
-    });
+    };
+    std::ranges::sort(projection.skills, by_identity);
+    std::ranges::sort(projection.unmaterialized_entries, by_identity);
     return projection;
 }
 
 auto codex_runtime_projection_digest(const codex_runtime_projection& projection)
     -> std::expected<std::string, std::string> {
-    if (projection.skills.size() > max_bundle_entries) {
-        return std::unexpected(std::string{"Codex projection exceeds its skill bound"});
+    if (projection.skills.size() > max_bundle_entries ||
+        projection.unmaterialized_entries.size() > max_bundle_entries - projection.skills.size()) {
+        return std::unexpected(std::string{"Codex projection exceeds its entry bound"});
     }
     canonical_encoder encoder;
-    if (auto appended = encoder.append_string("glove.codex-runtime-projection"); !appended) {
-        return std::unexpected(appended.error());
+    for (const std::string_view domain : {
+             std::string_view{"glove.codex-runtime-projection.v2"},
+             std::string_view{"materialized-skills.v1"},
+         }) {
+        if (auto appended = encoder.append_string(domain); !appended) {
+            return std::unexpected(appended.error());
+        }
     }
     if (auto appended = encoder.append_size(projection.skills.size()); !appended) {
         return std::unexpected(appended.error());
     }
+    std::set<std::pair<std::string, std::string>> identities;
     std::pair<std::string, std::string> previous;
     bool have_previous = false;
+    std::size_t total_bytes = 0;
     for (const auto& skill : projection.skills) {
         if (!valid_projection_id(skill.projection_id) ||
             !valid_digest(skill.bundle_content_digest) || !valid_skill_key(skill.key) ||
             !valid_digest(skill.content_digest) || skill.content.empty() ||
             !valid_skill_directory_name(skill.projection_id, skill.key) ||
-            skill.content.size() > max_entry_bytes) {
+            skill.content.size() > max_entry_bytes ||
+            skill.content.find('\0') != std::string::npos ||
+            skill.content.size() > max_projection_bytes - total_bytes) {
             return std::unexpected(std::string{"Codex projection is invalid"});
         }
         const auto identity = std::pair{skill.projection_id, skill.key};
-        if (have_previous && identity <= previous) {
+        if ((have_previous && identity <= previous) || !identities.insert(identity).second) {
             return std::unexpected(std::string{"Codex projection is not canonically ordered"});
         }
         const auto* raw = reinterpret_cast<const unsigned char*>(skill.content.data());
@@ -259,12 +515,56 @@ auto codex_runtime_projection_digest(const codex_runtime_projection& projection)
                  std::string_view{skill.projection_id},
                  std::string_view{skill.bundle_content_digest},
                  std::string_view{skill.key},
+                 std::string_view{"skill"},
                  std::string_view{skill.content_digest},
              }) {
             if (auto appended = encoder.append_string(value); !appended) {
                 return std::unexpected(appended.error());
             }
         }
+        if (auto appended = encoder.append_size(skill.content.size()); !appended) {
+            return std::unexpected(appended.error());
+        }
+        total_bytes += skill.content.size();
+        previous = identity;
+        have_previous = true;
+    }
+
+    if (auto appended = encoder.append_string("unmaterialized-known-entries.v1"); !appended) {
+        return std::unexpected(appended.error());
+    }
+    if (auto appended = encoder.append_size(projection.unmaterialized_entries.size()); !appended) {
+        return std::unexpected(appended.error());
+    }
+    previous = {};
+    have_previous = false;
+    for (const auto& entry : projection.unmaterialized_entries) {
+        if (!valid_projection_id(entry.projection_id) ||
+            !valid_digest(entry.bundle_content_digest) || !valid_skill_key(entry.key) ||
+            !known_unmaterialized_bundle_kind(entry.kind) || !valid_digest(entry.content_digest) ||
+            entry.content_size == 0U || entry.content_size > max_entry_bytes ||
+            entry.content_size > max_projection_bytes - total_bytes) {
+            return std::unexpected(std::string{"Codex unmaterialized entry is invalid"});
+        }
+        const auto identity = std::pair{entry.projection_id, entry.key};
+        if ((have_previous && identity <= previous) || !identities.insert(identity).second) {
+            return std::unexpected(std::string{"Codex projection contains a duplicate identity"});
+        }
+        for (const std::string_view value : {
+                 std::string_view{entry.projection_id},
+                 std::string_view{entry.bundle_content_digest},
+                 std::string_view{entry.key},
+                 std::string_view{entry.kind},
+                 std::string_view{entry.content_digest},
+             }) {
+            if (auto appended = encoder.append_string(value); !appended) {
+                return std::unexpected(appended.error());
+            }
+        }
+        if (auto appended = encoder.append_size(entry.content_size); !appended) {
+            return std::unexpected(appended.error());
+        }
+        total_bytes += entry.content_size;
         previous = identity;
         have_previous = true;
     }

@@ -216,6 +216,7 @@ auto natural_exit_terminal_test(
                         .runtime_adoption_snapshot_digest = std::nullopt,
                         .secret_handle = "codex-auth",
                         .secret_runtime_id = "codex",
+                        .service_proxy_manifest_digest = std::nullopt,
                         .writable = true,
                         .directory = false,
                     }},

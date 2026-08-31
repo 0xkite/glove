@@ -8,11 +8,33 @@
 #include <exception>
 #include <new>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 namespace glove::container::linux_detail {
 
 namespace {
+
+class input_fd_guard final {
+public:
+    explicit input_fd_guard(int descriptor) noexcept : descriptor_{descriptor} {}
+
+    input_fd_guard(const input_fd_guard&) = delete;
+    auto operator=(const input_fd_guard&) -> input_fd_guard& = delete;
+    input_fd_guard(input_fd_guard&&) = delete;
+    auto operator=(input_fd_guard&&) -> input_fd_guard& = delete;
+
+    ~input_fd_guard() {
+        if (descriptor_ >= 0) {
+            ::close(descriptor_);
+        }
+    }
+
+    void release() noexcept { descriptor_ = -1; }
+
+private:
+    int descriptor_ = -1;
+};
 
 class cgroup_termination_failure final : public std::exception {
 public:
@@ -103,8 +125,15 @@ void linux_resource_lifecycle::release_secret_resources() noexcept {
             ::close(descriptor);
         }
     }
+    for (auto& mount : service_mounts_) {
+        if (mount.descriptor_fd >= 0) {
+            ::close(mount.descriptor_fd);
+            mount.descriptor_fd = -1;
+        }
+    }
     secret_mounts_.clear();
     secret_lease_locks_.clear();
+    service_mounts_.clear();
 }
 
 auto linux_resource_lifecycle::install_secret_mounts(
@@ -138,6 +167,25 @@ auto linux_resource_lifecycle::install_secret_mounts(
     }
     secret_mounts_ = std::move(mounts);
     secret_lease_locks_ = std::move(lease_locks);
+    return {};
+}
+
+auto linux_resource_lifecycle::install_service_mount(supervisor::linux_detail::session_mount mount)
+    -> std::expected<void, std::string> {
+    input_fd_guard input{mount.descriptor_fd};
+    if (!service_mounts_.empty() || mount.descriptor_fd < 0 || mount.writable || !mount.directory ||
+        mount.alias != "local-services" || mount.target_path != "/run/glove-services/local" ||
+        !mount.source_identity || !mount.service_proxy_manifest_digest) {
+        return std::unexpected(std::string{"invalid Linux local service mount"});
+    }
+    try {
+        service_mounts_.reserve(1U);
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(std::string{"allocate Linux local service mount"});
+    }
+    static_assert(std::is_nothrow_move_constructible_v<decltype(mount)>);
+    service_mounts_.push_back(std::move(mount));
+    input.release();
     return {};
 }
 

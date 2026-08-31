@@ -3,6 +3,7 @@
 #include "glove/supervisor/harness_adoption.hpp"
 #include "glove/supervisor/library_bundle.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -77,22 +78,42 @@ struct native_skill_projection {
     auto operator==(const native_skill_projection&) const -> bool = default;
 };
 
+struct native_unmaterialized_entry_projection {
+    std::string projection_id;
+    std::string bundle_content_digest;
+    std::string key;
+    std::string kind;
+    std::string content_digest;
+    std::size_t content_size = 0;
+
+    auto operator==(const native_unmaterialized_entry_projection&) const -> bool = default;
+};
+
 struct native_skill_runtime_projection {
     std::vector<native_skill_projection> skills;
+    // Validated known entries without an Agent Skills materialization. A runtime
+    // must retain the verified raw bundle or reject this projection before effects.
+    std::vector<native_unmaterialized_entry_projection> unmaterialized_entries;
 
     auto operator==(const native_skill_runtime_projection&) const -> bool = default;
 };
 
-// Decode identity-pinned Sage bundles into the shared Agent Skills format.
-// Every supported harness uses a private native location for these exact
-// SKILL.md bytes; unsupported entry kinds fail closed.
+// Decode identity-pinned Sage bundles into the shared Agent Skills format while
+// retaining known non-skill metadata. Unknown entry kinds fail closed.
 [[nodiscard]] auto resolve_native_skill_runtime_projection(
     const native_skill_runtime_adapter& adapter,
     const std::vector<resolved_library_projection>& bundles
 ) -> std::expected<native_skill_runtime_projection, std::string>;
 
-// Commitment includes the adapter ID as well as every projected skill, so a
-// valid context for one harness cannot be rebound as another harness's home.
+// True when accepting the native-only materialization would omit known validated
+// entries. A runtime without the verified raw bundles must reject before effects.
+[[nodiscard]] auto native_skill_runtime_projection_requires_raw_bundle(
+    const native_skill_runtime_projection& projection
+) noexcept -> bool;
+
+// Commitment includes the adapter ID, projected skills, and unmaterialized
+// known-entry metadata, so a valid context cannot be rebound to another harness
+// or to a projection that silently omitted a validated entry.
 [[nodiscard]] auto native_skill_runtime_projection_digest(
     const native_skill_runtime_adapter& adapter,
     const native_skill_runtime_projection& projection,

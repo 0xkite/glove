@@ -169,6 +169,7 @@ auto run() -> int {
         .path_exposure_journal = std::nullopt,
         .apple_container = std::nullopt,
         .remote_backend = remote,
+        .local_service_proxy = std::nullopt,
     };
     REQUIRE(glove::host::validate(configured).has_value());
     auto encoded = glove::host::encode_config(configured);

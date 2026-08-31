@@ -4,6 +4,7 @@
 #include "glove/supervisor/library_bundle.hpp"
 #include "glove/supervisor/session_plan.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -16,6 +17,100 @@
 namespace glove::control {
 
 inline constexpr std::uint64_t default_session_registry_bytes = std::uint64_t{64} * 1024U * 1024U;
+inline constexpr std::size_t max_pending_intent_page_size = 256U;
+inline constexpr std::size_t max_observation_quarantine_page_size = max_pending_intent_page_size;
+inline constexpr std::string_view observation_schema_unavailable = "schema_unavailable";
+inline constexpr std::string_view observation_schema_incompatible = "schema_incompatible";
+inline constexpr std::size_t max_observation_items = 4'096U;
+inline constexpr std::size_t max_observation_body_bytes = 65'536U;
+inline constexpr std::uint64_t max_observation_intent_ttl_ms = 600'000U;
+inline constexpr std::uint64_t max_observation_intent_clock_skew_ms = 30'000U;
+
+// Host-registered guest payload admission. Defined in guest_channel.hpp;
+// forward-declared here so registries can be opened without an admission
+// table (observation intents then fail closed).
+class channel_host;
+
+struct glove_observation_body {
+    std::string schema;
+    std::string intent_id;
+    std::string observation;
+    std::string value_digest;
+    std::uint64_t item_count = 0;
+
+    auto operator==(const glove_observation_body&) const -> bool = default;
+};
+
+struct observation_intent_context {
+    std::string session_id;
+    std::string controller_plan_digest;
+    std::string profile_digest;
+    std::string runtime_id;
+    std::string projection_digest;
+    std::uint64_t policy_revision = 0;
+    std::string channel_id;
+    std::uint64_t channel_generation = 0;
+    std::uint64_t issued_at_ms = 0;
+    std::uint64_t expires_at_ms = 0;
+
+    auto operator==(const observation_intent_context&) const -> bool = default;
+};
+
+enum class intent_disposition : std::uint8_t {
+    pending,
+    accepted,
+    rejected,
+    expired,
+};
+
+struct observation_intent_item {
+    std::uint64_t sequence = 0;
+    glove_observation_body body;
+    observation_intent_context context;
+    std::string intent_digest;
+    intent_disposition disposition = intent_disposition::pending;
+    std::uint64_t decided_at_ms = 0;
+
+    auto operator==(const observation_intent_item&) const -> bool = default;
+};
+
+struct observation_intent_disposition {
+    std::string session_id;
+    std::uint64_t channel_generation = 0;
+    std::string intent_id;
+    std::string intent_digest;
+    intent_disposition disposition = intent_disposition::pending;
+    std::uint64_t decided_at_ms = 0;
+
+    auto operator==(const observation_intent_disposition&) const -> bool = default;
+};
+
+struct pending_intent_page {
+    std::vector<observation_intent_item> items;
+    std::optional<std::uint64_t> next_after_sequence;
+
+    auto operator==(const pending_intent_page&) const -> bool = default;
+};
+
+// Payload-free recovery metadata for an authentic historical observation
+// whose schema is unavailable under the current host catalog.
+struct observation_intent_quarantine_entry {
+    std::uint64_t sequence = 0;
+    std::string session_id;
+    std::string schema_id;
+    std::string intent_id;
+    std::uint64_t channel_generation = 0;
+    std::string closed_reason;
+
+    auto operator==(const observation_intent_quarantine_entry&) const -> bool = default;
+};
+
+struct observation_intent_quarantine_page {
+    std::vector<observation_intent_quarantine_entry> items;
+    std::optional<std::uint64_t> next_after_sequence;
+
+    auto operator==(const observation_intent_quarantine_page&) const -> bool = default;
+};
 
 enum class session_state : std::uint8_t {
     created,
@@ -40,7 +135,7 @@ struct session_record {
     auto operator==(const session_record&) const -> bool = default;
 };
 
-// Sage-issued, local-channel start authorization. This contains no opaque
+// Host-issued, local-channel start authorization. This contains no opaque
 // operator proof. Direct-write plans therefore remain structurally ineligible
 // until Glove has a separately authenticated local-consent verifier.
 struct session_start_authorization {
@@ -380,11 +475,15 @@ public:
     auto operator=(session_registry&&) -> session_registry& = delete;
     ~session_registry();
 
+    // `channels` is the frozen host-registered guest payload admission table.
+    // When absent, new observation enqueue is rejected. Authentic historical
+    // observations recover as payload-free quarantine metadata.
     [[nodiscard]] static auto open_or_create(
         const std::filesystem::path& path,
         std::shared_ptr<const supervisor::session_plan_validator> validator,
         std::shared_ptr<const supervisor::library_bundle_store> library_bundles = nullptr,
-        std::uint64_t max_bytes = default_session_registry_bytes
+        std::uint64_t max_bytes = default_session_registry_bytes,
+        std::shared_ptr<const channel_host> channels = nullptr
     ) -> session_registry_result<std::unique_ptr<session_registry>>;
 
     [[nodiscard]] auto create(
@@ -506,8 +605,27 @@ public:
         -> session_registry_result<std::vector<session_recovery_record>>;
     [[nodiscard]] auto canonical_plan(std::string_view session_id) const
         -> session_registry_result<std::string>;
+    [[nodiscard]] auto enqueue_observation_intent(
+        const glove_observation_body& body,
+        const observation_intent_context& context,
+        std::uint64_t now_ms
+    ) -> session_registry_result<observation_intent_item>;
+    [[nodiscard]] auto
+    set_observation_intent_disposition(const observation_intent_disposition& disposition)
+        -> session_registry_result<observation_intent_item>;
+    [[nodiscard]] auto pending_observation_intents(
+        std::uint64_t after_sequence, std::size_t limit, std::uint64_t now_ms
+    ) const -> session_registry_result<pending_intent_page>;
+    [[nodiscard]] auto
+    quarantined_observation_intents(std::uint64_t after_sequence, std::size_t limit) const
+        -> session_registry_result<observation_intent_quarantine_page>;
     [[nodiscard]] auto record_count() const -> std::uint64_t;
     [[nodiscard]] auto library_projections_available() const noexcept -> bool;
+    // Narrow construction predicate for ephemeral channel factories. Pointer
+    // identity is the catalog contract; equivalent caller-built tables do not
+    // satisfy it.
+    [[nodiscard]] auto
+    uses_channel_host(const std::shared_ptr<const channel_host>& channels) const noexcept -> bool;
 
 private:
     std::unique_ptr<implementation> state_;

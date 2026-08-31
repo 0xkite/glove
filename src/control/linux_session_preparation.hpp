@@ -2,6 +2,7 @@
 
 #include "glove/audit/sink.hpp"
 #include "glove/container/profile.hpp"
+#include "glove/control/local_service_proxy.hpp"
 #include "glove/control/session_registry.hpp"
 #include "glove/net/egress_proxy.hpp"
 
@@ -35,6 +36,7 @@ struct linux_prepared_session {
     linux_filesystem_recovery_identity filesystem_identity;
     std::unique_ptr<container::linux_detail::linux_resource_lifecycle> lifecycle;
     std::unique_ptr<net::egress_proxy> egress_proxy;
+    std::unique_ptr<local_service_proxy_session> local_service_proxy;
     std::shared_ptr<container::refinement_transcript_evaluator> refinement_evaluator;
 
     [[nodiscard]] auto execution_binding() const -> session_execution_binding {
@@ -62,9 +64,11 @@ public:
     auto operator=(linux_session_preparer&&) -> linux_session_preparer& = delete;
     ~linux_session_preparer() = default;
 
-    [[nodiscard]] static auto
-    create(std::string materialization_root, std::shared_ptr<audit::sink> egress_audit = {})
-        -> std::expected<linux_session_preparer, std::string>;
+    [[nodiscard]] static auto create(
+        std::string materialization_root,
+        std::shared_ptr<audit::sink> egress_audit = {},
+        std::shared_ptr<local_service_proxy_factory> local_services = {}
+    ) -> std::expected<linux_session_preparer, std::string>;
 
     [[nodiscard]] auto prepare(session_start_inputs&& inputs, std::uint64_t started_at_ms)
         -> std::expected<linux_prepared_session, std::string>;
@@ -79,12 +83,21 @@ private:
     linux_session_preparer(
         std::string materialization_root,
         container::linux_detail::cgroup_v2_root cgroup_root,
-        std::shared_ptr<audit::sink> egress_audit
+        std::shared_ptr<audit::sink> egress_audit,
+        std::shared_ptr<local_service_proxy_factory> local_services
     ) noexcept;
+
+    friend class linux_session_runtime;
+
+    [[nodiscard]] auto local_service_factory() const noexcept
+        -> const local_service_proxy_factory* {
+        return local_services_.get();
+    }
 
     std::string materialization_root_;
     container::linux_detail::cgroup_v2_root cgroup_root_;
     std::shared_ptr<audit::sink> egress_audit_;
+    std::shared_ptr<local_service_proxy_factory> local_services_;
 };
 
 } // namespace glove::control::linux_detail

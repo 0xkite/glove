@@ -2,6 +2,7 @@
 
 #include "glove/supervisor/library_bundle.hpp"
 
+#include <cstddef>
 #include <expected>
 #include <string>
 #include <vector>
@@ -23,22 +24,38 @@ struct codex_skill_projection {
     auto operator==(const codex_skill_projection&) const -> bool = default;
 };
 
+struct codex_unmaterialized_entry_projection {
+    std::string projection_id;
+    std::string bundle_content_digest;
+    std::string key;
+    std::string kind;
+    std::string content_digest;
+    std::size_t content_size = 0;
+
+    auto operator==(const codex_unmaterialized_entry_projection&) const -> bool = default;
+};
+
 struct codex_runtime_projection {
     std::vector<codex_skill_projection> skills;
+    // These validated entries remain available in the raw bundle but have no
+    // Codex-native materialization. Their metadata is part of projection identity.
+    std::vector<codex_unmaterialized_entry_projection> unmaterialized_entries;
 
     auto operator==(const codex_runtime_projection&) const -> bool = default;
 };
 
 // Strictly decodes each verified Sage session-library bundle. Only `skill`
-// entries have an unambiguous Codex-native location. Other entry kinds are
-// rejected rather than silently dropping controller-selected context.
+// entries materialize into the Codex private home. Known non-skill kinds
+// (`behavior`, `prompt`, `template`, `workflow`) remain explicitly represented
+// in projection identity. Unknown kinds fail closed.
 [[nodiscard]] auto
 resolve_codex_runtime_projection(const std::vector<resolved_library_projection>& bundles)
     -> std::expected<codex_runtime_projection, std::string>;
 
-// Canonical commitment for the exact native projection. This deliberately
-// commits every source bundle identity and skill byte digest without exposing
-// the skill contents in a receipt or controller-visible launch record.
+// Canonical, versioned commitment for the exact native projection. This
+// deliberately commits every source bundle identity, skill byte digest, and
+// unmaterialized known-entry metadata without exposing contents in a receipt or
+// controller-visible launch record.
 [[nodiscard]] auto codex_runtime_projection_digest(const codex_runtime_projection& projection)
     -> std::expected<std::string, std::string>;
 

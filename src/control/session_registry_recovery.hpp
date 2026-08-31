@@ -12,6 +12,13 @@
 
 namespace glove::control {
 
+// Binding-identity comparison for frozen observation intent/disposition
+// snapshots against the session record they were bound to. Neutralizes the
+// append-journal bookkeeping fields plus the three lifecycle-mutable fields
+// (`state`, `running_at_ms`, `policy_revision`); any other difference is a
+// genuine session-binding crossing. Exposed for regression tests.
+auto same_session_snapshot(wire::persisted_session left, wire::persisted_session right) -> bool;
+
 // A single decoded persisted record plus the byte offset of the next record.
 struct decoded_persisted_record {
     wire::persisted_session record;

@@ -418,6 +418,61 @@ that lane alongside the filesystem and environment SBPL probes. Linux keeps
 the privileged Docker workflow lane for namespace, cgroup, receipt, cleanup,
 and no-network assertions.
 
+## Guest observation channels and Sage guest proposals
+
+The guest service channel is schema-generic: Glove core enforces structural
+invariants (identifier charset, digest hex, TTL/skew arithmetic, capacity,
+idempotency) and delegates body semantics to the host-registered admission
+table. Schemas are registered by the host at registry construction, never
+compiled into core. Current admission and enqueue fail closed for an
+unregistered schema. Recovery may retain an authentic historical record after
+its schema retires only under the metadata-only quarantine rule below.
+
+The Sage guest adapter registers only the bounded observation schema required
+for current registry admission. Dormant proposal and mutation schemas remain
+unregistered until an authenticated activation path exists, and current enqueue
+rejects every unregistered schema. Only authentic records already present in
+durable history may recover after schema retirement; they become non-actionable
+quarantine metadata and cannot be enqueued again or launched.
+
+Linux local-service forwarding is enabled when operator configuration has a
+runtime-allowlisted endpoint. Configuration contains only a canonical sorted
+alias list, normalized absolute host Unix-socket paths, canonical sorted runtime
+IDs, and an optional opaque guest-channel adapter/schema binding; guest targets,
+TCP, UIDs, tokens, credentials, and payload semantics are not configurable.
+Glove core does not interpret that binding. The explicit Sage adapter resolves
+only its exact binding and runtime set; an unsupported binding fails startup,
+while an unbound arbitrary service—including one allowed for `pi`—remains a
+generic proxy and advertises no Sage channel capability. Codex-only and
+OpenCode-only endpoint sets likewise advertise schema version `0`.
+
+Each admitted session receives a read-only directory at
+`/run/glove-services/local` and only
+`GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local`. Alias sockets are `0600`;
+their owner-`0700` directory and the configured upstream parent remain
+descriptor-pinned. Endpoint pathname identity is checked before and after
+connect, but portable pathname `AF_UNIX` does not exclude same-UID ABA
+replacement. The operator and other processes under the service UID are trusted
+endpoint authority. Linux `SO_PEERCRED` must match the configured UID at both
+guest and upstream connections; this detects drift and mismatched peers, not
+application-process identity.
+
+Before any path materialization, Glove compares each resolved grant descriptor
+with the descriptor-pinned endpoint parent and every actual ancestor descriptor. A grant
+for the socket, its parent, or an ancestor that would expose it is rejected;
+lexical aliases do not bypass this identity check. The nested user-namespace
+credential lane remains a Linux privileged environment gate.
+
+One opaque request and response, each at most 16 KiB, share one absolute
+deadline. Before release, Glove durably records non-success
+`delivery_pending`; it records `delivered` only after a successful guest send,
+and best-effort `delivery_failed` after a failed send. Records contain only the
+session ID, alias, phase, status, and latency. Audit appends check the same
+deadline before and after synchronous durability work. A kernel-blocked
+`fsync(2)` cannot be preempted cooperatively, so this is not a hard wall-clock
+bound; if it completes after the deadline, the response remains suppressed and
+the conservative pending record remains. Apple advertises no G6 capability.
+
 ## Receipts and recovery
 
 Terminal resource receipts are HMAC-SHA-256 authenticated and chained to Sage's
@@ -450,8 +505,14 @@ codes. Ambiguous transactions are never retried or terminalized automatically.
 
 ## Remaining boundary
 
-Glove's Codex adapter expands only exact `skill` bundle entries; unsupported
-bundle entry kinds fail closed. Other harnesses do not inherit Codex's layout,
-and `prompt_ref` remains rejected. Live direct host writes are outside v2.
+Glove's native adapters expand only exact `skill` bundle entries into a
+private-home `SKILL.md` layout. `behavior`, `prompt`, `template`, and
+`workflow` are admitted only as known non-skill entries: they remain in the
+verified raw bundle and make that raw bundle a required launch input rather
+than being interpreted as skills. Apple Container rejects any projection
+that contains a known non-skill entry because its launch path cannot preserve
+the required raw bundle. Unknown kinds fail closed. Harnesses do not inherit
+Codex's layout, and `prompt_ref` remains rejected. Live direct host writes
+are outside v2.
 Applying a retained stage remains unavailable until Glove verifies an
 independently signed, single-use local authorization.

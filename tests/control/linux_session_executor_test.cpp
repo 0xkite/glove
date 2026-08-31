@@ -99,6 +99,7 @@ struct supervisor_capabilities {
     std::uint8_t change_manifest_schema_version = 0;
     std::uint8_t change_apply_authorization_schema_version = 0;
     std::uint8_t refinement_evaluation_protocol_schema_version = 0;
+    std::uint8_t observation_intent_channel_schema_version = 0;
     std::vector<backend_capabilities> backends;
 };
 
@@ -458,12 +459,17 @@ auto run() -> int {
     REQUIRE(producer.has_value());
     REQUIRE((*producer)->acknowledge_bootstrap((*producer)->anchor()).has_value());
 
-    auto preparer =
+    auto preparer_result =
         glove::control::linux_detail::linux_session_preparer::create(materializations.string());
-    if (!preparer) {
-        std::fprintf(stderr, "Linux executor topology unavailable: %s\n", preparer.error().c_str());
+    if (!preparer_result) {
+        std::fprintf(
+            stderr, "Linux executor topology unavailable: %s\n", preparer_result.error().c_str()
+        );
         return 77;
     }
+    auto preparer = std::make_shared<glove::control::linux_detail::linux_session_preparer>(
+        std::move(*preparer_result)
+    );
     auto exited = glove::control::linux_detail::execute_linux_session(
         **registry,
         *preparer,
@@ -562,17 +568,23 @@ auto run() -> int {
     REQUIRE(!std::filesystem::is_empty(materializations));
 
     registry->reset();
-    auto recovered_registry = glove::control::session_registry::open_or_create(
+    auto recovered_registry_result = glove::control::session_registry::open_or_create(
         tree.root() / "sessions.journal", shared_validator
     );
-    REQUIRE(recovered_registry.has_value());
+    REQUIRE(recovered_registry_result.has_value());
+    auto shared_registry =
+        std::shared_ptr<glove::control::session_registry>{std::move(*recovered_registry_result)};
+    REQUIRE(!glove::control::linux_detail::linux_session_runtime::create({}, preparer, {}, 1)
+                 .has_value());
+    REQUIRE(!glove::control::linux_detail::linux_session_runtime::create(shared_registry, {}, {}, 1)
+                 .has_value());
     REQUIRE(!glove::control::linux_detail::linux_session_runtime::create(
-                 **recovered_registry, *preparer, {}, 0
+                 shared_registry, preparer, {}, 0
     )
                  .has_value());
     auto session_runtime_result = glove::control::linux_detail::linux_session_runtime::create(
-        **recovered_registry,
-        *preparer,
+        shared_registry,
+        preparer,
         {
             .transcript_bytes = page,
             .max_read_bytes = page,
@@ -595,7 +607,7 @@ auto run() -> int {
     REQUIRE(reconciliation->recovered_exited == 0);
     REQUIRE(reconciliation->recovered_terminated == 0);
     REQUIRE((*session_runtime_result)->reconcile(**producer, epoch_ms() + 2U) == reconciliation);
-    auto recovered_failure = (*recovered_registry)->failed_status("session-starting-crash");
+    auto recovered_failure = shared_registry->failed_status("session-starting-crash");
     REQUIRE(recovered_failure.has_value());
     REQUIRE(
         recovered_failure->code == glove::control::session_failure_code::recovered_without_process
@@ -606,8 +618,6 @@ auto run() -> int {
     REQUIRE(std::filesystem::is_empty(materializations));
     REQUIRE(std::filesystem::exists(source / "tracked.txt"));
 
-    auto shared_registry =
-        std::shared_ptr<glove::control::session_registry>{std::move(*recovered_registry)};
     auto shared_producer =
         std::shared_ptr<glove::container::receipt_audit_producer>{std::move(*producer)};
 
@@ -630,8 +640,8 @@ auto run() -> int {
         .expires_at_ms = interactive_now_ms + 30'000U,
     };
     auto wire_runtime_result = glove::control::linux_detail::linux_session_runtime::create(
-        *shared_registry,
-        *preparer,
+        shared_registry,
+        preparer,
         {
             .transcript_bytes = page,
             .max_read_bytes = page,
@@ -1072,13 +1082,13 @@ auto run() -> int {
     auto capability_registry_shared =
         std::shared_ptr<glove::control::session_registry>{std::move(*capability_registry)};
     auto capability_runtime = glove::control::linux_detail::linux_session_runtime::create(
-        *capability_registry_shared, *preparer, {}, 1
+        capability_registry_shared, preparer, {}, 1
     );
     REQUIRE(capability_runtime.has_value());
     auto capability_runtime_shared =
         std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
             std::move(*capability_runtime)
-        };
+    };
     REQUIRE(capability_runtime_shared->refinement_evaluation_protocol_schema_version() == 1);
     auto capability_protocol = glove::control::receipt_audit_protocol::create(
         bootstrap_secret,
@@ -1110,6 +1120,7 @@ auto run() -> int {
         refinement_capabilities, refinement_capability_response->result->str
     ));
     REQUIRE(refinement_capabilities.refinement_evaluation_protocol_schema_version == 1);
+    REQUIRE(refinement_capabilities.observation_intent_channel_schema_version == 0);
 
     const std::string candidate_bytes = R"({"candidate":"exact"})";
     const auto candidate_digest = glove::container::sha256_hex(

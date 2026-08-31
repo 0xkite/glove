@@ -176,11 +176,44 @@ target_include_directories(control_remote_session_runtime_test PRIVATE
 add_test(NAME control_remote_session_runtime COMMAND control_remote_session_runtime_test)
 
 add_executable(control_session_registry_test control/session_registry_test.cpp)
-target_link_libraries(control_session_registry_test PRIVATE glove_control)
+target_link_libraries(control_session_registry_test PRIVATE glove_control glaze::glaze)
 target_include_directories(control_session_registry_test PRIVATE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
 )
 add_test(NAME control_session_registry COMMAND control_session_registry_test)
+
+add_executable(control_guest_channel_test control/guest_channel_test.cpp)
+target_link_libraries(control_guest_channel_test PRIVATE glove_control)
+add_test(NAME control_guest_channel COMMAND control_guest_channel_test)
+
+add_executable(
+    control_sage_guest_channel_adapter_test
+    control/sage_guest_channel_adapter_test.cpp
+)
+target_link_libraries(control_sage_guest_channel_adapter_test PRIVATE glove_sage_adapter)
+add_test(NAME control_sage_guest_channel_adapter COMMAND control_sage_guest_channel_adapter_test)
+
+add_executable(control_guest_channel_transport_test control/guest_channel_transport_test.cpp)
+target_link_libraries(control_guest_channel_transport_test PRIVATE glove_control)
+add_test(NAME control_guest_channel_transport COMMAND control_guest_channel_transport_test)
+set_tests_properties(control_guest_channel_transport PROPERTIES TIMEOUT 10)
+
+add_executable(
+    control_observation_intent_unix_server_test
+    control/observation_intent_unix_server_test.cpp
+)
+target_link_libraries(
+    control_observation_intent_unix_server_test
+    PRIVATE glove_control glaze::glaze
+)
+target_include_directories(control_observation_intent_unix_server_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+)
+add_test(
+    NAME control_observation_intent_unix_server
+    COMMAND control_observation_intent_unix_server_test
+)
+set_tests_properties(control_observation_intent_unix_server PROPERTIES TIMEOUT 15)
 
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(
@@ -508,6 +541,30 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     )
 
     add_executable(
+        control_local_service_proxy_test
+        control/local_service_proxy_test.cpp
+    )
+    target_link_libraries(
+        control_local_service_proxy_test
+        PRIVATE glove_control glove_sage_adapter
+    )
+    target_include_directories(control_local_service_proxy_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container/linux>
+    )
+    add_test(NAME control_local_service_proxy COMMAND control_local_service_proxy_test)
+    set_tests_properties(control_local_service_proxy PROPERTIES TIMEOUT 20)
+    add_test(
+        NAME control_local_service_proxy_privileged
+        COMMAND control_local_service_proxy_test --privileged
+    )
+    set_tests_properties(control_local_service_proxy_privileged PROPERTIES
+        TIMEOUT 20
+        SKIP_RETURN_CODE 77
+    )
+
+    add_executable(
         control_linux_session_preparation_test
         control/linux_session_preparation_test.cpp
     )
@@ -578,6 +635,20 @@ if(APPLE)
         TIMEOUT 60
         SKIP_RETURN_CODE 77
     )
+
+    add_executable(
+        control_apple_container_unavailable_test
+        control/apple_container_unavailable_test.cpp
+    )
+    target_link_libraries(control_apple_container_unavailable_test PRIVATE glove_control)
+    target_include_directories(control_apple_container_unavailable_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+    )
+    add_test(
+        NAME control_apple_container_unavailable
+        COMMAND control_apple_container_unavailable_test
+    )
+    set_tests_properties(control_apple_container_unavailable PROPERTIES TIMEOUT 30)
 
     add_executable(mcp_stdio_transport_test mcp/stdio_transport_test.cpp)
     target_link_libraries(mcp_stdio_transport_test PRIVATE glove_kernel)

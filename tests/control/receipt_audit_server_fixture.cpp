@@ -205,6 +205,7 @@ auto run(int argc, char** argv) -> int {
         .plan_validator = std::move(shared_validator),
         .sessions = std::shared_ptr<glove::control::session_registry>{std::move(*sessions)},
         .session_runtime = {},
+        .local_services = {},
         .path_exposures = {},
         .materialization_root = {},
         .io_timeout_ms = 5'000,

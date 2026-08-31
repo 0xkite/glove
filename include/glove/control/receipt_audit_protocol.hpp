@@ -14,6 +14,9 @@
 #include <string_view>
 
 namespace glove::control {
+namespace linux_detail {
+class local_service_proxy_capability;
+}
 
 inline constexpr std::size_t max_control_frame_bytes = std::size_t{1024} * 1024U;
 
@@ -45,7 +48,8 @@ public:
         std::shared_ptr<session_registry> sessions = {},
         std::shared_ptr<session_runtime> managed_runtime = {},
         std::shared_ptr<supervisor::path_exposure_registry> path_exposures = {},
-        std::string materialization_root = {}
+        std::string materialization_root = {},
+        std::shared_ptr<const linux_detail::local_service_proxy_capability> local_services = {}
     ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string>;
 
     // The first authenticated page supplies Sage's trusted prefix and lazily
@@ -58,7 +62,8 @@ public:
         std::shared_ptr<session_registry> sessions = {},
         std::shared_ptr<session_runtime> managed_runtime = {},
         std::shared_ptr<supervisor::path_exposure_registry> path_exposures = {},
-        std::string materialization_root = {}
+        std::string materialization_root = {},
+        std::shared_ptr<const linux_detail::local_service_proxy_capability> local_services = {}
     ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string>;
 
     // Request failures are encoded as stable JSON-RPC errors. `unexpected` is
