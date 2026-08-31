@@ -14,12 +14,21 @@
 #include "linux_session_preparation.hpp"
 
 #include <fcntl.h>
+#include <linux/mount.h>
 #include <sched.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#    define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+#ifndef MNT_DETACH
+#    define MNT_DETACH 2
+#endif
 
 #include <algorithm>
 #include <array>
@@ -499,6 +508,37 @@ auto exchange_once(
     };
 }
 
+// bind_session_mount installs the local-services descriptor with move_mount(2),
+// so the proxy mount path must hand out detached open_tree clones. Cloning a
+// mount requires mount authority over the current mount namespace; EPERM from
+// open_tree(2) positively identifies its absence, and no part of this test can
+// exercise the session mount path without it.
+auto probe_mount_authority(const std::filesystem::path& probe_directory)
+    -> std::expected<bool, std::string> {
+    const int directory =
+        ::open(probe_directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0) {
+        return std::unexpected(
+            std::string{"open mount authority probe directory: "} + std::strerror(errno)
+        );
+    }
+    const int cloned = static_cast<int>(
+        // Linux has no typed libc wrapper for open_tree(2).
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+        ::syscall(SYS_open_tree, directory, "", AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)
+    );
+    const int saved = errno;
+    static_cast<void>(::close(directory));
+    if (cloned >= 0) {
+        static_cast<void>(::close(cloned));
+        return true;
+    }
+    if (saved == EPERM) {
+        return false;
+    }
+    return std::unexpected(std::string{"probe session mount authority: "} + std::strerror(saved));
+}
+
 auto run(bool privileged_only) -> int {
     using glove::control::guest_channel_transport;
     using glove::control::linux_detail::local_service_proxy_factory;
@@ -529,6 +569,14 @@ auto run(bool privileged_only) -> int {
 
     temporary_directory temporary;
     REQUIRE(!temporary.root().empty());
+    const auto mount_probe_directory = temporary.root() / "mount-authority-probe";
+    REQUIRE(make_owner_directory(mount_probe_directory));
+    const auto mount_authority = probe_mount_authority(mount_probe_directory);
+    REQUIRE(mount_authority.has_value());
+    if (!*mount_authority) {
+        std::fprintf(stderr, "SKIP session mount authority (open_tree/move_mount) unavailable\n");
+        return 77;
+    }
     const auto source = temporary.root() / "source";
     const auto runtime = temporary.root() / "runtime";
     const auto upstream = temporary.root() / "upstream";
@@ -543,6 +591,63 @@ auto run(bool privileged_only) -> int {
     REQUIRE(validator.has_value());
     auto shared_validator =
         std::make_shared<const glove::supervisor::session_plan_validator>(std::move(*validator));
+
+    // Regression (Workflow #218 Ghost E2E): bind_session_mount installs the
+    // local-services descriptor with move_mount(2), which only accepts a
+    // detached mount. The descriptor produced by mount() must therefore be an
+    // open_tree clone of the proxy session directory, not a plain directory
+    // descriptor; a plain descriptor fails there with EINVAL. Uses a dedicated
+    // runtime root so the assertion is independent of the shared-runtime
+    // scenarios below. Requires mount authority, guaranteed by the gate above.
+    {
+        const auto provenance_runtime = temporary.root() / "provenance-runtime";
+        REQUIRE(make_owner_directory(provenance_runtime));
+        auto provenance_registry_result = glove::control::session_registry::open_or_create(
+            temporary.root() / "provenance-sessions.journal", shared_validator
+        );
+        REQUIRE(provenance_registry_result.has_value());
+        auto provenance_registry = std::shared_ptr<glove::control::session_registry>{
+            std::move(*provenance_registry_result)
+        };
+        auto provenance_factory = local_service_proxy_factory::create(
+            options_for(provenance_runtime, endpoint, glove::audit::make_memory_sink(), {}),
+            provenance_registry
+        );
+        REQUIRE(provenance_factory.has_value());
+        auto provenance_session =
+            (*provenance_factory)->prepare_session("mount-detached-provenance", "pi");
+        REQUIRE(provenance_session.has_value());
+        auto provenance_mount = (*provenance_session)->mount();
+        REQUIRE(provenance_mount.has_value());
+        unique_fd provenance_descriptor{provenance_mount->descriptor_fd};
+        provenance_mount->descriptor_fd = -1;
+        REQUIRE(provenance_descriptor.get() >= 0);
+        const auto attach_target = temporary.root() / "mount-provenance-attach";
+        REQUIRE(make_owner_directory(attach_target));
+        const int attached = static_cast<int>(
+            // Linux has no typed libc wrapper for move_mount(2).
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+            ::syscall(
+                SYS_move_mount,
+                provenance_descriptor.get(),
+                "",
+                AT_FDCWD,
+                attach_target.c_str(),
+                MOVE_MOUNT_F_EMPTY_PATH
+            )
+        );
+        if (attached != 0) {
+            std::fprintf(
+                stderr,
+                "local-services mount descriptor is not a detached mount: %s\n",
+                std::strerror(errno)
+            );
+            return 1;
+        }
+        REQUIRE(::syscall(SYS_umount2, attach_target.c_str(), MNT_DETACH) == 0);
+        REQUIRE(::rmdir(attach_target.c_str()) == 0);
+    }
+
     auto adapter = glove::adapters::sage::resolve_guest_channel_adapter(
         "sage-observation", "sage.glove-observation.v1"
     );

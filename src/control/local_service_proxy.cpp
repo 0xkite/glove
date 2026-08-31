@@ -6,9 +6,11 @@
 #include "linux_session_executor.hpp"
 
 #include <fcntl.h>
+#include <linux/mount.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -141,6 +143,10 @@ auto same_identity(const file_identity& expected, const struct stat& status) -> 
 
 auto same_object(const file_identity& left, const file_identity& right) noexcept -> bool {
     return left.device == right.device && left.inode == right.inode;
+}
+
+auto errno_message(int error) -> std::string {
+    return std::error_code{error, std::generic_category()}.message();
 }
 
 class bound_socket_rollback {
@@ -597,10 +603,26 @@ auto local_service_proxy_session::mount() const
         !same_identity(state_->directory_identity, status)) {
         return std::unexpected(std::string{"local service session is unavailable"});
     }
-    unique_fd descriptor{::fcntl(state_->directory.get(), F_DUPFD_CLOEXEC, 3)};
-    if (descriptor.get() < 0) {
-        return std::unexpected(std::string{"local service session is unavailable"});
+    // bind_session_mount installs this descriptor with move_mount(2), which
+    // accepts only a detached mount, never a plain directory descriptor. Clone
+    // the verified session directory as a detached open_tree mount so the
+    // local-services mount matches every other session mount path.
+    const int cloned = static_cast<int>(
+        // Linux has no typed libc wrapper for open_tree(2).
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+        ::syscall(
+            SYS_open_tree,
+            state_->directory.get(),
+            "",
+            AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC
+        )
+    );
+    if (cloned < 0) {
+        return std::unexpected(
+            std::string{"clone local service session mount: "} + errno_message(errno)
+        );
     }
+    unique_fd descriptor{cloned};
     try {
         supervisor::linux_detail::session_mount mount;
         mount.target_path = local_service_guest_directory;
