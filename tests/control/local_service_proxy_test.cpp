@@ -14,12 +14,21 @@
 #include "linux_session_preparation.hpp"
 
 #include <fcntl.h>
+#include <linux/mount.h>
 #include <sched.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#    define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#endif
+#ifndef MNT_DETACH
+#    define MNT_DETACH 2
+#endif
 
 #include <algorithm>
 #include <array>
@@ -372,15 +381,6 @@ auto connect_mount(int directory_fd, std::string_view alias) -> int {
     return descriptor;
 }
 
-auto descriptor_path(int descriptor) -> std::filesystem::path {
-    std::string link = "/proc/self/fd/" + std::to_string(descriptor);
-    std::vector<char> path(4096U, '\0');
-    const auto length = ::readlink(link.c_str(), path.data(), path.size() - 1U);
-    return length > 0
-               ? std::filesystem::path{std::string{path.data(), static_cast<std::size_t>(length)}}
-               : std::filesystem::path{};
-}
-
 auto descriptor_count() -> std::size_t {
     std::error_code error;
     std::size_t count = 0;
@@ -499,6 +499,37 @@ auto exchange_once(
     };
 }
 
+// bind_session_mount installs the local-services descriptor with move_mount(2),
+// so the proxy mount path must hand out detached open_tree clones. Cloning a
+// mount requires mount authority over the current mount namespace; EPERM from
+// open_tree(2) positively identifies its absence, and no part of this test can
+// exercise the session mount path without it.
+auto probe_mount_authority(const std::filesystem::path& probe_directory)
+    -> std::expected<bool, std::string> {
+    const int directory =
+        ::open(probe_directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory < 0) {
+        return std::unexpected(
+            std::string{"open mount authority probe directory: "} + std::strerror(errno)
+        );
+    }
+    const int cloned = static_cast<int>(
+        // Linux has no typed libc wrapper for open_tree(2).
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+        ::syscall(SYS_open_tree, directory, "", AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC)
+    );
+    const int saved = errno;
+    static_cast<void>(::close(directory));
+    if (cloned >= 0) {
+        static_cast<void>(::close(cloned));
+        return true;
+    }
+    if (saved == EPERM) {
+        return false;
+    }
+    return std::unexpected(std::string{"probe session mount authority: "} + std::strerror(saved));
+}
+
 auto run(bool privileged_only) -> int {
     using glove::control::guest_channel_transport;
     using glove::control::linux_detail::local_service_proxy_factory;
@@ -529,6 +560,14 @@ auto run(bool privileged_only) -> int {
 
     temporary_directory temporary;
     REQUIRE(!temporary.root().empty());
+    const auto mount_probe_directory = temporary.root() / "mount-authority-probe";
+    REQUIRE(make_owner_directory(mount_probe_directory));
+    const auto mount_authority = probe_mount_authority(mount_probe_directory);
+    REQUIRE(mount_authority.has_value());
+    if (!*mount_authority) {
+        std::fprintf(stderr, "SKIP session mount authority (open_tree/move_mount) unavailable\n");
+        return 77;
+    }
     const auto source = temporary.root() / "source";
     const auto runtime = temporary.root() / "runtime";
     const auto upstream = temporary.root() / "upstream";
@@ -543,6 +582,63 @@ auto run(bool privileged_only) -> int {
     REQUIRE(validator.has_value());
     auto shared_validator =
         std::make_shared<const glove::supervisor::session_plan_validator>(std::move(*validator));
+
+    // Regression (Workflow #218 Ghost E2E): bind_session_mount installs the
+    // local-services descriptor with move_mount(2), which only accepts a
+    // detached mount. The descriptor produced by mount() must therefore be an
+    // open_tree clone of the proxy session directory, not a plain directory
+    // descriptor; a plain descriptor fails there with EINVAL. Uses a dedicated
+    // runtime root so the assertion is independent of the shared-runtime
+    // scenarios below. Requires mount authority, guaranteed by the gate above.
+    {
+        const auto provenance_runtime = temporary.root() / "provenance-runtime";
+        REQUIRE(make_owner_directory(provenance_runtime));
+        auto provenance_registry_result = glove::control::session_registry::open_or_create(
+            temporary.root() / "provenance-sessions.journal", shared_validator
+        );
+        REQUIRE(provenance_registry_result.has_value());
+        auto provenance_registry = std::shared_ptr<glove::control::session_registry>{
+            std::move(*provenance_registry_result)
+        };
+        auto provenance_factory = local_service_proxy_factory::create(
+            options_for(provenance_runtime, endpoint, glove::audit::make_memory_sink(), {}),
+            provenance_registry
+        );
+        REQUIRE(provenance_factory.has_value());
+        auto provenance_session =
+            (*provenance_factory)->prepare_session("mount-detached-provenance", "pi");
+        REQUIRE(provenance_session.has_value());
+        auto provenance_mount = (*provenance_session)->mount();
+        REQUIRE(provenance_mount.has_value());
+        unique_fd provenance_descriptor{provenance_mount->descriptor_fd};
+        provenance_mount->descriptor_fd = -1;
+        REQUIRE(provenance_descriptor.get() >= 0);
+        const auto attach_target = temporary.root() / "mount-provenance-attach";
+        REQUIRE(make_owner_directory(attach_target));
+        const int attached = static_cast<int>(
+            // Linux has no typed libc wrapper for move_mount(2).
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+            ::syscall(
+                SYS_move_mount,
+                provenance_descriptor.get(),
+                "",
+                AT_FDCWD,
+                attach_target.c_str(),
+                MOVE_MOUNT_F_EMPTY_PATH
+            )
+        );
+        if (attached != 0) {
+            std::fprintf(
+                stderr,
+                "local-services mount descriptor is not a detached mount: %s\n",
+                std::strerror(errno)
+            );
+            return 1;
+        }
+        REQUIRE(::syscall(SYS_umount2, attach_target.c_str(), MNT_DETACH) == 0);
+        REQUIRE(::rmdir(attach_target.c_str()) == 0);
+    }
+
     auto adapter = glove::adapters::sage::resolve_guest_channel_adapter(
         "sage-observation", "sage.glove-observation.v1"
     );
@@ -557,6 +653,49 @@ auto run(bool privileged_only) -> int {
     );
     REQUIRE(registry.has_value());
     auto shared_registry = std::shared_ptr<glove::control::session_registry>{std::move(*registry)};
+    // Regression (Workflow #218 Ghost E2E): every prepare_session mkdirat(2)s
+    // a svc-* staging directory under the runtime root, and on ext4/tmpfs/APFS
+    // a directory's st_nlink is 2 plus its subdirectory count. The operational
+    // identity must therefore not pin the runtime root's link count: two
+    // factories sharing one runtime root - and one factory preparing
+    // consecutive sessions - must both stay operational across a
+    // prepare_session. On the pre-fix baseline the first prepare_session of a
+    // second factory sharing the root failed here as false "identity drift"
+    // (nlink 2 -> 3; Ghost LastTest.log line 666). Permission drift on the
+    // root must still fail closed, and endpoint sockets keep their exact
+    // dev/ino/uid/mode/nlink recheck (unchanged endpoint_current). Both
+    // factories use the shared registry and the same adapter binding, the
+    // only supported sharing shape.
+    {
+        const auto shared_runtime_root = temporary.root() / "shared-runtime-root";
+        REQUIRE(make_owner_directory(shared_runtime_root));
+        auto first_factory = local_service_proxy_factory::create(
+            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), *adapter),
+            shared_registry
+        );
+        REQUIRE(first_factory.has_value());
+        REQUIRE((*first_factory)->operational());
+        auto first_session = (*first_factory)->prepare_session("shared-root-a", "pi");
+        REQUIRE(first_session.has_value());
+        REQUIRE((*first_factory)->operational());
+        auto second_factory = local_service_proxy_factory::create(
+            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), *adapter),
+            shared_registry
+        );
+        REQUIRE(second_factory.has_value());
+        REQUIRE((*second_factory)->operational());
+        auto second_session = (*second_factory)->prepare_session("shared-root-b", "pi");
+        REQUIRE(second_session.has_value());
+        REQUIRE((*second_factory)->operational());
+        REQUIRE((*first_factory)->operational());
+        REQUIRE(::chmod(shared_runtime_root.c_str(), 0755) == 0);
+        REQUIRE(!(*first_factory)->operational());
+        REQUIRE(!(*second_factory)->operational());
+        REQUIRE(::chmod(shared_runtime_root.c_str(), 0700) == 0);
+        REQUIRE((*first_factory)->operational());
+        REQUIRE((*second_factory)->operational());
+    }
+
     auto audit = glove::audit::make_memory_sink();
     auto factory = local_service_proxy_factory::create(
         options_for(runtime, endpoint, audit, *adapter), shared_registry
@@ -1415,7 +1554,23 @@ auto run(bool privileged_only) -> int {
     REQUIRE(::unlink(extra_link.c_str()) == 0);
     REQUIRE((*factory)->operational());
 
-    const auto session_directory = descriptor_path(mount_fd.get());
+    // The mount descriptor is a detached open_tree clone, and Linux 6.12+
+    // renders its /proc/self/fd readlink output as the mount root "/", not the
+    // underlying path, so descriptor_path(mount_fd) cannot yield the session
+    // directory here (and connect_mount already addresses the guest socket
+    // through /proc/self/fd/N/alias instead). Resolve the session directory by
+    // its exact staged name: prepare_session names it
+    // "svc-<factory-generation>-<session-generation>-<session-id>", and the
+    // only other staged directory under this runtime root belongs to
+    // "generic-session", so the suffix below is unique.
+    std::filesystem::path session_directory;
+    for (const auto& entry : std::filesystem::directory_iterator{runtime}) {
+        const auto name = entry.path().filename().string();
+        if (entry.is_directory() && name.starts_with("svc-") && name.ends_with("-session-1")) {
+            REQUIRE(session_directory.empty());
+            session_directory = entry.path();
+        }
+    }
     REQUIRE(!session_directory.empty());
     const auto guest_socket = session_directory / "sage-observe";
     REQUIRE(::unlink(guest_socket.c_str()) == 0);
@@ -1577,9 +1732,19 @@ auto run(bool privileged_only) -> int {
     REQUIRE(retained_registry.expired());
 
     listener = unique_fd{};
-    REQUIRE(::unlink(endpoint.c_str()) == 0);
-    auto replacement_listener = make_listener(endpoint);
+    // Replace the endpoint socket with a listener whose identity cannot equal
+    // the recorded one: bind the replacement at a fresh path while the
+    // original socket file still exists, then swap it in. Binding the
+    // replacement only after unlinking can recycle the just-freed inode on
+    // filesystems that reuse them, which would make the socket identity
+    // comparison pass by ABA and defeat the drift expectation this section
+    // asserts (docs/session-policy.md: pathname AF_UNIX does not exclude
+    // same-UID ABA replacement).
+    const auto replacement_socket = upstream / "replacement.sock";
+    auto replacement_listener = make_listener(replacement_socket);
     REQUIRE(replacement_listener.get() >= 0);
+    REQUIRE(::unlink(endpoint.c_str()) == 0);
+    REQUIRE(::rename(replacement_socket.c_str(), endpoint.c_str()) == 0);
     REQUIRE(!(*factory)->operational());
     REQUIRE(!(*factory)->prepare_session("replaced", "pi").has_value());
     return 0;

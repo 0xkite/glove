@@ -6,9 +6,11 @@
 #include "linux_session_executor.hpp"
 
 #include <fcntl.h>
+#include <linux/mount.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -139,8 +141,41 @@ auto same_identity(const file_identity& expected, const struct stat& status) -> 
     return expected == identity(status);
 }
 
+// The runtime root's link count must not participate in the operational
+// identity. On ext4, tmpfs, and APFS a directory's st_nlink is 2 plus its
+// subdirectory count, so every legitimate prepare_session - which mkdirat(2)s
+// a svc-* staging directory under the root - and its inode-safe teardown
+// necessarily changes the root's link count. That term therefore could never
+// distinguish sanctioned staging from tampering (only subdirectory creation
+// moves it; files and symlinks do not) while it rejected any second
+// operational check sharing the root as false "identity drift": a second
+// factory over the same runtime root, or the same factory's next session,
+// failed once one session existed (Workflow #218 Ghost E2E, baseline
+// LastTest.log line 666, root nlink 2 -> 3 verified by instrumentation).
+// Entry-level enumeration whitelisting would not add a real enforcement
+// claim either: the production runtime root is shared with the gloved
+// instance lock and control socket (src/gloved_main.cpp), and same-UID
+// writes to this owner-only root are trusted operator authority per
+// docs/session-policy.md. Genuine drift still fails closed: the root's
+// dev/ino (replacement), uid, and mode (permission drift) terms stay exact,
+// and the descriptor-pinned endpoint parents and their sockets retain the
+// exact dev/ino/uid/mode/nlink recheck in endpoint_current(), which is where
+// the recorded endpoint identity drift claim (docs/architecture.md) is
+// enforced.
+auto root_identity_current(const file_identity& expected, const struct stat& status) noexcept
+    -> bool {
+    return expected.device == static_cast<std::uint64_t>(status.st_dev) &&
+           expected.inode == static_cast<std::uint64_t>(status.st_ino) &&
+           expected.uid == static_cast<std::uint32_t>(status.st_uid) &&
+           expected.mode == static_cast<std::uint32_t>(status.st_mode);
+}
+
 auto same_object(const file_identity& left, const file_identity& right) noexcept -> bool {
     return left.device == right.device && left.inode == right.inode;
+}
+
+auto errno_message(int error) -> std::string {
+    return std::error_code{error, std::generic_category()}.message();
 }
 
 class bound_socket_rollback {
@@ -597,10 +632,26 @@ auto local_service_proxy_session::mount() const
         !same_identity(state_->directory_identity, status)) {
         return std::unexpected(std::string{"local service session is unavailable"});
     }
-    unique_fd descriptor{::fcntl(state_->directory.get(), F_DUPFD_CLOEXEC, 3)};
-    if (descriptor.get() < 0) {
-        return std::unexpected(std::string{"local service session is unavailable"});
+    // bind_session_mount installs this descriptor with move_mount(2), which
+    // accepts only a detached mount, never a plain directory descriptor. Clone
+    // the verified session directory as a detached open_tree mount so the
+    // local-services mount matches every other session mount path.
+    const int cloned = static_cast<int>(
+        // Linux has no typed libc wrapper for open_tree(2).
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
+        ::syscall(
+            SYS_open_tree,
+            state_->directory.get(),
+            "",
+            AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC
+        )
+    );
+    if (cloned < 0) {
+        return std::unexpected(
+            std::string{"clone local service session mount: "} + errno_message(errno)
+        );
     }
+    unique_fd descriptor{cloned};
     try {
         supervisor::linux_detail::session_mount mount;
         mount.target_path = local_service_guest_directory;
@@ -737,7 +788,7 @@ auto local_service_proxy_factory::manages_runtime(std::string_view runtime_id) c
 auto local_service_proxy_factory::operational() const noexcept -> bool {
     struct stat root_status{};
     return state_ && ::fstat(state_->runtime_root_fd.get(), &root_status) == 0 &&
-           same_identity(state_->runtime_root_identity, root_status) && state_->registry &&
+           root_identity_current(state_->runtime_root_identity, root_status) && state_->registry &&
            (!state_->guest_channel_adapter ||
             (state_->adapter_catalog_admits_schema && state_->guest_channel_adapter->channels &&
              state_->guest_channel_adapter->channels->frozen() &&
