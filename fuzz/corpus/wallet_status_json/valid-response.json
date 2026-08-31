@@ -1,1 +1,0 @@
-{"jsonrpc":"2.0","id":"status-1","result":{"schema_version":1,"connected":true,"fresh_at_ms":9000,"wallet_server_alias":"wallet-test-host","allowed_chain_ids":[8453,84532],"available_actions":["status"],"mutating_actions":[]}}
