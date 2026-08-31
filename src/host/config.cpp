@@ -50,6 +50,24 @@ struct remote_backend_wire {
     std::string staging_root;
 };
 
+struct local_service_proxy_endpoint_wire {
+    std::string alias;
+    std::string socket_path;
+    std::vector<std::string> runtime_ids;
+};
+
+struct guest_channel_adapter_wire {
+    std::string adapter_id;
+    std::string channel_schema_id;
+};
+
+struct local_service_proxy_wire {
+    std::uint64_t io_timeout_ms = 0;
+    std::uint32_t max_concurrency = 0;
+    std::optional<guest_channel_adapter_wire> guest_channel_adapter;
+    std::vector<local_service_proxy_endpoint_wire> endpoints;
+};
+
 struct config_wire {
     std::uint8_t schema_version = 0;
     bool persistent_service = false;
@@ -64,6 +82,7 @@ struct config_wire {
     std::optional<std::string> path_exposure_journal;
     std::optional<apple_container_wire> apple_container;
     std::optional<remote_backend_wire> remote_backend;
+    std::optional<local_service_proxy_wire> local_service_proxy;
 };
 } // namespace config_wire_types
 
@@ -71,6 +90,9 @@ namespace {
 
 using config_wire_types::apple_container_wire;
 using config_wire_types::config_wire;
+using config_wire_types::guest_channel_adapter_wire;
+using config_wire_types::local_service_proxy_endpoint_wire;
+using config_wire_types::local_service_proxy_wire;
 using config_wire_types::remote_backend_wire;
 using config_wire_types::sage_guest_wire;
 
@@ -197,6 +219,44 @@ auto valid_user_token(std::string_view value) -> bool {
            });
 }
 
+auto valid_local_service_alias(std::string_view value) -> bool {
+    return !value.empty() && value.size() <= 64U && value != "." && value != ".." &&
+           std::ranges::all_of(value, [](const char byte) {
+               return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' || byte == '.';
+           });
+}
+
+auto valid_opaque_id(std::string_view value) -> bool {
+    return !value.empty() && value.size() <= 128U &&
+           std::ranges::all_of(value, [](const char byte) {
+               return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' || byte == '.';
+           });
+}
+
+auto path_has_nul(const std::filesystem::path& value) -> bool {
+    return value.string().find('\0') != std::string::npos;
+}
+
+auto path_is_ancestor_or_same(
+    const std::filesystem::path& ancestor, const std::filesystem::path& descendant
+) -> bool {
+    return std::mismatch(ancestor.begin(), ancestor.end(), descendant.begin(), descendant.end())
+               .first == ancestor.end();
+}
+
+auto paths_conflict(const std::filesystem::path& left, const std::filesystem::path& right) -> bool {
+    return path_is_ancestor_or_same(left, right) || path_is_ancestor_or_same(right, left);
+}
+
+auto valid_runtime_id(std::string_view value) -> bool {
+    return !value.empty() && value.size() <= 64U && value.front() >= 'a' && value.front() <= 'z' &&
+           std::ranges::all_of(value, [](const char byte) {
+               return (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') || byte == '-';
+           });
+}
+
 auto all_configured_paths(const config& value) -> std::vector<std::filesystem::path> {
     std::vector<std::filesystem::path> paths{
         value.runtime_directory,
@@ -220,6 +280,9 @@ auto all_configured_paths(const config& value) -> std::vector<std::filesystem::p
     }
     if (value.remote_backend) {
         paths.push_back(value.remote_backend->identity_file);
+    }
+    if (value.local_service_proxy) {
+        paths.push_back(value.receipt_journal.parent_path() / local_service_audit_filename);
     }
     return paths;
 }
@@ -308,7 +371,8 @@ auto validate(const config& value) -> result<void> {
     }
     const auto paths = all_configured_paths(value);
     for (const auto& path : paths) {
-        if (!path.is_absolute() || path == path.root_path() || path.lexically_normal() != path) {
+        if (path_has_nul(path) || !path.is_absolute() || path == path.root_path() ||
+            path.lexically_normal() != path) {
             return std::unexpected(
                 std::string{"configuration paths must be dedicated normalized absolute paths"}
             );
@@ -364,6 +428,63 @@ auto validate(const config& value) -> result<void> {
             return std::unexpected(valid.error());
         }
     }
+    if (value.local_service_proxy) {
+        if (!value.session_store || !value.materialization_root || value.remote_backend ||
+            value.apple_container) {
+            return std::unexpected(
+                std::string{"local service proxy requires the Linux managed-session runtime"}
+            );
+        }
+        const auto& proxy = *value.local_service_proxy;
+        if (proxy.io_timeout_ms == 0U || proxy.io_timeout_ms > 60'000U ||
+            proxy.max_concurrency == 0U || proxy.max_concurrency > 16U || proxy.endpoints.empty() ||
+            proxy.endpoints.size() > 16U) {
+            return std::unexpected(std::string{"local service proxy configuration is invalid"});
+        }
+        if (proxy.guest_channel_adapter &&
+            (!valid_opaque_id(proxy.guest_channel_adapter->adapter_id) ||
+             !valid_opaque_id(proxy.guest_channel_adapter->channel_schema_id))) {
+            return std::unexpected(
+                std::string{"local service guest channel adapter binding is invalid"}
+            );
+        }
+        if (!std::ranges::is_sorted(proxy.endpoints, {}, &local_service_proxy_endpoint::alias)) {
+            return std::unexpected(
+                std::string{"local service proxy endpoints must be sorted by alias"}
+            );
+        }
+        std::vector<std::string_view> aliases;
+        std::vector<std::filesystem::path> socket_paths;
+        aliases.reserve(proxy.endpoints.size());
+        socket_paths.reserve(proxy.endpoints.size());
+        for (const auto& endpoint : proxy.endpoints) {
+            const auto normalized = endpoint.socket_path.lexically_normal();
+            const bool canonical_runtimes =
+                !endpoint.runtime_ids.empty() && std::ranges::is_sorted(endpoint.runtime_ids) &&
+                std::ranges::adjacent_find(endpoint.runtime_ids) == endpoint.runtime_ids.end() &&
+                std::ranges::all_of(endpoint.runtime_ids, valid_runtime_id);
+            if (!valid_local_service_alias(endpoint.alias) || !endpoint.socket_path.is_absolute() ||
+                endpoint.socket_path == endpoint.socket_path.root_path() ||
+                normalized != endpoint.socket_path || path_has_nul(endpoint.socket_path) ||
+                !canonical_runtimes ||
+                std::ranges::find(aliases, endpoint.alias) != aliases.end() ||
+                std::ranges::any_of(
+                    paths,
+                    [&](const auto& configured_path) {
+                        return paths_conflict(endpoint.socket_path, configured_path);
+                    }
+                ) ||
+                std::ranges::any_of(socket_paths, [&](const auto& configured_socket) {
+                    return paths_conflict(endpoint.socket_path, configured_socket);
+                })) {
+                return std::unexpected(
+                    std::string{"local service proxy endpoints must be canonical and distinct"}
+                );
+            }
+            aliases.push_back(endpoint.alias);
+            socket_paths.push_back(endpoint.socket_path);
+        }
+    }
     if (value.path_exposure_policy.has_value() != value.path_exposure_journal.has_value()) {
         return std::unexpected(
             std::string{"path exposure policy and journal must be configured together"}
@@ -379,9 +500,7 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
     }
     config_wire encoded;
     if (const auto error = glz::read<strict_read_options>(encoded, *contents); error) {
-        return std::unexpected(
-            std::string{"configuration JSON is invalid: "} + glz::format_error(error, *contents)
-        );
+        return std::unexpected(std::string{"configuration JSON is invalid"});
     }
     config decoded{
         .schema_version = encoded.schema_version,
@@ -435,7 +554,33 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
                       .staging_root = encoded.remote_backend->staging_root,
                   }}
                 : std::nullopt,
+        .local_service_proxy = std::nullopt,
     };
+    if (encoded.local_service_proxy) {
+        local_service_proxy_config proxy{
+            .io_timeout_ms = encoded.local_service_proxy->io_timeout_ms,
+            .max_concurrency = encoded.local_service_proxy->max_concurrency,
+            .guest_channel_adapter =
+                encoded.local_service_proxy->guest_channel_adapter
+                    ? std::optional<guest_channel_adapter_config>{guest_channel_adapter_config{
+                          .adapter_id =
+                              encoded.local_service_proxy->guest_channel_adapter->adapter_id,
+                          .channel_schema_id =
+                              encoded.local_service_proxy->guest_channel_adapter->channel_schema_id,
+                      }}
+                    : std::nullopt,
+            .endpoints = {},
+        };
+        proxy.endpoints.reserve(encoded.local_service_proxy->endpoints.size());
+        for (auto& endpoint : encoded.local_service_proxy->endpoints) {
+            proxy.endpoints.push_back({
+                .alias = std::move(endpoint.alias),
+                .socket_path = std::move(endpoint.socket_path),
+                .runtime_ids = std::move(endpoint.runtime_ids),
+            });
+        }
+        decoded.local_service_proxy = std::move(proxy);
+    }
     if (auto valid = validate(decoded); !valid) {
         return std::unexpected(valid.error());
     }
@@ -445,6 +590,32 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
 auto encode_config(const config& value) -> result<std::string> {
     if (auto valid = validate(value); !valid) {
         return std::unexpected(valid.error());
+    }
+    std::optional<local_service_proxy_wire> proxy_wire;
+    if (value.local_service_proxy) {
+        local_service_proxy_wire proxy{
+            .io_timeout_ms = value.local_service_proxy->io_timeout_ms,
+            .max_concurrency = value.local_service_proxy->max_concurrency,
+            .guest_channel_adapter =
+                value.local_service_proxy->guest_channel_adapter
+                    ? std::optional<guest_channel_adapter_wire>{guest_channel_adapter_wire{
+                          .adapter_id =
+                              value.local_service_proxy->guest_channel_adapter->adapter_id,
+                          .channel_schema_id =
+                              value.local_service_proxy->guest_channel_adapter->channel_schema_id,
+                      }}
+                    : std::nullopt,
+            .endpoints = {},
+        };
+        proxy.endpoints.reserve(value.local_service_proxy->endpoints.size());
+        for (const auto& endpoint : value.local_service_proxy->endpoints) {
+            proxy.endpoints.push_back({
+                .alias = endpoint.alias,
+                .socket_path = endpoint.socket_path.string(),
+                .runtime_ids = endpoint.runtime_ids,
+            });
+        }
+        proxy_wire = std::move(proxy);
     }
     auto encoded = glz::write_json(
         config_wire{
@@ -500,6 +671,7 @@ auto encode_config(const config& value) -> result<std::string> {
                           .staging_root = value.remote_backend->staging_root.string(),
                       }}
                     : std::nullopt,
+            .local_service_proxy = std::move(proxy_wire),
         }
     );
     if (!encoded) {

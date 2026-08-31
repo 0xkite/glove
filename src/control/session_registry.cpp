@@ -33,6 +33,21 @@ namespace glove::control {
 
 namespace {
 
+auto same_observation_replay_context(
+    const wire::persisted_session& record,
+    const wire::persisted_observation_intent& intent,
+    const observation_intent_context& context
+) noexcept -> bool {
+    return record.session_id == context.session_id &&
+           record.controller_plan_digest == context.controller_plan_digest &&
+           intent.profile_digest == context.profile_digest &&
+           intent.runtime_id == context.runtime_id &&
+           intent.projection_digest == context.projection_digest &&
+           record.policy_revision == context.policy_revision &&
+           intent.channel_id == context.channel_id &&
+           intent.channel_generation == context.channel_generation;
+}
+
 auto current_observation_item_locked(
     const session_registry::implementation& state, std::string_view key
 ) -> session_registry_result<observation_intent_item> {
@@ -70,7 +85,8 @@ auto session_registry::open_or_create(
     std::shared_ptr<const channel_host> channels
 ) -> session_registry_result<std::unique_ptr<session_registry>> {
     if (!validator || path.empty() || max_bytes < min_registry_bytes ||
-        max_bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+        max_bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+        (channels && (!channels->frozen() || channels->empty()))) {
         return std::unexpected(failure(
             session_registry_error_code::invalid_request, "invalid session registry configuration"
         ));
@@ -2111,37 +2127,52 @@ auto session_registry::enqueue_observation_intent(
     const observation_intent_context& context,
     std::uint64_t now_ms
 ) -> session_registry_result<observation_intent_item> {
-    // Host-registered admission is resolved before the lock: the table is
-    // immutable once shared with a registry, so admits() is lock-free safe.
-    const channel_host* channels = state_ ? state_->channels.get() : nullptr;
+    // Replays may reconstruct only host-stamped temporal fields. The durable
+    // body and every immutable security-context field remain exact-match bound.
+    if (!valid_observation_body_shape(body) || !valid_identifier(context.session_id) ||
+        context.channel_generation == 0) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request, "invalid observation intent request"
+        ));
+    }
+    const auto key =
+        observation_intent_key(context.session_id, context.channel_generation, body.intent_id);
+    {
+        const std::scoped_lock lock{state_->mutex};
+        if (state_->poisoned || !verify_identity(*state_)) {
+            return std::unexpected(storage_failure("session registry is poisoned"));
+        }
+        if (state_->quarantined_observation_intents.contains(key)) {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_state,
+                "observation intent schema is unavailable"
+            ));
+        }
+    }
+
+    // Host-registered admission is resolved outside the append lock: the
+    // catalog is immutable once shared with a registry.
+    const channel_host* channels = state_->channels.get();
     const auto* descriptor = channels == nullptr ? nullptr : channels->admits(body.schema);
-    if (!valid_observation_body_shape(body) || descriptor == nullptr ||
-        !valid_identifier(context.session_id) || !valid_digest(context.controller_plan_digest) ||
-        !valid_digest(context.profile_digest) || !valid_identifier(context.runtime_id) ||
-        !valid_digest(context.projection_digest) || context.policy_revision == 0 ||
-        !valid_identifier(context.channel_id) || context.channel_generation == 0 ||
-        context.issued_at_ms == 0 || context.expires_at_ms <= context.issued_at_ms || now_ms == 0) {
+    if (descriptor == nullptr) {
         return std::unexpected(failure(
             session_registry_error_code::invalid_request,
-            descriptor == nullptr && channels != nullptr ? "observation schema is not registered"
-                                                         : "invalid observation intent request"
+            channels != nullptr ? "observation schema is not registered"
+                                : "invalid observation intent request"
         ));
     }
     if (body.item_count > descriptor->bounds.max_items ||
         observation_body_bytes(body) > descriptor->bounds.max_body_bytes ||
-        !descriptor->body_validator(body)) {
+        !body_validator_accepts(*descriptor, body)) {
         return std::unexpected(
             failure(session_registry_error_code::invalid_request, "observation body rejected")
         );
     }
     auto intent_digest = hash_observation_intent_body(body);
-    auto request_digest = hash_observation_intent_request(body, context);
-    if (!intent_digest || !request_digest) {
+    if (!intent_digest) {
         return std::unexpected(storage_failure("hash observation intent failed"));
     }
 
-    const auto key =
-        observation_intent_key(context.session_id, context.channel_generation, body.intent_id);
     auto queued = ([&]() -> session_registry_result<observation_intent_item> {
         const std::scoped_lock lock{state_->mutex};
         if (state_->poisoned || !verify_identity(*state_)) {
@@ -2152,13 +2183,26 @@ auto session_registry::enqueue_observation_intent(
             const auto& record = state_->records[replay->second];
             if (!record.observation_intent ||
                 record.observation_intent->intent_digest != *intent_digest ||
-                record.request_digest != *request_digest) {
+                !same_observation_replay_context(record, *record.observation_intent, context)) {
                 return std::unexpected(failure(
                     session_registry_error_code::idempotency_conflict,
-                    "observation intent payload changed"
+                    "observation intent body or security context changed"
                 ));
             }
             return current_observation_item_locked(*state_, key);
+        }
+        if (!valid_digest(context.controller_plan_digest) ||
+            !valid_digest(context.profile_digest) || !valid_identifier(context.runtime_id) ||
+            !valid_digest(context.projection_digest) || context.policy_revision == 0 ||
+            !valid_identifier(context.channel_id) || context.issued_at_ms == 0 ||
+            context.expires_at_ms <= context.issued_at_ms || now_ms == 0) {
+            return std::unexpected(failure(
+                session_registry_error_code::invalid_request, "invalid observation intent request"
+            ));
+        }
+        auto request_digest = hash_observation_intent_request(body, context);
+        if (!request_digest) {
+            return std::unexpected(storage_failure("hash observation intent failed"));
         }
         if ((context.issued_at_ms > now_ms &&
              context.issued_at_ms - now_ms > descriptor->bounds.max_skew_ms) ||
@@ -2258,6 +2302,11 @@ auto session_registry::set_observation_intent_disposition(
     if (state_->poisoned || !verify_identity(*state_)) {
         return std::unexpected(storage_failure("session registry is poisoned"));
     }
+    if (state_->quarantined_observation_intents.contains(key)) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_state, "observation intent schema is unavailable"
+        ));
+    }
     const auto enqueued = state_->observation_intents.find(key);
     if (enqueued == state_->observation_intents.end()) {
         return std::unexpected(
@@ -2350,7 +2399,8 @@ auto session_registry::pending_observation_intents(
         const auto& intent = *record.observation_intent;
         const auto key =
             observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id);
-        if (state_->observation_dispositions.contains(key)) {
+        if (!state_->observation_intents.contains(key) ||
+            state_->observation_dispositions.contains(key)) {
             continue;
         }
         if (page.items.size() == limit) {
@@ -2366,6 +2416,52 @@ auto session_registry::pending_observation_intents(
     return page;
 }
 
+auto session_registry::quarantined_observation_intents(
+    std::uint64_t after_sequence, std::size_t limit
+) const -> session_registry_result<observation_intent_quarantine_page> {
+    if (limit == 0 || limit > max_observation_quarantine_page_size) {
+        return std::unexpected(failure(
+            session_registry_error_code::invalid_request,
+            "invalid observation intent quarantine page request"
+        ));
+    }
+    const std::scoped_lock lock{state_->mutex};
+    if (state_->poisoned || !verify_identity(*state_)) {
+        return std::unexpected(storage_failure("session registry is poisoned"));
+    }
+    observation_intent_quarantine_page page;
+    page.items.reserve(limit);
+    for (const auto& record : state_->records) {
+        if (record.sequence <= after_sequence ||
+            record.operation != "enqueue_observation_intent_v1" || !record.observation_intent) {
+            continue;
+        }
+        const auto& intent = *record.observation_intent;
+        const auto key =
+            observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id);
+        const auto quarantined = state_->quarantined_observation_intents.find(key);
+        if (quarantined == state_->quarantined_observation_intents.end() ||
+            quarantined->second.enqueue_index >= state_->records.size() ||
+            state_->records[quarantined->second.enqueue_index].sequence != record.sequence) {
+            continue;
+        }
+        if (page.items.size() == limit) {
+            page.next_after_sequence = page.items.back().sequence;
+            break;
+        }
+        page.items.push_back({
+            .sequence = record.sequence,
+            .session_id = record.session_id,
+            .schema_id = intent.schema,
+            .intent_id = intent.intent_id,
+            .channel_generation = intent.channel_generation,
+            .closed_reason =
+                std::string{observation_quarantine_reason_name(quarantined->second.reason)},
+        });
+    }
+    return page;
+}
+
 auto session_registry::record_count() const -> std::uint64_t {
     const std::scoped_lock lock{state_->mutex};
     return static_cast<std::uint64_t>(state_->records.size());
@@ -2373,6 +2469,12 @@ auto session_registry::record_count() const -> std::uint64_t {
 
 auto session_registry::library_projections_available() const noexcept -> bool {
     return state_ && state_->library_bundles != nullptr;
+}
+
+auto session_registry::uses_channel_host(
+    const std::shared_ptr<const channel_host>& channels
+) const noexcept -> bool {
+    return state_ && channels && state_->channels.get() == channels.get();
 }
 
 } // namespace glove::control

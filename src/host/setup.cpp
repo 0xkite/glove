@@ -685,6 +685,7 @@ auto plan_setup(const setup_options& options, const environment& values) -> resu
             canonical_root ? std::optional{roots->state / "path-exposures.journal"} : std::nullopt,
         .apple_container = std::nullopt,
         .remote_backend = std::nullopt,
+        .local_service_proxy = std::nullopt,
     };
 #if defined(__APPLE__)
     if (session_policy) {
@@ -712,6 +713,9 @@ auto plan_setup(const setup_options& options, const environment& values) -> resu
         if (!options.persistent_service) {
             service.persistent_service = existing->persistent_service;
         }
+        // Setup does not author host service endpoints. Preserve the operator's
+        // validated block byte-for-byte while reconciling setup-owned fields.
+        service.local_service_proxy = existing->local_service_proxy;
         const bool runtime_differs = existing->runtime_directory != service.runtime_directory;
         const bool paired_apple_addition =
             !existing->apple_container && service.apple_container.has_value();

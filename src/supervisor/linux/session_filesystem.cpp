@@ -416,6 +416,7 @@ auto scratch_mount(int source_fd, std::string target, std::string alias, std::ui
         .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
+        .service_proxy_manifest_digest = std::nullopt,
         .writable = true,
         .directory = true,
     };
@@ -521,6 +522,7 @@ auto append_read_mount(const resolved_path_grant& grant, std::vector<session_mou
         .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
+        .service_proxy_manifest_digest = std::nullopt,
         .writable = false,
         .directory = static_cast<bool>(S_ISDIR(mode)),
     };
@@ -564,6 +566,7 @@ auto append_ephemeral_mount(
         .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
+        .service_proxy_manifest_digest = std::nullopt,
         .writable = true,
         .directory = materialized->is_directory(),
     };
@@ -605,6 +608,7 @@ auto append_library_mounts(
             .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
+            .service_proxy_manifest_digest = std::nullopt,
             .writable = false,
             .directory = false,
         };

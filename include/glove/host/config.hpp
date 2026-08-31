@@ -5,10 +5,14 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace glove::host {
 
 template<typename Value> using result = std::expected<Value, std::string>;
+
+inline constexpr std::string_view local_service_audit_filename = "local-service-audit.jsonl";
 
 struct environment {
     std::optional<std::string> home;
@@ -69,6 +73,30 @@ struct remote_backend_config {
     auto operator==(const remote_backend_config&) const -> bool = default;
 };
 
+struct local_service_proxy_endpoint {
+    std::string alias;
+    std::filesystem::path socket_path;
+    std::vector<std::string> runtime_ids;
+
+    auto operator==(const local_service_proxy_endpoint&) const -> bool = default;
+};
+
+struct guest_channel_adapter_config {
+    std::string adapter_id;
+    std::string channel_schema_id;
+
+    auto operator==(const guest_channel_adapter_config&) const -> bool = default;
+};
+
+struct local_service_proxy_config {
+    std::uint64_t io_timeout_ms = 5'000;
+    std::uint32_t max_concurrency = 4;
+    std::optional<guest_channel_adapter_config> guest_channel_adapter;
+    std::vector<local_service_proxy_endpoint> endpoints;
+
+    auto operator==(const local_service_proxy_config&) const -> bool = default;
+};
+
 struct config {
     std::uint8_t schema_version = 1;
     bool persistent_service = false;
@@ -83,6 +111,7 @@ struct config {
     std::optional<std::filesystem::path> path_exposure_journal;
     std::optional<apple_container_config> apple_container;
     std::optional<remote_backend_config> remote_backend;
+    std::optional<local_service_proxy_config> local_service_proxy;
 
     auto operator==(const config&) const -> bool = default;
 };

@@ -390,6 +390,7 @@ auto resolve_secret_mounts(
             .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = policy.handle,
             .secret_runtime_id = policy.runtime_id,
+            .service_proxy_manifest_digest = std::nullopt,
             .writable = true,
             .directory = false,
         });
@@ -404,14 +405,18 @@ auto resolve_secret_mounts(
 linux_session_preparer::linux_session_preparer(
     std::string materialization_root,
     container::linux_detail::cgroup_v2_root cgroup_root,
-    std::shared_ptr<audit::sink> egress_audit
+    std::shared_ptr<audit::sink> egress_audit,
+    std::shared_ptr<local_service_proxy_factory> local_services
 ) noexcept
     : materialization_root_{std::move(materialization_root)},
       cgroup_root_{std::move(cgroup_root)},
-      egress_audit_{std::move(egress_audit)} {}
+      egress_audit_{std::move(egress_audit)},
+      local_services_{std::move(local_services)} {}
 
 auto linux_session_preparer::create(
-    std::string materialization_root, std::shared_ptr<audit::sink> egress_audit
+    std::string materialization_root,
+    std::shared_ptr<audit::sink> egress_audit,
+    std::shared_ptr<local_service_proxy_factory> local_services
 ) -> std::expected<linux_session_preparer, std::string> {
     if (materialization_root.empty()) {
         return std::unexpected(std::string{"Linux preparation materialization root is required"});
@@ -421,7 +426,10 @@ auto linux_session_preparer::create(
         return std::unexpected(cgroup_root.error());
     }
     return linux_session_preparer{
-        std::move(materialization_root), std::move(*cgroup_root), std::move(egress_audit)
+        std::move(materialization_root),
+        std::move(*cgroup_root),
+        std::move(egress_audit),
+        std::move(local_services)
     };
 }
 
@@ -431,6 +439,13 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
     if (auto valid = validate_inputs(owned_inputs, started_at_ms); !valid) {
         return std::unexpected(valid.error());
     }
+    if (local_services_) {
+        if (auto safe = local_services_->validate_path_grants(owned_inputs.path_grants); !safe) {
+            return std::unexpected(safe.error());
+        }
+    }
+    const bool local_services_enabled =
+        local_services_ && local_services_->manages_runtime(owned_inputs.launch.runtime_id);
 
     const auto limits = convert_limits(owned_inputs.launch.limits);
     container::profile requested_profile;
@@ -439,6 +454,14 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         requested_profile.runtime_filesystem.push_back({.path = path, .writable = false});
     }
     requested_profile.environment = owned_inputs.launch.environment;
+    if (local_services_enabled) {
+        if (std::ranges::any_of(requested_profile.environment, [](const auto& entry) {
+                return entry.starts_with("GLOVE_LOCAL_SERVICE_DIR=");
+            })) {
+            return std::unexpected(std::string{"local service environment is managed by Glove"});
+        }
+        requested_profile.environment.emplace_back(local_service_environment);
+    }
     const auto adapter =
         supervisor::native_skill_runtime_adapter_for(owned_inputs.launch.runtime_id);
     if (adapter) {
@@ -636,6 +659,23 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         !installed) {
         return std::unexpected(installed.error());
     }
+    std::unique_ptr<local_service_proxy_session> local_service_proxy;
+    if (local_services_enabled) {
+        auto service_session = local_services_->prepare_session(
+            owned_inputs.session.session_id, owned_inputs.launch.runtime_id
+        );
+        if (!service_session) {
+            return std::unexpected(service_session.error());
+        }
+        auto mount = (*service_session)->mount();
+        if (!mount) {
+            return std::unexpected(mount.error());
+        }
+        if (auto installed = (*lifecycle)->install_service_mount(std::move(*mount)); !installed) {
+            return std::unexpected(installed.error());
+        }
+        local_service_proxy = std::move(*service_session);
+    }
     auto binding = container::linux_detail::bind_managed_session(
         *profile, owned_inputs.launch.argv, **lifecycle, owned_inputs.session.controller_plan_digest
     );
@@ -661,6 +701,7 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         .filesystem_identity = std::move(filesystem_identity),
         .lifecycle = std::move(*lifecycle),
         .egress_proxy = std::move(egress_proxy),
+        .local_service_proxy = std::move(local_service_proxy),
         .refinement_evaluator = std::move(refinement_evaluator),
     };
 }

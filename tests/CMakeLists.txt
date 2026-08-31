@@ -146,33 +146,6 @@ add_executable(control_remote_protocol_test control/remote_protocol_test.cpp)
 target_link_libraries(control_remote_protocol_test PRIVATE glove_control)
 add_test(NAME control_remote_protocol COMMAND control_remote_protocol_test)
 
-add_executable(control_wallet_status_bridge_test control/wallet_status_bridge_test.cpp)
-target_link_libraries(control_wallet_status_bridge_test PRIVATE glove_control)
-add_test(NAME control_wallet_status_bridge COMMAND control_wallet_status_bridge_test)
-set_tests_properties(control_wallet_status_bridge PROPERTIES TIMEOUT 10)
-
-add_executable(
-    control_wallet_status_managed_session_test
-    control/wallet_status_managed_session_test.cpp
-)
-target_link_libraries(control_wallet_status_managed_session_test PRIVATE glove_control)
-target_include_directories(control_wallet_status_managed_session_test PRIVATE
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
-)
-add_test(NAME control_wallet_status_managed_session COMMAND control_wallet_status_managed_session_test)
-set_tests_properties(control_wallet_status_managed_session PROPERTIES TIMEOUT 10)
-
-add_executable(
-    control_wallet_pi_status_adapter_test
-    control/wallet_pi_status_adapter_test.cpp
-)
-target_link_libraries(control_wallet_pi_status_adapter_test PRIVATE glove_control)
-target_include_directories(control_wallet_pi_status_adapter_test PRIVATE
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
-)
-add_test(NAME control_wallet_pi_status_adapter COMMAND control_wallet_pi_status_adapter_test)
-set_tests_properties(control_wallet_pi_status_adapter PROPERTIES TIMEOUT 10)
-
 add_executable(control_remote_validation_test control/remote_validation_test.cpp)
 target_link_libraries(control_remote_validation_test PRIVATE glove_control)
 add_test(NAME control_remote_validation COMMAND control_remote_validation_test)
@@ -208,6 +181,22 @@ target_include_directories(control_session_registry_test PRIVATE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
 )
 add_test(NAME control_session_registry COMMAND control_session_registry_test)
+
+add_executable(control_guest_channel_test control/guest_channel_test.cpp)
+target_link_libraries(control_guest_channel_test PRIVATE glove_control)
+add_test(NAME control_guest_channel COMMAND control_guest_channel_test)
+
+add_executable(
+    control_sage_guest_channel_adapter_test
+    control/sage_guest_channel_adapter_test.cpp
+)
+target_link_libraries(control_sage_guest_channel_adapter_test PRIVATE glove_sage_adapter)
+add_test(NAME control_sage_guest_channel_adapter COMMAND control_sage_guest_channel_adapter_test)
+
+add_executable(control_guest_channel_transport_test control/guest_channel_transport_test.cpp)
+target_link_libraries(control_guest_channel_transport_test PRIVATE glove_control)
+add_test(NAME control_guest_channel_transport COMMAND control_guest_channel_transport_test)
+set_tests_properties(control_guest_channel_transport PROPERTIES TIMEOUT 10)
 
 add_executable(
     control_observation_intent_unix_server_test
@@ -548,6 +537,30 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     )
     set_tests_properties(container_linux_native_harness_matrix PROPERTIES
         TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
+
+    add_executable(
+        control_local_service_proxy_test
+        control/local_service_proxy_test.cpp
+    )
+    target_link_libraries(
+        control_local_service_proxy_test
+        PRIVATE glove_control glove_sage_adapter
+    )
+    target_include_directories(control_local_service_proxy_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container/linux>
+    )
+    add_test(NAME control_local_service_proxy COMMAND control_local_service_proxy_test)
+    set_tests_properties(control_local_service_proxy PROPERTIES TIMEOUT 20)
+    add_test(
+        NAME control_local_service_proxy_privileged
+        COMMAND control_local_service_proxy_test --privileged
+    )
+    set_tests_properties(control_local_service_proxy_privileged PROPERTIES
+        TIMEOUT 20
         SKIP_RETURN_CODE 77
     )
 

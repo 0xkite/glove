@@ -2,6 +2,10 @@
 
 #include "receipt_audit_wire.hpp"
 
+#if defined(__linux__)
+#    include "glove/control/local_service_proxy.hpp"
+#endif
+
 #include <glaze/glaze.hpp>
 
 #include <algorithm>
@@ -231,8 +235,16 @@ auto handle_capabilities(
                 lifecycle_operational
                     ? state.session_runtime->refinement_evaluation_protocol_schema_version()
                     : std::uint8_t{0},
+#if defined(__linux__)
             .observation_intent_channel_schema_version =
-                state.sessions ? std::uint8_t{1} : std::uint8_t{0},
+                state.local_services && state.local_services->operational_for(
+                                            state.session_runtime.get(), state.sessions.get()
+                                        )
+                    ? std::uint8_t{1}
+                    : std::uint8_t{0},
+#else
+            .observation_intent_channel_schema_version = 0,
+#endif
             .backends = {
                 backend_capabilities{
                     .backend = "linux_production",

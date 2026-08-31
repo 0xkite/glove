@@ -7,6 +7,8 @@ project(glove
 )
 
 include(GNUInstallDirs)
+include(CheckCXXCompilerFlag)
+include(CheckCXXSourceCompiles)
 
 # --- Global toolchain defaults ----------------------------------------------
 
@@ -40,8 +42,35 @@ endif()
 
 # --- Targets ----------------------------------------------------------------
 
+# libc++ 18 exposes std::stop_token behind its supported experimental-library
+# switch. Probe the facility first and add that switch only when required.
+check_cxx_source_compiles(
+    "#include <stop_token>\nint main() { std::stop_source source; return source.stop_possible() ? 0 : 1; }"
+    GLOVE_HAS_STD_STOP_TOKEN
+)
+set(GLOVE_STOP_TOKEN_COMPILE_OPTION "")
+if(NOT GLOVE_HAS_STD_STOP_TOKEN)
+    check_cxx_compiler_flag("-fexperimental-library" GLOVE_HAS_EXPERIMENTAL_LIBRARY_FLAG)
+    if(GLOVE_HAS_EXPERIMENTAL_LIBRARY_FLAG)
+        set(_glove_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+        string(APPEND CMAKE_REQUIRED_FLAGS " -fexperimental-library")
+        check_cxx_source_compiles(
+            "#include <stop_token>\nint main() { std::stop_source source; return source.stop_possible() ? 0 : 1; }"
+            GLOVE_HAS_EXPERIMENTAL_STD_STOP_TOKEN
+        )
+        set(CMAKE_REQUIRED_FLAGS "${_glove_saved_required_flags}")
+    endif()
+    if(NOT GLOVE_HAS_EXPERIMENTAL_STD_STOP_TOKEN)
+        message(FATAL_ERROR "The configured C++ standard library does not provide std::stop_token")
+    endif()
+    set(GLOVE_STOP_TOKEN_COMPILE_OPTION "-fexperimental-library")
+endif()
+
 # Shared compile options carrier; INTERFACE so consumers inherit it
 add_library(glove_options INTERFACE)
+if(GLOVE_STOP_TOKEN_COMPILE_OPTION)
+    target_compile_options(glove_options INTERFACE "${GLOVE_STOP_TOKEN_COMPILE_OPTION}")
+endif()
 glove_set_warnings(glove_options)
 glove_apply_sanitizers(glove_options)
 target_compile_features(glove_options INTERFACE cxx_std_23)

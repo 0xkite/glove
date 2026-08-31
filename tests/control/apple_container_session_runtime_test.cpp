@@ -380,6 +380,22 @@ auto run() -> int {
         );
         REQUIRE(gated_protocol.has_value());
         const auto gated_now_ms = epoch_ms();
+        auto gated_capabilities = (*gated_protocol)
+                                      ->handle_frame(
+                                          make_request(
+                                              "gated-capabilities",
+                                              "capabilities",
+                                              "null",
+                                              std::nullopt,
+                                              gated_now_ms + 1'000U
+                                          ),
+                                          gated_now_ms
+                                      );
+        REQUIRE(gated_capabilities.has_value());
+        REQUIRE(
+            gated_capabilities->find("\"observation_intent_channel_schema_version\":0") !=
+            std::string::npos
+        );
         const auto gated_start_session = std::string{
             R"({"authorization":{"schema_version":1,"authorization_id":"gated-approval",)"
             R"("session_id":"gated-session","controller_plan_digest":")" +

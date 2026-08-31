@@ -33,7 +33,8 @@ auto receipt_audit_protocol::create(
     std::shared_ptr<session_registry> sessions,
     std::shared_ptr<session_runtime> session_runtime,
     std::shared_ptr<supervisor::path_exposure_registry> path_exposures,
-    std::string materialization_root
+    std::string materialization_root,
+    std::shared_ptr<const linux_detail::local_service_proxy_capability> local_services
 ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string> {
     if (!valid_hex_secret(bootstrap_secret_hex) || !producer || (sessions && !plan_validator) ||
         (session_runtime &&
@@ -48,6 +49,7 @@ auto receipt_audit_protocol::create(
     state->plan_validator = std::move(plan_validator);
     state->sessions = std::move(sessions);
     state->session_runtime = std::move(session_runtime);
+    state->local_services = std::move(local_services);
     state->path_exposures = std::move(path_exposures);
     state->materialization_root = std::move(materialization_root);
     return std::make_unique<receipt_audit_protocol>(construction_token{}, std::move(state));
@@ -60,7 +62,8 @@ auto receipt_audit_protocol::create(
     std::shared_ptr<session_registry> sessions,
     std::shared_ptr<session_runtime> session_runtime,
     std::shared_ptr<supervisor::path_exposure_registry> path_exposures,
-    std::string materialization_root
+    std::string materialization_root,
+    std::shared_ptr<const linux_detail::local_service_proxy_capability> local_services
 ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string> {
     if (!valid_hex_secret(bootstrap_secret_hex) || producer_config.key_path.empty() ||
         producer_config.journal_path.empty() || (sessions && !plan_validator) ||
@@ -80,6 +83,7 @@ auto receipt_audit_protocol::create(
     state->plan_validator = std::move(plan_validator);
     state->sessions = std::move(sessions);
     state->session_runtime = std::move(session_runtime);
+    state->local_services = std::move(local_services);
     state->path_exposures = std::move(path_exposures);
     state->materialization_root = std::move(materialization_root);
     return std::make_unique<receipt_audit_protocol>(construction_token{}, std::move(state));

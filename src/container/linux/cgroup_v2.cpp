@@ -1,7 +1,12 @@
 #include "cgroup_v2.hpp"
 
 #include <fcntl.h>
+#include <linux/magic.h>
+#include <sched.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -198,7 +203,8 @@ auto valid_session_id(std::string_view value) -> bool {
            });
 }
 
-auto current_cgroup_path() -> std::expected<std::filesystem::path, std::string> {
+auto current_cgroup_membership()
+    -> std::expected<std::optional<std::filesystem::path>, std::string> {
     unique_fd fd{::open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
     if (fd.get() < 0) {
         return std::unexpected(std::string{"open /proc/self/cgroup: "} + std::strerror(errno));
@@ -219,14 +225,143 @@ auto current_cgroup_path() -> std::expected<std::filesystem::path, std::string> 
             if (!relative.empty()) {
                 path /= relative;
             }
-            return path.lexically_normal();
+            return std::optional<std::filesystem::path>{path.lexically_normal()};
         }
         if (end == std::string::npos) {
             break;
         }
         offset = end + 1;
     }
-    return std::unexpected(std::string{"unified cgroup v2 membership not found"});
+    return std::optional<std::filesystem::path>{};
+}
+
+auto current_cgroup_path() -> std::expected<std::filesystem::path, std::string> {
+    auto membership = current_cgroup_membership();
+    if (!membership) {
+        return std::unexpected(membership.error());
+    }
+    if (!*membership) {
+        return std::unexpected(std::string{"unified cgroup v2 membership not found"});
+    }
+    return std::move(**membership);
+}
+
+auto probe_user_namespace() -> std::expected<bool, std::string> {
+    std::array<int, 2> pipe_descriptors{-1, -1};
+    if (::pipe(pipe_descriptors.data()) != 0) {
+        return std::unexpected(std::string{"probe user namespace pipe: "} + std::strerror(errno));
+    }
+    unique_fd read_end{pipe_descriptors[0]};
+    unique_fd write_end{pipe_descriptors[1]};
+    const auto child = ::fork();
+    if (child < 0) {
+        return std::unexpected(std::string{"probe user namespace fork: "} + std::strerror(errno));
+    }
+    if (child == 0) {
+        read_end.reset();
+        if (::unshare(CLONE_NEWUSER) == 0) {
+            ::_exit(0);
+        }
+        const int failure = errno;
+        const auto* bytes = reinterpret_cast<const unsigned char*>(&failure);
+        std::size_t written = 0;
+        while (written < sizeof(failure)) {
+            const auto amount =
+                ::write(write_end.get(), bytes + written, sizeof(failure) - written);
+            if (amount > 0) {
+                written += static_cast<std::size_t>(amount);
+            } else if (amount < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        ::_exit(1);
+    }
+    write_end.reset();
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return std::unexpected(
+                std::string{"probe user namespace wait: "} + std::strerror(errno)
+            );
+        }
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return true;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 1) {
+        return std::unexpected(std::string{"probe user namespace child failed"});
+    }
+    int failure = 0;
+    auto* bytes = reinterpret_cast<unsigned char*>(&failure);
+    std::size_t received = 0;
+    while (received < sizeof(failure)) {
+        const auto amount = ::read(read_end.get(), bytes + received, sizeof(failure) - received);
+        if (amount > 0) {
+            received += static_cast<std::size_t>(amount);
+        } else if (amount < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    if (received != sizeof(failure)) {
+        return std::unexpected(std::string{"probe user namespace result is incomplete"});
+    }
+    switch (failure) {
+    case EACCES:
+    case EINVAL:
+    case ENOSPC:
+    case ENOSYS:
+    case EPERM:
+    case EUSERS:
+        return false;
+    default:
+        return std::unexpected(
+            std::string{"probe user namespace creation: "} + std::strerror(failure)
+        );
+    }
+}
+
+auto current_cgroup_is_exclusive(int directory_fd) -> std::expected<bool, std::string> {
+    auto processes = read_at(directory_fd, "cgroup.procs");
+    if (!processes) {
+        return std::unexpected(processes.error());
+    }
+    const auto current = static_cast<std::uint64_t>(::getpid());
+    bool found_current = false;
+    std::size_t offset = 0;
+    while (offset < processes->size()) {
+        while (offset < processes->size() &&
+               std::isspace(static_cast<unsigned char>((*processes)[offset])) != 0) {
+            ++offset;
+        }
+        if (offset == processes->size()) {
+            break;
+        }
+        const auto end = processes->find_first_of(" \t\r\n", offset);
+        const auto field = std::string_view{*processes}.substr(
+            offset, end == std::string::npos ? processes->size() - offset : end - offset
+        );
+        std::uint64_t process = 0;
+        const auto parsed = std::from_chars(field.data(), field.data() + field.size(), process);
+        if (parsed.ec != std::errc{} || parsed.ptr != field.data() + field.size()) {
+            return std::unexpected(std::string{"parse delegated cgroup membership"});
+        }
+        if (process != current) {
+            return false;
+        }
+        found_current = true;
+        if (end == std::string::npos) {
+            break;
+        }
+        offset = end + 1U;
+    }
+    if (!found_current) {
+        return std::unexpected(std::string{"current process is absent from delegated cgroup"});
+    }
+    return true;
 }
 
 auto create_unique_host_leaf(int root_fd) -> std::expected<std::string, std::string> {
@@ -249,6 +384,124 @@ auto remove_directory_at(int parent_fd, const std::string& name) noexcept -> boo
 }
 
 } // namespace
+
+auto probe_linux_session_prerequisite() -> std::expected<linux_session_prerequisite, std::string> {
+    auto user_namespace = probe_user_namespace();
+    if (!user_namespace) {
+        return std::unexpected(user_namespace.error());
+    }
+    if (!*user_namespace) {
+        return linux_session_prerequisite::user_namespace_unavailable;
+    }
+
+    struct statfs cgroup_filesystem{};
+    if (::statfs("/sys/fs/cgroup", &cgroup_filesystem) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return linux_session_prerequisite::cgroup_v2_unavailable;
+        }
+        return std::unexpected(std::string{"probe cgroup v2 filesystem: "} + std::strerror(errno));
+    }
+    if (static_cast<unsigned long>(cgroup_filesystem.f_type) !=
+        static_cast<unsigned long>(CGROUP2_SUPER_MAGIC)) {
+        return linux_session_prerequisite::cgroup_v2_unavailable;
+    }
+
+    auto membership = current_cgroup_membership();
+    if (!membership) {
+        return std::unexpected(membership.error());
+    }
+    if (!*membership) {
+        // The cgroup filesystem above was positively identified as cgroup v2.
+        // Missing unified membership is therefore inconsistent or malformed
+        // process state, not an environmental absence that acceptance tests
+        // may skip.
+        return std::unexpected(std::string{"unified cgroup v2 membership not found"});
+    }
+    unique_fd root_fd{
+        ::open((*membership)->c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+    };
+    if (root_fd.get() < 0) {
+        if (errno == EACCES || errno == ENOENT || errno == ENOTDIR) {
+            return linux_session_prerequisite::cgroup_delegation_unavailable;
+        }
+        return std::unexpected(std::string{"probe delegated cgroup: "} + std::strerror(errno));
+    }
+
+    const auto file_exists = [&](const char* name) -> std::expected<bool, std::string> {
+        struct stat status{};
+        if (::fstatat(root_fd.get(), name, &status, AT_SYMLINK_NOFOLLOW) == 0) {
+            return S_ISREG(status.st_mode);
+        }
+        if (errno == ENOENT) {
+            return false;
+        }
+        return std::unexpected(
+            std::string{"probe delegated cgroup control file: "} + std::strerror(errno)
+        );
+    };
+    auto controllers_file = file_exists("cgroup.controllers");
+    if (!controllers_file) {
+        return std::unexpected(controllers_file.error());
+    }
+    if (!*controllers_file) {
+        return linux_session_prerequisite::cgroup_controllers_unavailable;
+    }
+    for (const auto* name : {"cgroup.procs", "cgroup.subtree_control"}) {
+        auto present = file_exists(name);
+        if (!present) {
+            return std::unexpected(present.error());
+        }
+        if (!*present) {
+            return linux_session_prerequisite::cgroup_delegation_unavailable;
+        }
+    }
+
+    auto controllers = read_at(root_fd.get(), "cgroup.controllers");
+    if (!controllers) {
+        return std::unexpected(controllers.error());
+    }
+    for (const auto required : {"cpu", "memory", "pids"}) {
+        if (!contains_word(*controllers, required)) {
+            return linux_session_prerequisite::cgroup_controllers_unavailable;
+        }
+    }
+    auto subtree = read_at(root_fd.get(), "cgroup.subtree_control");
+    if (!subtree) {
+        return std::unexpected(subtree.error());
+    }
+    if (contains_word(*subtree, "cpu") || contains_word(*subtree, "memory") ||
+        contains_word(*subtree, "pids")) {
+        return linux_session_prerequisite::cgroup_delegation_unavailable;
+    }
+
+    struct statvfs mount_status{};
+    if (::fstatvfs(root_fd.get(), &mount_status) != 0) {
+        return std::unexpected(
+            std::string{"probe delegated cgroup mount: "} + std::strerror(errno)
+        );
+    }
+    if ((mount_status.f_flag & ST_RDONLY) != 0U) {
+        return linux_session_prerequisite::cgroup_delegation_unavailable;
+    }
+    for (const auto* name : {".", "cgroup.procs", "cgroup.subtree_control"}) {
+        if (::faccessat(root_fd.get(), name, W_OK, AT_EACCESS) != 0) {
+            if (errno == EACCES || errno == EPERM || errno == EROFS) {
+                return linux_session_prerequisite::cgroup_delegation_unavailable;
+            }
+            return std::unexpected(
+                std::string{"probe delegated cgroup write access: "} + std::strerror(errno)
+            );
+        }
+    }
+    auto exclusive = current_cgroup_is_exclusive(root_fd.get());
+    if (!exclusive) {
+        return std::unexpected(exclusive.error());
+    }
+    if (!*exclusive) {
+        return linux_session_prerequisite::cgroup_delegation_unavailable;
+    }
+    return linux_session_prerequisite::available;
+}
 
 cgroup_v2_session::cgroup_v2_session(
     int parent_fd, int directory_fd, std::filesystem::path path, std::string directory_name

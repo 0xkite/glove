@@ -80,6 +80,7 @@ public:
     [[nodiscard]] auto mounts() const -> std::vector<supervisor::linux_detail::session_mount> {
         auto mounts = filesystem_.mounts();
         mounts.insert(mounts.end(), secret_mounts_.begin(), secret_mounts_.end());
+        mounts.insert(mounts.end(), service_mounts_.begin(), service_mounts_.end());
         return mounts;
     }
 
@@ -87,6 +88,8 @@ public:
         std::vector<supervisor::linux_detail::session_mount> mounts,
         std::vector<int> lease_locks = {}
     ) -> std::expected<void, std::string>;
+    [[nodiscard]] auto install_service_mount(supervisor::linux_detail::session_mount mount)
+        -> std::expected<void, std::string>;
 
     [[nodiscard]] auto finish(int wait_status, std::uint64_t finished_at_ms)
         -> std::expected<linux_resource_terminal_observation, std::string>;
@@ -125,6 +128,7 @@ private:
     std::optional<linux_resource_terminal_observation> pending_terminal_;
     std::optional<linux_resource_terminal_observation> terminal_;
     std::vector<supervisor::linux_detail::session_mount> secret_mounts_;
+    std::vector<supervisor::linux_detail::session_mount> service_mounts_;
     // These descriptors carry exclusive flock(2) leases for rotating
     // credentials. They intentionally outlive process creation and remain
     // held until the child and its isolated resources are terminal.

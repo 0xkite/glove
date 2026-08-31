@@ -88,13 +88,22 @@ auto accept_recovered_record(
     std::string_view previous_hash
 ) -> std::expected<void, std::string> {
     const auto sequence = static_cast<std::uint64_t>(state.records.size()) + 1U;
-    if (!valid_record_shape(record, sequence, state.channels.get()) ||
-        record.previous_hash != previous_hash || state.requests.contains(record.idempotency_key)) {
+    if (!valid_record_shape(record, sequence) || record.previous_hash != previous_hash ||
+        state.requests.contains(record.idempotency_key)) {
         return std::unexpected(std::string{"session registry record is invalid"});
+    }
+    auto plan_digest = hash_plan(record.canonical_plan_json);
+    auto record_hash = hash_record(record);
+    if (!plan_digest || !record_hash || *plan_digest != record.plan_content_digest ||
+        *record_hash != record.this_hash) {
+        return std::unexpected(std::string{"session registry content commitment mismatch"});
     }
     const auto existing = state.sessions.find(record.session_id);
     const bool enqueue_intent = record.operation == "enqueue_observation_intent_v1";
     const bool set_intent_disposition = record.operation == "set_observation_intent_disposition_v1";
+    std::string observation_key;
+    std::optional<observation_quarantine_reason> quarantine_reason;
+    bool quarantined_disposition = false;
     if (enqueue_intent || set_intent_disposition) {
         if (existing == state.sessions.end() || !record.observation_intent) {
             return std::unexpected(std::string{"session registry observation intent is orphaned"});
@@ -108,7 +117,7 @@ auto accept_recovered_record(
         const auto body = observation_body_from_wire(*record.observation_intent);
         const auto context = observation_context_from_wire(record, *record.observation_intent);
         auto body_digest = hash_observation_intent_body(body);
-        const auto key = observation_intent_key(
+        observation_key = observation_intent_key(
             record.session_id,
             record.observation_intent->channel_generation,
             record.observation_intent->intent_id
@@ -125,8 +134,10 @@ auto accept_recovered_record(
                 glz::read<partial_read_options>(runtime, current_session.canonical_plan_json);
             if (!request_digest || *request_digest != record.request_digest ||
                 record.idempotency_key != "intent-enqueue:" + record.request_digest ||
-                state.observation_intents.contains(key) || current_session.state != "running" ||
-                runtime_error || runtime.runtime_id != record.observation_intent->runtime_id ||
+                state.observation_intents.contains(observation_key) ||
+                state.quarantined_observation_intents.contains(observation_key) ||
+                current_session.state != "running" || runtime_error ||
+                runtime.runtime_id != record.observation_intent->runtime_id ||
                 record.observation_intent->profile_digest !=
                     current_session.launch_profile_digest ||
                 record.observation_intent->issued_at_ms < current_session.running_at_ms) {
@@ -134,15 +145,28 @@ auto accept_recovered_record(
                     std::string{"session registry observation enqueue commitment mismatch"}
                 );
             }
+            quarantine_reason = historical_observation_quarantine_reason(
+                state.channels.get(),
+                body,
+                record.observation_intent->expires_at_ms - record.observation_intent->issued_at_ms
+            );
         } else {
-            const auto enqueued = state.observation_intents.find(key);
-            if (enqueued == state.observation_intents.end() ||
-                state.observation_dispositions.contains(key)) {
+            const auto enqueued = state.observation_intents.find(observation_key);
+            const auto quarantined = state.quarantined_observation_intents.find(observation_key);
+            const bool active_original = enqueued != state.observation_intents.end();
+            const bool quarantined_original =
+                quarantined != state.quarantined_observation_intents.end();
+            if (active_original == quarantined_original ||
+                state.observation_dispositions.contains(observation_key) ||
+                (quarantined_original && quarantined->second.disposition_index.has_value())) {
                 return std::unexpected(
                     std::string{"session registry observation disposition is orphaned"}
                 );
             }
-            const auto& original = state.records[enqueued->second];
+            quarantined_disposition = quarantined_original;
+            const auto original_index =
+                active_original ? enqueued->second : quarantined->second.enqueue_index;
+            const auto& original = state.records[original_index];
             if (!original.observation_intent ||
                 !same_observation_intent_binding(
                     *record.observation_intent, *original.observation_intent
@@ -467,25 +491,26 @@ auto accept_recovered_record(
             return std::unexpected(std::string{"session registry failure commitment mismatch"});
         }
     }
-    auto plan_digest = hash_plan(record.canonical_plan_json);
-    auto record_hash = hash_record(record);
-    if (!plan_digest || !record_hash || *plan_digest != record.plan_content_digest ||
-        *record_hash != record.this_hash) {
-        return std::unexpected(std::string{"session registry content commitment mismatch"});
-    }
     const auto index = state.records.size();
     if (enqueue_intent) {
-        const auto& intent = *record.observation_intent;
-        state.observation_intents.emplace(
-            observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id),
-            index
-        );
+        if (quarantine_reason) {
+            state.quarantined_observation_intents.emplace(
+                observation_key,
+                quarantined_observation_state{
+                    .enqueue_index = index,
+                    .disposition_index = std::nullopt,
+                    .reason = *quarantine_reason,
+                }
+            );
+        } else {
+            state.observation_intents.emplace(observation_key, index);
+        }
     } else if (set_intent_disposition) {
-        const auto& intent = *record.observation_intent;
-        state.observation_dispositions.emplace(
-            observation_intent_key(record.session_id, intent.channel_generation, intent.intent_id),
-            index
-        );
+        if (quarantined_disposition) {
+            state.quarantined_observation_intents.at(observation_key).disposition_index = index;
+        } else {
+            state.observation_dispositions.emplace(observation_key, index);
+        }
     } else {
         state.sessions.insert_or_assign(record.session_id, index);
     }

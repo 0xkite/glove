@@ -139,11 +139,11 @@ public:
     auto operator=(const linux_session_runtime&) -> linux_session_runtime& = delete;
     linux_session_runtime(linux_session_runtime&&) = delete;
     auto operator=(linux_session_runtime&&) -> linux_session_runtime& = delete;
-    ~linux_session_runtime();
+    ~linux_session_runtime() override;
 
     [[nodiscard]] static auto create(
-        session_registry& registry,
-        linux_session_preparer& preparer,
+        std::shared_ptr<session_registry> registry,
+        std::shared_ptr<linux_session_preparer> preparer,
         container::linux_detail::managed_pty_session_options options,
         std::size_t max_sessions = default_max_live_linux_pty_sessions
     ) -> std::expected<std::unique_ptr<linux_session_runtime>, std::string>;
@@ -157,9 +157,7 @@ public:
         return 1;
     }
 
-    [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override {
-        return {"codex", "claude-code", "pi", "copilot", "opencode"};
-    }
+    [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override;
 
     [[nodiscard]] auto refinement_evaluation_protocol_schema_version() const noexcept
         -> std::uint8_t override;
@@ -203,6 +201,14 @@ public:
         -> std::expected<void, std::string> override;
 
 private:
+    friend class local_service_proxy_factory;
+    friend class local_service_proxy_capability;
+    [[nodiscard]] auto local_service_factory() const noexcept -> const local_service_proxy_factory*;
+    [[nodiscard]] auto registry_identity() const noexcept -> const session_registry*;
+    [[nodiscard]] auto
+    local_service_runtime_intersection(const local_service_proxy_factory& factory) const noexcept
+        -> bool;
+
     std::unique_ptr<implementation> state_;
 };
 

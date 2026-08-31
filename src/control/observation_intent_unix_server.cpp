@@ -6,15 +6,15 @@
 
 #include "glove/control/observation_intent_unix_server.hpp"
 
+#include "glove/control/guest_channel_transport.hpp"
+
 #include "channel_identifier_grammar.hpp"
 
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -33,14 +33,11 @@
 #include <expected>
 #include <filesystem>
 #include <limits>
-#include <list>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 
 namespace glove::control::observation_wire {
@@ -74,7 +71,6 @@ using observation_wire::enqueue_success_v1;
 
 constexpr std::uint64_t max_io_timeout_ms = 60'000U;
 constexpr std::uint64_t max_intent_ttl_ms = 600'000U;
-constexpr std::size_t max_replay_cache_capacity = 65'536U;
 // Transient wait/accept failures are retried inside serve_one_for with this
 // bounded backoff ladder; only persistent or fatal errors are surfaced.
 constexpr unsigned max_transient_accept_retries = 8U;
@@ -104,6 +100,8 @@ public:
 
     [[nodiscard]] auto get() const noexcept -> int { return descriptor_; }
 
+    [[nodiscard]] auto release() noexcept -> int { return std::exchange(descriptor_, -1); }
+
     void reset(int descriptor = -1) noexcept {
         if (descriptor_ >= 0) {
             static_cast<void>(::close(descriptor_));
@@ -113,56 +111,6 @@ public:
 
 private:
     int descriptor_ = -1;
-};
-
-struct replay_record {
-    glove_observation_body body;
-    enqueue_success_v1 response;
-};
-
-// Bounded least-recently-used replay cache. Eviction is safe: the durable
-// session registry remains the authoritative idempotency layer, so a replay
-// that misses an evicted entry still resolves through the registry queue.
-class replay_cache {
-public:
-    explicit replay_cache(std::size_t capacity) noexcept : capacity_{capacity} {}
-
-    auto find(const std::string& intent_id) -> const replay_record* {
-        const auto found = entries_.find(intent_id);
-        if (found == entries_.end()) {
-            return nullptr;
-        }
-        order_.splice(order_.begin(), order_, found->second.order);
-        return &found->second.record;
-    }
-
-    void insert(std::string intent_id, replay_record record) {
-        if (capacity_ == 0U) {
-            return;
-        }
-        if (entries_.contains(intent_id)) {
-            return;
-        }
-        if (entries_.size() >= capacity_) {
-            const auto& evicted = order_.back();
-            entries_.erase(evicted);
-            order_.pop_back();
-        }
-        order_.emplace_front(intent_id);
-        entries_.emplace(
-            std::move(intent_id), cache_entry{.record = std::move(record), .order = order_.begin()}
-        );
-    }
-
-private:
-    struct cache_entry {
-        replay_record record;
-        std::list<std::string>::const_iterator order;
-    };
-
-    std::size_t capacity_ = 0;
-    std::list<std::string> order_;
-    std::unordered_map<std::string, cache_entry> entries_;
 };
 
 void wipe(std::string& value) noexcept {
@@ -203,38 +151,28 @@ auto current_epoch_ms() noexcept -> std::uint64_t {
     return value < 0 ? 0U : static_cast<std::uint64_t>(value);
 }
 
-void transient_backoff(unsigned attempt) noexcept {
+auto transient_backoff(
+    unsigned attempt, guest_channel_deadline accept_deadline, std::stop_token stop
+) noexcept -> bool {
     using namespace std::chrono;
-    const auto delay = std::min(
-        std::chrono::milliseconds{1} * (1U << std::min<unsigned>(attempt, 7U)),
-        transient_backoff_cap
-    );
-    std::this_thread::sleep_for(delay);
-}
-
-// Returns the peer uid, or nullopt when the platform exposes no peer-credential
-// facility or the getsockopt probe fails.
-auto peer_uid(int descriptor) -> std::optional<std::uint32_t> {
-#if defined(SO_PEERCRED)
-    struct ::ucred credentials{};
-    ::socklen_t length = sizeof(credentials);
-    if (::getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED, &credentials, &length) != 0 ||
-        length != sizeof(credentials)) {
-        return std::nullopt;
+    const auto delay =
+        std::min(milliseconds{1} * (1U << std::min<unsigned>(attempt, 7U)), transient_backoff_cap);
+    const auto wake_at = std::min(steady_clock::now() + delay, accept_deadline);
+    for (;;) {
+        if (stop.stop_requested()) {
+            return false;
+        }
+        const auto now = steady_clock::now();
+        if (now >= accept_deadline) {
+            return false;
+        }
+        if (now >= wake_at) {
+            return true;
+        }
+        std::this_thread::sleep_for(
+            std::min(wake_at - now, duration_cast<steady_clock::duration>(milliseconds{5}))
+        );
     }
-    return credentials.uid;
-#elif defined(LOCAL_PEERCRED)
-    struct xucred credentials{};
-    ::socklen_t length = sizeof(credentials);
-    if (::getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERCRED, &credentials, &length) != 0 ||
-        credentials.cr_version != XUCRED_VERSION) {
-        return std::nullopt;
-    }
-    return credentials.cr_uid;
-#else
-    (void)descriptor;
-    return std::nullopt;
-#endif
 }
 
 auto validate_socket_path(const std::filesystem::path& path) -> std::expected<void, std::string> {
@@ -273,82 +211,31 @@ auto socket_address(const std::filesystem::path& path)
 }
 
 auto create_listener() -> std::expected<unique_fd, std::string> {
+    int socket_type = SOCK_STREAM;
 #if defined(SOCK_CLOEXEC)
-    unique_fd descriptor{::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)};
-#else
-    unique_fd descriptor{::socket(AF_UNIX, SOCK_STREAM, 0)};
+    socket_type |= SOCK_CLOEXEC;
 #endif
+#if defined(SOCK_NONBLOCK)
+    socket_type |= SOCK_NONBLOCK;
+#endif
+    unique_fd descriptor{::socket(AF_UNIX, socket_type, 0)};
     if (descriptor.get() < 0) {
         return std::unexpected(system_error("create observation socket"));
     }
 #if !defined(SOCK_CLOEXEC)
-    if (::fcntl(descriptor.get(), F_SETFD, FD_CLOEXEC) != 0) {
+    const int descriptor_flags = ::fcntl(descriptor.get(), F_GETFD);
+    if (descriptor_flags < 0 ||
+        ::fcntl(descriptor.get(), F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
         return std::unexpected(system_error("protect observation socket descriptor"));
     }
 #endif
+#if !defined(SOCK_NONBLOCK)
+    const int status_flags = ::fcntl(descriptor.get(), F_GETFL);
+    if (status_flags < 0 || ::fcntl(descriptor.get(), F_SETFL, status_flags | O_NONBLOCK) != 0) {
+        return std::unexpected(system_error("make observation listener nonblocking"));
+    }
+#endif
     return descriptor;
-}
-
-auto set_io_timeout(int descriptor, std::uint64_t timeout_ms) -> std::expected<void, std::string> {
-    const ::timeval timeout{
-        .tv_sec = static_cast<time_t>(timeout_ms / 1'000U),
-        .tv_usec = static_cast<suseconds_t>((timeout_ms % 1'000U) * 1'000U),
-    };
-    if (::setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
-        ::setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
-        return std::unexpected(system_error("set observation socket timeout"));
-    }
-#if defined(SO_NOSIGPIPE)
-    const int enabled = 1;
-    if (::setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
-        return std::unexpected(system_error("set observation socket no-sigpipe"));
-    }
-#endif
-    return {};
-}
-
-auto read_exact(int descriptor, void* output, std::size_t size)
-    -> std::expected<void, std::string> {
-    auto* bytes = static_cast<std::byte*>(output);
-    std::size_t consumed = 0;
-    while (consumed < size) {
-        const auto result = ::read(descriptor, bytes + consumed, size - consumed);
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return std::unexpected(std::string{"observation request timed out"});
-        }
-        if (result <= 0) {
-            return std::unexpected(
-                result < 0 ? system_error("read observation request")
-                           : std::string{"observation request ended unexpectedly"}
-            );
-        }
-        consumed += static_cast<std::size_t>(result);
-    }
-    return {};
-}
-
-auto write_exact(int descriptor, const void* input, std::size_t size)
-    -> std::expected<void, std::string> {
-    const auto* bytes = static_cast<const std::byte*>(input);
-    std::size_t written = 0;
-    while (written < size) {
-#if defined(MSG_NOSIGNAL)
-        const auto result = ::send(descriptor, bytes + written, size - written, MSG_NOSIGNAL);
-#else
-        const auto result = ::write(descriptor, bytes + written, size - written);
-#endif
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result <= 0) {
-            return std::unexpected(system_error("write observation response"));
-        }
-        written += static_cast<std::size_t>(result);
-    }
-    return {};
 }
 
 template<typename Value>
@@ -358,18 +245,6 @@ auto encode(const Value& value) -> std::expected<std::string, std::string> {
         return std::unexpected(std::string{"encode observation response failed"});
     }
     return std::move(*encoded);
-}
-
-auto send_frame(int descriptor, std::string_view payload) -> std::expected<void, std::string> {
-    if (payload.empty() || payload.size() > max_observation_frame_bytes ||
-        payload.size() > std::numeric_limits<std::uint32_t>::max()) {
-        return std::unexpected(std::string{"observation response exceeds its bound"});
-    }
-    const auto length = htonl(static_cast<std::uint32_t>(payload.size()));
-    if (auto written = write_exact(descriptor, &length, sizeof(length)); !written) {
-        return written;
-    }
-    return write_exact(descriptor, payload.data(), payload.size());
 }
 
 auto error_code_for(const session_registry_error& error) -> std::string {
@@ -400,7 +275,30 @@ struct attempt_outcome {
     int error_number = 0;
 };
 
+auto send_response(
+    guest_channel_transport& channel,
+    std::string_view response,
+    guest_channel_deadline deadline,
+    std::stop_token stop
+) -> attempt_outcome {
+    return {
+        .served = classify_observation_response_send(channel.send_frame(response, deadline, stop)),
+        .error_number = 0
+    };
+}
+
 } // namespace
+
+auto classify_observation_response_send(guest_channel_transport_result<void> sent)
+    -> std::expected<bool, std::string> {
+    if (sent) {
+        return true;
+    }
+    if (sent.error().code == guest_channel_transport_error_code::cancelled) {
+        return false;
+    }
+    return std::unexpected(std::move(sent.error().message));
+}
 
 struct observation_intent_unix_server::implementation {
     observation_intent_unix_server_config config;
@@ -408,10 +306,6 @@ struct observation_intent_unix_server::implementation {
     ::dev_t socket_device = 0;
     ::ino_t socket_inode = 0;
     bool owns_socket_path = false;
-    std::mutex request_mutex;
-    replay_cache replays;
-
-    implementation() : replays{config.replay_cache_capacity} {}
 
     ~implementation() {
         wipe(config.channel_token);
@@ -441,25 +335,11 @@ struct observation_intent_unix_server::implementation {
             return encode(enqueue_error_v1{.code = "unauthorized"});
         }
 
-        std::lock_guard lock{request_mutex};
-        if (const auto* replay = replays.find(request.body.intent_id); replay != nullptr) {
-            if (replay->body != request.body) {
-                return encode(enqueue_error_v1{.code = "idempotency_conflict"});
-            }
-            // Cached replays return the frozen enqueue response captured at
-            // first accept; post-eviction replays resolve through the durable
-            // registry and return the intent's current disposition. Documented
-            // divergence — the registry remains the authoritative layer.
-            return encode(replay->response);
-        }
         const auto ttl_ceiling =
             now_ms > std::numeric_limits<std::uint64_t>::max() - max_intent_ttl_ms
                 ? std::numeric_limits<std::uint64_t>::max()
                 : now_ms + max_intent_ttl_ms;
         const auto expires_at_ms = std::min(config.session_expires_at_ms, ttl_ceiling);
-        if (now_ms == 0U || expires_at_ms <= now_ms) {
-            return encode(enqueue_error_v1{.code = "intent_expired"});
-        }
         const observation_intent_context context{
             .session_id = config.session_id,
             .controller_plan_digest = config.controller_plan_digest,
@@ -474,96 +354,121 @@ struct observation_intent_unix_server::implementation {
         };
         auto queued = config.sessions->enqueue_observation_intent(request.body, context, now_ms);
         if (!queued) {
-            return encode(enqueue_error_v1{.code = error_code_for(queued.error())});
+            const auto code = now_ms == 0U || expires_at_ms <= now_ms
+                                  ? std::string{"intent_expired"}
+                                  : error_code_for(queued.error());
+            return encode(enqueue_error_v1{.code = code});
         }
         enqueue_success_v1 response{
             .sequence = queued->sequence,
             .intent_digest = queued->intent_digest,
         };
-        std::string intent_id = request.body.intent_id;
-        replays.insert(
-            std::move(intent_id),
-            replay_record{.body = std::move(request.body), .response = response}
-        );
         return encode(response);
     }
 };
 
 auto serve_attempt(
-    observation_intent_unix_server::implementation& state, std::uint64_t accept_timeout_ms
+    observation_intent_unix_server::implementation& state,
+    guest_channel_deadline accept_deadline,
+    std::stop_token stop
 ) -> attempt_outcome {
-    const int timeout =
-        accept_timeout_ms > static_cast<std::uint64_t>(std::numeric_limits<int>::max())
-            ? std::numeric_limits<int>::max()
-            : static_cast<int>(accept_timeout_ms);
-    ::pollfd event{.fd = state.listener.get(), .events = POLLIN, .revents = 0};
-    int ready = 0;
-    do {
-        ready = ::poll(&event, 1, timeout);
-    } while (ready < 0 && errno == EINTR);
-    if (ready == 0) {
-        return {.served = false};
+    for (;;) {
+        if (stop.stop_requested()) {
+            return {.served = false};
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= accept_deadline) {
+            return {.served = false};
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(accept_deadline - now);
+        const int timeout = static_cast<int>(std::clamp<std::int64_t>(remaining.count(), 1, 25));
+        ::pollfd event{.fd = state.listener.get(), .events = POLLIN, .revents = 0};
+        const int ready = ::poll(&event, 1, timeout);
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ready == 0) {
+            continue;
+        }
+        if (ready < 0 || (event.revents & POLLIN) == 0) {
+            const int error_number = errno;
+            return {
+                .served =
+                    std::unexpected(system_error("wait for observation connection", error_number)),
+                .error_number = error_number
+            };
+        }
+        if (stop.stop_requested() || std::chrono::steady_clock::now() >= accept_deadline) {
+            return {.served = false};
+        }
+        break;
     }
-    if (ready < 0 || (event.revents & POLLIN) == 0) {
-        return {
-            .served = std::unexpected(system_error("wait for observation connection")),
-            .error_number = errno
-        };
-    }
-#if defined(SOCK_CLOEXEC)
-    unique_fd client{::accept4(state.listener.get(), nullptr, nullptr, SOCK_CLOEXEC)};
+#if defined(__linux__) && defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
+    unique_fd client{
+        ::accept4(state.listener.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK)
+    };
 #else
     unique_fd client{::accept(state.listener.get(), nullptr, nullptr)};
 #endif
     if (client.get() < 0) {
+        const int error_number = errno;
         return {
-            .served = std::unexpected(system_error("accept observation connection")),
-            .error_number = errno
+            .served = std::unexpected(system_error("accept observation connection", error_number)),
+            .error_number = error_number
         };
     }
-#if !defined(SOCK_CLOEXEC)
-    if (::fcntl(client.get(), F_SETFD, FD_CLOEXEC) != 0) {
+    auto channel = guest_channel_transport::adopt(
+        client.release(), max_observation_frame_bytes, state.config.expected_peer_uid
+    );
+    if (!channel) {
         return {.served = true};
     }
-#endif
-    // Defense-in-depth peer-credential check: reject connections whose
-    // peer-uid differs from the configured expectation before any frame is
-    // read. A socket-file permission gap then cannot grant another local
-    // account access to the channel.
-    if (state.config.expected_peer_uid.has_value()) {
-        const auto uid = peer_uid(client.get());
-        if (!uid || *uid != *state.config.expected_peer_uid) {
-            return {.served = true};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{state.config.io_timeout_ms};
+    auto frame = (*channel)->receive_frame(deadline, stop);
+    if (!frame) {
+        if (frame.error().code == guest_channel_transport_error_code::cancelled) {
+            return {.served = false};
         }
-    }
-    if (auto timeout_set = set_io_timeout(client.get(), state.config.io_timeout_ms); !timeout_set) {
-        return {.served = true};
-    }
-    std::uint32_t network_length = 0;
-    if (auto read = read_exact(client.get(), &network_length, sizeof(network_length)); !read) {
-        return {.served = true};
-    }
-    const auto frame_size = static_cast<std::size_t>(ntohl(network_length));
-    if (frame_size == 0U || frame_size > max_observation_frame_bytes) {
-        auto response = encode(enqueue_error_v1{.code = "invalid_request"});
-        if (!response) {
-            return {.served = std::unexpected(response.error()), .error_number = 0};
+        if (frame.error().code == guest_channel_transport_error_code::frame_too_large) {
+            auto response = encode(enqueue_error_v1{.code = "invalid_request"});
+            if (!response) {
+                return {.served = std::unexpected(response.error()), .error_number = 0};
+            }
+            return send_response(**channel, *response, deadline, stop);
         }
-        static_cast<void>(send_frame(client.get(), *response));
         return {.served = true};
     }
-    std::string frame(frame_size, '\0');
-    if (auto read = read_exact(client.get(), frame.data(), frame.size()); !read) {
-        wipe(frame);
-        return {.served = true};
+    // Registry persistence is synchronous trusted local work. These checks
+    // prevent starting it after cancellation/expiry and suppress a late
+    // response, but cannot forcibly interrupt persistence already in progress.
+    if (stop.stop_requested()) {
+        wipe(*frame);
+        return {.served = false};
     }
-    auto response = state.handle(frame, current_epoch_ms());
-    wipe(frame);
+    if (std::chrono::steady_clock::now() >= deadline) {
+        wipe(*frame);
+        return {
+            .served = std::unexpected(std::string{"guest channel deadline exceeded"}),
+            .error_number = 0
+        };
+    }
+    auto response = state.handle(*frame, current_epoch_ms());
+    wipe(*frame);
+    if (stop.stop_requested()) {
+        return {.served = false};
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        return {
+            .served = std::unexpected(std::string{"guest channel deadline exceeded"}),
+            .error_number = 0
+        };
+    }
     if (!response) {
         return {.served = std::unexpected(response.error()), .error_number = 0};
     }
-    static_cast<void>(send_frame(client.get(), *response));
-    return {.served = true};
+    return send_response(**channel, *response, deadline, stop);
 }
 
 observation_intent_unix_server::observation_intent_unix_server(
@@ -581,8 +486,7 @@ auto observation_intent_unix_server::create(observation_intent_unix_server_confi
         config.policy_revision == 0U || !valid_identifier(config.service_channel_id) ||
         config.channel_generation == 0U || config.session_expires_at_ms == 0U ||
         !valid_hex(config.channel_token) || config.io_timeout_ms == 0U ||
-        config.io_timeout_ms > max_io_timeout_ms || config.replay_cache_capacity == 0U ||
-        config.replay_cache_capacity > max_replay_cache_capacity) {
+        config.io_timeout_ms > max_io_timeout_ms) {
         wipe(config.channel_token);
         return std::unexpected(std::string{"invalid observation server configuration"});
     }
@@ -598,7 +502,6 @@ auto observation_intent_unix_server::create(observation_intent_unix_server_confi
     }
     auto state = std::make_unique<implementation>();
     state->config = std::move(config);
-    state->replays = replay_cache{state->config.replay_cache_capacity};
     state->listener = std::move(*listener);
     const auto address_size = static_cast<socklen_t>(
         offsetof(::sockaddr_un, sun_path) + state->config.socket_path.string().size() + 1U
@@ -626,17 +529,18 @@ auto observation_intent_unix_server::create(observation_intent_unix_server_confi
     return std::make_unique<observation_intent_unix_server>(construction_token{}, std::move(state));
 }
 
-auto observation_intent_unix_server::serve_one_for(std::uint64_t accept_timeout_ms)
-    -> std::expected<bool, std::string> {
+auto observation_intent_unix_server::serve_one_for(
+    std::uint64_t accept_timeout_ms, std::stop_token stop
+) -> std::expected<bool, std::string> {
     if (!state_ || accept_timeout_ms > max_io_timeout_ms) {
         return std::unexpected(std::string{"invalid observation accept timeout"});
     }
-    // A transient wait/accept failure (EINTR, fd exhaustion, aborted
-    // connection) must not permanently kill the observation channel worker:
-    // retry here with a bounded backoff ladder and only surface persistent
-    // or fatal errors to the caller.
+    // One absolute accept deadline governs every wait, accept retry, and
+    // transient backoff in this call. Retries must never renew it.
+    const auto accept_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{accept_timeout_ms};
     for (unsigned attempt = 0;; ++attempt) {
-        auto outcome = serve_attempt(*state_, accept_timeout_ms);
+        auto outcome = serve_attempt(*state_, accept_deadline, stop);
         if (outcome.served.has_value()) {
             return outcome.served;
         }
@@ -645,7 +549,9 @@ auto observation_intent_unix_server::serve_one_for(std::uint64_t accept_timeout_
             attempt + 1U >= max_transient_accept_retries) {
             return std::unexpected(std::move(outcome.served.error()));
         }
-        transient_backoff(attempt);
+        if (!transient_backoff(attempt, accept_deadline, stop)) {
+            return false;
+        }
     }
 }
 

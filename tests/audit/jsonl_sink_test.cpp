@@ -50,6 +50,17 @@ auto run() -> int {
     };
     REQUIRE(sink->record(b).has_value());
 
+    glove::audit::event local_service{
+        .what = glove::audit::action::local_service,
+        .tool_name = "session-1:sage-observe",
+        .arguments_json = {},
+        .status = glove::mcp::tool_call_status::transport_error,
+        .error_message = "closed",
+        .at = std::chrono::system_clock::now(),
+        .latency = std::chrono::nanoseconds{7},
+    };
+    REQUIRE(sink->record(local_service).has_value());
+
     std::ifstream in{path};
     REQUIRE(in);
     std::stringstream buf;
@@ -62,15 +73,17 @@ auto run() -> int {
     REQUIRE(contents.find("\"tool\":\"rm\"") != std::string::npos);
     REQUIRE(contents.find("\"status\":\"invalid_arguments\"") != std::string::npos);
     REQUIRE(contents.find("policy denied") != std::string::npos);
+    REQUIRE(contents.find("\"action\":\"local_service\"") != std::string::npos);
+    REQUIRE(contents.find("session-1:sage-observe") != std::string::npos);
 
-    // Two lines, two newlines.
+    // Three lines, three newlines.
     int newlines = 0;
     for (char c : contents) {
         if (c == '\n') {
             ++newlines;
         }
     }
-    REQUIRE(newlines == 2);
+    REQUIRE(newlines == 3);
 
     std::filesystem::remove(path);
     return 0;

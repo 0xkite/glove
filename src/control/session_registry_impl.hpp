@@ -107,6 +107,17 @@ inline auto system_error(std::string_view operation, int error_number = errno) -
            std::error_code{error_number, std::generic_category()}.message();
 }
 
+enum class observation_quarantine_reason : std::uint8_t {
+    schema_unavailable,
+    schema_incompatible,
+};
+
+struct quarantined_observation_state {
+    std::size_t enqueue_index = 0;
+    std::optional<std::size_t> disposition_index;
+    observation_quarantine_reason reason = observation_quarantine_reason::schema_unavailable;
+};
+
 struct session_registry::implementation {
     opened_registry opened;
     std::shared_ptr<const supervisor::session_plan_validator> validator;
@@ -121,6 +132,7 @@ struct session_registry::implementation {
     std::unordered_map<std::string, std::size_t> requests;
     std::unordered_map<std::string, std::size_t> observation_intents;
     std::unordered_map<std::string, std::size_t> observation_dispositions;
+    std::unordered_map<std::string, quarantined_observation_state> quarantined_observation_intents;
     mutable std::mutex mutex;
 };
 
@@ -149,6 +161,17 @@ inline auto intent_disposition_name(intent_disposition disposition) noexcept -> 
         return "rejected";
     case intent_disposition::expired:
         return "expired";
+    }
+    return {};
+}
+
+inline auto observation_quarantine_reason_name(observation_quarantine_reason reason) noexcept
+    -> std::string_view {
+    switch (reason) {
+    case observation_quarantine_reason::schema_unavailable:
+        return observation_schema_unavailable;
+    case observation_quarantine_reason::schema_incompatible:
+        return observation_schema_incompatible;
     }
     return {};
 }
@@ -183,6 +206,27 @@ inline auto valid_observation_body_shape(const glove_observation_body& body) noe
     return valid_identifier(body.intent_id) && valid_identifier(body.observation) &&
            valid_digest(body.value_digest) && body.item_count <= max_observation_items &&
            observation_body_bytes(body) <= max_observation_body_bytes;
+}
+
+inline auto body_validator_accepts(
+    const channel_descriptor& descriptor, const glove_observation_body& body
+) noexcept -> bool {
+    return descriptor.body_validator != nullptr && descriptor.body_validator(body);
+}
+
+inline auto historical_observation_quarantine_reason(
+    const channel_host* channels, const glove_observation_body& body, std::uint64_t ttl_ms
+) -> std::optional<observation_quarantine_reason> {
+    const auto* descriptor = channels == nullptr ? nullptr : channels->admits(body.schema);
+    if (descriptor == nullptr) {
+        return observation_quarantine_reason::schema_unavailable;
+    }
+    if (body.item_count > descriptor->bounds.max_items ||
+        observation_body_bytes(body) > descriptor->bounds.max_body_bytes ||
+        ttl_ms > descriptor->bounds.max_ttl_ms || !body_validator_accepts(*descriptor, body)) {
+        return observation_quarantine_reason::schema_incompatible;
+    }
+    return std::nullopt;
 }
 
 inline auto observation_body_from_wire(const wire::persisted_observation_intent& intent)
@@ -535,11 +579,8 @@ inline auto public_record(const wire::persisted_session& record) -> session_reco
     };
 }
 
-inline auto valid_record_shape(
-    const wire::persisted_session& record,
-    std::uint64_t sequence,
-    const channel_host* channels = nullptr
-) -> bool {
+inline auto valid_record_shape(const wire::persisted_session& record, std::uint64_t sequence)
+    -> bool {
     const bool common =
         record.schema_version == 1 && record.sequence == sequence &&
         valid_identifier(record.operation) && valid_identifier(record.idempotency_key) &&
@@ -561,30 +602,18 @@ inline auto valid_record_shape(
         }
         const auto& intent = *record.observation_intent;
         const auto disposition = intent_disposition_from_wire(intent.disposition);
-        // Structural invariants live in core; body semantics are delegated to
-        // the host-registered admission table and fail closed when the schema
-        // is no longer registered at recovery time.
+        // Historical integrity is independent of the current host catalog.
+        // Runtime availability is classified only after all durable
+        // commitments and session bindings have been verified.
         const bool structural =
-            intent.schema_version == 1 && !intent.schema.empty() &&
-            intent.schema.size() <= max_identifier_bytes &&
+            intent.schema_version == 1 && valid_identifier(intent.schema) &&
             valid_observation_body_shape(observation_body_from_wire(intent)) &&
             valid_digest(intent.intent_digest) && valid_digest(intent.profile_digest) &&
             valid_identifier(intent.runtime_id) && valid_digest(intent.projection_digest) &&
             valid_identifier(intent.channel_id) && intent.channel_generation != 0 &&
             intent.issued_at_ms != 0 && intent.expires_at_ms > intent.issued_at_ms &&
             intent.expires_at_ms - intent.issued_at_ms <= max_observation_intent_ttl_ms;
-        if (!structural || !disposition.has_value() || channels == nullptr) {
-            return false;
-        }
-        const auto* descriptor = channels->admits(intent.schema);
-        if (descriptor == nullptr) {
-            return false;
-        }
-        const auto body = observation_body_from_wire(intent);
-        if (body.item_count > descriptor->bounds.max_items ||
-            observation_body_bytes(body) > descriptor->bounds.max_body_bytes ||
-            intent.expires_at_ms - intent.issued_at_ms > descriptor->bounds.max_ttl_ms ||
-            !descriptor->body_validator(body)) {
+        if (!structural || !disposition.has_value()) {
             return false;
         }
         if (enqueue_intent) {

@@ -17,8 +17,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -93,6 +95,76 @@ auto replace_after_marker(
     std::fstream output{path, std::ios::binary | std::ios::in | std::ios::out};
     output.seekp(static_cast<std::streamoff>(value_offset));
     output.write(to.data(), static_cast<std::streamsize>(to.size()));
+    output.flush();
+    return output.good();
+}
+
+auto rewrite_observation_record_and_rechain(
+    const std::filesystem::path& path,
+    const std::function<bool(const glove::control::wire::persisted_session&)>& select,
+    const std::function<void(glove::control::wire::persisted_session&)>& mutate
+) -> bool {
+    using namespace glove::control;
+    std::ifstream input{path, std::ios::binary};
+    std::string bytes(static_cast<std::size_t>(std::filesystem::file_size(path)), '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!input.good() || bytes.size() < registry_magic.size() ||
+        !std::equal(registry_magic.begin(), registry_magic.end(), bytes.begin())) {
+        return false;
+    }
+
+    std::vector<wire::persisted_session> records;
+    std::size_t offset = registry_magic.size();
+    while (offset < bytes.size()) {
+        if (bytes.size() - offset < 8U) {
+            return false;
+        }
+        std::array<unsigned char, 4> prefix{};
+        std::copy_n(
+            reinterpret_cast<const unsigned char*>(bytes.data() + offset), 4, prefix.begin()
+        );
+        const auto payload_size = static_cast<std::size_t>(wire::decode_u32(prefix));
+        if (payload_size == 0 || payload_size > bytes.size() - offset - 8U) {
+            return false;
+        }
+        auto decoded =
+            wire::decode_record(std::string_view{bytes}.substr(offset + 4U, payload_size));
+        if (!decoded) {
+            return false;
+        }
+        records.push_back(std::move(*decoded));
+        offset += payload_size + 8U;
+    }
+
+    auto found = std::ranges::find_if(records, select);
+    if (found == records.end()) {
+        return false;
+    }
+    mutate(*found);
+
+    std::vector<unsigned char> rewritten(registry_magic.begin(), registry_magic.end());
+    std::string previous_hash(digest_hex_bytes, '0');
+    for (auto& record : records) {
+        record.previous_hash = previous_hash;
+        record.this_hash.clear();
+        auto record_hash = wire::hash_record(record);
+        if (!record_hash) {
+            return false;
+        }
+        record.this_hash = *record_hash;
+        previous_hash = *record_hash;
+        auto encoded = wire::encode_record(record);
+        if (!encoded) {
+            return false;
+        }
+        rewritten.insert(rewritten.end(), encoded->begin(), encoded->end());
+    }
+
+    std::ofstream output{path, std::ios::binary | std::ios::trunc};
+    output.write(
+        reinterpret_cast<const char*>(rewritten.data()),
+        static_cast<std::streamsize>(rewritten.size())
+    );
     output.flush();
     return output.good();
 }
@@ -270,58 +342,92 @@ auto filesystem_identity() -> glove::control::linux_filesystem_recovery_identity
     };
 }
 
-constexpr std::string_view test_observation_schema = "sage.glove-observation.v1";
-constexpr std::string_view test_proposal_schema = "sage.glove-sxxx-self-delegation-proposal.v1";
+constexpr std::string_view test_observation_schema = "test.observation.v1";
+constexpr std::string_view test_proposal_schema = "test.proposal.v1";
+
+auto accepts_test_observation(const glove::control::glove_observation_body&) noexcept -> bool {
+    return true;
+}
+
+auto accepts_test_proposal(const glove::control::glove_observation_body& body) noexcept -> bool {
+    return body.observation == "retired-proposal" && body.item_count == 1U;
+}
+
+auto rejects_first_intent(const glove::control::glove_observation_body& body) noexcept -> bool {
+    return body.intent_id != "intent-1";
+}
 
 // Registration example: the host owns payload semantics; Glove core only
 // enforces structural invariants and the registered bounds.
 auto test_channel_host() -> std::shared_ptr<const glove::control::channel_host> {
     auto host = std::make_shared<glove::control::channel_host>();
-    (void)host->register_channel({
-        .channel_id = "test-observation",
-        .schema_id = std::string{test_observation_schema},
-        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
-        .bounds = {
-            .max_items = 4'096,
-            .max_body_bytes = 8'192,
-            .max_ttl_ms = 600'000,
-            .max_skew_ms = 30'000,
-        },
-    });
-    (void)host->register_channel({
-        .channel_id = "test-proposal",
-        .schema_id = std::string{test_proposal_schema},
-        .body_validator =
-            [](const glove::control::glove_observation_body& body) {
-                return body.observation == "sxxx-self-delegation" &&
-                       body.value_digest ==
-                           "4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b" &&
-                       body.item_count == 1U;
+    if (!host->register_channel({
+            .schema_id = std::string{test_observation_schema},
+            .body_validator = &accepts_test_observation,
+            .bounds = {
+                .max_items = 4'096,
+                .max_body_bytes = 8'192,
+                .max_ttl_ms = 600'000,
+                .max_skew_ms = 30'000,
             },
-        .bounds = {
-            .max_items = 1,
-            .max_body_bytes = 1'024,
-            .max_ttl_ms = 600'000,
-            .max_skew_ms = 30'000,
-        },
-    });
+        })) {
+        return {};
+    }
+    if (!host->register_channel({
+            .schema_id = std::string{test_proposal_schema},
+            .body_validator = &accepts_test_proposal,
+            .bounds = {
+                .max_items = 1,
+                .max_body_bytes = 1'024,
+                .max_ttl_ms = 600'000,
+                .max_skew_ms = 30'000,
+            },
+        })) {
+        return {};
+    }
+    if (!host->freeze()) {
+        return {};
+    }
     return host;
 }
 
 // Tight bounds to exercise descriptor-level rejection paths.
 auto tight_channel_host() -> std::shared_ptr<const glove::control::channel_host> {
     auto host = std::make_shared<glove::control::channel_host>();
-    (void)host->register_channel({
-        .channel_id = "tight-observation",
-        .schema_id = std::string{test_observation_schema},
-        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
-        .bounds = {
-            .max_items = 1,
-            .max_body_bytes = 512,
-            .max_ttl_ms = 50'000,
-            .max_skew_ms = 1'000,
-        },
-    });
+    if (!host->register_channel({
+            .schema_id = std::string{test_observation_schema},
+            .body_validator = &accepts_test_observation,
+            .bounds =
+                {
+                    .max_items = 1,
+                    .max_body_bytes = 512,
+                    .max_ttl_ms = 50'000,
+                    .max_skew_ms = 1'000,
+                },
+        }) ||
+        !host->freeze()) {
+        return {};
+    }
+    return host;
+}
+
+// Changed payload semantics with the original broad bounds.
+auto rejecting_channel_host() -> std::shared_ptr<const glove::control::channel_host> {
+    auto host = std::make_shared<glove::control::channel_host>();
+    if (!host->register_channel({
+            .schema_id = std::string{test_observation_schema},
+            .body_validator = &rejects_first_intent,
+            .bounds =
+                {
+                    .max_items = 4'096,
+                    .max_body_bytes = 8'192,
+                    .max_ttl_ms = 600'000,
+                    .max_skew_ms = 30'000,
+                },
+        }) ||
+        !host->freeze()) {
+        return {};
+    }
     return host;
 }
 
@@ -446,6 +552,49 @@ auto run() -> int {
     auto shared_bundle_store = std::make_shared<const glove::supervisor::library_bundle_store>(
         std::move(*opened_bundle_store)
     );
+
+    auto empty_catalog = std::make_shared<glove::control::channel_host>();
+    const auto empty_catalog_path = temp.root() / "empty-catalog-sessions.journal";
+    auto empty_catalog_registry = glove::control::session_registry::open_or_create(
+        empty_catalog_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        empty_catalog
+    );
+    REQUIRE(!empty_catalog_registry.has_value());
+    REQUIRE(
+        empty_catalog_registry.error().code ==
+        glove::control::session_registry_error_code::invalid_request
+    );
+    REQUIRE(!std::filesystem::exists(empty_catalog_path));
+
+    auto mutable_catalog = std::make_shared<glove::control::channel_host>();
+    REQUIRE(mutable_catalog->register_channel({
+        .schema_id = "test.mutable.v1",
+        .body_validator = &accepts_test_observation,
+        .bounds = {
+            .max_items = 1,
+            .max_body_bytes = 128,
+            .max_ttl_ms = 1'000,
+            .max_skew_ms = 100,
+        },
+    }));
+    const auto mutable_catalog_path = temp.root() / "mutable-catalog-sessions.journal";
+    auto mutable_catalog_registry = glove::control::session_registry::open_or_create(
+        mutable_catalog_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        mutable_catalog
+    );
+    REQUIRE(!mutable_catalog_registry.has_value());
+    REQUIRE(
+        mutable_catalog_registry.error().code ==
+        glove::control::session_registry_error_code::invalid_request
+    );
+    REQUIRE(!std::filesystem::exists(mutable_catalog_path));
+
     const auto store_path = temp.root() / "sessions.journal";
     auto registry = glove::control::session_registry::open_or_create(
         store_path, shared_validator, shared_bundle_store
@@ -1518,7 +1667,7 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(running_b.has_value());
 
     const glove::control::glove_observation_body body{
-        .schema = "sage.glove-observation.v1",
+        .schema = std::string{test_observation_schema},
         .intent_id = "intent-1",
         .observation = "guest-capability-inventory",
         .value_digest = std::string(64, 'a'),
@@ -1544,7 +1693,7 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(enqueued->disposition == glove::control::intent_disposition::pending);
     REQUIRE(
         enqueued->intent_digest ==
-        "3b6597eb187f1883063a3316272cb2622b1bf0bc5e33dc17253ba16fac145c2e"
+        "9cbc0bb0de2ed9d104318e9b5a5c8641af770c672511e5102e0ba4b61549b6b2"
     );
     const auto count_after_enqueue = (*registry)->record_count();
 
@@ -1554,6 +1703,49 @@ auto run_intent_queue_contract() -> int {
     auto replayed_after_expiry =
         (*registry)->enqueue_observation_intent(body, context_a, context_a.expires_at_ms);
     REQUIRE(replayed_after_expiry == enqueued);
+    REQUIRE((*registry)->record_count() == count_after_enqueue);
+
+    // Durable replay excludes only reconstructed timestamps. Every immutable
+    // security-context field must still match the first accepted enqueue.
+    for (const auto& drifted : {
+             [&] {
+                 auto value = context_a;
+                 value.controller_plan_digest = std::string(64, 'd');
+                 return value;
+             }(),
+             [&] {
+                 auto value = context_a;
+                 value.profile_digest = std::string(64, 'f');
+                 return value;
+             }(),
+             [&] {
+                 auto value = context_a;
+                 value.runtime_id = "other-guest";
+                 return value;
+             }(),
+             [&] {
+                 auto value = context_a;
+                 value.projection_digest = std::string(64, 'e');
+                 return value;
+             }(),
+             [&] {
+                 auto value = context_a;
+                 value.policy_revision += 1U;
+                 return value;
+             }(),
+             [&] {
+                 auto value = context_a;
+                 value.channel_id = "sage-session-a-observation-drifted";
+                 return value;
+             }(),
+         }) {
+        auto conflict = (*registry)->enqueue_observation_intent(body, drifted, 30'001);
+        REQUIRE(!conflict.has_value());
+        REQUIRE(
+            conflict.error().code ==
+            glove::control::session_registry_error_code::idempotency_conflict
+        );
+    }
     REQUIRE((*registry)->record_count() == count_after_enqueue);
 
     auto changed_body = body;
@@ -1592,7 +1784,7 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(enqueued_next_generation->sequence != enqueued->sequence);
 
     auto invalid_body = body;
-    invalid_body.schema = "sage.glove-observation.v2";
+    invalid_body.schema = "test.observation.v2";
     REQUIRE(!(*registry)->enqueue_observation_intent(invalid_body, context_a, 30'002).has_value());
     invalid_body = body;
     invalid_body.intent_id = std::string(129, 'i');
@@ -1604,24 +1796,38 @@ auto run_intent_queue_contract() -> int {
     invalid_body.item_count = 4'097;
     REQUIRE(!(*registry)->enqueue_observation_intent(invalid_body, context_a, 30'002).has_value());
 
+    auto unseen_body = body;
+    unseen_body.intent_id = "intent-context-validation";
     auto mismatched_context = context_a;
     mismatched_context.profile_digest = std::string(64, 'f');
-    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    REQUIRE(!(*registry)
+                 ->enqueue_observation_intent(unseen_body, mismatched_context, 30'002)
+                 .has_value());
     mismatched_context = context_a;
     mismatched_context.runtime_id = "codex";
-    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    REQUIRE(!(*registry)
+                 ->enqueue_observation_intent(unseen_body, mismatched_context, 30'002)
+                 .has_value());
     mismatched_context = context_a;
     mismatched_context.policy_revision = 8;
-    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    REQUIRE(!(*registry)
+                 ->enqueue_observation_intent(unseen_body, mismatched_context, 30'002)
+                 .has_value());
     mismatched_context = context_a;
     mismatched_context.channel_generation = 0;
-    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    REQUIRE(!(*registry)
+                 ->enqueue_observation_intent(unseen_body, mismatched_context, 30'002)
+                 .has_value());
     mismatched_context = context_a;
     mismatched_context.expires_at_ms = mismatched_context.issued_at_ms + 600'001U;
-    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    REQUIRE(!(*registry)
+                 ->enqueue_observation_intent(unseen_body, mismatched_context, 30'002)
+                 .has_value());
     mismatched_context = context_a;
     mismatched_context.expires_at_ms = 29'999;
-    REQUIRE(!(*registry)->enqueue_observation_intent(body, mismatched_context, 30'002).has_value());
+    REQUIRE(!(*registry)
+                 ->enqueue_observation_intent(unseen_body, mismatched_context, 30'002)
+                 .has_value());
 
     auto second_body = body;
     second_body.intent_id = "intent-2";
@@ -1661,6 +1867,14 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(accepted_result.has_value());
     REQUIRE(accepted_result->disposition == glove::control::intent_disposition::accepted);
     const auto count_after_accept = (*registry)->record_count();
+    auto reconstructed_context = context_a;
+    reconstructed_context.issued_at_ms = 50'000;
+    reconstructed_context.expires_at_ms = 60'000;
+    auto replayed_after_disposition =
+        (*registry)->enqueue_observation_intent(body, reconstructed_context, 50'000);
+    REQUIRE(replayed_after_disposition == accepted_result);
+    REQUIRE(replayed_after_disposition->context == context_a);
+    REQUIRE((*registry)->record_count() == count_after_accept);
     REQUIRE((*registry)->set_observation_intent_disposition(accepted) == accepted_result);
     REQUIRE((*registry)->record_count() == count_after_accept);
     auto changed_disposition = accepted;
@@ -1728,24 +1942,24 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(expired_result->disposition == glove::control::intent_disposition::expired);
     REQUIRE((*registry)->set_observation_intent_disposition(expired) == expired_result);
 
-    const glove::control::glove_observation_body sxxx_proposal{
-        .schema = "sage.glove-sxxx-self-delegation-proposal.v1",
+    const glove::control::glove_observation_body retired_proposal{
+        .schema = std::string{test_proposal_schema},
         .intent_id = "proposal-1",
-        .observation = "sxxx-self-delegation",
-        .value_digest = "4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b",
+        .observation = "retired-proposal",
+        .value_digest = std::string(64, 'a'),
         .item_count = 1,
     };
     auto proposal_context = context_a;
     proposal_context.issued_at_ms = 30'101;
     proposal_context.expires_at_ms = 30'201;
     auto proposed =
-        (*registry)->enqueue_observation_intent(sxxx_proposal, proposal_context, 30'101);
+        (*registry)->enqueue_observation_intent(retired_proposal, proposal_context, 30'101);
     REQUIRE(proposed.has_value());
     REQUIRE(
         proposed->intent_digest ==
-        "0720ddf91b535e5a2db6badf0079d687e1bc239b41af7330bd9ee200cd6038c4"
+        "1ec5cd4e47e46feb63e3b2cc9836e320c2fe6fa5fca6dd022275631ccc3a81f9"
     );
-    auto altered_proposal = sxxx_proposal;
+    auto altered_proposal = retired_proposal;
     altered_proposal.item_count = 2;
     REQUIRE(!(*registry)
                  ->enqueue_observation_intent(altered_proposal, proposal_context, 30'101)
@@ -1753,7 +1967,7 @@ auto run_intent_queue_contract() -> int {
     const glove::control::observation_intent_disposition proposal_accepted{
         .session_id = proposal_context.session_id,
         .channel_generation = proposal_context.channel_generation,
-        .intent_id = sxxx_proposal.intent_id,
+        .intent_id = retired_proposal.intent_id,
         .intent_digest = proposed->intent_digest,
         .disposition = glove::control::intent_disposition::accepted,
         .decided_at_ms = 30'102,
@@ -1785,6 +1999,18 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(recovered_page->items[0].sequence < recovered_page->items[1].sequence);
     REQUIRE((*registry)->set_observation_intent_disposition(accepted) == accepted_result);
     REQUIRE((*registry)->set_observation_intent_disposition(expired) == expired_result);
+    auto replayed_after_reopen =
+        (*registry)->enqueue_observation_intent(body, reconstructed_context, 55'000);
+    REQUIRE(replayed_after_reopen == accepted_result);
+    REQUIRE(replayed_after_reopen->context == context_a);
+    auto expiring_reconstructed_context = expiring_context;
+    expiring_reconstructed_context.issued_at_ms = 60'000;
+    expiring_reconstructed_context.expires_at_ms = 60'100;
+    auto replayed_expired_after_reopen = (*registry)->enqueue_observation_intent(
+        expiring_body, expiring_reconstructed_context, 60'000
+    );
+    REQUIRE(replayed_expired_after_reopen == expired_result);
+    REQUIRE(replayed_expired_after_reopen->context == expiring_context);
 
     // Generalized admission: enqueue on a non-sage runtime binds to the
     // session's parsed runtime_id instead of a hardcoded guest identity.
@@ -1856,7 +2082,18 @@ auto run_intent_queue_contract() -> int {
         REQUIRE(codex_enqueued.has_value());
         auto wrong_runtime = codex_context;
         wrong_runtime.runtime_id = "other-guest";
-        REQUIRE(!(*registry)->enqueue_observation_intent(body, wrong_runtime, 40'011).has_value());
+        auto wrong_runtime_replay =
+            (*registry)->enqueue_observation_intent(body, wrong_runtime, 40'011);
+        REQUIRE(!wrong_runtime_replay.has_value());
+        REQUIRE(
+            wrong_runtime_replay.error().code ==
+            glove::control::session_registry_error_code::idempotency_conflict
+        );
+        auto unseen_codex_body = body;
+        unseen_codex_body.intent_id = "codex-unseen-intent";
+        REQUIRE(!(*registry)
+                     ->enqueue_observation_intent(unseen_codex_body, wrong_runtime, 40'011)
+                     .has_value());
     }
 
     const auto legacy_store = temp.root() / "legacy-observation-intent-sessions.journal";
@@ -1898,8 +2135,8 @@ auto run_intent_queue_contract() -> int {
     REQUIRE(replace_after_marker(
         hash_corrupted_schema_store,
         R"("operation":"enqueue_observation_intent_v1")",
-        "sage.glove-observation.v1",
-        "sage.glove-observation.v2"
+        "test.observation.v1",
+        "test.observation.v2"
     ));
     REQUIRE(!glove::control::session_registry::open_or_create(
                  hash_corrupted_schema_store,
@@ -1927,6 +2164,104 @@ auto run_intent_queue_contract() -> int {
                  test_channel_host()
     )
                  .has_value());
+
+    // Fully re-chained corruption must still fail before historical data can
+    // enter quarantine. Selectors keep each mutation focused on one commitment.
+    const auto enqueue_record = [](const auto& record) {
+        return record.operation == "enqueue_observation_intent_v1";
+    };
+    const auto accepted_disposition_record = [](const auto& record) {
+        return record.operation == "set_observation_intent_disposition_v1" &&
+               record.observation_intent && record.observation_intent->intent_id == "intent-1" &&
+               record.observation_intent->disposition == "accepted";
+    };
+    const auto rechained_recovery_rejected =
+        [&](std::string_view filename, const auto& select, const auto& mutate) {
+            const auto corrupted_store = temp.root() / filename;
+            return std::filesystem::copy_file(store_path, corrupted_store) &&
+                   ::chmod(corrupted_store.c_str(), 0600) == 0 &&
+                   rewrite_observation_record_and_rechain(corrupted_store, select, mutate) &&
+                   !glove::control::session_registry::open_or_create(
+                        corrupted_store,
+                        shared_validator,
+                        shared_bundle_store,
+                        glove::control::default_session_registry_bytes,
+                        nullptr
+                   )
+                        .has_value();
+        };
+
+    REQUIRE(rechained_recovery_rejected(
+        "body-commitment-corrupt.journal", enqueue_record, [](auto& record) {
+            record.observation_intent->item_count += 1U;
+        }
+    ));
+    REQUIRE(rechained_recovery_rejected(
+        "request-commitment-corrupt.journal", enqueue_record, [](auto& record) {
+            record.request_digest = std::string(64, 'f');
+        }
+    ));
+    REQUIRE(rechained_recovery_rejected(
+        "session-binding-corrupt.journal", enqueue_record, [](auto& record) {
+            record.launch_profile_digest = std::string(64, 'f');
+        }
+    ));
+    REQUIRE(rechained_recovery_rejected(
+        "enqueue-structural-corrupt.journal", enqueue_record, [](auto& record) {
+            record.observation_intent->schema_version = 2;
+        }
+    ));
+    REQUIRE(rechained_recovery_rejected(
+        "disposition-link-corrupt.journal", accepted_disposition_record, [](auto& record) {
+            record.observation_intent->profile_digest = std::string(64, 'f');
+        }
+    ));
+    REQUIRE(rechained_recovery_rejected(
+        "disposition-time-corrupt.journal", accepted_disposition_record, [](auto& record) {
+            record.observation_intent->decided_at_ms += 1U;
+        }
+    ));
+    REQUIRE(rechained_recovery_rejected(
+        "disposition-request-corrupt.journal", accepted_disposition_record, [](auto& record) {
+            record.request_digest = std::string(64, 'f');
+        }
+    ));
+    REQUIRE(rechained_recovery_rejected(
+        "duplicate-quarantine-key.journal",
+        [](const auto& record) {
+            return record.operation == "enqueue_observation_intent_v1" &&
+                   record.observation_intent && record.observation_intent->intent_id == "intent-2";
+        },
+        [](auto& record) {
+            using namespace glove::control;
+            auto& intent = *record.observation_intent;
+            intent.intent_id = "intent-1";
+            const glove_observation_body duplicate_body{
+                .schema = intent.schema,
+                .intent_id = intent.intent_id,
+                .observation = intent.observation,
+                .value_digest = intent.value_digest,
+                .item_count = intent.item_count,
+            };
+            const observation_intent_context duplicate_context{
+                .session_id = record.session_id,
+                .controller_plan_digest = record.controller_plan_digest,
+                .profile_digest = intent.profile_digest,
+                .runtime_id = intent.runtime_id,
+                .projection_digest = intent.projection_digest,
+                .policy_revision = record.policy_revision,
+                .channel_id = intent.channel_id,
+                .channel_generation = intent.channel_generation,
+                .issued_at_ms = intent.issued_at_ms,
+                .expires_at_ms = intent.expires_at_ms,
+            };
+            intent.intent_digest = wire::hash_observation_intent_body(duplicate_body).value_or("");
+            record.request_digest =
+                wire::hash_observation_intent_request(duplicate_body, duplicate_context)
+                    .value_or("");
+            record.idempotency_key = "intent-enqueue:" + record.request_digest;
+        }
+    ));
 
     const auto torn_store = temp.root() / "torn-intent-sessions.journal";
     REQUIRE(std::filesystem::copy_file(store_path, torn_store));
@@ -2052,10 +2387,12 @@ auto run_intent_queue_contract() -> int {
             (*tight)->enqueue_observation_intent(tight_body, tight_context, 60'010).has_value()
         );
         // Beyond the registered ttl bound (but inside the core ceiling).
+        auto long_ttl_body = tight_body;
+        long_ttl_body.intent_id = "tight-long-ttl";
         auto long_ttl = tight_context;
         long_ttl.issued_at_ms = 60'060;
         long_ttl.expires_at_ms = 60'060 + 600'000U;
-        REQUIRE(!(*tight)->enqueue_observation_intent(tight_body, long_ttl, 60'060).has_value());
+        REQUIRE(!(*tight)->enqueue_observation_intent(long_ttl_body, long_ttl, 60'060).has_value());
         // Beyond the registered skew bound.
         auto skew_body = tight_body;
         skew_body.intent_id = "tight-skew";
@@ -2074,27 +2411,122 @@ auto run_intent_queue_contract() -> int {
         );
     }
 
-    // Fail closed: replay of a store carrying intents must reject when no
-    // admission table is registered, and when the schema is missing from it.
+    // Historical integrity is independent of the current catalog. Retiring
+    // schemas quarantines only their authentic observation records and does
+    // not block unrelated session recovery.
     const auto unadmitted_store = temp.root() / "unadmitted-copy.journal";
     REQUIRE(std::filesystem::copy_file(store_path, unadmitted_store));
     REQUIRE(::chmod(unadmitted_store.c_str(), 0600) == 0);
-    REQUIRE(!glove::control::session_registry::open_or_create(
-                 unadmitted_store, shared_validator, shared_bundle_store
-    )
+    auto unadmitted = glove::control::session_registry::open_or_create(
+        unadmitted_store, shared_validator, shared_bundle_store
+    );
+    REQUIRE(unadmitted.has_value());
+    REQUIRE((*unadmitted)->status("sage-session-b").has_value());
+    auto unavailable_page = (*unadmitted)->quarantined_observation_intents(0, 1);
+    REQUIRE(unavailable_page.has_value());
+    REQUIRE(unavailable_page->items.size() == 1U);
+    REQUIRE(unavailable_page->items[0].closed_reason == "schema_unavailable");
+    REQUIRE(unavailable_page->next_after_sequence.has_value());
+    auto unavailable_next =
+        (*unadmitted)->quarantined_observation_intents(*unavailable_page->next_after_sequence, 256);
+    REQUIRE(unavailable_next.has_value());
+    REQUIRE(!unavailable_next->items.empty());
+    REQUIRE(std::ranges::all_of(unavailable_next->items, [](const auto& entry) {
+        return entry.closed_reason == glove::control::observation_schema_unavailable;
+    }));
+    REQUIRE(!(*unadmitted)->quarantined_observation_intents(0, 0).has_value());
+    REQUIRE(!(*unadmitted)
+                 ->quarantined_observation_intents(
+                     0, glove::control::max_observation_quarantine_page_size + 1U
+                 )
                  .has_value());
-    REQUIRE(!glove::control::session_registry::open_or_create(
-                 unadmitted_store,
-                 shared_validator,
-                 shared_bundle_store,
-                 glove::control::default_session_registry_bytes,
-                 tight_channel_host()
-    )
-                 .has_value());
+    auto unavailable_pending = (*unadmitted)->pending_observation_intents(0, 256, 30'080);
+    REQUIRE(unavailable_pending.has_value());
+    REQUIRE(unavailable_pending->items.empty());
+    auto quarantined_replay = (*unadmitted)->enqueue_observation_intent(body, context_a, 30'080);
+    REQUIRE(!quarantined_replay.has_value());
+    REQUIRE(
+        quarantined_replay.error().code ==
+        glove::control::session_registry_error_code::invalid_state
+    );
+    auto reused_body = body;
+    reused_body.item_count += 1U;
+    auto quarantined_key_reuse =
+        (*unadmitted)->enqueue_observation_intent(reused_body, context_a, 30'080);
+    REQUIRE(!quarantined_key_reuse.has_value());
+    REQUIRE(
+        quarantined_key_reuse.error().code ==
+        glove::control::session_registry_error_code::invalid_state
+    );
+    auto quarantined_disposition = (*unadmitted)->set_observation_intent_disposition(accepted);
+    REQUIRE(!quarantined_disposition.has_value());
+    REQUIRE(
+        quarantined_disposition.error().code ==
+        glove::control::session_registry_error_code::invalid_state
+    );
+    unadmitted->reset();
+
+    // A present schema with changed bounds/validation is incompatible, while
+    // an unknown historical schema remains unavailable. Interleaved terminal
+    // dispositions recover but never reactivate either quarantined key.
+    auto incompatible = glove::control::session_registry::open_or_create(
+        unadmitted_store,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        tight_channel_host()
+    );
+    REQUIRE(incompatible.has_value());
+    auto incompatible_page = (*incompatible)->quarantined_observation_intents(0, 256);
+    REQUIRE(incompatible_page.has_value());
+    REQUIRE(std::ranges::any_of(incompatible_page->items, [](const auto& entry) {
+        return entry.schema_id == test_observation_schema &&
+               entry.closed_reason == glove::control::observation_schema_incompatible;
+    }));
+    REQUIRE(std::ranges::any_of(incompatible_page->items, [](const auto& entry) {
+        return entry.schema_id == test_proposal_schema &&
+               entry.closed_reason == glove::control::observation_schema_unavailable;
+    }));
+    REQUIRE(std::ranges::any_of(incompatible_page->items, [&](const auto& entry) {
+        return entry.intent_id == accepted.intent_id && entry.session_id == accepted.session_id;
+    }));
+    incompatible->reset();
+
+    auto validator_incompatible = glove::control::session_registry::open_or_create(
+        unadmitted_store,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        rejecting_channel_host()
+    );
+    REQUIRE(validator_incompatible.has_value());
+    auto validator_incompatible_page =
+        (*validator_incompatible)->quarantined_observation_intents(0, 256);
+    REQUIRE(validator_incompatible_page.has_value());
+    REQUIRE(std::ranges::any_of(validator_incompatible_page->items, [&](const auto& entry) {
+        return entry.intent_id == accepted.intent_id && entry.session_id == accepted.session_id &&
+               entry.closed_reason == glove::control::observation_schema_incompatible;
+    }));
+    validator_incompatible->reset();
+
+    // Re-enabling the original frozen catalog fully rehydrates the same file;
+    // no journal migration or rewrite is needed.
+    auto readmitted = glove::control::session_registry::open_or_create(
+        unadmitted_store,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
+    );
+    REQUIRE(readmitted.has_value());
+    auto readmitted_quarantine = (*readmitted)->quarantined_observation_intents(0, 256);
+    REQUIRE(readmitted_quarantine.has_value());
+    REQUIRE(readmitted_quarantine->items.empty());
+    REQUIRE((*readmitted)->set_observation_intent_disposition(accepted) == accepted_result);
 
     // Unregistered schema enqueue fails closed.
     auto unregistered_body = body;
-    unregistered_body.schema = "sage.glove-observation.v2";
+    unregistered_body.schema = "test.observation.v2";
     REQUIRE(
         !(*registry)->enqueue_observation_intent(unregistered_body, context_a, 30'080).has_value()
     );
@@ -2277,7 +2709,7 @@ auto run_intent_recovery_transitions() -> int {
                 .has_value());
 
     const glove::control::glove_observation_body body{
-        .schema = "sage.glove-observation.v1",
+        .schema = std::string{test_observation_schema},
         .intent_id = "transition-intent-1",
         .observation = "guest-capability-inventory",
         .value_digest = std::string(64, 'a'),
@@ -2342,26 +2774,41 @@ auto run_intent_recovery_transitions() -> int {
     REQUIRE(registry.has_value());
     REQUIRE((*registry)->set_observation_intent_disposition(accepted).has_value());
 
-    // Fail-closed recovery regression: reopening a store holding durable
-    // observation intents must fail without the registered schema table.
-    // Neither a null channel host nor an empty one (no registered schemas)
-    // can admit the frozen intents, so recovery is refused outright.
-    REQUIRE(!glove::control::session_registry::open_or_create(
-                 store_path,
-                 shared_validator,
-                 shared_bundle_store,
-                 glove::control::default_session_registry_bytes,
-                 nullptr
-    )
-                 .has_value());
-    REQUIRE(!glove::control::session_registry::open_or_create(
-                 store_path,
-                 shared_validator,
-                 shared_bundle_store,
-                 glove::control::default_session_registry_bytes,
-                 std::make_shared<const glove::control::channel_host>()
-    )
-                 .has_value());
+    // The interleaved enqueue/disposition remains authentic when the schema
+    // is retired, but neither record is reactivated.
+    registry->reset();
+    auto retired = glove::control::session_registry::open_or_create(
+        store_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        nullptr
+    );
+    REQUIRE(retired.has_value());
+    auto retired_page = (*retired)->quarantined_observation_intents(0, 16);
+    REQUIRE(retired_page.has_value());
+    REQUIRE(retired_page->items.size() == 1U);
+    REQUIRE(retired_page->items[0].sequence == enqueued->sequence);
+    REQUIRE(retired_page->items[0].session_id == session_id);
+    REQUIRE(retired_page->items[0].schema_id == body.schema);
+    REQUIRE(retired_page->items[0].intent_id == body.intent_id);
+    REQUIRE(retired_page->items[0].channel_generation == 1U);
+    REQUIRE(retired_page->items[0].closed_reason == "schema_unavailable");
+    auto retired_pending = (*retired)->pending_observation_intents(0, 16, start_ms + 50U);
+    REQUIRE(retired_pending.has_value());
+    REQUIRE(retired_pending->items.empty());
+    REQUIRE(!(*retired)->set_observation_intent_disposition(accepted).has_value());
+    retired->reset();
+
+    auto reenabled = glove::control::session_registry::open_or_create(
+        store_path,
+        shared_validator,
+        shared_bundle_store,
+        glove::control::default_session_registry_bytes,
+        test_channel_host()
+    );
+    REQUIRE(reenabled.has_value());
+    REQUIRE((*reenabled)->set_observation_intent_disposition(accepted).has_value());
 
     return 0;
 }

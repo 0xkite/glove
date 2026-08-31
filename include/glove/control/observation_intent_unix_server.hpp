@@ -1,5 +1,6 @@
 #pragma once
 
+#include "glove/control/guest_channel_transport.hpp"
 #include "glove/control/session_registry.hpp"
 
 #include <cstddef>
@@ -7,7 +8,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
-#include <optional>
+#include <stop_token>
 #include <string>
 
 namespace glove::control {
@@ -35,6 +36,12 @@ inline constexpr std::size_t max_observation_frame_bytes = std::size_t{16} * 102
     }
 }
 
+// Response-send classification consumed by the owning worker's audit path.
+// Cancellation is an intentional shutdown; every other send failure remains
+// observable as an error. Exposed for regression tests.
+[[nodiscard]] auto classify_observation_response_send(guest_channel_transport_result<void> sent)
+    -> std::expected<bool, std::string>;
+
 struct observation_intent_unix_server_config {
     std::filesystem::path socket_path;
     session_registry* sessions = nullptr;
@@ -51,18 +58,16 @@ struct observation_intent_unix_server_config {
     std::uint64_t session_expires_at_ms = 0;
     std::string channel_token;
     std::uint64_t io_timeout_ms = 5'000;
-    // Defense-in-depth: when set, connections from peers whose peer-uid
-    // (SO_PEERCRED / LOCAL_PEERCRED) differs are rejected before any frame
-    // is read.
-    std::optional<std::uint32_t> expected_peer_uid;
-    // Bounded replay-cache capacity with least-recently-used eviction; the
-    // durable registry remains the authoritative idempotency layer.
-    std::size_t replay_cache_capacity = 1'024;
+    // Required defense-in-depth identity: peers whose uid (SO_PEERCRED /
+    // LOCAL_PEERCRED) differs are rejected before any frame is read.
+    std::uint32_t expected_peer_uid;
 };
 
-// Per-session guest observation ingress. One bounded request/response per
-// connection over an owner-only Unix socket. The host binds session context and
-// stamps observation intent timing; guests supply only the observation body.
+// Per-session guest observation ingress over an owner-only Unix socket. Accept
+// and framed I/O are deadline- and stop-bounded. Registry persistence is trusted
+// synchronous local work: stop/deadline are checked immediately around it, but
+// an in-progress persistence call cannot be forcibly interrupted. The host binds
+// session context and stamps timing; guests supply only the observation body.
 class observation_intent_unix_server final {
 public:
     struct implementation;
@@ -84,7 +89,7 @@ public:
     [[nodiscard]] static auto create(observation_intent_unix_server_config config)
         -> std::expected<std::unique_ptr<observation_intent_unix_server>, std::string>;
 
-    [[nodiscard]] auto serve_one_for(std::uint64_t accept_timeout_ms)
+    [[nodiscard]] auto serve_one_for(std::uint64_t accept_timeout_ms, std::stop_token stop = {})
         -> std::expected<bool, std::string>;
 
     [[nodiscard]] auto socket_path() const -> const std::filesystem::path&;

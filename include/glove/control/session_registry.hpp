@@ -18,6 +18,9 @@ namespace glove::control {
 
 inline constexpr std::uint64_t default_session_registry_bytes = std::uint64_t{64} * 1024U * 1024U;
 inline constexpr std::size_t max_pending_intent_page_size = 256U;
+inline constexpr std::size_t max_observation_quarantine_page_size = max_pending_intent_page_size;
+inline constexpr std::string_view observation_schema_unavailable = "schema_unavailable";
+inline constexpr std::string_view observation_schema_incompatible = "schema_incompatible";
 inline constexpr std::size_t max_observation_items = 4'096U;
 inline constexpr std::size_t max_observation_body_bytes = 65'536U;
 inline constexpr std::uint64_t max_observation_intent_ttl_ms = 600'000U;
@@ -87,6 +90,26 @@ struct pending_intent_page {
     std::optional<std::uint64_t> next_after_sequence;
 
     auto operator==(const pending_intent_page&) const -> bool = default;
+};
+
+// Payload-free recovery metadata for an authentic historical observation
+// whose schema is unavailable under the current host catalog.
+struct observation_intent_quarantine_entry {
+    std::uint64_t sequence = 0;
+    std::string session_id;
+    std::string schema_id;
+    std::string intent_id;
+    std::uint64_t channel_generation = 0;
+    std::string closed_reason;
+
+    auto operator==(const observation_intent_quarantine_entry&) const -> bool = default;
+};
+
+struct observation_intent_quarantine_page {
+    std::vector<observation_intent_quarantine_entry> items;
+    std::optional<std::uint64_t> next_after_sequence;
+
+    auto operator==(const observation_intent_quarantine_page&) const -> bool = default;
 };
 
 enum class session_state : std::uint8_t {
@@ -452,9 +475,9 @@ public:
     auto operator=(session_registry&&) -> session_registry& = delete;
     ~session_registry();
 
-    // `channels` is the host-registered guest payload admission table. When
-    // absent, observation intent enqueue is rejected and durable replay of
-    // any observation intent record fails closed.
+    // `channels` is the frozen host-registered guest payload admission table.
+    // When absent, new observation enqueue is rejected. Authentic historical
+    // observations recover as payload-free quarantine metadata.
     [[nodiscard]] static auto open_or_create(
         const std::filesystem::path& path,
         std::shared_ptr<const supervisor::session_plan_validator> validator,
@@ -593,8 +616,16 @@ public:
     [[nodiscard]] auto pending_observation_intents(
         std::uint64_t after_sequence, std::size_t limit, std::uint64_t now_ms
     ) const -> session_registry_result<pending_intent_page>;
+    [[nodiscard]] auto
+    quarantined_observation_intents(std::uint64_t after_sequence, std::size_t limit) const
+        -> session_registry_result<observation_intent_quarantine_page>;
     [[nodiscard]] auto record_count() const -> std::uint64_t;
     [[nodiscard]] auto library_projections_available() const noexcept -> bool;
+    // Narrow construction predicate for ephemeral channel factories. Pointer
+    // identity is the catalog contract; equivalent caller-built tables do not
+    // satisfy it.
+    [[nodiscard]] auto
+    uses_channel_host(const std::shared_ptr<const channel_host>& channels) const noexcept -> bool;
 
 private:
     std::unique_ptr<implementation> state_;

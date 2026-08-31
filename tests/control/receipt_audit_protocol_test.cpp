@@ -51,6 +51,98 @@ constexpr std::string_view intent_controller_digest =
 constexpr std::string_view library_bundle =
     R"({"schema_version":1,"source_library_ref":"bafy-test","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[]})";
 
+class capability_test_runtime final : public glove::control::session_runtime {
+public:
+    explicit capability_test_runtime(bool operational) : operational_{operational} {}
+
+    [[nodiscard]] auto backend_id() const noexcept -> std::string_view override {
+        return "capability-test";
+    }
+
+    [[nodiscard]] auto lifecycle_operational() const noexcept -> bool override {
+        return operational_;
+    }
+
+    [[nodiscard]] auto agent_runtime_adapter_schema_version() const noexcept
+        -> std::uint8_t override {
+        return 0;
+    }
+
+    [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override {
+        return {};
+    }
+
+    [[nodiscard]] auto resource_capabilities() const noexcept
+        -> glove::container::resource_enforcement_capabilities override {
+        return {};
+    }
+
+    [[nodiscard]] auto start(
+        glove::container::receipt_audit_producer&,
+        const glove::control::session_start_authorization&,
+        std::string_view,
+        std::uint64_t
+    ) -> std::expected<glove::control::session_record, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto reconcile(glove::container::receipt_audit_producer&, std::uint64_t)
+        -> std::expected<glove::control::session_reconciliation_report, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto list() const
+        -> std::expected<std::vector<std::string>, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto read(std::string_view, std::uint64_t, std::size_t) const
+        -> std::expected<glove::control::session_transcript_read, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto wait_read(std::string_view, std::uint64_t, std::size_t, std::uint64_t)
+        -> std::expected<glove::control::session_transcript_read, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto write_input(std::string_view, std::string_view)
+        -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto resize(std::string_view, std::uint16_t, std::uint16_t)
+        -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto signal(std::string_view, glove::control::session_signal)
+        -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto stop(std::string_view) -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto stop(std::string_view, std::string_view)
+        -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto wait(std::string_view)
+        -> std::expected<glove::control::session_terminal_record, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto cleanup(std::string_view) -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+private:
+    bool operational_ = false;
+};
+
 class temporary_directory {
 public:
     temporary_directory() {
@@ -456,6 +548,26 @@ auto make_request(
     return request;
 }
 
+auto observation_capability(
+    glove::control::receipt_audit_protocol& protocol, std::string_view request_id
+) -> std::optional<std::uint8_t> {
+    auto frame = protocol.handle_frame(
+        make_request(request_id, "capabilities", bootstrap_secret, "null"), 1'000
+    );
+    if (!frame) {
+        return std::nullopt;
+    }
+    auto response = decode_response(*frame);
+    if (!response || !response->result) {
+        return std::nullopt;
+    }
+    wire_test::supervisor_capabilities capabilities;
+    if (glz::read<glz::opts{.error_on_unknown_keys = true}>(capabilities, response->result->str)) {
+        return std::nullopt;
+    }
+    return capabilities.observation_intent_channel_schema_version;
+}
+
 auto library_bundle_digest() -> std::string {
     const auto* bytes = reinterpret_cast<const unsigned char*>(library_bundle.data());
     return glove::container::sha256_hex(std::span{bytes, library_bundle.size()}).value_or("");
@@ -477,19 +589,23 @@ auto intent_runtime_digest() -> std::string {
 }
 
 // Registration example (test fixture): the host owns payload semantics.
-auto intent_channel_host() -> std::shared_ptr<glove::control::channel_host> {
+auto intent_channel_host() -> std::shared_ptr<const glove::control::channel_host> {
     auto host = std::make_shared<glove::control::channel_host>();
-    (void)host->register_channel({
-        .channel_id = "test-observation",
-        .schema_id = "sage.glove-observation.v1",
-        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
-        .bounds = {
-            .max_items = 4'096,
-            .max_body_bytes = 8'192,
-            .max_ttl_ms = 600'000,
-            .max_skew_ms = 30'000,
-        },
-    });
+    if (!host->register_channel({
+            .schema_id = "test.observation.v1",
+            .body_validator =
+                [](const glove::control::glove_observation_body&) noexcept { return true; },
+            .bounds =
+                {
+                    .max_items = 4'096,
+                    .max_body_bytes = 8'192,
+                    .max_ttl_ms = 600'000,
+                    .max_skew_ms = 30'000,
+                },
+        }) ||
+        !host->freeze()) {
+        return {};
+    }
     return host;
 }
 
@@ -715,7 +831,7 @@ auto run_observation_intent_control_contract() -> int {
     REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
         capability_set, capabilities_response->result->str
     ));
-    REQUIRE(capability_set.observation_intent_channel_schema_version == 1);
+    REQUIRE(capability_set.observation_intent_channel_schema_version == 0);
 
     auto unauthorized_page = (*intent_protocol)
                                  ->handle_frame(
@@ -926,7 +1042,7 @@ auto run_observation_intent_control_contract() -> int {
     REQUIRE(marked_running.has_value());
 
     const glove::control::glove_observation_body body{
-        .schema = "sage.glove-observation.v1",
+        .schema = "test.observation.v1",
         .intent_id = "intent-1",
         .observation = "guest-capability-inventory",
         .value_digest = std::string(64, 'd'),
@@ -1578,7 +1694,20 @@ auto run() -> int {
     REQUIRE(planned_capability_set.session_control.create_session);
     REQUIRE(planned_capability_set.session_control.session_status);
     REQUIRE(!planned_capability_set.session_control.start_session);
-    REQUIRE(planned_capability_set.observation_intent_channel_schema_version == 1);
+    REQUIRE(planned_capability_set.observation_intent_channel_schema_version == 0);
+
+    auto operational_runtime = std::make_shared<capability_test_runtime>(true);
+    auto operational_protocol = glove::control::receipt_audit_protocol::create(
+        bootstrap_secret,
+        *recovered,
+        shared_validator,
+        shared_sessions,
+        operational_runtime,
+        {},
+        temp.root().string()
+    );
+    REQUIRE(operational_protocol.has_value());
+    REQUIRE(observation_capability(**operational_protocol, "operational-capabilities") == 0);
 
     auto remote_runtime = glove::control::remote_session_runtime::create({
         .ssh_argv = {"/usr/bin/ssh", "-F", "/tmp/glove-remote/config", "glove-remote"},
@@ -1592,7 +1721,7 @@ auto run() -> int {
     });
     REQUIRE(remote_runtime.has_value());
     auto remote_control = glove::control::receipt_audit_protocol::create(
-        bootstrap_secret, *recovered, shared_validator, shared_sessions, *remote_runtime
+        bootstrap_secret, *recovered, shared_validator, shared_sessions, *remote_runtime, {}, {}
     );
     REQUIRE(remote_control.has_value());
     auto remote_capabilities =
@@ -1621,6 +1750,7 @@ auto run() -> int {
     REQUIRE(remote_capability_set.agent_runtime_adapter_schema_version == 0);
     REQUIRE(remote_capability_set.managed_runtime_ids.empty());
     REQUIRE(remote_capability_set.refinement_evaluation_protocol_schema_version == 0);
+    REQUIRE(remote_capability_set.observation_intent_channel_schema_version == 0);
     REQUIRE(remote_capability_set.backends.size() == 2);
     for (const auto& backend : remote_capability_set.backends) {
         REQUIRE(backend.resource_enforcement.cpu_time == "unavailable");

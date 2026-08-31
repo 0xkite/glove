@@ -72,6 +72,7 @@ auto mounts() -> std::vector<session_mount> {
             .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
+            .service_proxy_manifest_digest = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -91,6 +92,7 @@ auto mounts() -> std::vector<session_mount> {
             .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
+            .service_proxy_manifest_digest = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -115,6 +117,7 @@ auto mounts() -> std::vector<session_mount> {
             .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
+            .service_proxy_manifest_digest = std::nullopt,
             .writable = true,
             .directory = true,
         },
@@ -139,6 +142,7 @@ auto mounts() -> std::vector<session_mount> {
             .runtime_adoption_snapshot_digest = std::nullopt,
             .secret_handle = std::nullopt,
             .secret_runtime_id = std::nullopt,
+            .service_proxy_manifest_digest = std::nullopt,
             .writable = false,
             .directory = true,
         },
@@ -165,6 +169,59 @@ auto run() -> int {
     REQUIRE(first->controller_plan_digest == controller_digest);
     REQUIRE(first->profile_digest.size() == 64);
     REQUIRE(first->library_projections.empty());
+    REQUIRE(!first->service_proxy_manifest_digest);
+
+    auto service_profile = first_profile;
+    service_profile.environment.push_back("GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local");
+    auto service_mounts = first_mounts;
+    service_mounts.push_back({
+        .descriptor_fd = 15,
+        .target_path = "/run/glove-services/local",
+        .alias = "local-services",
+        .quota_partition = "",
+        .quota_bytes = 0,
+        .source_identity =
+            glove::supervisor::path_identity{
+                .device = 7,
+                .inode = 13,
+                .mode = static_cast<std::uint32_t>(S_IFDIR | 0700),
+            },
+        .source_content_digest = std::nullopt,
+        .projection_id = std::nullopt,
+        .projection_destination_alias = std::nullopt,
+        .runtime_adapter_id = std::nullopt,
+        .runtime_context_digest = std::nullopt,
+        .runtime_adoption_manifest_digest = std::nullopt,
+        .runtime_adoption_snapshot_digest = std::nullopt,
+        .secret_handle = std::nullopt,
+        .secret_runtime_id = std::nullopt,
+        .service_proxy_manifest_digest = std::string(64U, 'b'),
+        .writable = false,
+        .directory = true,
+    });
+    auto service_binding = make_binding(service_profile, argv, service_mounts);
+    REQUIRE(service_binding.has_value());
+    REQUIRE(service_binding->service_proxy_manifest_digest == std::string(64U, 'b'));
+    REQUIRE(service_binding->profile_digest != first->profile_digest);
+    REQUIRE(!make_binding(first_profile, argv, service_mounts).has_value());
+    REQUIRE(!make_binding(service_profile, argv, first_mounts).has_value());
+    auto changed_service = service_mounts;
+    changed_service.back().service_proxy_manifest_digest = std::string(64U, 'c');
+    auto changed_service_binding = make_binding(service_profile, argv, changed_service);
+    REQUIRE(changed_service_binding.has_value());
+    REQUIRE(changed_service_binding->profile_digest != service_binding->profile_digest);
+    auto invalid_service = service_mounts;
+    invalid_service.back().alias = "__local_services";
+    REQUIRE(!make_binding(service_profile, argv, invalid_service).has_value());
+    invalid_service = service_mounts;
+    invalid_service.back().target_path = "/tmp/local-services";
+    REQUIRE(!make_binding(service_profile, argv, invalid_service).has_value());
+    invalid_service = service_mounts;
+    invalid_service.back().service_proxy_manifest_digest = "not-a-digest";
+    REQUIRE(!make_binding(service_profile, argv, invalid_service).has_value());
+    invalid_service = service_mounts;
+    invalid_service.push_back(service_mounts.back());
+    REQUIRE(!make_binding(service_profile, argv, invalid_service).has_value());
 
     std::ranges::reverse(first_profile.environment);
     std::ranges::reverse(first_mounts);
@@ -253,6 +310,7 @@ auto run() -> int {
         .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
+        .service_proxy_manifest_digest = std::nullopt,
         .writable = false,
         .directory = false,
     });
@@ -315,6 +373,7 @@ auto run() -> int {
         .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
+        .service_proxy_manifest_digest = std::nullopt,
         .writable = true,
         .directory = true,
     });
@@ -339,6 +398,7 @@ auto run() -> int {
         .runtime_adoption_snapshot_digest = std::nullopt,
         .secret_handle = "codex-auth",
         .secret_runtime_id = "codex",
+        .service_proxy_manifest_digest = std::nullopt,
         .writable = true,
         .directory = false,
     });
@@ -369,6 +429,7 @@ auto run() -> int {
         .runtime_adoption_snapshot_digest = std::string(64U, 'b'),
         .secret_handle = std::nullopt,
         .secret_runtime_id = std::nullopt,
+        .service_proxy_manifest_digest = std::nullopt,
         .writable = true,
         .directory = true,
     });

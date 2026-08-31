@@ -24,6 +24,15 @@ target_include_directories(glove_digest
 add_subdirectory(supervisor)
 add_subdirectory(container)
 add_subdirectory(control)
+
+add_library(glove_sage_adapter STATIC
+    adapters/sage/guest_channel.cpp
+)
+target_link_libraries(glove_sage_adapter PUBLIC glove_control)
+target_include_directories(glove_sage_adapter PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+
 add_subdirectory(kernel)
 add_subdirectory(run)
 
@@ -55,7 +64,7 @@ target_link_libraries(glove-remote-exec PRIVATE glove_control)
 
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(gloved gloved_main.cpp)
-    target_link_libraries(gloved PRIVATE glove_control glove_host)
+    target_link_libraries(gloved PRIVATE glove_control glove_host glove_sage_adapter)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_include_directories(gloved PRIVATE
             $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>

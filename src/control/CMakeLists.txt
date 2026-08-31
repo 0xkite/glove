@@ -2,6 +2,7 @@ add_library(glove_control STATIC
     guest_channel.cpp
     receipt_audit_protocol.cpp
     receipt_audit_unix_server.cpp
+    guest_channel_transport.cpp
     observation_intent_unix_server.cpp
     receipt_handlers.cpp
     receipt_path_handlers.cpp
@@ -16,11 +17,6 @@ add_library(glove_control STATIC
     session_registry_recovery.cpp
     session_registry_replay.cpp
     session_registry_wire.cpp
-    wallet_pi_status_adapter.cpp
-    wallet_status_bridge.cpp
-    wallet_status_channel.cpp
-    wallet_status_json.cpp
-    wallet_status_managed_session.cpp
 )
 add_library(glove::control ALIAS glove_control)
 
@@ -35,6 +31,7 @@ if(APPLE)
     )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(glove_control PRIVATE
+        local_service_proxy.cpp
         linux_process_identity.cpp
         linux_session_recovery.cpp
         linux_session_executor.cpp

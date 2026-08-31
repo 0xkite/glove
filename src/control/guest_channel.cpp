@@ -6,8 +6,10 @@ namespace glove::control {
 
 auto channel_host::register_channel(channel_descriptor descriptor)
     -> std::expected<void, std::string> {
-    if (!detail::valid_identifier(descriptor.channel_id) ||
-        !detail::valid_identifier(descriptor.schema_id) || !descriptor.body_validator) {
+    if (frozen_) {
+        return std::unexpected(std::string{"channel catalog is frozen"});
+    }
+    if (!detail::valid_identifier(descriptor.schema_id) || !descriptor.body_validator) {
         return std::unexpected(std::string{"channel descriptor identity is invalid"});
     }
     const auto& bounds = descriptor.bounds;
@@ -20,8 +22,8 @@ auto channel_host::register_channel(channel_descriptor descriptor)
     if (descriptors_.contains(descriptor.schema_id)) {
         return std::unexpected(std::string{"channel schema is already registered"});
     }
-    auto [position, inserted] =
-        descriptors_.emplace(std::move(descriptor.schema_id), std::move(descriptor));
+    auto schema_id = descriptor.schema_id;
+    auto [position, inserted] = descriptors_.emplace(std::move(schema_id), std::move(descriptor));
     if (!inserted) {
         return std::unexpected(std::string{"channel schema is already registered"});
     }
@@ -29,7 +31,21 @@ auto channel_host::register_channel(channel_descriptor descriptor)
     return {};
 }
 
+auto channel_host::freeze() -> std::expected<void, std::string> {
+    if (frozen_) {
+        return {};
+    }
+    if (descriptors_.empty()) {
+        return std::unexpected(std::string{"cannot freeze an empty channel catalog"});
+    }
+    frozen_ = true;
+    return {};
+}
+
 auto channel_host::admits(std::string_view schema_id) const -> const channel_descriptor* {
+    if (!frozen_) {
+        return nullptr;
+    }
     const auto found = descriptors_.find(std::string{schema_id});
     return found == descriptors_.end() ? nullptr : &found->second;
 }

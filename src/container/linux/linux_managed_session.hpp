@@ -13,6 +13,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -32,6 +33,7 @@ struct managed_launch_binding {
     std::string controller_plan_digest;
     std::string profile_digest;
     std::vector<library_projection_receipt> library_projections;
+    std::optional<std::string> service_proxy_manifest_digest;
 
     auto operator==(const managed_launch_binding&) const -> bool = default;
 };

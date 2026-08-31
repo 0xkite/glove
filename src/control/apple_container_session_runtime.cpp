@@ -422,18 +422,17 @@ struct observation_service_state {
     std::string channel_id;
     std::string commitment_digest;
     std::uint64_t channel_generation = 1;
-    std::atomic<bool> stop_requested{false};
     std::unique_ptr<observation_intent_unix_server> server;
     glove::audit::sink* audit = nullptr;
     std::string audit_channel;
-    std::thread worker;
+    std::jthread worker;
 
     observation_service_state() = default;
     observation_service_state(const observation_service_state&) = delete;
     auto operator=(const observation_service_state&) -> observation_service_state& = delete;
 
     ~observation_service_state() {
-        stop_requested.store(true);
+        worker.request_stop();
         if (worker.joinable()) {
             worker.join();
         }
@@ -516,13 +515,13 @@ public:
             // retry ladder. Persistent failures are retried here with an
             // audit event before the channel is given up, so an fd-pressure
             // spike no longer permanently kills guest observation ingress.
-            state_->worker = std::thread{[service] {
+            state_->worker = std::jthread{[service](std::stop_token stop) {
                 constexpr std::size_t failure_audit_threshold = 4;
                 constexpr std::size_t max_consecutive_failures = 32;
                 std::size_t consecutive_failures = 0;
                 bool audited = false;
-                while (!service->stop_requested.load()) {
-                    auto served = service->server->serve_one_for(100);
+                while (!stop.stop_requested()) {
+                    auto served = service->server->serve_one_for(100, stop);
                     if (served) {
                         consecutive_failures = 0;
                         audited = false;
@@ -541,7 +540,7 @@ public:
                         audited = true;
                     }
                     if (consecutive_failures >= max_consecutive_failures) {
-                        service->stop_requested.store(true);
+                        break;
                     }
                 }
             }};
@@ -556,7 +555,7 @@ public:
         if (!state_) {
             return;
         }
-        state_->stop_requested.store(true);
+        state_->worker.request_stop();
         if (state_->worker.joinable()) {
             state_->worker.join();
         }
@@ -3062,42 +3061,6 @@ auto apple_container_session_runtime::cleanup(std::string_view session_id)
     }
     state_->sessions.erase(found);
     return {};
-}
-
-auto sage_guest_channel_host() -> std::shared_ptr<const channel_host> {
-    // Harness-owned payload semantics. The bounded observation schema accepts
-    // any well-formed observation identifier; the self-delegation proposal
-    // schema stays closed to its fixed kind, digest, and single item.
-    auto host = std::make_shared<channel_host>();
-    static_cast<void>(host->register_channel({
-        .channel_id = "sage-guest-observation",
-        .schema_id = "sage.glove-observation.v1",
-        .body_validator = [](const glove_observation_body&) { return true; },
-        .bounds = {
-            .max_items = max_observation_items,
-            .max_body_bytes = 8'192U,
-            .max_ttl_ms = 600'000U,
-            .max_skew_ms = 30'000U,
-        },
-    }));
-    static_cast<void>(host->register_channel({
-        .channel_id = "sage-guest-sxxx-proposal",
-        .schema_id = "sage.glove-sxxx-self-delegation-proposal.v1",
-        .body_validator =
-            [](const glove_observation_body& body) {
-                return body.observation == "sxxx-self-delegation" &&
-                       body.value_digest ==
-                           "4dbcec31a233e128a757c18fe1483f62b5a6ca66ba811e833bf3f618a407232b" &&
-                       body.item_count == 1U;
-            },
-        .bounds = {
-            .max_items = 1U,
-            .max_body_bytes = 1'024U,
-            .max_ttl_ms = 600'000U,
-            .max_skew_ms = 30'000U,
-        },
-    }));
-    return host;
 }
 
 } // namespace glove::control::apple_detail

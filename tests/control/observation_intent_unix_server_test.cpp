@@ -10,12 +10,14 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
+#include <poll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -29,6 +31,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -66,6 +69,10 @@ constexpr std::string_view channel_token =
     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view library_bundle =
     R"({"schema_version":1,"source_library_ref":"bafy-test","source_manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entries":[]})";
+
+static_assert(std::is_same_v<
+              decltype(glove::control::observation_intent_unix_server_config::expected_peer_uid),
+              std::uint32_t>);
 
 auto write_owner_only(const std::filesystem::path& path, std::string_view value) -> bool {
     std::ofstream output{path, std::ios::binary | std::ios::trunc};
@@ -185,19 +192,23 @@ auto sage_guest_plan_at(std::uint64_t now_ms) -> std::string {
 }
 
 // Registration example (test fixture): the host owns payload semantics.
-auto test_channel_host() -> std::shared_ptr<glove::control::channel_host> {
+auto test_channel_host() -> std::shared_ptr<const glove::control::channel_host> {
     auto host = std::make_shared<glove::control::channel_host>();
-    (void)host->register_channel({
-        .channel_id = "test-observation",
-        .schema_id = "sage.glove-observation.v1",
-        .body_validator = [](const glove::control::glove_observation_body&) { return true; },
-        .bounds = {
-            .max_items = 4'096,
-            .max_body_bytes = 8'192,
-            .max_ttl_ms = 600'000,
-            .max_skew_ms = 30'000,
-        },
-    });
+    if (!host->register_channel({
+            .schema_id = "test.observation.v1",
+            .body_validator =
+                [](const glove::control::glove_observation_body&) noexcept { return true; },
+            .bounds =
+                {
+                    .max_items = 4'096,
+                    .max_body_bytes = 8'192,
+                    .max_ttl_ms = 600'000,
+                    .max_skew_ms = 30'000,
+                },
+        }) ||
+        !host->freeze()) {
+        return {};
+    }
     return host;
 }
 
@@ -474,7 +485,7 @@ auto make_enqueue_request(
 ) -> std::string {
     std::string request =
         std::string{"{\"schema_version\":1,\"channel_token\":\""} + std::string{token} +
-        "\",\"body\":{\"schema\":\"sage.glove-observation.v1\",\"intent_id\":\"" +
+        "\",\"body\":{\"schema\":\"test.observation.v1\",\"intent_id\":\"" +
         std::string{intent_id} + "\",\"observation\":\"" + std::string{observation} +
         "\",\"value_digest\":\"" + std::string{value_digest} +
         "\",\"item_count\":" + std::to_string(item_count) + "}";
@@ -548,6 +559,25 @@ auto connect_to(const std::filesystem::path& socket_path) -> unique_fd {
         return unique_fd{};
     }
     return descriptor;
+}
+
+// Locate and duplicate the private listening descriptor without adding a
+// production native-handle API or creating a second public transport owner.
+auto duplicate_listener_for(const std::filesystem::path& socket_path) -> unique_fd {
+    const auto expected = socket_path.string();
+    const long open_max = ::sysconf(_SC_OPEN_MAX);
+    const int upper_bound = static_cast<int>(std::clamp<long>(open_max, 0, 4'096));
+    for (int descriptor = 0; descriptor < upper_bound; ++descriptor) {
+        ::sockaddr_un address{};
+        ::socklen_t address_size = sizeof(address);
+        if (::getsockname(descriptor, reinterpret_cast<::sockaddr*>(&address), &address_size) !=
+                0 ||
+            address.sun_family != AF_UNIX || std::string_view{address.sun_path} != expected) {
+            continue;
+        }
+        return unique_fd{::dup(descriptor)};
+    }
+    return unique_fd{};
 }
 
 auto transact(const std::filesystem::path& socket_path, std::string_view frame)
@@ -650,6 +680,28 @@ auto serve_in_background(
 }
 
 auto run() -> int {
+    using glove::control::guest_channel_transport_error;
+    using glove::control::guest_channel_transport_error_code;
+
+    const auto classified_send_failure = [](guest_channel_transport_error_code code) {
+        return glove::control::classify_observation_response_send(
+            std::unexpected(guest_channel_transport_error{.code = code, .message = "send failed"})
+        );
+    };
+    for (const auto code : {
+             guest_channel_transport_error_code::deadline_exceeded,
+             guest_channel_transport_error_code::disconnected,
+             guest_channel_transport_error_code::io,
+         }) {
+        auto classified = classified_send_failure(code);
+        REQUIRE(!classified.has_value());
+        REQUIRE(classified.error() == "send failed");
+    }
+    auto cancelled_send = classified_send_failure(guest_channel_transport_error_code::cancelled);
+    REQUIRE(cancelled_send.has_value());
+    REQUIRE(!*cancelled_send);
+    REQUIRE(glove::control::classify_observation_response_send({}).value_or(false));
+
     // F5: transient accept-boundary errors are retryable; fatal config and
     // descriptor-state errors are not.
     REQUIRE(glove::control::observation_transient_accept_error(EINTR));
@@ -784,7 +836,7 @@ auto run() -> int {
     auto oversized_response = transact(
         socket_path,
         std::string{"{\"schema_version\":1,\"channel_token\":\""} + std::string{channel_token} +
-            "\",\"body\":{\"schema\":\"sage.glove-observation.v1\",\"intent_id\":\"intent-4\","
+            "\",\"body\":{\"schema\":\"test.observation.v1\",\"intent_id\":\"intent-4\","
             "\"observation\":\"" +
             oversized + "\",\"value_digest\":\"" + std::string(64, 'c') + "\",\"item_count\":1}}"
     );
@@ -857,6 +909,125 @@ auto run() -> int {
 
     server->reset();
     REQUIRE(::access(socket_path.c_str(), F_OK) != 0);
+
+    // A stop token tears down idle accept and partial header/body service
+    // without a concurrent listener/channel close. Destruction happens only
+    // after each owning worker has joined.
+    {
+        auto idle_config = server_config_for(
+            *fixture, fixture->temp.root() / "idle-stop.sock", start_ms + 120'000U
+        );
+        auto idle_server = glove::control::observation_intent_unix_server::create(idle_config);
+        REQUIRE(idle_server.has_value());
+        std::expected<bool, std::string> idle_result =
+            std::unexpected(std::string{"worker did not run"});
+        const auto started = std::chrono::steady_clock::now();
+        std::jthread idle_worker{[&](std::stop_token stop) {
+            idle_result = (*idle_server)->serve_one_for(5'000, stop);
+        }};
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        idle_worker.request_stop();
+        idle_worker.join();
+        REQUIRE(idle_result.has_value());
+        REQUIRE(!*idle_result);
+        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{250});
+        idle_server->reset();
+
+        // A competing raw accept consumes readiness without taking public
+        // ownership of the observation transport. The listener itself must be
+        // nonblocking, and the next service call must remain deadline/stop bounded.
+        auto race_config = server_config_for(
+            *fixture, fixture->temp.root() / "consumed-readiness.sock", start_ms + 120'000U
+        );
+        auto race_server = glove::control::observation_intent_unix_server::create(race_config);
+        REQUIRE(race_server.has_value());
+        auto competing_listener = duplicate_listener_for(race_server->get()->socket_path());
+        REQUIRE(competing_listener.get() >= 0);
+        const int listener_flags = ::fcntl(competing_listener.get(), F_GETFL);
+        REQUIRE(listener_flags >= 0);
+        REQUIRE((listener_flags & O_NONBLOCK) != 0);
+
+        const auto compete_after_wait = [&](std::uint64_t timeout_ms, bool cancel) -> bool {
+            std::expected<bool, std::string> result =
+                std::unexpected(std::string{"worker did not run"});
+            const auto started = std::chrono::steady_clock::now();
+            std::jthread worker{[&](std::stop_token stop) {
+                result = (*race_server)->serve_one_for(timeout_ms, stop);
+            }};
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            auto pending = connect_to(race_server->get()->socket_path());
+            if (pending.get() < 0) {
+                worker.request_stop();
+                worker.join();
+                return false;
+            }
+            ::pollfd event{.fd = competing_listener.get(), .events = POLLIN, .revents = 0};
+            if (::poll(&event, 1, 10) != 1 || (event.revents & POLLIN) == 0) {
+                worker.request_stop();
+                worker.join();
+                return false;
+            }
+            unique_fd consumed{::accept(competing_listener.get(), nullptr, nullptr)};
+            if (consumed.get() < 0) {
+                worker.request_stop();
+                worker.join();
+                return false;
+            }
+            if (cancel) {
+                worker.request_stop();
+            }
+            worker.join();
+            return result.has_value() && !*result &&
+                   std::chrono::steady_clock::now() - started < std::chrono::milliseconds{250};
+        };
+
+        bool deadline_race_exercised = false;
+        for (unsigned attempt = 0; attempt < 16U && !deadline_race_exercised; ++attempt) {
+            deadline_race_exercised = compete_after_wait(40, false);
+        }
+        REQUIRE(deadline_race_exercised);
+
+        bool cancellation_race_exercised = false;
+        for (unsigned attempt = 0; attempt < 16U && !cancellation_race_exercised; ++attempt) {
+            cancellation_race_exercised = compete_after_wait(5'000, true);
+        }
+        REQUIRE(cancellation_race_exercised);
+        race_server->reset();
+
+        for (const bool partial_body : {false, true}) {
+            const auto name = partial_body ? "partial-body-stop.sock" : "partial-header-stop.sock";
+            auto partial_config = server_config_for(
+                *fixture, fixture->temp.root() / name, start_ms + 120'000U, 5'000
+            );
+            auto partial_server =
+                glove::control::observation_intent_unix_server::create(partial_config);
+            REQUIRE(partial_server.has_value());
+            auto partial_client = connect_to(partial_server->get()->socket_path());
+            REQUIRE(partial_client.get() >= 0);
+            const auto declared = htonl(128U);
+            if (partial_body) {
+                REQUIRE(write_exact(partial_client.get(), &declared, sizeof(declared)));
+                REQUIRE(write_exact(partial_client.get(), "{", 1U));
+            } else {
+                REQUIRE(write_exact(partial_client.get(), &declared, 1U));
+            }
+            std::expected<bool, std::string> partial_result =
+                std::unexpected(std::string{"worker did not run"});
+            const auto partial_started = std::chrono::steady_clock::now();
+            std::jthread partial_worker{[&](std::stop_token stop) {
+                partial_result = (*partial_server)->serve_one_for(5'000, stop);
+            }};
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            partial_worker.request_stop();
+            partial_worker.join();
+            REQUIRE(partial_result.has_value());
+            REQUIRE(!*partial_result);
+            REQUIRE(
+                std::chrono::steady_clock::now() - partial_started < std::chrono::milliseconds{250}
+            );
+            partial_server->reset();
+        }
+    }
 
     REQUIRE(::chmod(fixture->temp.root().c_str(), 0755) == 0);
     REQUIRE(
@@ -940,58 +1111,58 @@ auto run() -> int {
         REQUIRE(fixture->registry->record_count() == count_before_guard);
     }
 
-    // F4: replay-cache eviction (LRU) keeps the channel alive past the
-    // cache capacity instead of returning capacity_exhausted forever.
+    // Durable replay survives server reconstruction; host timestamps are
+    // stamped only by the first acceptance and a changed stable body conflicts.
     {
-        auto bounded_config =
-            server_config_for(*fixture, fixture->temp.root() / "bounded.sock", start_ms + 120'000U);
-        bounded_config.replay_cache_capacity = 2U;
-        auto bounded_server =
-            glove::control::observation_intent_unix_server::create(bounded_config);
-        REQUIRE(bounded_server.has_value());
-        const auto bounded_socket = bounded_server->get()->socket_path();
-        const auto count_before_lru = fixture->registry->record_count();
-
-        // One serve iteration per transact below.
-        serve_error.reset();
-        server_thread = serve_in_background(**bounded_server, 6, serve_error);
-
-        auto lru_first =
-            decode_success(*transact(bounded_socket, make_enqueue_request(channel_token, "lru-1")));
-        REQUIRE(lru_first.has_value());
-        auto lru_second =
-            decode_success(*transact(bounded_socket, make_enqueue_request(channel_token, "lru-2")));
-        REQUIRE(lru_second.has_value());
-        auto lru_third =
-            decode_success(*transact(bounded_socket, make_enqueue_request(channel_token, "lru-3")));
-        REQUIRE(lru_third.has_value());
-
-        // The cached tail still replays through the cache.
-        auto lru_cached_replay =
-            transact(bounded_socket, make_enqueue_request(channel_token, "lru-3"));
-        auto cached_replay = decode_success(*lru_cached_replay);
-        REQUIRE(cached_replay.has_value());
-        REQUIRE(cached_replay->sequence == lru_third->sequence);
-
-        // The evicted head replays through the durable registry: either an
-        // exact replay (same host-stamped millisecond) or a drifted
-        // idempotency_conflict — never capacity_exhausted, and the channel
-        // stays live.
-        auto lru_evicted_replay =
-            transact(bounded_socket, make_enqueue_request(channel_token, "lru-1"));
-        auto evicted_success = decode_success(*lru_evicted_replay);
-        auto evicted_error = decode_error(*lru_evicted_replay);
-        REQUIRE(
-            evicted_success.has_value() ||
-            (evicted_error.has_value() && evicted_error->code == "idempotency_conflict")
+        auto reconstructed_config = server_config_for(
+            *fixture, fixture->temp.root() / "reconstructed.sock", start_ms + 120'000U
         );
-
-        // New intents keep flowing past the old 1024-cap behavior.
-        auto lru_fourth = transact(bounded_socket, make_enqueue_request(channel_token, "lru-4"));
-        REQUIRE(decode_success(*lru_fourth).has_value());
+        auto reconstructed_server =
+            glove::control::observation_intent_unix_server::create(reconstructed_config);
+        REQUIRE(reconstructed_server.has_value());
+        const auto reconstructed_socket = reconstructed_server->get()->socket_path();
+        const auto count_before_reconstruction = fixture->registry->record_count();
+        serve_error.reset();
+        server_thread = serve_in_background(**reconstructed_server, 1, serve_error);
+        auto first = transact(
+            reconstructed_socket, make_enqueue_request(channel_token, "reconstructed-intent")
+        );
         server_thread.join();
         REQUIRE(!serve_error.has_value());
-        REQUIRE(fixture->registry->record_count() == count_before_lru + 4U);
+        REQUIRE(first.has_value());
+        auto first_success = decode_success(*first);
+        REQUIRE(first_success.has_value());
+        reconstructed_server->reset();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        reconstructed_server =
+            glove::control::observation_intent_unix_server::create(reconstructed_config);
+        REQUIRE(reconstructed_server.has_value());
+        serve_error.reset();
+        server_thread = serve_in_background(**reconstructed_server, 2, serve_error);
+        auto replay = transact(
+            reconstructed_server->get()->socket_path(),
+            make_enqueue_request(channel_token, "reconstructed-intent")
+        );
+        REQUIRE(replay.has_value());
+        auto reconstructed_replay_success = decode_success(*replay);
+        REQUIRE(reconstructed_replay_success.has_value());
+        REQUIRE(reconstructed_replay_success->sequence == first_success->sequence);
+        REQUIRE(reconstructed_replay_success->intent_digest == first_success->intent_digest);
+        auto changed = transact(
+            reconstructed_server->get()->socket_path(),
+            make_enqueue_request(
+                channel_token,
+                "reconstructed-intent",
+                "guest-capability-inventory",
+                std::string(64, '1')
+            )
+        );
+        server_thread.join();
+        REQUIRE(!serve_error.has_value());
+        REQUIRE(changed.has_value());
+        REQUIRE(decode_error(*changed)->code == "idempotency_conflict");
+        REQUIRE(fixture->registry->record_count() == count_before_reconstruction + 1U);
     }
 
     // F5: a transient accept failure (real fd exhaustion) is retried with a
@@ -1026,7 +1197,32 @@ auto run() -> int {
             }
         }
         if (exhausted_descriptors) {
-            REQUIRE(!(*retry_server)->serve_one_for(2'000).has_value());
+            // Every failed accept and backoff shares the original deadline;
+            // retries cannot turn 40 ms into one fresh timeout per attempt.
+            const auto deadline_started = std::chrono::steady_clock::now();
+            auto deadline_result = (*retry_server)->serve_one_for(40);
+            REQUIRE(deadline_result.has_value());
+            REQUIRE(!*deadline_result);
+            REQUIRE(
+                std::chrono::steady_clock::now() - deadline_started < std::chrono::milliseconds{250}
+            );
+
+            // Cancellation also interrupts the transient accept backoff.
+            std::expected<bool, std::string> stop_result =
+                std::unexpected(std::string{"worker did not run"});
+            const auto stop_started = std::chrono::steady_clock::now();
+            std::jthread retry_worker{[&](std::stop_token stop) {
+                stop_result = (*retry_server)->serve_one_for(2'000, stop);
+            }};
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+            retry_worker.request_stop();
+            retry_worker.join();
+            REQUIRE(stop_result.has_value());
+            REQUIRE(!*stop_result);
+            REQUIRE(
+                std::chrono::steady_clock::now() - stop_started < std::chrono::milliseconds{250}
+            );
+
             for (const int descriptor : exhausted) {
                 ::close(descriptor);
             }
