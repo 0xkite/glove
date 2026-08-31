@@ -27,7 +27,7 @@ struct request {
     glz::raw_json payload;
 };
 
-struct error {
+struct rpc_error {
     std::string code;
     std::string message;
 };
@@ -50,7 +50,7 @@ struct response {
     std::string jsonrpc;
     std::string id;
     std::optional<glz::raw_json> result;
-    std::optional<error> error;
+    std::optional<rpc_error> error;
 };
 
 } // namespace wire
@@ -94,7 +94,7 @@ auto encode_json(const Value& value) -> std::expected<std::string, std::string> 
 auto error_response(std::string_view id, std::string_view code, std::string_view message)
     -> std::expected<std::string, std::string> {
     auto encoded_error =
-        encode_json(wire::error{.code = std::string{code}, .message = std::string{message}});
+        encode_json(wire::rpc_error{.code = std::string{code}, .message = std::string{message}});
     if (!encoded_error) {
         return std::unexpected(encoded_error.error());
     }
@@ -103,7 +103,7 @@ auto error_response(std::string_view id, std::string_view code, std::string_view
             .jsonrpc = "2.0",
             .id = std::string{id},
             .result = std::nullopt,
-            .error = wire::error{.code = std::string{code}, .message = std::string{message}},
+            .error = wire::rpc_error{.code = std::string{code}, .message = std::string{message}},
         }
     );
 }

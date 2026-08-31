@@ -347,6 +347,8 @@ struct supervisor_health {
     -> std::expected<rpc_request, std::string>;
 [[nodiscard]] auto decode_rpc_params(std::string_view input)
     -> std::expected<rpc_params, std::string>;
+[[nodiscard]] auto decode_start_session(std::string_view input)
+    -> std::expected<start_session_request, std::string>;
 [[nodiscard]] auto encode_rpc_response(const rpc_response& response)
     -> std::expected<std::string, std::string>;
 

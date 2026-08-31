@@ -66,7 +66,11 @@ struct ledger {
     std::vector<ledger_resource> resources;
 };
 
-struct apple_container_runtime {
+// Named `apple_container_runtime_record`, not `apple_container_runtime`: the
+// member `apple_container_runtime` in `runtime_pair` below would otherwise
+// shadow the type name, which GCC 14 rejects (-Wchanges-meaning). Member
+// names stay untouched so the JSON wire keys are unchanged.
+struct apple_container_runtime_record {
     std::string image_reference;
     std::string image_digest;
     std::string harness_closure_digest;
@@ -78,7 +82,7 @@ struct apple_container_runtime {
 };
 
 struct runtime_pair {
-    std::optional<apple_container_runtime> apple_container_runtime;
+    std::optional<apple_container_runtime_record> apple_container_runtime;
 };
 
 } // namespace setup_wire

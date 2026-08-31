@@ -13,6 +13,7 @@ namespace glove::host {
 template<typename Value> using result = std::expected<Value, std::string>;
 
 inline constexpr std::string_view local_service_audit_filename = "local-service-audit.jsonl";
+inline constexpr std::string_view control_audit_filename = "control-audit.jsonl";
 
 struct environment {
     std::optional<std::string> home;

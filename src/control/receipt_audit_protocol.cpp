@@ -48,7 +48,7 @@ auto receipt_audit_protocol::create(
     state->producer = std::move(producer);
     state->plan_validator = std::move(plan_validator);
     state->sessions = std::move(sessions);
-    state->session_runtime = std::move(session_runtime);
+    state->runtime = std::move(session_runtime);
     state->local_services = std::move(local_services);
     state->path_exposures = std::move(path_exposures);
     state->materialization_root = std::move(materialization_root);
@@ -82,7 +82,7 @@ auto receipt_audit_protocol::create(
     state->producer_config = std::move(producer_config);
     state->plan_validator = std::move(plan_validator);
     state->sessions = std::move(sessions);
-    state->session_runtime = std::move(session_runtime);
+    state->runtime = std::move(session_runtime);
     state->local_services = std::move(local_services);
     state->path_exposures = std::move(path_exposures);
     state->materialization_root = std::move(materialization_root);

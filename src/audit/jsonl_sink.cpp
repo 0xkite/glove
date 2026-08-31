@@ -91,6 +91,8 @@ auto action_name(action a) -> std::string_view {
         return "observation";
     case action::local_service:
         return "local_service";
+    case action::control:
+        return "control";
     }
     return "unknown";
 }

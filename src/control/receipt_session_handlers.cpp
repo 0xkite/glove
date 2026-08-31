@@ -538,7 +538,7 @@ auto handle_start_session(
     const rpc_params& params,
     std::uint64_t now_ms
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -562,7 +562,7 @@ auto handle_start_session(
             request_id, "audit_reconciliation_required", "receipt audit acknowledgement is required"
         );
     }
-    if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
+    if (auto reconciled = state.runtime->reconcile(**producer, now_ms); !reconciled) {
         return error_response(
             request_id,
             "session_reconciliation_failed",
@@ -570,7 +570,7 @@ auto handle_start_session(
         );
     }
     auto started =
-        state.session_runtime->start(**producer, payload->authorization, idempotency_key, now_ms);
+        state.runtime->start(**producer, payload->authorization, idempotency_key, now_ms);
     if (!started) {
         // The authenticated caller receives a stable, non-sensitive denial,
         // while the owner-local service journal retains the actionable host
@@ -599,7 +599,7 @@ auto handle_stop_session(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -610,8 +610,7 @@ auto handle_stop_session(
     if (!payload || !valid_identifier(payload->session_id)) {
         return error_response(request_id, "invalid_request", "invalid session stop request");
     }
-    if (auto stopped = state.session_runtime->stop(payload->session_id, idempotency_key);
-        !stopped) {
+    if (auto stopped = state.runtime->stop(payload->session_id, idempotency_key); !stopped) {
         return error_response(request_id, "session_stop_failed", "session stop was rejected");
     }
     auto status = state.sessions->status(payload->session_id);
@@ -634,7 +633,7 @@ auto handle_attach(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     if (params.idempotency_key.has_value()) {
@@ -647,8 +646,7 @@ auto handle_attach(
         payload->max_bytes > max_session_io_bytes) {
         return error_response(request_id, "invalid_request", "invalid session attach request");
     }
-    auto read =
-        state.session_runtime->read(payload->session_id, payload->cursor, payload->max_bytes);
+    auto read = state.runtime->read(payload->session_id, payload->cursor, payload->max_bytes);
     if (!read) {
         return error_response(request_id, "session_attach_failed", "session attach was rejected");
     }
@@ -730,7 +728,7 @@ auto handle_write_stdin(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -753,9 +751,7 @@ auto handle_write_stdin(
         "session_input_failed",
         "session input was rejected",
         session_id,
-        [&state, &session_id, &bytes] {
-            return state.session_runtime->write_input(session_id, bytes);
-        }
+        [&state, &session_id, &bytes] { return state.runtime->write_input(session_id, bytes); }
     );
 }
 
@@ -764,7 +760,7 @@ auto handle_resize(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -790,7 +786,7 @@ auto handle_resize(
         "session resize was rejected",
         session_id,
         [&state, &session_id, rows, columns] {
-            return state.session_runtime->resize(session_id, rows, columns);
+            return state.runtime->resize(session_id, rows, columns);
         }
     );
 }
@@ -800,7 +796,7 @@ auto handle_signal(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -833,7 +829,7 @@ auto handle_signal(
         "session signal was rejected",
         session_id,
         [&state, &session_id, requested = *requested] {
-            return state.session_runtime->signal(session_id, requested);
+            return state.runtime->signal(session_id, requested);
         }
     );
 }
@@ -843,7 +839,7 @@ auto handle_detach(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -876,8 +872,7 @@ auto handle_detach(
             request_id, "idempotency_capacity", "idempotency capacity is unavailable"
         );
     }
-    if (auto cursor =
-            state.session_runtime->read(payload->session_id, payload->transcript_cursor, 1);
+    if (auto cursor = state.runtime->read(payload->session_id, payload->transcript_cursor, 1);
         !cursor) {
         return error_response(request_id, "session_detach_failed", "session detach was rejected");
     }
@@ -906,7 +901,7 @@ auto handle_cleanup_session(
     std::string_view request_id,
     const rpc_params& params
 ) -> std::expected<std::string, std::string> {
-    if (!state.session_runtime || !state.session_runtime->lifecycle_operational()) {
+    if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
     }
     const auto idempotency_key = params.idempotency_key.value_or(std::string{});
@@ -929,7 +924,7 @@ auto handle_cleanup_session(
         "session_cleanup_failed",
         "session cleanup was rejected",
         session_id,
-        [&state, &session_id] { return state.session_runtime->cleanup(session_id); }
+        [&state, &session_id] { return state.runtime->cleanup(session_id); }
     );
 }
 

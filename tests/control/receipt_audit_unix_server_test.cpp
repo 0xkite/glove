@@ -1,3 +1,4 @@
+#include "glove/audit/sink.hpp"
 #include "glove/container/receipt_producer.hpp"
 #include "glove/control/receipt_audit_protocol.hpp"
 #include "glove/control/receipt_audit_unix_server.hpp"
@@ -108,6 +109,13 @@ public:
         if (value_ >= 0) {
             ::close(value_);
         }
+    }
+
+    void reset(int value = -1) noexcept {
+        if (value_ >= 0) {
+            ::close(value_);
+        }
+        value_ = value;
     }
 
     [[nodiscard]] auto get() const noexcept -> int { return value_; }
@@ -271,6 +279,275 @@ auto decode_response(std::string_view frame) -> std::optional<wire_test::rpc_res
     return response;
 }
 
+// Regression stub for connection-scoped delivery degradation: records every
+// stop() so tests can prove a guest launched by start_session is torn down
+// through the normal idempotent stop path when its controller connection
+// fails at the transport level.
+class degrade_test_runtime final : public glove::control::session_runtime {
+public:
+    explicit degrade_test_runtime(bool stop_succeeds = true) : stop_succeeds_{stop_succeeds} {}
+
+    [[nodiscard]] auto backend_id() const noexcept -> std::string_view override {
+        return "degrade-test";
+    }
+
+    [[nodiscard]] auto agent_runtime_adapter_schema_version() const noexcept
+        -> std::uint8_t override {
+        return 0;
+    }
+
+    [[nodiscard]] auto managed_runtime_ids() const -> std::vector<std::string> override {
+        return {};
+    }
+
+    [[nodiscard]] auto resource_capabilities() const noexcept
+        -> glove::container::resource_enforcement_capabilities override {
+        return {};
+    }
+
+    auto start(
+        glove::container::receipt_audit_producer&,
+        const glove::control::session_start_authorization&,
+        std::string_view,
+        std::uint64_t
+    ) -> std::expected<glove::control::session_record, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    auto reconcile(glove::container::receipt_audit_producer&, std::uint64_t)
+        -> std::expected<glove::control::session_reconciliation_report, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto list() const
+        -> std::expected<std::vector<std::string>, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto read(std::string_view, std::uint64_t, std::size_t) const
+        -> std::expected<glove::control::session_transcript_read, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    [[nodiscard]] auto wait_read(std::string_view, std::uint64_t, std::size_t, std::uint64_t)
+        -> std::expected<glove::control::session_transcript_read, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    auto write_input(std::string_view, std::string_view)
+        -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    auto resize(std::string_view, std::uint16_t, std::uint16_t)
+        -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    auto signal(std::string_view, glove::control::session_signal)
+        -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    auto stop(std::string_view session_id) -> std::expected<void, std::string> override {
+        stopped.emplace_back(session_id);
+        if (!stop_succeeds_) {
+            return std::unexpected(std::string{"stop unavailable"});
+        }
+        return {};
+    }
+
+    auto stop(std::string_view session_id, std::string_view)
+        -> std::expected<void, std::string> override {
+        return stop(session_id);
+    }
+
+    [[nodiscard]] auto wait(std::string_view)
+        -> std::expected<glove::control::session_terminal_record, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    auto cleanup(std::string_view) -> std::expected<void, std::string> override {
+        return std::unexpected(std::string{"unavailable"});
+    }
+
+    std::vector<std::string> stopped;
+
+private:
+    bool stop_succeeds_ = true;
+};
+
+// Regression test (Workflow #218): a transport-level control write failure
+// (broken pipe after the client vanished) must degrade the affected session
+// — structured `control` audit event plus idempotent guest teardown for a
+// start_session request — instead of becoming a daemon-fatal error. Audit-
+// chain integrity is untouched: this seam runs only after handle_frame
+// successfully applied an authenticated request.
+auto verify_degrade_failed_delivery() -> int {
+    auto audit_sink = glove::audit::make_memory_sink();
+    auto runtime = std::make_shared<degrade_test_runtime>();
+    const glove::control::receipt_audit_unix_server_config config{
+        .socket_path = {},
+        .bootstrap_secret_path = {},
+        .producer = {},
+        .plan_validator = {},
+        .sessions = {},
+        .runtime = runtime,
+        .local_services = {},
+        .path_exposures = {},
+        .materialization_root = {},
+        .io_timeout_ms = 5'000,
+        .control_audit = audit_sink,
+    };
+
+    const auto authorization_payload =
+        R"({"authorization":{"schema_version":1,"authorization_id":"auth-1",)"
+        R"("session_id":"session-9","controller_plan_digest":")" +
+        std::string(plan_digest) + R"(","plan_content_digest":")" + std::string(plan_digest) +
+        R"(","approved_at_ms":1,"expires_at_ms":4102444800000}})";
+    const auto start_frame = make_request("start-1", "start_session", authorization_payload);
+    glove::control::detail::degrade_failed_delivery(
+        config, start_frame, "write control frame: Broken pipe"
+    );
+    REQUIRE(runtime->stopped == std::vector<std::string>{"session-9"});
+
+    const auto health_frame = make_request("health-1", "health", "null");
+    glove::control::detail::degrade_failed_delivery(
+        config, health_frame, "write control frame: Broken pipe"
+    );
+    REQUIRE(runtime->stopped == std::vector<std::string>{"session-9"});
+
+    auto events = audit_sink->take();
+    REQUIRE(events.size() == 2);
+    REQUIRE(events[0].what == glove::audit::action::control);
+    REQUIRE(events[0].tool_name == "start_session:session-9");
+    REQUIRE(events[0].status == glove::mcp::tool_call_status::transport_error);
+    REQUIRE(events[0].error_message == "write control frame: Broken pipe");
+    REQUIRE(events[1].what == glove::audit::action::control);
+    REQUIRE(events[1].tool_name == "health");
+
+    // A failed stop must stay non-fatal and still be audited.
+    auto failing_sink = glove::audit::make_memory_sink();
+    auto failing_runtime = std::make_shared<degrade_test_runtime>(false);
+    const glove::control::receipt_audit_unix_server_config failing_config{
+        .socket_path = {},
+        .bootstrap_secret_path = {},
+        .producer = {},
+        .plan_validator = {},
+        .sessions = {},
+        .runtime = failing_runtime,
+        .local_services = {},
+        .path_exposures = {},
+        .materialization_root = {},
+        .io_timeout_ms = 5'000,
+        .control_audit = failing_sink,
+    };
+    glove::control::detail::degrade_failed_delivery(
+        failing_config, start_frame, "write control frame: Broken pipe"
+    );
+    REQUIRE(failing_runtime->stopped == std::vector<std::string>{"session-9"});
+    auto failing_events = failing_sink->take();
+    REQUIRE(failing_events.size() == 2);
+    REQUIRE(failing_events[0].tool_name == "start_session:session-9");
+    REQUIRE(failing_events[1].tool_name == "degrade_stop:session-9");
+    REQUIRE(failing_events[1].status == glove::mcp::tool_call_status::transport_error);
+    return 0;
+}
+
+// Regression test (Workflow #218): gloved exited fatally when the control
+// client vanished between sending its request and reading the response. The
+// response write must fail as a connection-scoped outcome — the daemon keeps
+// serving — with the delivery failure recorded in the structured control
+// audit journal. Read timeouts and listener failures remain errors.
+auto verify_broken_pipe_delivery_is_connection_scoped() -> int {
+    temporary_directory temp;
+    REQUIRE(!temp.root().empty());
+    const auto socket_path = temp.root() / "gloved.sock";
+    const auto secret_path = temp.root() / "bootstrap-secret";
+    const auto audit_key_path = temp.root() / "audit.key";
+    const auto journal_path = temp.root() / "receipts.journal";
+    REQUIRE(write_owner_only(secret_path, bootstrap_secret));
+    REQUIRE(write_owner_only(audit_key_path, audit_key));
+
+    const glove::container::receipt_audit_producer_config producer_config{
+        .key_path = audit_key_path,
+        .journal_path = journal_path,
+    };
+    auto producer = glove::container::receipt_audit_producer::initialize(producer_config);
+    REQUIRE(producer.has_value());
+    REQUIRE((*producer)->acknowledge_bootstrap((*producer)->anchor()).has_value());
+    producer->reset();
+
+    auto audit_sink = glove::audit::make_memory_sink();
+    const glove::control::receipt_audit_unix_server_config server_config{
+        .socket_path = socket_path,
+        .bootstrap_secret_path = secret_path,
+        .producer = producer_config,
+        .plan_validator = {},
+        .sessions = {},
+        .runtime = {},
+        .local_services = {},
+        .path_exposures = {},
+        .materialization_root = {},
+        .io_timeout_ms = 2'000,
+        .control_audit = audit_sink,
+    };
+    auto server = glove::control::receipt_audit_unix_server::create(server_config);
+    REQUIRE(server.has_value());
+
+    std::optional<glove::control::receipt_audit_serve_outcome> outcome;
+    std::optional<std::string> server_error;
+    std::thread server_thread{[&] {
+        if (auto served = (*server)->serve_one(); !served) {
+            server_error = served.error();
+        } else {
+            outcome = *served;
+        }
+    }};
+
+    auto descriptor = connect_to(socket_path);
+    REQUIRE(descriptor.get() >= 0);
+    const ::linger reset_on_close{.l_onoff = 1, .l_linger = 0};
+    REQUIRE(
+        ::setsockopt(
+            descriptor.get(), SOL_SOCKET, SO_LINGER, &reset_on_close, sizeof(reset_on_close)
+        ) == 0
+    );
+    const auto frame = make_request("health-1", "health", "null");
+    const auto size = htonl(static_cast<std::uint32_t>(frame.size()));
+    REQUIRE(write_exact(descriptor.get(), &size, sizeof(size)));
+    REQUIRE(write_exact(descriptor.get(), frame.data(), frame.size()));
+    descriptor.reset();
+
+    server_thread.join();
+    REQUIRE(!server_error.has_value());
+    REQUIRE(outcome.has_value());
+    REQUIRE(*outcome == glove::control::receipt_audit_serve_outcome::connection_failed);
+
+    const auto events = audit_sink->take();
+    REQUIRE(events.size() == 1);
+    REQUIRE(events.front().what == glove::audit::action::control);
+    REQUIRE(events.front().tool_name == "health");
+    REQUIRE(events.front().status == glove::mcp::tool_call_status::transport_error);
+
+    // The daemon-level invariant under repair: the server keeps serving
+    // subsequent connections after a connection-scoped delivery failure.
+    std::optional<std::string> recovery_error;
+    std::thread recovery_thread{[&] {
+        if (auto served = (*server)->serve_one(); !served) {
+            recovery_error = served.error();
+        }
+    }};
+    auto recovery = transact(socket_path, make_request("health-2", "health", "null"));
+    recovery_thread.join();
+    REQUIRE(!recovery_error.has_value());
+    REQUIRE(recovery.has_value());
+    auto recovery_response = decode_response(*recovery);
+    REQUIRE(recovery_response.has_value());
+    REQUIRE(recovery_response->result.has_value());
+    return 0;
+}
+
 auto verify_peer_credential_contract() -> int {
     int descriptors[2] = {-1, -1};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors) == 0);
@@ -285,6 +562,8 @@ auto verify_peer_credential_contract() -> int {
 
 auto run() -> int {
     REQUIRE(verify_peer_credential_contract() == 0);
+    REQUIRE(verify_degrade_failed_delivery() == 0);
+    REQUIRE(verify_broken_pipe_delivery_is_connection_scoped() == 0);
     temporary_directory temp;
     REQUIRE(!temp.root().empty());
     const auto socket_path = temp.root() / "gloved.sock";
@@ -321,11 +600,12 @@ auto run() -> int {
         .producer = producer_config,
         .plan_validator = {},
         .sessions = {},
-        .session_runtime = {},
+        .runtime = {},
         .local_services = {},
         .path_exposures = {},
         .materialization_root = {},
         .io_timeout_ms = 100,
+        .control_audit = {},
     };
     auto server = glove::control::receipt_audit_unix_server::create(server_config);
     REQUIRE(server.has_value());

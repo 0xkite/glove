@@ -164,10 +164,9 @@ auto handle_capabilities(
     }
     wire::resource_enforcement_capabilities linux_enforcement;
     wire::resource_enforcement_capabilities apple_enforcement;
-    const bool lifecycle_operational =
-        state.session_runtime && state.session_runtime->lifecycle_operational();
+    const bool lifecycle_operational = state.runtime && state.runtime->lifecycle_operational();
     if (lifecycle_operational) {
-        const auto capabilities = state.session_runtime->resource_capabilities();
+        const auto capabilities = state.runtime->resource_capabilities();
         wire::resource_enforcement_capabilities advertised{
             .cpu_time = capabilities.cpu_time,
             .memory = capabilities.memory,
@@ -177,15 +176,15 @@ auto handle_capabilities(
             .terminal_output = capabilities.terminal_output,
             .receipt_schema_version = capabilities.receipt_schema_version,
         };
-        if (state.session_runtime->backend_id() == "linux_production") {
+        if (state.runtime->backend_id() == "linux_production") {
             linux_enforcement = advertised;
-        } else if (state.session_runtime->backend_id() == "apple_container") {
+        } else if (state.runtime->backend_id() == "apple_container") {
             apple_enforcement = advertised;
         }
     }
 #if defined(__linux__)
     const auto retained_write_schema_version =
-        lifecycle_operational && state.session_runtime->backend_id() == "linux_production" &&
+        lifecycle_operational && state.runtime->backend_id() == "linux_production" &&
                 state.path_exposures
             ? std::uint8_t{1}
             : std::uint8_t{0};
@@ -218,12 +217,10 @@ auto handle_capabilities(
             // Managed sessions own a fresh private harness home and
             // derive its native skills from verified Sage library bundles.
             .agent_runtime_adapter_schema_version =
-                lifecycle_operational
-                    ? state.session_runtime->agent_runtime_adapter_schema_version()
-                    : std::uint8_t{0},
-            .managed_runtime_ids = lifecycle_operational
-                                       ? state.session_runtime->managed_runtime_ids()
-                                       : std::vector<std::string>{},
+                lifecycle_operational ? state.runtime->agent_runtime_adapter_schema_version()
+                                      : std::uint8_t{0},
+            .managed_runtime_ids = lifecycle_operational ? state.runtime->managed_runtime_ids()
+                                                         : std::vector<std::string>{},
             .path_exposure_admin_schema_version =
                 state.path_exposures ? std::uint8_t{1} : std::uint8_t{0},
             .path_exposure_catalog_schema_version =
@@ -233,12 +230,12 @@ auto handle_capabilities(
             .change_apply_authorization_schema_version = 0,
             .refinement_evaluation_protocol_schema_version =
                 lifecycle_operational
-                    ? state.session_runtime->refinement_evaluation_protocol_schema_version()
+                    ? state.runtime->refinement_evaluation_protocol_schema_version()
                     : std::uint8_t{0},
 #if defined(__linux__)
             .observation_intent_channel_schema_version =
                 state.local_services && state.local_services->operational_for(
-                                            state.session_runtime.get(), state.sessions.get()
+                                            state.runtime.get(), state.sessions.get()
                                         )
                     ? std::uint8_t{1}
                     : std::uint8_t{0},
@@ -324,9 +321,9 @@ auto handle_page(
             request_id, "audit_reconciliation_failed", "receipt audit producer bootstrap failed"
         );
     }
-    if (state.session_runtime && state.session_runtime->lifecycle_operational() &&
+    if (state.runtime && state.runtime->lifecycle_operational() &&
         (*producer)->bootstrap_reconciled()) {
-        if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
+        if (auto reconciled = state.runtime->reconcile(**producer, now_ms); !reconciled) {
             return error_response(
                 request_id,
                 "session_reconciliation_failed",
@@ -398,8 +395,8 @@ auto handle_acknowledgement(
             request_id, "audit_reconciliation_failed", "receipt audit head was not accepted"
         );
     }
-    if (state.session_runtime && state.session_runtime->lifecycle_operational()) {
-        if (auto reconciled = state.session_runtime->reconcile(**producer, now_ms); !reconciled) {
+    if (state.runtime && state.runtime->lifecycle_operational()) {
+        if (auto reconciled = state.runtime->reconcile(**producer, now_ms); !reconciled) {
             return error_response(
                 request_id,
                 "session_reconciliation_failed",
