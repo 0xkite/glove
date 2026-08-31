@@ -381,15 +381,6 @@ auto connect_mount(int directory_fd, std::string_view alias) -> int {
     return descriptor;
 }
 
-auto descriptor_path(int descriptor) -> std::filesystem::path {
-    std::string link = "/proc/self/fd/" + std::to_string(descriptor);
-    std::vector<char> path(4096U, '\0');
-    const auto length = ::readlink(link.c_str(), path.data(), path.size() - 1U);
-    return length > 0
-               ? std::filesystem::path{std::string{path.data(), static_cast<std::size_t>(length)}}
-               : std::filesystem::path{};
-}
-
 auto descriptor_count() -> std::size_t {
     std::error_code error;
     std::size_t count = 0;
@@ -662,6 +653,49 @@ auto run(bool privileged_only) -> int {
     );
     REQUIRE(registry.has_value());
     auto shared_registry = std::shared_ptr<glove::control::session_registry>{std::move(*registry)};
+    // Regression (Workflow #218 Ghost E2E): every prepare_session mkdirat(2)s
+    // a svc-* staging directory under the runtime root, and on ext4/tmpfs/APFS
+    // a directory's st_nlink is 2 plus its subdirectory count. The operational
+    // identity must therefore not pin the runtime root's link count: two
+    // factories sharing one runtime root - and one factory preparing
+    // consecutive sessions - must both stay operational across a
+    // prepare_session. On the pre-fix baseline the first prepare_session of a
+    // second factory sharing the root failed here as false "identity drift"
+    // (nlink 2 -> 3; Ghost LastTest.log line 666). Permission drift on the
+    // root must still fail closed, and endpoint sockets keep their exact
+    // dev/ino/uid/mode/nlink recheck (unchanged endpoint_current). Both
+    // factories use the shared registry and the same adapter binding, the
+    // only supported sharing shape.
+    {
+        const auto shared_runtime_root = temporary.root() / "shared-runtime-root";
+        REQUIRE(make_owner_directory(shared_runtime_root));
+        auto first_factory = local_service_proxy_factory::create(
+            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), *adapter),
+            shared_registry
+        );
+        REQUIRE(first_factory.has_value());
+        REQUIRE((*first_factory)->operational());
+        auto first_session = (*first_factory)->prepare_session("shared-root-a", "pi");
+        REQUIRE(first_session.has_value());
+        REQUIRE((*first_factory)->operational());
+        auto second_factory = local_service_proxy_factory::create(
+            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), *adapter),
+            shared_registry
+        );
+        REQUIRE(second_factory.has_value());
+        REQUIRE((*second_factory)->operational());
+        auto second_session = (*second_factory)->prepare_session("shared-root-b", "pi");
+        REQUIRE(second_session.has_value());
+        REQUIRE((*second_factory)->operational());
+        REQUIRE((*first_factory)->operational());
+        REQUIRE(::chmod(shared_runtime_root.c_str(), 0755) == 0);
+        REQUIRE(!(*first_factory)->operational());
+        REQUIRE(!(*second_factory)->operational());
+        REQUIRE(::chmod(shared_runtime_root.c_str(), 0700) == 0);
+        REQUIRE((*first_factory)->operational());
+        REQUIRE((*second_factory)->operational());
+    }
+
     auto audit = glove::audit::make_memory_sink();
     auto factory = local_service_proxy_factory::create(
         options_for(runtime, endpoint, audit, *adapter), shared_registry
@@ -1520,7 +1554,23 @@ auto run(bool privileged_only) -> int {
     REQUIRE(::unlink(extra_link.c_str()) == 0);
     REQUIRE((*factory)->operational());
 
-    const auto session_directory = descriptor_path(mount_fd.get());
+    // The mount descriptor is a detached open_tree clone, and Linux 6.12+
+    // renders its /proc/self/fd readlink output as the mount root "/", not the
+    // underlying path, so descriptor_path(mount_fd) cannot yield the session
+    // directory here (and connect_mount already addresses the guest socket
+    // through /proc/self/fd/N/alias instead). Resolve the session directory by
+    // its exact staged name: prepare_session names it
+    // "svc-<factory-generation>-<session-generation>-<session-id>", and the
+    // only other staged directory under this runtime root belongs to
+    // "generic-session", so the suffix below is unique.
+    std::filesystem::path session_directory;
+    for (const auto& entry : std::filesystem::directory_iterator{runtime}) {
+        const auto name = entry.path().filename().string();
+        if (entry.is_directory() && name.starts_with("svc-") && name.ends_with("-session-1")) {
+            REQUIRE(session_directory.empty());
+            session_directory = entry.path();
+        }
+    }
     REQUIRE(!session_directory.empty());
     const auto guest_socket = session_directory / "sage-observe";
     REQUIRE(::unlink(guest_socket.c_str()) == 0);
@@ -1682,9 +1732,19 @@ auto run(bool privileged_only) -> int {
     REQUIRE(retained_registry.expired());
 
     listener = unique_fd{};
-    REQUIRE(::unlink(endpoint.c_str()) == 0);
-    auto replacement_listener = make_listener(endpoint);
+    // Replace the endpoint socket with a listener whose identity cannot equal
+    // the recorded one: bind the replacement at a fresh path while the
+    // original socket file still exists, then swap it in. Binding the
+    // replacement only after unlinking can recycle the just-freed inode on
+    // filesystems that reuse them, which would make the socket identity
+    // comparison pass by ABA and defeat the drift expectation this section
+    // asserts (docs/session-policy.md: pathname AF_UNIX does not exclude
+    // same-UID ABA replacement).
+    const auto replacement_socket = upstream / "replacement.sock";
+    auto replacement_listener = make_listener(replacement_socket);
     REQUIRE(replacement_listener.get() >= 0);
+    REQUIRE(::unlink(endpoint.c_str()) == 0);
+    REQUIRE(::rename(replacement_socket.c_str(), endpoint.c_str()) == 0);
     REQUIRE(!(*factory)->operational());
     REQUIRE(!(*factory)->prepare_session("replaced", "pi").has_value());
     return 0;
