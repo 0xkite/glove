@@ -769,7 +769,8 @@ auto run(const options& configured) -> std::expected<void, std::string> {
     }
 
     auto control_audit = glove::audit::make_jsonl_sink(
-        configured.journal.parent_path() / glove::host::control_audit_filename
+        configured.journal.parent_path() / glove::host::control_audit_filename,
+        {.max_file_bytes = glove::host::control_audit_max_file_bytes}
     );
     if (!control_audit) {
         return std::unexpected(std::string{"open control audit journal: "} + control_audit.error());

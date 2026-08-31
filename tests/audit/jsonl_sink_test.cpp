@@ -86,6 +86,45 @@ auto run() -> int {
     REQUIRE(newlines == 3);
 
     std::filesystem::remove(path);
+
+    // Bounded policy: with a positive max_file_bytes cap, the sink truncates
+    // the oldest records to make room for the newest one, and the file stays
+    // under the cap.
+    const auto bounded_path =
+        std::filesystem::temp_directory_path() / "glove_jsonl_sink_bounded_test.jsonl";
+    std::filesystem::remove(bounded_path);
+    auto bounded_or = glove::audit::make_jsonl_sink(bounded_path, {.max_file_bytes = 512});
+    REQUIRE(bounded_or.has_value());
+    auto bounded = *bounded_or;
+
+    for (int index = 0; index < 200; ++index) {
+        glove::audit::event fill{
+            .what = glove::audit::action::call_tool,
+            .tool_name = "fill-" + std::to_string(index),
+            .arguments_json = R"({"padding":"0123456789012345678901234567890123456789"})",
+            .status = glove::mcp::tool_call_status::ok,
+            .error_message = "",
+            .at = std::chrono::system_clock::now(),
+            .latency = std::chrono::nanoseconds{1},
+        };
+        REQUIRE(bounded->record(fill).has_value());
+    }
+
+    auto bounded_size = std::filesystem::file_size(bounded_path);
+    REQUIRE(bounded_size <= 512);
+    REQUIRE(bounded_size > 0);
+
+    // The newest record must be present after truncation; the oldest are
+    // gone.
+    std::ifstream bounded_in{bounded_path};
+    REQUIRE(bounded_in);
+    std::stringstream bounded_buf;
+    bounded_buf << bounded_in.rdbuf();
+    const auto bounded_contents = bounded_buf.str();
+    REQUIRE(bounded_contents.find("fill-199") != std::string::npos);
+    REQUIRE(bounded_contents.find("fill-0\"") == std::string::npos);
+
+    std::filesystem::remove(bounded_path);
     return 0;
 }
 

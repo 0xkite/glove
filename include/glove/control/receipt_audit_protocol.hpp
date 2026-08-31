@@ -20,6 +20,28 @@ class local_service_proxy_capability;
 
 inline constexpr std::size_t max_control_frame_bytes = std::size_t{1024} * 1024U;
 
+// Structured, per-request outcome metadata produced by handle_frame. It is
+// the ONLY source of degradation authority for the control transport: the
+// server must never infer what a connection asked for by re-decoding its raw
+// frame, because a re-decode has no authentication, schema, deadline, or
+// application evidence. Fields stay unset until the corresponding stage of
+// the real dispatch actually passed.
+struct receipt_control_outcome {
+    // The bootstrap secret, schema, and deadline checks all passed.
+    bool authenticated = false;
+    // The dispatched handler applied the request and returned a success
+    // (JSON-RPC result) response. Denied, rejected, and replayed requests are
+    // never "applied".
+    bool applied = false;
+    // The response frame is a result rather than an error.
+    bool response_success = false;
+    // The request envelope's method (set once the envelope is valid).
+    std::string method;
+    // The typed, post-authentication session identifier carried by a
+    // session-scoped request; empty for every other method.
+    std::string session_id;
+};
+
 // Authenticated request handler for the receipt-reconciliation subset of the
 // future gloved control plane. Socket ownership and peer credentials remain the
 // transport's responsibility; this layer independently checks the bootstrap
@@ -67,8 +89,17 @@ public:
     ) -> std::expected<std::unique_ptr<receipt_audit_protocol>, std::string>;
 
     // Request failures are encoded as stable JSON-RPC errors. `unexpected` is
-    // reserved for local response-encoding failures.
+    // reserved for local response-encoding failures. The two-argument overload
+    // discards outcome metadata.
     [[nodiscard]] auto handle_frame(std::string_view frame, std::uint64_t now_ms)
+        -> std::expected<std::string, std::string>;
+    // Same dispatch, plus structured authenticated/applied outcome metadata in
+    // `*outcome` (reset at entry; never null-dereferenced when nullptr). The
+    // control transport's degrade path must consume this metadata instead of
+    // re-decoding the raw frame: only genuinely authenticated and applied
+    // requests may drive connection-scoped teardown.
+    [[nodiscard]] auto
+    handle_frame(std::string_view frame, std::uint64_t now_ms, receipt_control_outcome* outcome)
         -> std::expected<std::string, std::string>;
 
 private:

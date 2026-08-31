@@ -1,5 +1,7 @@
 #include "../../include/glove/control/remote_protocol.hpp"
 
+#include "receipt_wire.hpp"
+
 #include <arpa/inet.h>
 #include <glaze/glaze.hpp>
 #include <poll.h>
@@ -12,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -19,17 +22,18 @@
 namespace glove::control {
 namespace wire {
 
+// `rpc_error` and the JSON-RPC response envelope are shared with the receipt
+// wire header (receipt_wire.hpp); this TU previously redefined them
+// identically in a second TU, which is an ODR hazard. The request envelope is
+// remote-specific and stays local.
+using response = rpc_response;
+
 struct request {
     std::string jsonrpc;
     std::string id;
     std::string method;
     std::uint64_t deadline_remaining_ms = 0;
     glz::raw_json payload;
-};
-
-struct rpc_error {
-    std::string code;
-    std::string message;
 };
 
 struct health_result {
@@ -44,13 +48,6 @@ struct health_result {
     bool validation_only = false;
     bool lifecycle_operational = false;
     bool independently_verified = true;
-};
-
-struct response {
-    std::string jsonrpc;
-    std::string id;
-    std::optional<glz::raw_json> result;
-    std::optional<rpc_error> error;
 };
 
 } // namespace wire

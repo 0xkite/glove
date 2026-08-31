@@ -91,7 +91,13 @@ auto receipt_audit_protocol::create(
 
 auto receipt_audit_protocol::handle_frame(std::string_view frame, std::uint64_t now_ms)
     -> std::expected<std::string, std::string> {
-    return receipt_handlers::handle_frame(*state_, frame, now_ms);
+    return handle_frame(frame, now_ms, nullptr);
+}
+
+auto receipt_audit_protocol::handle_frame(
+    std::string_view frame, std::uint64_t now_ms, receipt_control_outcome* outcome
+) -> std::expected<std::string, std::string> {
+    return receipt_handlers::handle_frame(*state_, frame, now_ms, outcome);
 }
 
 } // namespace glove::control

@@ -419,8 +419,14 @@ auto handle_acknowledgement(
 }
 
 auto handle_frame(
-    receipt_audit_protocol::implementation& state, std::string_view frame, std::uint64_t now_ms
+    receipt_audit_protocol::implementation& state,
+    std::string_view frame,
+    std::uint64_t now_ms,
+    receipt_control_outcome* outcome
 ) -> std::expected<std::string, std::string> {
+    if (outcome != nullptr) {
+        *outcome = receipt_control_outcome{};
+    }
     if (frame.empty() || frame.size() > max_control_frame_bytes) {
         return error_response("", "invalid_request", "invalid control frame size");
     }
@@ -431,6 +437,9 @@ auto handle_frame(
     if (request->jsonrpc != "2.0" || !valid_identifier(request->id) ||
         !valid_identifier(request->method)) {
         return error_response(request->id, "invalid_request", "invalid JSON-RPC envelope");
+    }
+    if (outcome != nullptr) {
+        outcome->method = request->method;
     }
     auto params = wire::decode_rpc_params(request->params.str);
     if (!params) {
@@ -446,6 +455,11 @@ auto handle_frame(
     }
     if (params->deadline_ms == 0 || params->deadline_ms < now_ms) {
         return error_response(request->id, "deadline_exceeded", "request deadline elapsed");
+    }
+    // From here the request is authenticated: degradation may rely on the
+    // outcome metadata but never on a re-decode of the raw frame.
+    if (outcome != nullptr) {
+        outcome->authenticated = true;
     }
 
     if (request->method == "health") {
@@ -481,7 +495,7 @@ auto handle_frame(
     }
 
     if (request->method == "start_session") {
-        return handle_start_session(state, request->id, *params, now_ms);
+        return handle_start_session(state, request->id, *params, now_ms, outcome);
     }
 
     if (request->method == "session_status") {

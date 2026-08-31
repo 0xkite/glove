@@ -18,12 +18,15 @@ namespace glove::control::detail {
 
 // Private test seam for connection-scoped delivery degradation. Called only
 // after `handle_frame` authenticated and applied a request whose response
-// could not be written back to the client. Degrades the request's session
-// (tears down a guest launched by `start_session`) and records one bounded
-// structured `control` audit event; never throws and never fails the daemon.
+// could not be written back to the client. Acts ONLY on the structured
+// authenticated/applied outcome metadata produced by the real dispatch: a
+// genuinely applied `start_session` is degraded (guest torn down through the
+// normal stop path); every other outcome records one bounded structured
+// `control` audit event and never touches session state. Never throws and
+// never fails the daemon.
 auto degrade_failed_delivery(
     const receipt_audit_unix_server_config& config,
-    std::string_view frame,
+    const receipt_control_outcome& outcome,
     std::string_view transport_error
 ) -> void;
 

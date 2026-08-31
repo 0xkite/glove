@@ -262,6 +262,12 @@ auto all_configured_paths(const config& value) -> std::vector<std::filesystem::p
         value.runtime_directory,
         value.audit_key,
         value.receipt_journal,
+        // gloved always derives this owner-only control delivery journal next
+        // to the receipt journal; registering it here makes the distinctness
+        // checks below reject any configuration that would alias it with the
+        // receipt journal, the audit key, the session store, or any other
+        // configured path.
+        value.receipt_journal.parent_path() / control_audit_filename,
     };
     for (const auto* optional : {
              &value.session_policy,

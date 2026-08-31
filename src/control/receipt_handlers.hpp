@@ -14,7 +14,9 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace glove::control::receipt_handlers {
+namespace glove::control {
+
+namespace receipt_handlers {
 
 inline constexpr std::size_t max_identifier_bytes = 128U;
 inline constexpr std::size_t max_start_idempotency_namespace_bytes = 112U;
@@ -36,9 +38,7 @@ struct session_mutation_record {
 
 void wipe(std::string& value) noexcept;
 
-} // namespace glove::control::receipt_handlers
-
-namespace glove::control {
+} // namespace receipt_handlers
 
 struct receipt_audit_protocol::implementation {
     std::string bootstrap_secret;
@@ -106,7 +106,8 @@ valid_identifier(std::string_view value, std::size_t max_bytes = max_identifier_
     receipt_audit_protocol::implementation& state,
     std::string_view request_id,
     const wire::rpc_params& params,
-    std::uint64_t now_ms
+    std::uint64_t now_ms,
+    receipt_control_outcome* outcome
 ) -> std::expected<std::string, std::string>;
 [[nodiscard]] auto handle_stop_session(
     receipt_audit_protocol::implementation& state,
@@ -198,7 +199,10 @@ valid_identifier(std::string_view value, std::size_t max_bytes = max_identifier_
 ) -> std::expected<std::string, std::string>;
 
 [[nodiscard]] auto handle_frame(
-    receipt_audit_protocol::implementation& state, std::string_view frame, std::uint64_t now_ms
+    receipt_audit_protocol::implementation& state,
+    std::string_view frame,
+    std::uint64_t now_ms,
+    receipt_control_outcome* outcome
 ) -> std::expected<std::string, std::string>;
 
 } // namespace receipt_handlers

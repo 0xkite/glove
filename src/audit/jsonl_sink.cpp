@@ -99,7 +99,8 @@ auto action_name(action a) -> std::string_view {
 
 class jsonl_sink final : public sink {
 public:
-    explicit jsonl_sink(int descriptor) : descriptor_{descriptor} {}
+    explicit jsonl_sink(int descriptor, jsonl_sink_limits limits, std::uint64_t current_bytes)
+        : descriptor_{descriptor}, limits_{limits}, current_bytes_{current_bytes} {}
 
     ~jsonl_sink() override {
         if (descriptor_ >= 0) {
@@ -129,9 +130,16 @@ public:
 
         std::scoped_lock lock{mu_};
         encoded->push_back('\n');
+        if (limits_.max_file_bytes != 0 &&
+            current_bytes_ + encoded->size() > limits_.max_file_bytes) {
+            if (auto truncated = truncate_oldest(encoded->size()); !truncated) {
+                return truncated;
+            }
+        }
         if (auto written = write_all(descriptor_, *encoded); !written) {
             return written;
         }
+        current_bytes_ += encoded->size();
         if (::fsync(descriptor_) != 0) {
             return std::unexpected(system_error("sync audit event"));
         }
@@ -139,19 +147,86 @@ public:
     }
 
 private:
+    // Drop the oldest complete records until `incoming` bytes fit under the
+    // configured cap. Reads are bounded by the cap itself, so this cannot
+    // scan an unbounded file. The file descriptor stays O_APPEND: after
+    // ftruncate(0) the next write lands at offset 0.
+    auto truncate_oldest(std::uint64_t incoming) -> std::expected<void, std::string> {
+        const auto keep_budget =
+            limits_.max_file_bytes > incoming ? limits_.max_file_bytes - incoming : 0U;
+        std::string contents(static_cast<std::size_t>(current_bytes_), '\0');
+        std::size_t consumed = 0;
+        while (consumed < contents.size()) {
+            const auto result = ::pread(
+                descriptor_,
+                contents.data() + consumed,
+                contents.size() - consumed,
+                static_cast<off_t>(consumed)
+            );
+            if (result < 0 && errno == EINTR) {
+                continue;
+            }
+            if (result <= 0) {
+                return std::unexpected(system_error("read audit journal for truncation"));
+            }
+            consumed += static_cast<std::size_t>(result);
+        }
+        // Keep the newest complete lines that fit in the retained budget.
+        std::size_t keep_from = contents.size();
+        std::uint64_t kept_bytes = 0;
+        while (keep_from > 0) {
+            const auto line_start = contents.rfind('\n', keep_from - 1);
+            if (line_start == std::string::npos) {
+                // `keep_from` sits at the first (possibly unterminated) line;
+                // it is never retained.
+                break;
+            }
+            const std::size_t begin = line_start + 1U;
+            if (begin == keep_from) {
+                // Degenerate double-newline input: skip the empty line.
+                keep_from = begin - 1U;
+                continue;
+            }
+            const std::size_t line_bytes = keep_from - begin;
+            if (kept_bytes + line_bytes > keep_budget) {
+                break;
+            }
+            kept_bytes += line_bytes;
+            keep_from = begin;
+        }
+        if (::ftruncate(descriptor_, 0) != 0) {
+            return std::unexpected(system_error("truncate audit journal"));
+        }
+        current_bytes_ = 0;
+        if (keep_from < contents.size() && kept_bytes != 0) {
+            const std::string_view retained{
+                contents.data() + keep_from, contents.size() - keep_from
+            };
+            if (auto written = write_all(descriptor_, retained); !written) {
+                return written;
+            }
+            current_bytes_ = kept_bytes;
+        }
+        return {};
+    }
+
     std::mutex mu_;
     int descriptor_ = -1;
+    jsonl_sink_limits limits_;
+    std::uint64_t current_bytes_ = 0;
 };
 
 } // namespace
 
-auto make_jsonl_sink(const std::filesystem::path& path)
+auto make_jsonl_sink(const std::filesystem::path& path, jsonl_sink_limits limits)
     -> std::expected<std::shared_ptr<sink>, std::string> {
     if (!path.is_absolute() || path == path.root_path() || path.lexically_normal() != path) {
         return std::unexpected(std::string{"jsonl_sink: path must be dedicated and absolute"});
     }
+    // O_RDWR (not O_WRONLY): the bounded policy must read the journal back to
+    // truncate its oldest records.
     const int descriptor = ::open( // NOLINT(cppcoreguidelines-pro-type-vararg,hicpp-vararg)
-        path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600
+        path.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600
     );
     if (descriptor < 0) {
         return std::unexpected(system_error("open audit journal"));
@@ -173,7 +248,9 @@ auto make_jsonl_sink(const std::filesystem::path& path)
         ::close(descriptor);
         return std::unexpected(error);
     }
-    return std::make_shared<jsonl_sink>(descriptor);
+    return std::make_shared<jsonl_sink>(
+        descriptor, limits, static_cast<std::uint64_t>(metadata.st_size)
+    );
 }
 
 } // namespace glove::audit

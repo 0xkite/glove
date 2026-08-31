@@ -536,7 +536,8 @@ auto handle_start_session(
     receipt_audit_protocol::implementation& state,
     std::string_view request_id,
     const rpc_params& params,
-    std::uint64_t now_ms
+    std::uint64_t now_ms,
+    receipt_control_outcome* outcome
 ) -> std::expected<std::string, std::string> {
     if (!state.runtime || !state.runtime->lifecycle_operational()) {
         return error_response(request_id, "method_not_found", "control method is unavailable");
@@ -548,6 +549,11 @@ auto handle_start_session(
     auto payload = decode_strict<start_session_request>(params.payload.str);
     if (!payload) {
         return error_response(request_id, "invalid_request", "invalid session start request");
+    }
+    // The session identifier is only surfaced after schema validation; the
+    // degrade path may name it for teardown, but only when `applied` is set.
+    if (outcome != nullptr) {
+        outcome->session_id = payload->authorization.session_id;
     }
     auto producer = state.initialized_producer();
     if (!producer) {
@@ -590,6 +596,12 @@ auto handle_start_session(
     auto result = encode_json(*response);
     if (!result) {
         return std::unexpected(result.error());
+    }
+    // Only a genuinely applied start (success response encoded) grants the
+    // degrade path teardown authority over this session.
+    if (outcome != nullptr) {
+        outcome->applied = true;
+        outcome->response_success = true;
     }
     return success_response(request_id, std::move(*result));
 }

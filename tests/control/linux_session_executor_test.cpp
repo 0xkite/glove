@@ -1016,6 +1016,25 @@ auto run() -> int {
     REQUIRE(durable_interactive->finished_at_ms == interactive_exited->finished_at_ms);
     REQUIRE(durable_interactive->receipt_digest == interactive_exited->receipt_digest);
     REQUIRE(durable_interactive->termination_cause == interactive_exited->termination_cause);
+
+    // Degrade-path invariant (Workflow #218): the stop path durably marks the
+    // session stopping (linux_session_executor stop: mark_stopping before
+    // any child release) and the transition must survive an independent
+    // registry reopen. The control delivery degradation path tears a guest
+    // down through exactly this stop path after a broken control pipe, so
+    // the durable stopping ordering is asserted here, not inferred.
+    shared_registry.reset();
+    auto replayed_registry_result = glove::control::session_registry::open_or_create(
+        tree.root() / "sessions.journal", shared_validator
+    );
+    REQUIRE(replayed_registry_result.has_value());
+    auto replayed_registry =
+        std::shared_ptr<glove::control::session_registry>{std::move(*replayed_registry_result)};
+    auto replayed_interactive = replayed_registry->exited_status("session-interactive");
+    REQUIRE(replayed_interactive.has_value());
+    REQUIRE(replayed_interactive->session == durable_interactive->session);
+    REQUIRE(replayed_interactive->stopping_at_ms >= replayed_interactive->running_at_ms);
+    REQUIRE(replayed_interactive->stopping_at_ms == stopping_at_ms);
     const auto cleanup_payload = "{\"session_id\":\"" + interactive_created->session_id + "\"}";
     auto cleanup_frame = (*protocol)->handle_frame(
         make_request(

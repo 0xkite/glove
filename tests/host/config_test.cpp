@@ -226,6 +226,21 @@ auto run() -> int {
     audit_collision = proxy_config;
     audit_collision.session_store = local_service_audit;
     REQUIRE(rejects_local_service_audit_collision(std::move(audit_collision)));
+
+    // The derived control delivery journal (control-audit.jsonl next to the
+    // receipt journal) is always registered in the configured-path set: no
+    // configured path may alias it.
+    const auto control_audit_path =
+        proxy_config.receipt_journal.parent_path() / control_audit_filename;
+    auto control_collision = proxy_config;
+    control_collision.receipt_journal = control_audit_path;
+    REQUIRE(rejects_local_service_audit_collision(std::move(control_collision)));
+    control_collision = proxy_config;
+    control_collision.audit_key = control_audit_path;
+    REQUIRE(rejects_local_service_audit_collision(std::move(control_collision)));
+    control_collision = proxy_config;
+    control_collision.session_store = control_audit_path;
+    REQUIRE(rejects_local_service_audit_collision(std::move(control_collision)));
     audit_collision = proxy_config;
     audit_collision.local_service_proxy->endpoints.front().socket_path = local_service_audit;
     auto endpoint_audit_collision = validate(audit_collision);
