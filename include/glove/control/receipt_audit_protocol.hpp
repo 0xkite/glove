@@ -33,6 +33,11 @@ struct receipt_control_outcome {
     // (JSON-RPC result) response. Denied, rejected, and replayed requests are
     // never "applied".
     bool applied = false;
+    // The dispatched start_session was an idempotent replay of an
+    // already-recorded start rather than a fresh launch. Replays carry
+    // application evidence but never teardown authority; the control audit
+    // event for a replayed-degrade still reflects the replay disposition.
+    bool replay = false;
     // The response frame is a result rather than an error.
     bool response_success = false;
     // The request envelope's method (set once the envelope is valid).

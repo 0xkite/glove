@@ -82,8 +82,8 @@ auto remote_session_runtime::start(
     const session_start_authorization& /*authorization*/,
     std::string_view /*idempotency_namespace*/,
     std::uint64_t /*now_ms*/
-) -> std::expected<session_record, std::string> {
-    return unavailable_result<session_record>();
+) -> std::expected<session_start_result, std::string> {
+    return unavailable_result<session_start_result>();
 }
 
 auto remote_session_runtime::reconcile(

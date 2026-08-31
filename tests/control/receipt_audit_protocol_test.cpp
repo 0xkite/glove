@@ -82,7 +82,7 @@ public:
         const glove::control::session_start_authorization&,
         std::string_view,
         std::uint64_t
-    ) -> std::expected<glove::control::session_record, std::string> override {
+    ) -> std::expected<glove::control::session_start_result, std::string> override {
         return std::unexpected(std::string{"unavailable"});
     }
 

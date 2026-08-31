@@ -589,7 +589,7 @@ auto handle_start_session(
         );
         return error_response(request_id, "session_start_failed", "session start was rejected");
     }
-    auto response = session_result(*state.sessions, *started);
+    auto response = session_result(*state.sessions, started->record);
     if (!response) {
         return registry_error_response(request_id, response.error());
     }
@@ -597,10 +597,15 @@ auto handle_start_session(
     if (!result) {
         return std::unexpected(result.error());
     }
-    // Only a genuinely applied start (success response encoded) grants the
-    // degrade path teardown authority over this session.
+    // Only a genuinely fresh, committed launch (success response encoded)
+    // grants the degrade path teardown authority over this session. An
+    // idempotent replay returns the existing record — tearing down an
+    // already-running guest because its controller connection dropped
+    // during a replayed start would stop a guest this connection never
+    // launched.
     if (outcome != nullptr) {
-        outcome->applied = true;
+        outcome->replay = !started->fresh_launch;
+        outcome->applied = started->fresh_launch;
         outcome->response_success = true;
     }
     return success_response(request_id, std::move(*result));

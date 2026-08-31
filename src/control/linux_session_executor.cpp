@@ -615,7 +615,7 @@ auto linux_session_runtime::start(
     const session_start_authorization& authorization,
     std::string_view idempotency_namespace,
     std::uint64_t now_ms
-) -> std::expected<session_record, std::string> {
+) -> std::expected<session_start_result, std::string> {
     if (!state_ || !valid_identifier(idempotency_namespace, max_idempotency_namespace_bytes) ||
         now_ms == 0) {
         return std::unexpected(std::string{"invalid Linux session runtime start request"});
@@ -636,7 +636,12 @@ auto linux_session_runtime::start(
         return std::unexpected(registry_error("read reserved Linux PTY session", current.error()));
     }
     if (current->state != session_state::preparing) {
-        return std::move(*current);
+        // Idempotent replay of an already-committed start: return the
+        // durable record without launching. This disposition must stay
+        // explicit so protocol callers never treat a replay as a freshly
+        // applied launch (a replayed start must never gain teardown
+        // authority over the already-running guest).
+        return session_start_result{.record = std::move(*current), .fresh_launch = false};
     }
     if (state_->sessions->contains(authorization.session_id)) {
         return std::unexpected(std::string{"Linux PTY live-session index is inconsistent"});
@@ -660,7 +665,9 @@ auto linux_session_runtime::start(
     }
     auto status = state_->registry->status(authorization.session_id);
     return status
-               ? std::expected<session_record, std::string>{std::move(*status)}
+               ? std::expected<session_start_result, std::string>{session_start_result{
+                     .record = std::move(*status), .fresh_launch = true
+                 }}
                : std::unexpected(registry_error("read started Linux PTY session", status.error()));
 }
 

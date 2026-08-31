@@ -26,6 +26,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -319,25 +320,39 @@ public:
     auto start(
         glove::container::receipt_audit_producer&,
         const glove::control::session_start_authorization& authorization,
-        std::string_view,
+        std::string_view idempotency_key,
         std::uint64_t now_ms
-    ) -> std::expected<glove::control::session_record, std::string> override {
+    ) -> std::expected<glove::control::session_start_result, std::string> override {
+        // Gate handshake: the block decision is read under the same mutex
+        // that arms it, and the test observes — via the condition variable —
+        // that the dispatch is parked inside the blocked gate BEFORE the
+        // client resets the connection. That makes the broken-pipe outcome
+        // deterministic instead of racy.
+        {
+            std::unique_lock lock{mutex_};
+            if (block_start_) {
+                gate_entered_ = true;
+                start_gate_.notify_all();
+                start_gate_.wait(lock, [this] { return gate_open_; });
+            }
+        }
+        // The start is recorded only AFTER the dispatch completes (and the
+        // handler has decided outcome.applied), so cross-thread observers
+        // never see a start before it is committed.
+        const bool replay = [this, &idempotency_key] {
+            const std::scoped_lock lock{mutex_};
+            return !used_keys_.insert(std::string{idempotency_key}).second;
+        }();
         {
             const std::scoped_lock lock{mutex_};
             started.emplace_back(authorization.session_id);
         }
-        // Optional synchronization gate: when armed, start() blocks until the
-        // test releases it, so the controller connection can be torn down
-        // with certainty BEFORE the server writes its response. This makes
-        // the broken-pipe outcome deterministic instead of racy.
-        if (block_start_) {
-            std::unique_lock lock{mutex_};
-            start_gate_.wait(lock, [this] { return gate_open_; });
-        }
         // State `created` needs no registry projection: handle_start_session
-        // encodes the record directly, so the dispatch completes and the
-        // start is genuinely applied for the degrade path.
-        return glove::control::session_record{
+        // encodes the record directly. A repeated idempotency key models an
+        // authenticated idempotent replay: the same record is returned, but
+        // with the explicit replay disposition (fresh_launch == false), so
+        // the handler must not treat the replay as applied.
+        glove::control::session_record record{
             .schema_version = 1,
             .session_id = authorization.session_id,
             .controller_plan_digest = authorization.controller_plan_digest,
@@ -346,6 +361,9 @@ public:
             .policy_revision = 1,
             .expires_at_ms = authorization.expires_at_ms,
             .created_at_ms = now_ms,
+        };
+        return glove::control::session_start_result{
+            .record = std::move(record), .fresh_launch = !replay
         };
     }
 
@@ -418,11 +436,20 @@ public:
         return stopped;
     }
 
-    // Arm the start() gate before the request is sent; release it after the
-    // controller connection has been torn down.
+    // Arm the start() gate before the request is sent; the handshake proves
+    // the dispatch is parked inside the blocked gate before the client
+    // resets, and release it after the connection is torn down.
     void arm_start_gate() {
         const std::scoped_lock lock{mutex_};
         block_start_ = true;
+        gate_entered_ = false;
+        gate_open_ = false;
+    }
+
+    template<class Rep, class Period>
+    [[nodiscard]] auto wait_for_start_gate(std::chrono::duration<Rep, Period> timeout) -> bool {
+        std::unique_lock lock{mutex_};
+        return start_gate_.wait_for(lock, timeout, [this] { return gate_entered_; });
     }
 
     void release_start_gate() {
@@ -440,8 +467,10 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable start_gate_;
     bool block_start_ = false;
+    bool gate_entered_ = false;
     bool gate_open_ = false;
     bool stop_succeeds_ = true;
+    std::set<std::string> used_keys_;
 };
 
 // Minimal bounded plan validator for the full protocol/server stack below
@@ -623,6 +652,30 @@ auto verify_degrade_requires_authenticated_applied_outcome() -> int {
     );
     REQUIRE(runtime->stopped_snapshot() == std::vector<std::string>{"session-9"});
 
+    // An authenticated idempotent start replay (same request, same
+    // idempotency key): the response is still the existing record, but the
+    // outcome must mark it as a replay — never applied — so a broken
+    // delivery during a replay must NOT tear down the already-running
+    // guest.
+    glove::control::receipt_control_outcome replay_outcome;
+    auto replay_frame = (*protocol)->handle_frame(
+        make_request("start-1-replay", "start_session", start_payload, "degrade-start-1"),
+        1'000,
+        &replay_outcome
+    );
+    REQUIRE(replay_frame.has_value());
+    auto replay_response = decode_response(*replay_frame);
+    REQUIRE(replay_response.has_value());
+    REQUIRE(replay_response->result.has_value());
+    REQUIRE(replay_response->result->str == start_response->result->str);
+    REQUIRE(replay_outcome.authenticated);
+    REQUIRE(replay_outcome.replay);
+    REQUIRE(!replay_outcome.applied);
+    glove::control::detail::degrade_failed_delivery(
+        config, replay_outcome, "write control frame: Broken pipe"
+    );
+    REQUIRE(runtime->stopped_snapshot() == std::vector<std::string>{"session-9"});
+
     // Wrong secret: unauthenticated. No stop attempt; only the audit event.
     glove::control::receipt_control_outcome bad_secret_outcome;
     auto bad_secret_frame = (*protocol)->handle_frame(
@@ -697,14 +750,16 @@ auto verify_degrade_requires_authenticated_applied_outcome() -> int {
     REQUIRE(runtime->stopped_snapshot() == std::vector<std::string>{"session-9"});
 
     // Audit journal: one event per degrade call, naming method and session
-    // where the typed decode succeeded.
+    // where the typed decode succeeded; a replayed start's event reflects
+    // the replay disposition.
     auto events = audit_sink->take();
-    REQUIRE(events.size() == 5);
+    REQUIRE(events.size() == 6);
     REQUIRE(events[0].tool_name == "start_session:session-9");
-    REQUIRE(events[1].tool_name == "start_session");
+    REQUIRE(events[1].tool_name == "start_session:replay:session-9");
     REQUIRE(events[2].tool_name == "start_session");
-    REQUIRE(events[3].tool_name == "health");
-    REQUIRE(events[4].tool_name == "start_session");
+    REQUIRE(events[3].tool_name == "start_session");
+    REQUIRE(events[4].tool_name == "health");
+    REQUIRE(events[5].tool_name == "start_session");
     for (const auto& event : events) {
         REQUIRE(event.what == glove::audit::action::control);
         REQUIRE(event.status == glove::mcp::tool_call_status::transport_error);
@@ -748,9 +803,9 @@ auto verify_degrade_requires_authenticated_applied_outcome() -> int {
 // authenticated+applied start_session through the real handle_frame, so the
 // post-construction runtime ownership is exercised: on the pre-fix code the
 // server's stored config held a moved-from runtime pointer and the guest was
-// never torn down. Determinism: the client resets the socket only after an
-// observable proves the request was processed (the test runtime recorded the
-// start), so the server is guaranteed to fail at the response write.
+// never torn down. Determinism: the client resets the socket only after the
+// mutex-protected gate handshake proves the dispatch is parked inside the
+// blocked gate, so the server is guaranteed to fail at the response write.
 auto verify_broken_pipe_delivery_is_connection_scoped() -> int {
     temporary_directory temp;
     REQUIRE(!temp.root().empty());
@@ -865,19 +920,13 @@ auto verify_broken_pipe_delivery_is_connection_scoped() -> int {
     REQUIRE(write_exact(descriptor.get(), &size, sizeof(size)));
     REQUIRE(write_exact(descriptor.get(), frame.data(), frame.size()));
 
-    // Synchronize on an observable proving the request was processed (the
-    // start dispatch is inside handle_frame and currently blocked) BEFORE the
-    // reset, so the server's response write failure is deterministic rather
-    // than racy with the read.
-    bool observed = false;
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        if (!runtime->started_snapshot().empty()) {
-            observed = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    }
-    REQUIRE(observed);
+    // Synchronize on the gate handshake: the condition variable proves the
+    // dispatch is parked inside the blocked gate (inside handle_frame,
+    // before the start has been applied) BEFORE the reset, so the server's
+    // response write failure is deterministic rather than racy with the
+    // read. The started snapshot is only recorded after start() returns, so
+    // it is not usable as a "dispatch is inside the gate" observable.
+    REQUIRE(runtime->wait_for_start_gate(std::chrono::seconds{5}));
     const ::linger reset_on_close{.l_onoff = 1, .l_linger = 0};
     REQUIRE(
         ::setsockopt(
@@ -924,6 +973,181 @@ auto verify_broken_pipe_delivery_is_connection_scoped() -> int {
     return 0;
 }
 
+// Regression test (Workflow #218, round 3): an authenticated idempotent
+// start_session replay is a success response but never a freshly applied
+// launch. If the transport fails while a replay is being served, the live
+// guest — launched by the earlier, already-delivered request — must NOT be
+// stopped, outcome.applied must stay false, and the control audit event
+// must reflect the replay disposition. The replay dispatch is parked inside
+// a mutex-protected gate and observed via a condition-variable handshake
+// before the client resets, so the broken pipe is deterministic.
+auto verify_replay_broken_pipe_never_stops_live_session() -> int {
+    temporary_directory temp;
+    REQUIRE(!temp.root().empty());
+    const auto socket_path = temp.root() / "gloved.sock";
+    const auto secret_path = temp.root() / "bootstrap-secret";
+    const auto audit_key_path = temp.root() / "audit.key";
+    const auto journal_path = temp.root() / "receipts.journal";
+    const auto sessions_path = temp.root() / "sessions.journal";
+    const auto plan_source = temp.root() / "plan-source";
+    REQUIRE(std::filesystem::create_directory(plan_source));
+    std::ofstream{plan_source / "tracked.txt"} << "host-owned\n";
+    REQUIRE(write_owner_only(secret_path, bootstrap_secret));
+    REQUIRE(write_owner_only(audit_key_path, audit_key));
+
+    auto validator_result = plan_validator_for(plan_source);
+    REQUIRE(validator_result.has_value());
+    auto validator = std::make_shared<const glove::supervisor::session_plan_validator>(
+        std::move(*validator_result)
+    );
+    auto sessions = glove::control::session_registry::open_or_create(sessions_path, validator);
+    REQUIRE(sessions.has_value());
+    auto registry = std::shared_ptr<glove::control::session_registry>{std::move(*sessions)};
+
+    const glove::container::receipt_audit_producer_config producer_config{
+        .key_path = audit_key_path,
+        .journal_path = journal_path,
+    };
+    auto producer = glove::container::receipt_audit_producer::initialize(producer_config);
+    REQUIRE(producer.has_value());
+    REQUIRE((*producer)->acknowledge_bootstrap((*producer)->anchor()).has_value());
+    producer->reset();
+
+    auto audit_sink = glove::audit::make_memory_sink();
+    auto runtime = std::make_shared<degrade_test_runtime>();
+    const glove::control::receipt_audit_unix_server_config server_config{
+        .socket_path = socket_path,
+        .bootstrap_secret_path = secret_path,
+        .producer = producer_config,
+        .plan_validator = validator,
+        .sessions = registry,
+        .runtime = runtime,
+        .local_services = {},
+        .path_exposures = {},
+        .materialization_root = (temp.root() / "materializations").string(),
+        .io_timeout_ms = 5'000,
+        .control_audit = audit_sink,
+    };
+    auto server = glove::control::receipt_audit_unix_server::create(server_config);
+    REQUIRE(server.has_value());
+
+    const glove::container::receipt_audit_anchor genesis{
+        .key_id = std::string{audit_key_id},
+        .sequence = 0,
+        .head_hmac = std::string(64, '0'),
+    };
+    auto genesis_json = glz::write_json(genesis);
+    REQUIRE(genesis_json.has_value());
+
+    const auto start_payload =
+        R"({"authorization":{"schema_version":1,"authorization_id":"auth-replay",)"
+        R"("session_id":"session-replayed","controller_plan_digest":")" +
+        std::string(plan_digest) + R"(","plan_content_digest":")" + std::string(plan_digest) +
+        R"(","approved_at_ms":1,"expires_at_ms":4102444800000}})";
+
+    // Each delivered connection pairs one serve_one() with one transact().
+    auto serve_and_transact = [&](std::string_view frame) -> std::optional<std::string> {
+        std::optional<std::string> server_failure;
+        std::thread server_thread{[&] {
+            if (auto served = (*server)->serve_one(); !served) {
+                server_failure = served.error();
+            }
+        }};
+        auto response = transact(socket_path, frame);
+        server_thread.join();
+        // REQUIRE's `return 1` does not fit this lambda's optional return
+        // type, so failures exit the test process directly.
+        if (server_failure.has_value() || !response.has_value()) {
+            std::fprintf(
+                stderr, "REQUIRE failed: serve_and_transact @ %s:%d\n", __FILE__, __LINE__
+            );
+            std::exit(1);
+        }
+        return response;
+    };
+
+    // Connection 1: prime the producer and deliver a genuine fresh start.
+    auto primed = serve_and_transact(make_request(
+        "page-prime", "verify_audit_chain", "{\"sage_anchor\":" + *genesis_json + ",\"limit\":10}"
+    ));
+    auto primed_response = decode_response(*primed);
+    REQUIRE(primed_response.has_value());
+    REQUIRE(primed_response->result.has_value());
+    auto delivered = serve_and_transact(
+        make_request("start-live", "start_session", start_payload, "replay-start-e2e")
+    );
+    auto delivered_response = decode_response(*delivered);
+    REQUIRE(delivered_response.has_value());
+    REQUIRE(delivered_response->result.has_value());
+    REQUIRE(runtime->started_snapshot() == std::vector<std::string>{"session-replayed"});
+    REQUIRE(runtime->stopped_snapshot().empty());
+    REQUIRE(audit_sink->take().empty());
+
+    // Connection 2: authenticated idempotent replay of the same request.
+    std::optional<glove::control::receipt_audit_serve_outcome> outcome;
+    std::optional<std::string> server_error;
+    std::thread server_thread{[&] {
+        if (auto served = (*server)->serve_one(); !served) {
+            server_error = served.error();
+        } else {
+            outcome = *served;
+        }
+    }};
+    auto descriptor = connect_to(socket_path);
+    REQUIRE(descriptor.get() >= 0);
+    runtime->arm_start_gate();
+    const auto frame =
+        make_request("start-replay", "start_session", start_payload, "replay-start-e2e");
+    const auto size = htonl(static_cast<std::uint32_t>(frame.size()));
+    REQUIRE(write_exact(descriptor.get(), &size, sizeof(size)));
+    REQUIRE(write_exact(descriptor.get(), frame.data(), frame.size()));
+    // The gate handshake proves the replay dispatch is parked inside the
+    // blocked gate before the connection is reset.
+    REQUIRE(runtime->wait_for_start_gate(std::chrono::seconds{5}));
+    const ::linger reset_on_close{.l_onoff = 1, .l_linger = 0};
+    REQUIRE(
+        ::setsockopt(
+            descriptor.get(), SOL_SOCKET, SO_LINGER, &reset_on_close, sizeof(reset_on_close)
+        ) == 0
+    );
+    descriptor.reset();
+    runtime->release_start_gate();
+
+    server_thread.join();
+    REQUIRE(!server_error.has_value());
+    REQUIRE(outcome.has_value());
+    REQUIRE(*outcome == glove::control::receipt_audit_serve_outcome::connection_failed);
+
+    // The replay must not be treated as a fresh launch: the live session is
+    // still running (no stop), and the replay's delivery failure produced
+    // exactly one control audit event carrying the replay disposition.
+    const std::vector<std::string> expected_started{"session-replayed", "session-replayed"};
+    REQUIRE(runtime->started_snapshot() == expected_started);
+    REQUIRE(runtime->stopped_snapshot().empty());
+
+    const auto events = audit_sink->take();
+    REQUIRE(events.size() == 1);
+    REQUIRE(events.front().what == glove::audit::action::control);
+    REQUIRE(events.front().tool_name == "start_session:replay:session-replayed");
+    REQUIRE(events.front().status == glove::mcp::tool_call_status::transport_error);
+
+    // The daemon keeps serving after the connection-scoped failure.
+    std::optional<std::string> recovery_error;
+    std::thread recovery_thread{[&] {
+        if (auto served = (*server)->serve_one(); !served) {
+            recovery_error = served.error();
+        }
+    }};
+    auto recovery = transact(socket_path, make_request("health-3", "health", "null"));
+    recovery_thread.join();
+    REQUIRE(!recovery_error.has_value());
+    REQUIRE(recovery.has_value());
+    auto recovery_response = decode_response(*recovery);
+    REQUIRE(recovery_response.has_value());
+    REQUIRE(recovery_response->result.has_value());
+    return 0;
+}
+
 auto verify_peer_credential_contract() -> int {
     int descriptors[2] = {-1, -1};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors) == 0);
@@ -940,6 +1164,7 @@ auto run() -> int {
     REQUIRE(verify_peer_credential_contract() == 0);
     REQUIRE(verify_degrade_requires_authenticated_applied_outcome() == 0);
     REQUIRE(verify_broken_pipe_delivery_is_connection_scoped() == 0);
+    REQUIRE(verify_replay_broken_pipe_never_stops_live_session() == 0);
     temporary_directory temp;
     REQUIRE(!temp.root().empty());
     const auto socket_path = temp.root() / "gloved.sock";

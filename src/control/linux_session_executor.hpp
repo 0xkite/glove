@@ -169,7 +169,7 @@ public:
         const session_start_authorization& authorization,
         std::string_view idempotency_namespace,
         std::uint64_t now_ms
-    ) -> std::expected<session_record, std::string> override;
+    ) -> std::expected<session_start_result, std::string> override;
     [[nodiscard]] auto
     reconcile(container::receipt_audit_producer& receipt_producer, std::uint64_t now_ms)
         -> std::expected<session_reconciliation_report, std::string> override;

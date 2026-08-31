@@ -7,9 +7,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <filesystem>
 #include <memory>
@@ -97,6 +99,91 @@ auto action_name(action a) -> std::string_view {
     return "unknown";
 }
 
+// Drop the oldest complete records until `incoming` bytes fit under the
+// configured cap, and return the exact physical byte count of the
+// truncated journal. Only the newest `cap` bytes of the journal are ever
+// read, so this cannot scan an unbounded file. The retained region is a
+// contiguous run of newline-terminated complete records ending at the
+// journal's last newline: a trailing partial record, blank lines, and
+// any line that extends left of the bounded read window are never
+// retained, and the returned byte count includes every newline so the
+// caller's accounting tracks the physical file exactly. The file
+// descriptor stays O_APPEND: after ftruncate(0) the next write lands at
+// offset 0.
+static auto truncate_oldest(
+    int descriptor,
+    const jsonl_sink_limits& limits,
+    std::uint64_t physical_bytes,
+    std::uint64_t incoming
+) -> std::expected<std::uint64_t, std::string> {
+    const auto keep_budget =
+        limits.max_file_bytes > incoming ? limits.max_file_bytes - incoming : 0U;
+    const auto window =
+        static_cast<std::size_t>(std::min<std::uint64_t>(physical_bytes, limits.max_file_bytes));
+    std::string tail(window, '\0');
+    std::size_t consumed = 0;
+    while (consumed < tail.size()) {
+        const auto result = ::pread(
+            descriptor,
+            tail.data() + consumed,
+            tail.size() - consumed,
+            static_cast<off_t>(physical_bytes - window + consumed)
+        );
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return std::unexpected(system_error("read audit journal for truncation"));
+        }
+        consumed += static_cast<std::size_t>(result);
+    }
+    const auto window_offset = static_cast<std::uint64_t>(physical_bytes - window);
+    std::size_t keep_from = tail.size();
+    std::uint64_t kept_bytes = 0;
+    const auto last_newline = tail.rfind('\n');
+    if (last_newline != std::string::npos) {
+        // A trailing partial record (no terminating newline) is dropped.
+        keep_from = last_newline + 1U;
+        std::size_t line_end = last_newline;
+        while (true) {
+            const auto start_newline =
+                line_end == 0U ? std::string::npos : tail.rfind('\n', line_end - 1U);
+            if (start_newline == std::string::npos && window_offset != 0U) {
+                // The oldest candidate line extends left of the bounded
+                // read window, so it is not provably complete.
+                break;
+            }
+            const std::size_t line_start =
+                start_newline == std::string::npos ? 0U : start_newline + 1U;
+            const std::size_t line_bytes = line_end - line_start + 1U;
+            if (line_bytes == 1U) {
+                // Blank line: never retained, and retention stops here
+                // so the kept region stays contiguous without blanks.
+                break;
+            }
+            if (kept_bytes + line_bytes > keep_budget) {
+                break;
+            }
+            kept_bytes += line_bytes;
+            keep_from = line_start;
+            if (start_newline == std::string::npos) {
+                break;
+            }
+            line_end = start_newline;
+        }
+    }
+    if (::ftruncate(descriptor, 0) != 0) {
+        return std::unexpected(system_error("truncate audit journal"));
+    }
+    if (kept_bytes != 0) {
+        const std::string_view retained{tail.data() + keep_from, kept_bytes};
+        if (auto written = write_all(descriptor, retained); !written) {
+            return std::unexpected(written.error());
+        }
+    }
+    return kept_bytes;
+}
+
 class jsonl_sink final : public sink {
 public:
     explicit jsonl_sink(int descriptor, jsonl_sink_limits limits, std::uint64_t current_bytes)
@@ -130,10 +217,29 @@ public:
 
         std::scoped_lock lock{mu_};
         encoded->push_back('\n');
-        if (limits_.max_file_bytes != 0 &&
-            current_bytes_ + encoded->size() > limits_.max_file_bytes) {
-            if (auto truncated = truncate_oldest(encoded->size()); !truncated) {
-                return truncated;
+        if (limits_.max_file_bytes != 0) {
+            if (encoded->size() > limits_.max_file_bytes) {
+                // Hard cap: a single event whose encoded form can never fit
+                // under the cap is dropped with a structured operator note
+                // instead of pushing the journal past its configured bound.
+                std::fprintf(
+                    stderr,
+                    "gloved: audit event %s dropped: encoded %llu bytes exceeds journal cap %llu"
+                    " bytes\n",
+                    w.tool.c_str(),
+                    static_cast<unsigned long long>(encoded->size()),
+                    static_cast<unsigned long long>(limits_.max_file_bytes)
+                );
+                return {};
+            }
+            if (current_bytes_ + encoded->size() > limits_.max_file_bytes) {
+                if (auto truncated =
+                        truncate_oldest(descriptor_, limits_, current_bytes_, encoded->size());
+                    !truncated) {
+                    return std::unexpected(truncated.error());
+                } else {
+                    current_bytes_ = *truncated;
+                }
             }
         }
         if (auto written = write_all(descriptor_, *encoded); !written) {
@@ -147,69 +253,6 @@ public:
     }
 
 private:
-    // Drop the oldest complete records until `incoming` bytes fit under the
-    // configured cap. Reads are bounded by the cap itself, so this cannot
-    // scan an unbounded file. The file descriptor stays O_APPEND: after
-    // ftruncate(0) the next write lands at offset 0.
-    auto truncate_oldest(std::uint64_t incoming) -> std::expected<void, std::string> {
-        const auto keep_budget =
-            limits_.max_file_bytes > incoming ? limits_.max_file_bytes - incoming : 0U;
-        std::string contents(static_cast<std::size_t>(current_bytes_), '\0');
-        std::size_t consumed = 0;
-        while (consumed < contents.size()) {
-            const auto result = ::pread(
-                descriptor_,
-                contents.data() + consumed,
-                contents.size() - consumed,
-                static_cast<off_t>(consumed)
-            );
-            if (result < 0 && errno == EINTR) {
-                continue;
-            }
-            if (result <= 0) {
-                return std::unexpected(system_error("read audit journal for truncation"));
-            }
-            consumed += static_cast<std::size_t>(result);
-        }
-        // Keep the newest complete lines that fit in the retained budget.
-        std::size_t keep_from = contents.size();
-        std::uint64_t kept_bytes = 0;
-        while (keep_from > 0) {
-            const auto line_start = contents.rfind('\n', keep_from - 1);
-            if (line_start == std::string::npos) {
-                // `keep_from` sits at the first (possibly unterminated) line;
-                // it is never retained.
-                break;
-            }
-            const std::size_t begin = line_start + 1U;
-            if (begin == keep_from) {
-                // Degenerate double-newline input: skip the empty line.
-                keep_from = begin - 1U;
-                continue;
-            }
-            const std::size_t line_bytes = keep_from - begin;
-            if (kept_bytes + line_bytes > keep_budget) {
-                break;
-            }
-            kept_bytes += line_bytes;
-            keep_from = begin;
-        }
-        if (::ftruncate(descriptor_, 0) != 0) {
-            return std::unexpected(system_error("truncate audit journal"));
-        }
-        current_bytes_ = 0;
-        if (keep_from < contents.size() && kept_bytes != 0) {
-            const std::string_view retained{
-                contents.data() + keep_from, contents.size() - keep_from
-            };
-            if (auto written = write_all(descriptor_, retained); !written) {
-                return written;
-            }
-            current_bytes_ = kept_bytes;
-        }
-        return {};
-    }
-
     std::mutex mu_;
     int descriptor_ = -1;
     jsonl_sink_limits limits_;
@@ -248,9 +291,20 @@ auto make_jsonl_sink(const std::filesystem::path& path, jsonl_sink_limits limits
         ::close(descriptor);
         return std::unexpected(error);
     }
-    return std::make_shared<jsonl_sink>(
-        descriptor, limits, static_cast<std::uint64_t>(metadata.st_size)
-    );
+    auto physical_bytes = static_cast<std::uint64_t>(metadata.st_size);
+    if (limits.max_file_bytes != 0 && physical_bytes > limits.max_file_bytes) {
+        // A pre-existing oversized journal is bounded to the cap with a
+        // bounded read before the sink accepts any event; construction never
+        // records an unrestricted size that the first truncation would have
+        // to allocate wholesale.
+        auto bounded = truncate_oldest(descriptor, limits, physical_bytes, 0);
+        if (!bounded) {
+            ::close(descriptor);
+            return std::unexpected(std::string{"bound audit journal to cap: "} + bounded.error());
+        }
+        physical_bytes = *bounded;
+    }
+    return std::make_shared<jsonl_sink>(descriptor, limits, physical_bytes);
 }
 
 } // namespace glove::audit

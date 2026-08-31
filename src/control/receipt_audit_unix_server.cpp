@@ -422,12 +422,16 @@ auto record_control_delivery_audit(
     const std::shared_ptr<audit::sink>& control_audit,
     std::string_view method,
     std::string_view session_id,
+    bool replay,
     std::string_view transport_error
 ) -> void {
     if (!control_audit) {
         return;
     }
     std::string subject{method};
+    if (replay) {
+        subject += ":replay";
+    }
     if (!session_id.empty()) {
         subject += ':';
         subject += session_id;
@@ -466,19 +470,20 @@ auto degrade_failed_delivery(
     // authentication, schema, deadline, or application evidence, so it can
     // never grant teardown authority.
     record_control_delivery_audit(
-        config.control_audit, outcome.method, outcome.session_id, transport_error
+        config.control_audit, outcome.method, outcome.session_id, outcome.replay, transport_error
     );
 
-    // A guest launched by a genuinely applied start_session would outlive its
-    // vanished controller connection. Tear it down through the normal
-    // idempotent stop path, which preserves the pending-before-release audit
-    // guarantees and produces the authenticated terminal receipt. Every other
-    // outcome — wrong secret, unauthenticated peer, expired deadline, schema
-    // mismatch, rejected start, or a non-start method — gets no stop attempt:
-    // only the connection-scoped audit event above. Stop failures are
-    // recorded and logged, never fatal: integrity failures cannot reach this
-    // path because handle_frame applied the request and only the transport
-    // write failed.
+    // A guest launched by a genuinely fresh, applied start_session would
+    // outlive its vanished controller connection. Tear it down through the
+    // normal idempotent stop path, which preserves the pending-before-release
+    // audit guarantees and produces the authenticated terminal receipt. Every
+    // other outcome — wrong secret, unauthenticated peer, expired deadline,
+    // schema mismatch, rejected start, an idempotent start replay (the
+    // already-running guest was launched by an earlier, delivered request),
+    // or a non-start method — gets no stop attempt: only the
+    // connection-scoped audit event above. Stop failures are recorded and
+    // logged, never fatal: integrity failures cannot reach this path because
+    // handle_frame applied the request and only the transport write failed.
     const bool degradable = outcome.authenticated && outcome.applied && outcome.response_success &&
                             outcome.method == "start_session" && !outcome.session_id.empty();
     if (!degradable || !config.runtime || !config.runtime->lifecycle_operational()) {
@@ -492,7 +497,7 @@ auto degrade_failed_delivery(
             stopped.error().c_str()
         );
         record_control_delivery_audit(
-            config.control_audit, "degrade_stop", outcome.session_id, stopped.error()
+            config.control_audit, "degrade_stop", outcome.session_id, false, stopped.error()
         );
         return;
     }
