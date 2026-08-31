@@ -96,92 +96,53 @@ For `glove run`:
 Malformed frames, unknown tools, policy failures, transport errors, and audit
 append failures fail closed.
 
-## Wallet status bridge construction boundary
+## Historical synthetic status milestone
 
-Glove contains a construction-only, status-only wallet bridge protocol. It is
-not registered as a general MCP extension and is not wired into `gloved` or a
-managed Pi launch. The host must supply an already-open per-session Unix socket
-as an inherited descriptor; the bridge never discovers or connects a Sage,
-Glove, P2P, provider, or wallet endpoint.
+The former construction-only synthetic status stack and harness-shaped adapter were
+removed because they had no production composition or child descriptor mapping. Any
+future ephemeral query service must be built at a live composition seam and may share
+only the harness-neutral bounded guest-channel transport; payload semantics,
+persistence, and harness projection remain outside that transport.
 
-The private protocol processor accepts only `wallet_status` with a 64-KiB
-frame limit, an absolute receive-inclusive deadline, strict unknown-field
-rejection, and a host-derived running-session binding. The guest cannot submit
-session or plan digests. The processor owns four private authority interfaces
-for the current plan/session/policy, audit/journal and containment readiness,
-owner-local adapter digest, and stable wallet-server status. Every snapshot is
-bound to the same nonzero plan generation and absolute deadline; the plan is
-read again after the other snapshots to detect in-request revision. Missing,
-ambiguous, rolled-back, revised, or cross-boundary evidence makes the method
-unavailable. A single failed or over-deadline authority read terminates the
-status worker for that composition — the bridge never retries or resynchronizes
-transient authority faults, so composing live authorities requires deliberate
-retry or replacement policy at composition time. No public
-capability-discovery method is added by this milestone.
+The shared `guest_channel_transport` owns one connected Unix stream descriptor,
+verifies `AF_UNIX`, `SOCK_STREAM`, and the required peer UID, and performs only
+bounded four-byte big-endian framed I/O. Each receive or send uses its caller's
+absolute steady-clock deadline and stop token. The transport is single-thread
+confined and has no handler, exchange, or public close API; its owner stops and
+joins the worker before destruction closes the descriptor, avoiding concurrent
+close and descriptor-reuse races.
 
-The private processor owns its clock, samples it before request decoding and
-after authority validation, and revalidates the exact session digests, policy revision, state,
-expiry, adapter and server digests, owner-local wallet-server alias, chain
-policy, audit/journal generations, and observation freshness. The authority
-contracts must reject durable generation reuse or rollback. The bridge keeps no
-global high-water state and performs no provider, Sage, P2P, wallet, or network
-call itself. The in-request plan re-read detects revision but does not by itself
-defend against generation-reuse (ABA) by an authority; that rejection belongs to
-the authority contracts and must be covered by adversarial authority tests before
-any live composition is approved.
+The observation server carries one absolute accept deadline through every retry
+and stop-aware transient backoff. After accept, receive and response send share
+one absolute I/O deadline. Stop/deadline checks immediately surround registry
+handling, but registry persistence is trusted synchronous local work and cannot
+be forcibly interrupted once started. The hard bound therefore covers accept,
+framed I/O, and cooperative cancellation—not arbitrary handler execution.
 
-Responses omit node identifiers, wallet addresses, RPC URLs, peer details,
-signatures, provider errors, session digests, and host paths. The only available
-action is `status`; the mutating-action list is structurally empty. Stale,
-future, mismatched, missing, failed, stopped, revised, or expired observations
-return no cached status.
+The Linux local-service proxy remains schema-generic. It mounts only
+runtime-allowed alias sockets from a private owner-only directory and forwards
+one bounded G2 request/response without parsing the payload. Upstream parents
+are descriptor-pinned and endpoint identities are drift-checked around connect.
+Because portable pathname Unix sockets cannot prevent same-UID ABA replacement,
+the operator and service-UID processes are trusted endpoint authority; the
+checks do not authenticate an application process. Resolved path grants are
+compared by descriptor identity against every endpoint parent ancestor before
+filesystem materialization, preventing a grant from exposing the host socket
+directly.
 
-This module is synthetic integration infrastructure, not activation evidence.
-Before typed Glaze decoding, a bounded recursive structural scan rejects
-malformed JSON, more than 64 nested containers, and repeated decoded object
-keys at every level. This includes equivalent escaped keys and keys inside the
-raw result object. A dedicated 64-KiB fuzz target and adversarial corpus keep
-that precondition exercised. Only deterministic offline authority fakes exist
-in this milestone.
+Guest-channel semantics enter only through an opaque adapter binding resolved
+in `src/adapters/`. A generic or arbitrarily named `pi` endpoint does not imply
+a Sage schema. The sealed capability requires the exact adapter binding,
+registry catalog, factory, concrete Linux runtime, and adapter/runtime endpoint
+intersection. Its current endpoint checks are construction and drift evidence,
+not process-authentication evidence.
 
-A second private, disabled-by-default synthetic owner composes one unnamed Unix
-stream socketpair with the processor. Construction verifies the creator/owner
-UID and the creation-time socketpair peer UID (the same synthetic owner, not a
-future child identity), plus `AF_UNIX`, `SOCK_STREAM`, nonblocking mode, and
-`FD_CLOEXEC` on both endpoints.
-One sequential `std::jthread` exclusively owns the host endpoint. It uses one
-absolute request deadline for framing, authority processing, and response
-writing; cancellation, EOF, malformed or partial framing, oversized input,
-processing failure, backpressure timeout, session expiry, or destruction closes
-every endpoint still owned by the session without resynchronization. The guest
-endpoint can be transferred
-exactly once for in-process socketpair tests and remains `CLOEXEC`. No production
-launcher maps it into a child, no environment variable advertises it, and no
-managed Pi process is started by this milestone.
-
-A future runtime composition must implement the authority interfaces with
-concrete protected registry, policy, audit/journal, adapter-digest, and status
-objects; add separately reviewed child descriptor mapping and unintended-FD
-closure; preserve the same absolute deadline; and prove descriptor containment
-before capability discovery may expose schema version 1. Live Sage/P2P/wallet
-connection remains a separate operator gate. Authority callbacks may request
-session close, but they must not destroy the session owner from its worker
-thread; live composition requires an independently owned lifetime.
-
-A third private construction-only adapter projects that status into a minimal
-Pi-shaped tool descriptor and result. It defaults disabled, owns only a
-single-operation fake status channel, and re-attests through the existing host
-bridge on every listing and invocation. Disabled, stale, unavailable,
-mismatched, malformed, cancelled, or expired evidence yields no advertised
-tool; invocation rechecks and reports only generic absence. A cancellable,
-deadline-aware transaction gate covers lock acquisition, exchange, strict
-decoding, and result construction. The accepted tool has an exact empty-object
-schema, read-only/idempotent/closed-world annotations,
-and emits only the sanitized v1 status fields with `available_actions` fixed to
-`["status"]` and an empty `mutating_actions` array. The adapter is not a kernel
-extension and is absent from Pi settings, native runtime registration, `gloved`,
-production factories, and capability discovery. Its fake-channel tests do not
-constitute child descriptor mapping or a live contained-Pi integration.
+Proxy audit uses a conservative three-phase sequence: durable non-success
+`delivery_pending` before release, `delivered` only after successful guest send,
+and best-effort `delivery_failed` after send failure. Synchronous audit
+persistence checks the exchange deadline before and after the append, but a
+kernel-blocked `fsync(2)` is not cooperatively preemptible. A late append cannot
+release the response.
 
 `glove exec` bypasses the MCP kernel. It is intended for agents that manage
 their own tool protocol, so its security boundary is the OS sandbox and explicit
@@ -308,25 +269,47 @@ directories is not implemented; `prompt_ref` remains rejected.
 The durable per-session queue is schema-generic: Glove core enforces only
 structural invariants (identifier charset, digest hex, TTL/skew arithmetic,
 capacity, idempotency) and delegates body semantics to a host-registered
-admission table (`channel_descriptor{channel_id, schema_id, body_validator,
-bounds}` registered through a `channel_host` at registry construction).
-Schema strings never appear in core; a host registers the
-payload contracts its guests use, and replay of a durable intent whose schema
-is no longer registered fails closed.
+admission table (`channel_descriptor{schema_id, body_validator, bounds}`). A
+host must register every payload contract, propagate registration failures, and
+freeze the nonempty `channel_host` before registry construction. Schema strings
+never appear in core. Current admission rejects enqueue for every unregistered
+schema. Only an authentic intent already present in durable history may recover
+after its schema retires, and then solely as non-actionable quarantine metadata
+that cannot be enqueued again or launched.
 
-The Sage guest adapter registers two closed logical schemas. The observation
-schema carries bounded non-signing observations. The
-`sage.glove-sxxx-self-delegation-proposal.v1` schema carries only a proposal
-identifier, the fixed `sxxx-self-delegation` kind, one constant value digest,
-and `item_count = 1`. It carries no wallet, profile, chain, token, calldata,
-fee, nonce, Remote Procedure Call endpoint, credential, or operator proof.
+The explicit Sage harness adapter under `src/adapters/sage/` registers only the
+bounded, non-signing `sage.glove-observation.v1` schema currently required for
+registry admission. Dormant proposal or mutation schemas are not registered, so
+current enqueue rejects them. Authentic historical records using a subsequently
+retired schema recover only as non-actionable quarantine metadata.
 
-Both registered schemas use the same channel token and authoritative session
-context, but their body contracts are distinct. Glove commits either body with
-the same length-prefixed digest algorithm and preserves its exact schema in
-the durable queue. Sage decides whether to build a final host intent. Glove
-never signs or broadcasts a transaction. Intents bind to the session's parsed
-`runtime_id`, so any managed guest runtime can carry a registered payload.
+Glove commits admitted bodies with the shared length-prefixed digest algorithm
+and preserves the exact schema in the durable queue. Intents bind to the
+session's parsed `runtime_id`, so any managed guest runtime can carry a
+registered payload.
+
+Capability discovery does not infer observation ingress from registry storage.
+On Linux, schema version `1` requires an opaque capability produced only by
+sealing the concrete lifecycle runtime against the exact registry, frozen
+catalog, preparer-owned proxy factory, managed runtime intersection, complete
+resource mechanisms, descriptor-pinned endpoint parents, and current rechecked
+socket identities. The opaque capability owns the runtime, which owns its
+preparer and registry; the preparer owns the factory, and the factory owns the
+same registry. No edge points back to the capability or runtime. Generic,
+remote, Apple, mismatched, unsealed, absent-config, and drifted compositions
+report `0`.
+
+The optional local-service proxy descriptor-pins each configured owner-`0700`
+parent and records and rechecks the owner-only Unix socket's exact
+`dev/ino/uid/mode/nlink` before and after every connect. An allowed session gets
+one fresh owner-only directory mounted read-only at
+`/run/glove-services/local` and the fixed `GLOVE_LOCAL_SERVICE_DIR` environment.
+Alias listeners forward one bounded G2-framed opaque request and response under
+one absolute deadline with peer-UID checks on both sides. A fixed worker set is
+joined before inode-safe socket and directory cleanup. The launch digest commits
+the sorted runtime-filtered aliases, descriptor-pinned parent identities,
+recorded socket identities, and factory generation; no durable registry or
+receipt schema changes.
 
 ## Persistence
 
