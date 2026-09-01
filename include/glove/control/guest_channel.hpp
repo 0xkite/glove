@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -76,8 +77,14 @@ private:
 struct guest_channel_adapter_binding {
     std::string adapter_id;
     std::string channel_schema_id;
+    // Opaque owner-local transport selector. Empty preserves the compatibility path.
+    std::string transport_id;
     std::vector<std::string> runtime_ids;
     std::shared_ptr<const channel_host> channels;
+    // Optional adapter-owned alias projection; core treats the environment as opaque while
+    // binding the selected alias to exactly one inherited endpoint.
+    std::optional<std::string> service_alias;
+    std::optional<std::string> service_alias_environment;
 };
 
 } // namespace glove::control

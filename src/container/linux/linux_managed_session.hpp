@@ -3,6 +3,7 @@
 #include "glove/container/profile.hpp"
 #include "glove/container/receipt_producer.hpp"
 
+#include "inherited_stream_descriptor.hpp"
 #include "linux_resource_lifecycle.hpp"
 #include "pty_session_channel.hpp"
 
@@ -104,7 +105,8 @@ private:
     const profile& prof,
     const std::vector<std::string>& resolved_argv,
     std::span<const supervisor::linux_detail::session_mount> mounts,
-    std::string_view controller_plan_digest
+    std::string_view controller_plan_digest,
+    std::span<const inherited_stream_descriptor> inherited_streams = {}
 ) -> std::expected<managed_launch_binding, std::string>;
 
 // Same canonical encoder over a borrowed, already-pinned executable. Start
@@ -115,7 +117,8 @@ private:
     const std::vector<std::string>& resolved_argv,
     std::span<const supervisor::linux_detail::session_mount> mounts,
     std::string_view controller_plan_digest,
-    int executable_fd
+    int executable_fd,
+    std::span<const inherited_stream_descriptor> inherited_streams = {}
 ) -> std::expected<managed_launch_binding, std::string>;
 
 // Recomputable planning operation. Start repeats the same resolution and

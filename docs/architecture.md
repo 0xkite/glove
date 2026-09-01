@@ -119,7 +119,8 @@ handling, but registry persistence is trusted synchronous local work and cannot
 be forcibly interrupted once started. The hard bound therefore covers accept,
 framed I/O, and cooperative cancellation—not arbitrary handler execution.
 
-The Linux local-service proxy remains schema-generic. It mounts only
+The Linux local-service proxy remains schema-generic. The compatibility
+transport, selected when an adapter omits `transport_id`, mounts only
 runtime-allowed alias sockets from a private owner-only directory and forwards
 one bounded G2 request/response without parsing the payload. Upstream parents
 are descriptor-pinned and endpoint identities are drift-checked around connect.
@@ -130,12 +131,27 @@ compared by descriptor identity against every endpoint parent ancestor before
 filesystem materialization, preventing a grant from exposing the host socket
 directly.
 
+An adapter may instead select `inherited-stream-v1`. Glove creates one
+owner-`0600` connected `AF_UNIX`/`SOCK_STREAM` socketpair for the exact
+adapter-bound alias, keeps the supervisor peer outside the sandbox, and installs
+the guest peer at child descriptor 3 before seccomp. The child receives only the
+compact one-entry `GLOVE_LOCAL_SERVICE_FDS_V1` alias-to-descriptor map; no proxy
+path, other configured local service, or host endpoint metadata is projected.
+Clone setup preserves exactly that descriptor and closes every gap and all
+undeclared descriptors. The persistent stream accepts sequential existing G2
+frames, rejects empty, oversized, trailing, or pipelined input, uses one
+absolute deadline per exchange, and is poisoned on transport, identity,
+upstream, framing, timeout, or cancellation failure. The managed-launch binding
+commits the selector, alias and child descriptor, both socket identities, and
+manifest digest. User-supplied `GLOVE_LOCAL_SERVICE_*` variables and mixed
+pathname/inherited authority fail closed.
+
 Guest-channel semantics enter only through an opaque adapter binding resolved
 in `src/adapters/`. A generic or arbitrarily named `pi` endpoint does not imply
-a Sage schema. The sealed capability requires the exact adapter binding,
-registry catalog, factory, concrete Linux runtime, and adapter/runtime endpoint
-intersection. Its current endpoint checks are construction and drift evidence,
-not process-authentication evidence.
+a Sage schema. The sealed capability requires `inherited-stream-v1` plus the
+exact adapter binding, registry catalog, factory, concrete Linux runtime, and
+adapter/runtime endpoint intersection. Endpoint checks are construction and
+drift evidence, not process-authentication evidence.
 
 Proxy audit uses a conservative three-phase sequence: durable non-success
 `delivery_pending` before release, `delivered` only after successful guest send,

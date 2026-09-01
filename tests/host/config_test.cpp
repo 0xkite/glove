@@ -189,6 +189,7 @@ auto run() -> int {
             guest_channel_adapter_config{
                 .adapter_id = "sage-observation",
                 .channel_schema_id = "sage.glove-observation.v1",
+                .transport_id = "inherited-stream-v1",
             },
         .endpoints = {
             local_service_proxy_endpoint{
@@ -206,6 +207,12 @@ auto run() -> int {
     REQUIRE(validate(proxy_config).has_value());
     REQUIRE(write_config_exclusive(proxy_path, proxy_config).has_value());
     REQUIRE(load_config(proxy_path) == proxy_config);
+    auto legacy_proxy_config = proxy_config;
+    legacy_proxy_config.local_service_proxy->guest_channel_adapter->transport_id.reset();
+    REQUIRE(validate(legacy_proxy_config).has_value());
+    const auto legacy_proxy_path = temporary.root() / "legacy-proxy-config.json";
+    REQUIRE(write_config_exclusive(legacy_proxy_path, legacy_proxy_config).has_value());
+    REQUIRE(load_config(legacy_proxy_path) == legacy_proxy_config);
     auto generic_proxy_config = proxy_config;
     generic_proxy_config.local_service_proxy->guest_channel_adapter.reset();
     REQUIRE(validate(generic_proxy_config).has_value());
@@ -327,6 +334,9 @@ auto run() -> int {
     invalid_proxy = proxy_config;
     invalid_proxy.local_service_proxy->guest_channel_adapter->adapter_id =
         std::string{"sage\0hidden", 11U};
+    REQUIRE(!validate(invalid_proxy).has_value());
+    invalid_proxy = proxy_config;
+    invalid_proxy.local_service_proxy->guest_channel_adapter->transport_id = "unknown-v1";
     REQUIRE(!validate(invalid_proxy).has_value());
     invalid_proxy = proxy_config;
     invalid_proxy.local_service_proxy->endpoints.front().socket_path =

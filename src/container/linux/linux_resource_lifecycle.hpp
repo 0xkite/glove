@@ -4,6 +4,7 @@
 
 #include "../resource_monitor.hpp"
 #include "cgroup_v2.hpp"
+#include "inherited_stream_descriptor.hpp"
 
 #include <sys/types.h>
 
@@ -90,6 +91,16 @@ public:
     ) -> std::expected<void, std::string>;
     [[nodiscard]] auto install_service_mount(supervisor::linux_detail::session_mount mount)
         -> std::expected<void, std::string>;
+    [[nodiscard]] auto
+    install_inherited_streams(std::vector<inherited_stream_descriptor> descriptors)
+        -> std::expected<void, std::string>;
+
+    [[nodiscard]] auto inherited_streams() const noexcept
+        -> const std::vector<inherited_stream_descriptor>& {
+        return inherited_streams_;
+    }
+
+    void close_inherited_streams_after_clone() noexcept;
 
     [[nodiscard]] auto finish(int wait_status, std::uint64_t finished_at_ms)
         -> std::expected<linux_resource_terminal_observation, std::string>;
@@ -129,6 +140,7 @@ private:
     std::optional<linux_resource_terminal_observation> terminal_;
     std::vector<supervisor::linux_detail::session_mount> secret_mounts_;
     std::vector<supervisor::linux_detail::session_mount> service_mounts_;
+    std::vector<inherited_stream_descriptor> inherited_streams_;
     // These descriptors carry exclusive flock(2) leases for rotating
     // credentials. They intentionally outlive process creation and remain
     // held until the child and its isolated resources are terminal.

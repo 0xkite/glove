@@ -4,6 +4,7 @@
 #include "linux_managed_session.hpp"
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -419,6 +420,75 @@ private:
     bool valid_ = true;
 };
 
+auto inherited_environment(std::span<const inherited_stream_descriptor> streams) -> std::string {
+    std::string result{"GLOVE_LOCAL_SERVICE_FDS_V1={"};
+    for (std::size_t index = 0; index < streams.size(); ++index) {
+        if (index != 0U) {
+            result.push_back(',');
+        }
+        result += "\"" + streams[index].alias + "\":" + std::to_string(streams[index].child_fd);
+    }
+    result.push_back('}');
+    return result;
+}
+
+auto validate_inherited_streams(
+    std::span<const inherited_stream_descriptor> streams,
+    std::span<const std::string> environment,
+    std::size_t service_mounts
+) -> std::expected<std::optional<std::string>, std::string> {
+    const auto fd_environment = std::ranges::count_if(environment, [](const auto& entry) {
+        return entry.starts_with("GLOVE_LOCAL_SERVICE_FDS_V1=");
+    });
+    const auto path_environment =
+        std::ranges::count(environment, "GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local");
+    if (streams.empty()) {
+        if (fd_environment != 0U) {
+            return std::unexpected(std::string{"inherited stream environment lacks descriptors"});
+        }
+        return std::nullopt;
+    }
+    if (service_mounts != 0U || path_environment != 0U || fd_environment != 1U ||
+        !std::ranges::is_sorted(streams, {}, &inherited_stream_descriptor::alias) ||
+        !std::ranges::contains(environment, inherited_environment(streams))) {
+        return std::unexpected(std::string{"invalid managed inherited stream projection"});
+    }
+    std::set<int> descriptor_fds;
+    std::string_view previous_alias;
+    std::string_view manifest;
+    for (std::size_t index = 0; index < streams.size(); ++index) {
+        const auto& stream = streams[index];
+        struct stat status{};
+        int domain = 0;
+        int type = 0;
+        socklen_t length = sizeof(int);
+        if (!valid_identifier(stream.alias) ||
+            (!previous_alias.empty() && previous_alias >= stream.alias) ||
+            stream.descriptor_fd < 3 || stream.child_fd != static_cast<int>(index + 3U) ||
+            !descriptor_fds.insert(stream.descriptor_fd).second ||
+            ::fstat(stream.descriptor_fd, &status) != 0 || !S_ISSOCK(status.st_mode) ||
+            static_cast<std::uint64_t>(status.st_dev) != stream.device ||
+            static_cast<std::uint64_t>(status.st_ino) != stream.inode ||
+            static_cast<std::uint32_t>(status.st_uid) != stream.uid ||
+            static_cast<std::uint32_t>(status.st_mode) != stream.mode ||
+            static_cast<std::uint64_t>(status.st_nlink) != stream.links || stream.links != 1U ||
+            stream.peer_device == 0U || stream.peer_inode == 0U ||
+            stream.peer_uid != static_cast<std::uint32_t>(::geteuid()) ||
+            !S_ISSOCK(static_cast<mode_t>(stream.peer_mode)) || stream.peer_links != 1U ||
+            (stream.peer_mode & 0777U) != 0600U ||
+            ::getsockopt(stream.descriptor_fd, SOL_SOCKET, SO_DOMAIN, &domain, &length) != 0 ||
+            domain != AF_UNIX ||
+            ::getsockopt(stream.descriptor_fd, SOL_SOCKET, SO_TYPE, &type, &length) != 0 ||
+            type != SOCK_STREAM || !valid_digest(stream.manifest_digest) ||
+            (index != 0U && stream.manifest_digest != manifest)) {
+            return std::unexpected(std::string{"invalid managed inherited stream descriptor"});
+        }
+        previous_alias = stream.alias;
+        manifest = stream.manifest_digest;
+    }
+    return std::optional<std::string>{std::string{manifest}};
+}
+
 void append_limits(canonical_encoder& encoder, const resource_limits& limits) {
     encoder.append_u64(limits.cpu_time_ms);
     encoder.append_u64(limits.memory_bytes);
@@ -447,7 +517,8 @@ auto bind_managed_launch_projection_from_fd(
     const std::vector<std::string>& resolved_argv,
     std::span<const supervisor::linux_detail::session_mount> mounts,
     std::string_view controller_plan_digest,
-    int executable_fd
+    int executable_fd,
+    std::span<const inherited_stream_descriptor> inherited_streams
 ) -> std::expected<managed_launch_binding, std::string> {
     if (!valid_digest(controller_plan_digest)) {
         return std::unexpected(std::string{"invalid controller plan digest"});
@@ -509,7 +580,14 @@ auto bind_managed_launch_projection_from_fd(
     });
     const auto service_environment =
         std::ranges::count(checked->environment, local_service_environment);
-    if (service_mounts != service_environment || service_mounts > 1) {
+    auto inherited_manifest = validate_inherited_streams(
+        inherited_streams, checked->environment, static_cast<std::size_t>(service_mounts)
+    );
+    if (!inherited_manifest) {
+        return std::unexpected(inherited_manifest.error());
+    }
+    if (service_mounts != service_environment || service_mounts > 1 ||
+        (service_mounts != 0 && inherited_manifest->has_value())) {
         return std::unexpected(
             std::string{"managed local service mount and environment must be paired"}
         );
@@ -608,6 +686,26 @@ auto bind_managed_launch_projection_from_fd(
             encoder.append_string(*mount.service_proxy_manifest_digest);
         }
     }
+    if (!inherited_streams.empty()) {
+        encoder.append_string("glove.managed-launch-inherited-stream");
+        encoder.append_string("inherited-stream-v1");
+        encoder.append_u32(static_cast<std::uint32_t>(inherited_streams.size()));
+        for (const auto& stream : inherited_streams) {
+            encoder.append_string(stream.alias);
+            encoder.append_u32(static_cast<std::uint32_t>(stream.child_fd));
+            encoder.append_u64(stream.device);
+            encoder.append_u64(stream.inode);
+            encoder.append_u32(stream.uid);
+            encoder.append_u32(stream.mode);
+            encoder.append_u64(stream.links);
+            encoder.append_u64(stream.peer_device);
+            encoder.append_u64(stream.peer_inode);
+            encoder.append_u32(stream.peer_uid);
+            encoder.append_u32(stream.peer_mode);
+            encoder.append_u64(stream.peer_links);
+            encoder.append_string(stream.manifest_digest);
+        }
+    }
     // Preserve the version-1 digest for offline launches while binding the
     // exact ephemeral proxy capability whenever egress is present. This
     // prevents a controller-approved offline projection from being replayed
@@ -627,7 +725,8 @@ auto bind_managed_launch_projection_from_fd(
         return std::unexpected(digest.error());
     }
     std::vector<library_projection_receipt> library_projections;
-    std::optional<std::string> service_proxy_manifest_digest;
+    std::optional<std::string> service_proxy_manifest_digest =
+        inherited_manifest->has_value() ? *inherited_manifest : std::nullopt;
     for (const auto& mount : ordered_mounts) {
         if (mount.service_proxy_manifest_digest) {
             service_proxy_manifest_digest = mount.service_proxy_manifest_digest;
@@ -653,7 +752,8 @@ auto bind_managed_launch_projection(
     const profile& prof,
     const std::vector<std::string>& resolved_argv,
     std::span<const supervisor::linux_detail::session_mount> mounts,
-    std::string_view controller_plan_digest
+    std::string_view controller_plan_digest,
+    std::span<const inherited_stream_descriptor> inherited_streams
 ) -> std::expected<managed_launch_binding, std::string> {
     if (resolved_argv.empty()) {
         return std::unexpected(std::string{"invalid resolved managed launch argv"});
@@ -669,7 +769,7 @@ auto bind_managed_launch_projection(
         );
     }
     auto binding = bind_managed_launch_projection_from_fd(
-        prof, resolved_argv, mounts, controller_plan_digest, executable_fd
+        prof, resolved_argv, mounts, controller_plan_digest, executable_fd, inherited_streams
     );
     ::close(executable_fd);
     return binding;

@@ -446,8 +446,8 @@ while an unbound arbitrary service—including one allowed for `pi`—remains a
 generic proxy and advertises no Sage channel capability. Codex-only and
 OpenCode-only endpoint sets likewise advertise schema version `0`.
 
-Each admitted session receives a read-only directory at
-`/run/glove-services/local` and only
+When the adapter transport selector is absent, each admitted session receives
+the compatibility read-only directory at `/run/glove-services/local` and only
 `GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local`. Alias sockets are `0600`;
 their owner-`0700` directory and the configured upstream parent remain
 descriptor-pinned. Endpoint pathname identity is checked before and after
@@ -456,6 +456,21 @@ replacement. The operator and other processes under the service UID are trusted
 endpoint authority. Linux `SO_PEERCRED` must match the configured UID at both
 guest and upstream connections; this detects drift and mismatched peers, not
 application-process identity.
+
+For the owner-selected `inherited-stream-v1` adapter transport, Glove instead
+creates one nonblocking close-on-exec `AF_UNIX` stream socketpair for the exact
+adapter-bound alias. The child receives the guest endpoint at descriptor 3,
+`GLOVE_LOCAL_SERVICE_FDS_V1={"<alias>":3}`, and the adapter-owned alias selector.
+No local-service pathname, legacy endpoint/root/owner tuple, secret, network
+route, or other configured service descriptor is projected. The clone/exec lane
+installs only the committed descriptor and closes every undeclared descriptor.
+The supervisor retains the peer for sequential bounded exchanges; framing,
+upstream identity drift, timeout, cancellation, audit-gate, or transport failure
+permanently closes the stream. Mixed or operator-supplied reserved environment
+authority is rejected before launch. The managed-launch digest binds the
+transport, alias/FD map, both socket endpoint identities, and the existing
+upstream manifest. Capability version `1` requires this exact inherited
+composition; the compatibility pathname transport continues to advertise `0`.
 
 Before any path materialization, Glove compares each resolved grant descriptor
 with the descriptor-pinned endpoint parent and every actual ancestor descriptor. A grant

@@ -112,6 +112,15 @@ struct listener_record {
     file_identity identity;
 };
 
+struct inherited_stream_record {
+    std::shared_ptr<const pinned_endpoint> endpoint;
+    unique_fd supervisor;
+    unique_fd guest;
+    file_identity supervisor_identity;
+    file_identity guest_identity;
+    int child_fd = -1;
+};
+
 auto valid_identifier(std::string_view value, std::size_t max_bytes = 64U) -> bool {
     return !value.empty() && value.size() <= max_bytes && value != "." && value != ".." &&
            std::ranges::all_of(value, [](const char byte) {
@@ -257,6 +266,40 @@ auto inspect_socket(int parent, std::string_view name)
         return std::unexpected(std::string{"local service endpoint is unavailable"});
     }
     return identity(status);
+}
+
+auto create_inherited_socketpair() -> std::expected<std::pair<unique_fd, unique_fd>, std::string> {
+    int descriptors[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, descriptors) != 0) {
+        return std::unexpected(std::string{"local service inherited stream is unavailable"});
+    }
+    unique_fd first{descriptors[0]};
+    unique_fd second{descriptors[1]};
+    if (::fchmod(first.get(), 0600) != 0 || ::fchmod(second.get(), 0600) != 0) {
+        return std::unexpected(std::string{"local service inherited stream is unavailable"});
+    }
+    for (const int descriptor : {first.get(), second.get()}) {
+        struct stat status{};
+        int domain = 0;
+        int type = 0;
+        int accept_connection = 0;
+        const int descriptor_flags = ::fcntl(descriptor, F_GETFD);
+        const int status_flags = ::fcntl(descriptor, F_GETFL);
+        socklen_t size = sizeof(int);
+        if (::fstat(descriptor, &status) != 0 || !S_ISSOCK(status.st_mode) ||
+            status.st_uid != ::geteuid() || status.st_nlink != 1 || status.st_dev == 0 ||
+            status.st_ino == 0 || (static_cast<unsigned int>(status.st_mode) & 0777U) != 0600U ||
+            descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0 || status_flags < 0 ||
+            (status_flags & O_NONBLOCK) == 0 ||
+            ::getsockopt(descriptor, SOL_SOCKET, SO_DOMAIN, &domain, &size) != 0 ||
+            domain != AF_UNIX || ::getsockopt(descriptor, SOL_SOCKET, SO_TYPE, &type, &size) != 0 ||
+            type != SOCK_STREAM ||
+            ::getsockopt(descriptor, SOL_SOCKET, SO_ACCEPTCONN, &accept_connection, &size) != 0 ||
+            accept_connection != 0) {
+            return std::unexpected(std::string{"local service inherited stream is unavailable"});
+        }
+    }
+    return std::pair{std::move(first), std::move(second)};
 }
 
 auto endpoint_current(const pinned_endpoint& endpoint) noexcept -> bool {
@@ -421,6 +464,14 @@ struct local_service_proxy_session::implementation {
                 static_cast<void>(::shutdown(listener.listener.get(), SHUT_RDWR));
             }
         }
+        for (auto& stream : inherited_streams) {
+            if (stream.supervisor.get() >= 0) {
+                static_cast<void>(::shutdown(stream.supervisor.get(), SHUT_RDWR));
+            }
+            if (stream.guest.get() >= 0) {
+                static_cast<void>(::shutdown(stream.guest.get(), SHUT_RDWR));
+            }
+        }
         workers.clear();
         for (const auto& listener : listeners) {
             struct stat status{};
@@ -451,10 +502,13 @@ struct local_service_proxy_session::implementation {
     file_identity directory_identity;
     std::string session_id;
     std::string manifest;
+    std::optional<std::string> adapter_environment;
+    bool inherited = false;
     std::uint64_t io_timeout_ms = 0;
     std::shared_ptr<audit::sink> audit;
     std::vector<std::shared_ptr<const pinned_endpoint>> endpoints;
     std::vector<listener_record> listeners;
+    std::vector<inherited_stream_record> inherited_streams;
     std::vector<std::vector<pollfd>> worker_poll_sets;
     std::vector<std::jthread> workers;
 };
@@ -577,6 +631,96 @@ void serve_connection(
     }
 }
 
+void inherited_worker(
+    local_service_proxy_session::implementation& state,
+    std::size_t endpoint_index,
+    const std::stop_token& stop
+) noexcept {
+    const int socket = state.inherited_streams[endpoint_index].supervisor.get();
+
+    struct shutdown_guard {
+        int descriptor = -1;
+
+        ~shutdown_guard() {
+            if (descriptor >= 0) {
+                static_cast<void>(::shutdown(descriptor, SHUT_RDWR));
+            }
+        }
+    } shutdown_on_exit{socket};
+
+    const int duplicate = ::fcntl(socket, F_DUPFD_CLOEXEC, 3);
+    if (duplicate < 0) {
+        return;
+    }
+    auto guest = guest_channel_transport::adopt(
+        duplicate, max_frame_bytes, static_cast<std::uint32_t>(::geteuid())
+    );
+    if (!guest) {
+        return;
+    }
+    while (!stop.stop_requested()) {
+        pollfd readiness{.fd = socket, .events = POLLIN, .revents = 0};
+        const int ready = ::poll(&readiness, 1, 100);
+        if (ready == 0 || (ready < 0 && errno == EINTR)) {
+            continue;
+        }
+        if (ready < 0 || (static_cast<unsigned short>(readiness.revents) &
+                          static_cast<unsigned short>(POLLIN | POLLHUP | POLLERR)) == 0U) {
+            return;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        const auto deadline = started + std::chrono::milliseconds{state.io_timeout_ms};
+        const auto append_failure = [&] {
+            static_cast<void>(append_delivery_audit(
+                state,
+                endpoint_index,
+                "delivery_failed",
+                mcp::tool_call_status::transport_error,
+                started,
+                deadline
+            ));
+        };
+        auto request = (*guest)->receive_frame(deadline, stop);
+        if (!request) {
+            if (!stop.stop_requested()) {
+                append_failure();
+            }
+            return;
+        }
+        const auto request_boundary_clean = [&] {
+            char trailing = 0;
+            const auto pending = ::recv(socket, &trailing, 1, MSG_PEEK | MSG_DONTWAIT);
+            return pending < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        };
+        if (!request_boundary_clean()) {
+            append_failure();
+            return;
+        }
+        auto response =
+            exchange_upstream(*state.endpoints[endpoint_index], *request, deadline, stop);
+        if (!response || !request_boundary_clean()) {
+            append_failure();
+            return;
+        }
+        const auto audit = append_delivery_audit(
+            state,
+            endpoint_index,
+            "delivery_pending",
+            mcp::tool_call_status::transport_error,
+            started,
+            deadline
+        );
+        if (!audit.recorded || !audit.within_deadline ||
+            !(*guest)->send_frame(*response, deadline, stop)) {
+            append_failure();
+            return;
+        }
+        static_cast<void>(append_delivery_audit(
+            state, endpoint_index, "delivered", mcp::tool_call_status::ok, started, deadline
+        ));
+    }
+}
+
 void worker(
     local_service_proxy_session::implementation& state,
     std::size_t worker_index,
@@ -624,7 +768,7 @@ local_service_proxy_session::~local_service_proxy_session() = default;
 
 auto local_service_proxy_session::mount() const
     -> std::expected<supervisor::linux_detail::session_mount, std::string> {
-    if (!state_ || state_->directory.get() < 0) {
+    if (!state_ || state_->inherited || state_->directory.get() < 0) {
         return std::unexpected(std::string{"local service session is unavailable"});
     }
     struct stat status{};
@@ -673,6 +817,82 @@ auto local_service_proxy_session::mount() const
     }
 }
 
+auto local_service_proxy_session::release_inherited_streams()
+    -> std::expected<std::vector<local_service_inherited_stream>, std::string> {
+    if (!state_ || !state_->inherited || state_->inherited_streams.empty()) {
+        return std::unexpected(std::string{"local service inherited stream is unavailable"});
+    }
+    try {
+        std::vector<local_service_inherited_stream> result;
+        result.reserve(state_->inherited_streams.size());
+        for (const auto& stream : state_->inherited_streams) {
+            struct stat guest_status{};
+            struct stat supervisor_status{};
+            if (stream.guest.get() < 3 || !endpoint_current(*stream.endpoint) ||
+                ::fstat(stream.guest.get(), &guest_status) != 0 ||
+                ::fstat(stream.supervisor.get(), &supervisor_status) != 0 ||
+                !same_identity(stream.guest_identity, guest_status) ||
+                !same_identity(stream.supervisor_identity, supervisor_status)) {
+                return std::unexpected(
+                    std::string{"local service inherited stream is unavailable"}
+                );
+            }
+            result.push_back({
+                .alias = stream.endpoint->alias,
+                .descriptor_fd = -1,
+                .child_fd = stream.child_fd,
+                .device = stream.guest_identity.device,
+                .inode = stream.guest_identity.inode,
+                .uid = stream.guest_identity.uid,
+                .mode = stream.guest_identity.mode,
+                .links = stream.guest_identity.links,
+                .peer_device = stream.supervisor_identity.device,
+                .peer_inode = stream.supervisor_identity.inode,
+                .peer_uid = stream.supervisor_identity.uid,
+                .peer_mode = stream.supervisor_identity.mode,
+                .peer_links = stream.supervisor_identity.links,
+                .manifest_digest = state_->manifest,
+            });
+        }
+        for (std::size_t index = 0; index < result.size(); ++index) {
+            result[index].descriptor_fd = state_->inherited_streams[index].guest.release();
+        }
+        return result;
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(std::string{"allocate local service inherited stream set"});
+    }
+}
+
+auto local_service_proxy_session::adapter_environment() const -> std::optional<std::string> {
+    return state_ ? state_->adapter_environment : std::nullopt;
+}
+
+auto local_service_proxy_session::inherited() const noexcept -> bool {
+    return state_ && state_->inherited;
+}
+
+auto local_service_proxy_session::inherited_environment() const
+    -> std::expected<std::string, std::string> {
+    if (!state_ || !state_->inherited || state_->inherited_streams.empty()) {
+        return std::unexpected(std::string{"local service inherited stream is unavailable"});
+    }
+    try {
+        std::string result{inherited_stream_environment_name};
+        result += "={";
+        for (std::size_t index = 0; index < state_->inherited_streams.size(); ++index) {
+            if (index != 0U) {
+                result.push_back(',');
+            }
+            result += "\"" + state_->inherited_streams[index].endpoint->alias +
+                      "\":" + std::to_string(state_->inherited_streams[index].child_fd);
+        }
+        result.push_back('}');
+        return result;
+    } catch (const std::bad_alloc&) {
+        return std::unexpected(std::string{"allocate local service inherited environment"});
+    }
+}
+
 local_service_proxy_factory::local_service_proxy_factory(
     [[maybe_unused]] construction_token token, std::unique_ptr<implementation> state
 ) noexcept
@@ -688,8 +908,16 @@ auto local_service_proxy_factory::create(
         const bool adapter_valid =
             !adapter ||
             (valid_identifier(adapter->adapter_id, 128U) &&
-             valid_identifier(adapter->channel_schema_id, 128U) && !adapter->runtime_ids.empty() &&
-             std::ranges::is_sorted(adapter->runtime_ids) &&
+             valid_identifier(adapter->channel_schema_id, 128U) &&
+             (adapter->transport_id.empty() ||
+              adapter->transport_id == inherited_stream_transport) &&
+             (adapter->transport_id == inherited_stream_transport
+                  ? adapter->service_alias && valid_identifier(*adapter->service_alias) &&
+                        adapter->service_alias_environment &&
+                        !adapter->service_alias_environment->empty() &&
+                        adapter->service_alias_environment->find('\0') == std::string::npos
+                  : !adapter->service_alias && !adapter->service_alias_environment) &&
+             !adapter->runtime_ids.empty() && std::ranges::is_sorted(adapter->runtime_ids) &&
              std::ranges::adjacent_find(adapter->runtime_ids) == adapter->runtime_ids.end() &&
              std::ranges::all_of(adapter->runtime_ids, valid_runtime_id) && adapter->channels &&
              adapter->channels->frozen() && !adapter->channels->empty() &&
@@ -768,6 +996,22 @@ auto local_service_proxy_factory::create(
                 })
             );
         }
+        if (state->guest_channel_adapter &&
+            state->guest_channel_adapter->transport_id == inherited_stream_transport) {
+            const auto selected = std::ranges::find(
+                state->endpoints,
+                *state->guest_channel_adapter->service_alias,
+                [](const auto& endpoint) -> std::string_view { return endpoint->alias; }
+            );
+            if (selected == state->endpoints.end() ||
+                !std::ranges::all_of(
+                    state->guest_channel_adapter->runtime_ids, [&](const auto& runtime_id) {
+                        return std::ranges::binary_search((*selected)->runtime_ids, runtime_id);
+                    }
+                )) {
+                return std::unexpected(std::string{"local service proxy configuration is invalid"});
+            }
+        }
         return std::shared_ptr<local_service_proxy_factory>{
             new local_service_proxy_factory{construction_token{}, std::move(state)}
         };
@@ -837,8 +1081,12 @@ auto local_service_proxy_factory::prepare_session(
         }
         std::vector<std::shared_ptr<const pinned_endpoint>> selected;
         selected.reserve(state_->endpoints.size());
+        const bool inherited =
+            state_->guest_channel_adapter &&
+            state_->guest_channel_adapter->transport_id == inherited_stream_transport;
         for (const auto& endpoint : state_->endpoints) {
-            if (std::ranges::binary_search(endpoint->runtime_ids, runtime_id)) {
+            if (std::ranges::binary_search(endpoint->runtime_ids, runtime_id) &&
+                (!inherited || endpoint->alias == *state_->guest_channel_adapter->service_alias)) {
                 selected.push_back(endpoint);
             }
         }
@@ -859,6 +1107,43 @@ auto local_service_proxy_factory::prepare_session(
         session->io_timeout_ms = state_->io_timeout_ms;
         session->audit = state_->audit;
         session->endpoints = std::move(selected);
+        session->inherited = inherited;
+        if (session->inherited) {
+            session->adapter_environment = state_->guest_channel_adapter->service_alias_environment;
+            session->inherited_streams.reserve(session->endpoints.size());
+            for (std::size_t index = 0; index < session->endpoints.size(); ++index) {
+                auto pair = create_inherited_socketpair();
+                if (!pair) {
+                    return std::unexpected(pair.error());
+                }
+                struct stat supervisor_status{};
+                struct stat guest_status{};
+                if (::fstat(pair->first.get(), &supervisor_status) != 0 ||
+                    ::fstat(pair->second.get(), &guest_status) != 0) {
+                    return std::unexpected(
+                        std::string{"local service inherited stream is unavailable"}
+                    );
+                }
+                session->inherited_streams.push_back({
+                    .endpoint = session->endpoints[index],
+                    .supervisor = std::move(pair->first),
+                    .guest = std::move(pair->second),
+                    .supervisor_identity = identity(supervisor_status),
+                    .guest_identity = identity(guest_status),
+                    .child_fd = static_cast<int>(index + 3U),
+                });
+            }
+            session->workers.reserve(session->inherited_streams.size());
+            for (std::size_t index = 0; index < session->inherited_streams.size(); ++index) {
+                session->workers.emplace_back([owned = session.get(),
+                                               index](const std::stop_token& stop) {
+                    inherited_worker(*owned, index, stop);
+                });
+            }
+            return std::unique_ptr<local_service_proxy_session>{
+                new local_service_proxy_session{std::move(session)}
+            };
+        }
         session->listeners.reserve(session->endpoints.size());
         session->workers.reserve(state_->max_concurrency);
         session->worker_poll_sets.reserve(state_->max_concurrency);
@@ -973,6 +1258,9 @@ auto local_service_proxy_factory::capability_current(
     const session_registry& registry
 ) const noexcept -> bool {
     return operational() && state_->registry.get() == &registry && state_->guest_channel_adapter &&
+           state_->guest_channel_adapter->transport_id == inherited_stream_transport &&
+           state_->guest_channel_adapter->service_alias.has_value() &&
+           state_->guest_channel_adapter->service_alias_environment.has_value() &&
            state_->adapter_catalog_admits_schema;
 }
 
@@ -990,7 +1278,9 @@ auto local_service_proxy_factory::try_seal(std::shared_ptr<const linux_session_r
     if (!runtime || !state_ || !state_->registry) {
         return std::unexpected(std::string{"local service proxy composition is unavailable"});
     }
-    if (!state_->guest_channel_adapter || !runtime->local_service_runtime_intersection(*this)) {
+    if (!state_->guest_channel_adapter ||
+        state_->guest_channel_adapter->transport_id != inherited_stream_transport ||
+        !runtime->local_service_runtime_intersection(*this)) {
         return std::optional<std::shared_ptr<const local_service_proxy_capability>>{};
     }
     if (!sealed_for(*runtime, *state_->registry)) {

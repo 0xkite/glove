@@ -15,6 +15,7 @@
 
 #include <fcntl.h>
 #include <linux/mount.h>
+#include <poll.h>
 #include <sched.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -639,11 +640,22 @@ auto run(bool privileged_only) -> int {
         REQUIRE(::rmdir(attach_target.c_str()) == 0);
     }
 
-    auto adapter = glove::adapters::sage::resolve_guest_channel_adapter(
-        "sage-observation", "sage.glove-observation.v1"
+    auto inherited_adapter = glove::adapters::sage::resolve_guest_channel_adapter(
+        "sage-observation", "sage.glove-observation.v1", "inherited-stream-v1"
     );
-    REQUIRE(adapter.has_value());
-    const auto catalog = (*adapter)->channels;
+    REQUIRE(inherited_adapter.has_value());
+    const auto catalog = (*inherited_adapter)->channels;
+    auto adapter = std::make_shared<const glove::control::guest_channel_adapter_binding>(
+        glove::control::guest_channel_adapter_binding{
+            .adapter_id = "sage-observation",
+            .channel_schema_id = "sage.glove-observation.v1",
+            .transport_id = {},
+            .runtime_ids = {"pi"},
+            .channels = catalog,
+            .service_alias = std::nullopt,
+            .service_alias_environment = std::nullopt,
+        }
+    );
     auto registry = glove::control::session_registry::open_or_create(
         temporary.root() / "sessions.journal",
         shared_validator,
@@ -653,6 +665,148 @@ auto run(bool privileged_only) -> int {
     );
     REQUIRE(registry.has_value());
     auto shared_registry = std::shared_ptr<glove::control::session_registry>{std::move(*registry)};
+
+    const auto inherited_runtime = temporary.root() / "inherited-runtime";
+    REQUIRE(make_owner_directory(inherited_runtime));
+    auto inherited_audit = glove::audit::make_memory_sink();
+    const auto unrelated_endpoint = upstream / "tooling.sock";
+    auto unrelated_listener = make_listener(unrelated_endpoint);
+    REQUIRE(unrelated_listener.get() >= 0);
+    auto inherited_options =
+        options_for(inherited_runtime, endpoint, inherited_audit, *inherited_adapter, 250, 2);
+    inherited_options.endpoints.push_back({
+        .alias = "tooling.v1",
+        .socket_path = unrelated_endpoint,
+        .runtime_ids = {"pi"},
+    });
+    auto inherited_factory =
+        local_service_proxy_factory::create(std::move(inherited_options), shared_registry);
+    REQUIRE(inherited_factory.has_value());
+    auto inherited_session = (*inherited_factory)->prepare_session("inherited-session", "pi");
+    REQUIRE(inherited_session.has_value());
+    REQUIRE((*inherited_session)->inherited());
+    REQUIRE(!(*inherited_session)->mount().has_value());
+    REQUIRE(
+        (*inherited_session)->inherited_environment() ==
+        R"(GLOVE_LOCAL_SERVICE_FDS_V1={"sage-observe":3})"
+    );
+    REQUIRE(
+        (*inherited_session)->adapter_environment() ==
+        std::optional<std::string>{"GLOVE_GUEST_CHANNEL_SERVICE_ALIAS=sage-observe"}
+    );
+    auto inherited_streams = (*inherited_session)->release_inherited_streams();
+    REQUIRE(inherited_streams.has_value());
+    REQUIRE(inherited_streams->size() == 1U);
+    REQUIRE(inherited_streams->front().alias == "sage-observe");
+    REQUIRE(inherited_streams->front().descriptor_fd >= 3);
+    REQUIRE(inherited_streams->front().child_fd == 3);
+    struct stat inherited_status{};
+    REQUIRE(::fstat(inherited_streams->front().descriptor_fd, &inherited_status) == 0);
+    REQUIRE(S_ISSOCK(inherited_status.st_mode));
+    REQUIRE((static_cast<unsigned int>(inherited_status.st_mode) & 0777U) == 0600U);
+    REQUIRE(inherited_status.st_nlink == 1);
+    auto inherited_client = guest_channel_transport::adopt(
+        std::exchange(inherited_streams->front().descriptor_fd, -1),
+        16U * 1024U,
+        static_cast<std::uint32_t>(::geteuid())
+    );
+    REQUIRE(inherited_client.has_value());
+    for (const auto& [request, response] :
+         std::array{std::pair{"first", "one"}, std::pair{"second", "two"}}) {
+        std::atomic_bool inherited_exact{false};
+        auto exchange = exchange_once(listener.get(), request, response, inherited_exact);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        REQUIRE((*inherited_client)->send_frame(request, deadline).has_value());
+        auto received = (*inherited_client)->receive_frame(deadline);
+        REQUIRE(received.has_value());
+        REQUIRE(*received == response);
+        exchange.join();
+        REQUIRE(inherited_exact.load());
+    }
+    inherited_client->reset();
+    inherited_session->reset();
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    auto inherited_events = inherited_audit->take();
+    REQUIRE(inherited_events.size() >= 4U);
+    REQUIRE(std::ranges::count_if(inherited_events, [](const auto& event) {
+                return event.error_message == "delivered";
+            }) == 2);
+    REQUIRE(std::filesystem::is_empty(inherited_runtime));
+
+    auto pipelined_session = (*inherited_factory)->prepare_session("pipelined", "pi");
+    REQUIRE(pipelined_session.has_value());
+    auto pipelined_streams = (*pipelined_session)->release_inherited_streams();
+    REQUIRE(pipelined_streams.has_value());
+    const int pipelined_fd = std::exchange(pipelined_streams->front().descriptor_fd, -1);
+    const std::array<unsigned char, 10> pipelined{{0, 0, 0, 1, 'a', 0, 0, 0, 1, 'b'}};
+    REQUIRE(
+        ::send(pipelined_fd, pipelined.data(), pipelined.size(), MSG_NOSIGNAL) ==
+        static_cast<ssize_t>(pipelined.size())
+    );
+    pollfd closed{.fd = pipelined_fd, .events = POLLIN | POLLHUP, .revents = 0};
+    REQUIRE(::poll(&closed, 1, 1'000) > 0);
+    std::array<char, 1> closed_byte{};
+    REQUIRE(::recv(pipelined_fd, closed_byte.data(), closed_byte.size(), 0) == 0);
+    ::close(pipelined_fd);
+    pipelined_session->reset();
+    REQUIRE(inherited_audit->take().size() == 1U);
+
+    const auto expect_inherited_rejection = [&](std::string_view session_id,
+                                                std::span<const unsigned char> bytes) -> bool {
+        auto rejected_session =
+            (*inherited_factory)->prepare_session(std::string{session_id}, "pi");
+        if (!rejected_session) {
+            return false;
+        }
+        auto rejected_streams = (*rejected_session)->release_inherited_streams();
+        if (!rejected_streams) {
+            return false;
+        }
+        const int descriptor = std::exchange(rejected_streams->front().descriptor_fd, -1);
+        if (::send(descriptor, bytes.data(), bytes.size(), MSG_NOSIGNAL) !=
+            static_cast<ssize_t>(bytes.size())) {
+            ::close(descriptor);
+            return false;
+        }
+        pollfd rejected{.fd = descriptor, .events = POLLIN | POLLHUP, .revents = 0};
+        const bool closed_ready = ::poll(&rejected, 1, 1'000) > 0;
+        std::array<char, 1> byte{};
+        const bool closed_stream =
+            closed_ready && ::recv(descriptor, byte.data(), byte.size(), 0) == 0;
+        ::close(descriptor);
+        rejected_session->reset();
+        return closed_stream;
+    };
+    const std::array<unsigned char, 4> empty_frame{{0, 0, 0, 0}};
+    REQUIRE(expect_inherited_rejection("empty-frame", empty_frame));
+    REQUIRE(inherited_audit->take().size() == 1U);
+    const std::array<unsigned char, 4> oversized_frame{{0, 0, 0x40, 1}};
+    REQUIRE(expect_inherited_rejection("oversized-frame", oversized_frame));
+    REQUIRE(inherited_audit->take().size() == 1U);
+    const std::array<unsigned char, 2> partial_frame{{0, 0}};
+    REQUIRE(expect_inherited_rejection("partial-frame", partial_frame));
+    REQUIRE(inherited_audit->take().empty());
+
+    auto drift_session = (*inherited_factory)->prepare_session("endpoint-drift", "pi");
+    REQUIRE(drift_session.has_value());
+    auto drift_streams = (*drift_session)->release_inherited_streams();
+    REQUIRE(drift_streams.has_value());
+    const int drift_fd = std::exchange(drift_streams->front().descriptor_fd, -1);
+    REQUIRE(::chmod(endpoint.c_str(), 0660) == 0);
+    const std::array<unsigned char, 5> drift_frame{{0, 0, 0, 1, 'x'}};
+    REQUIRE(
+        ::send(drift_fd, drift_frame.data(), drift_frame.size(), MSG_NOSIGNAL) ==
+        static_cast<ssize_t>(drift_frame.size())
+    );
+    pollfd drift_closed{.fd = drift_fd, .events = POLLIN | POLLHUP, .revents = 0};
+    REQUIRE(::poll(&drift_closed, 1, 1'000) > 0);
+    std::array<char, 1> drift_byte{};
+    REQUIRE(::recv(drift_fd, drift_byte.data(), drift_byte.size(), 0) == 0);
+    REQUIRE(::chmod(endpoint.c_str(), 0600) == 0);
+    ::close(drift_fd);
+    drift_session->reset();
+    REQUIRE(inherited_audit->take().size() == 1U);
+
     // Regression (Workflow #218 Ghost E2E): every prepare_session mkdirat(2)s
     // a svc-* staging directory under the runtime root, and on ext4/tmpfs/APFS
     // a directory's st_nlink is 2 plus its subdirectory count. The operational
@@ -670,7 +824,7 @@ auto run(bool privileged_only) -> int {
         const auto shared_runtime_root = temporary.root() / "shared-runtime-root";
         REQUIRE(make_owner_directory(shared_runtime_root));
         auto first_factory = local_service_proxy_factory::create(
-            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), *adapter),
+            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), adapter),
             shared_registry
         );
         REQUIRE(first_factory.has_value());
@@ -679,7 +833,7 @@ auto run(bool privileged_only) -> int {
         REQUIRE(first_session.has_value());
         REQUIRE((*first_factory)->operational());
         auto second_factory = local_service_proxy_factory::create(
-            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), *adapter),
+            options_for(shared_runtime_root, endpoint, glove::audit::make_memory_sink(), adapter),
             shared_registry
         );
         REQUIRE(second_factory.has_value());
@@ -698,7 +852,7 @@ auto run(bool privileged_only) -> int {
 
     auto audit = glove::audit::make_memory_sink();
     auto factory = local_service_proxy_factory::create(
-        options_for(runtime, endpoint, audit, *adapter), shared_registry
+        options_for(runtime, endpoint, audit, adapter), shared_registry
     );
     REQUIRE(factory.has_value());
     REQUIRE((*factory)->operational());
@@ -746,7 +900,7 @@ auto run(bool privileged_only) -> int {
     const auto endpoint_root_alias = temporary.root() / "endpoint-root-alias";
     REQUIRE(::symlink(real_endpoint_root.c_str(), endpoint_root_alias.c_str()) == 0);
     auto alias_factory = local_service_proxy_factory::create(
-        options_for(runtime, endpoint_root_alias / "child/aliased.sock", audit, *adapter),
+        options_for(runtime, endpoint_root_alias / "child/aliased.sock", audit, adapter),
         shared_registry
     );
     REQUIRE(alias_factory.has_value());
@@ -773,8 +927,11 @@ auto run(bool privileged_only) -> int {
         glove::control::guest_channel_adapter_binding{
             .adapter_id = "sage-observation",
             .channel_schema_id = "sage.unregistered.v1",
+            .transport_id = {},
             .runtime_ids = {"pi"},
             .channels = catalog,
+            .service_alias = std::nullopt,
+            .service_alias_environment = std::nullopt,
         }
     );
     REQUIRE(!local_service_proxy_factory::create(
@@ -879,7 +1036,7 @@ auto run(bool privileged_only) -> int {
 
     auto terminal_failure_audit = std::make_shared<fail_terminal_sink>();
     auto terminal_failure_factory = local_service_proxy_factory::create(
-        options_for(runtime, endpoint, terminal_failure_audit, *adapter), shared_registry
+        options_for(runtime, endpoint, terminal_failure_audit, adapter), shared_registry
     );
     REQUIRE(terminal_failure_factory.has_value());
     auto terminal_failure_session =
@@ -917,7 +1074,7 @@ auto run(bool privileged_only) -> int {
 
     auto timeout_audit = glove::audit::make_memory_sink();
     auto timeout_factory = local_service_proxy_factory::create(
-        options_for(runtime, endpoint, timeout_audit, *adapter, 100, 1), shared_registry
+        options_for(runtime, endpoint, timeout_audit, adapter, 100, 1), shared_registry
     );
     REQUIRE(timeout_factory.has_value());
     auto timeout_session = (*timeout_factory)->prepare_session("timeout", "pi");
@@ -971,7 +1128,7 @@ auto run(bool privileged_only) -> int {
 
     auto slow_audit = std::make_shared<delayed_sink>(std::chrono::milliseconds{150});
     auto slow_audit_factory = local_service_proxy_factory::create(
-        options_for(runtime, endpoint, slow_audit, *adapter, 100, 1), shared_registry
+        options_for(runtime, endpoint, slow_audit, adapter, 100, 1), shared_registry
     );
     REQUIRE(slow_audit_factory.has_value());
     auto slow_audit_session = (*slow_audit_factory)->prepare_session("audit-deadline", "pi");
@@ -1000,7 +1157,7 @@ auto run(bool privileged_only) -> int {
 
     auto bounded_audit = glove::audit::make_memory_sink();
     auto bounded_factory = local_service_proxy_factory::create(
-        options_for(runtime, endpoint, bounded_audit, *adapter, 1'000, 1), shared_registry
+        options_for(runtime, endpoint, bounded_audit, adapter, 1'000, 1), shared_registry
     );
     REQUIRE(bounded_factory.has_value());
     auto bounded_session = (*bounded_factory)->prepare_session("bounded", "pi");
@@ -1071,7 +1228,7 @@ auto run(bool privileged_only) -> int {
     auto later_listener = make_listener(later_endpoint);
     REQUIRE(later_listener.get() >= 0);
 
-    auto non_pi_options = options_for(runtime, endpoint, audit, *adapter, 1'000, 1);
+    auto non_pi_options = options_for(runtime, endpoint, audit, adapter, 1'000, 1);
     non_pi_options.endpoints = {
         {
             .alias = "codex-only",
@@ -1090,7 +1247,7 @@ auto run(bool privileged_only) -> int {
     REQUIRE((*non_pi_factory)->prepare_session("codex-session", "codex").has_value());
     REQUIRE((*non_pi_factory)->prepare_session("opencode-session", "opencode").has_value());
 
-    auto fair_options = options_for(runtime, endpoint, audit, *adapter, 2'000, 1);
+    auto fair_options = options_for(runtime, endpoint, audit, adapter, 2'000, 1);
     fair_options.endpoints = {
         {
             .alias = "a-hot",
@@ -1175,9 +1332,7 @@ auto run(bool privileged_only) -> int {
         );
         if (!preparer_result) {
             std::fprintf(
-                stderr,
-                "Linux capability setup failed: %s\n",
-                preparer_result.error().c_str()
+                stderr, "Linux capability setup failed: %s\n", preparer_result.error().c_str()
             );
             return 1;
         }
@@ -1190,7 +1345,7 @@ auto run(bool privileged_only) -> int {
             )
                                            .count());
         {
-            auto pi_only_options = options_for(runtime, endpoint, audit, *adapter);
+            auto pi_only_options = options_for(runtime, endpoint, audit, adapter);
             pi_only_options.endpoints.front().runtime_ids = {"pi"};
             auto pi_only_factory =
                 local_service_proxy_factory::create(std::move(pi_only_options), shared_registry);
@@ -1280,8 +1435,51 @@ auto run(bool privileged_only) -> int {
         REQUIRE(::fcntl(reused_install_descriptor.get(), F_GETFD) >= 0);
 #endif
 
+        auto capability_preparer_result =
+            glove::control::linux_detail::linux_session_preparer::create(
+                materializations.string(), audit, *inherited_factory
+            );
+        REQUIRE(capability_preparer_result.has_value());
+        auto capability_preparer =
+            std::make_shared<glove::control::linux_detail::linux_session_preparer>(
+                std::move(*capability_preparer_result)
+            );
+        auto inherited_inputs = preparation_inputs(now_ms + 2U);
+        inherited_inputs.session.session_id = "inherited-preparation";
+        inherited_inputs.authorization_id = "approval-inherited-preparation";
+        auto inherited_prepared =
+            capability_preparer->prepare(std::move(inherited_inputs), now_ms + 2U);
+        REQUIRE(inherited_prepared.has_value());
+        REQUIRE(
+            std::ranges::find(
+                inherited_prepared->profile.environment,
+                R"(GLOVE_LOCAL_SERVICE_FDS_V1={"sage-observe":3})"
+            ) != inherited_prepared->profile.environment.end()
+        );
+        REQUIRE(
+            std::ranges::find(
+                inherited_prepared->profile.environment,
+                "GLOVE_GUEST_CHANNEL_SERVICE_ALIAS=sage-observe"
+            ) != inherited_prepared->profile.environment.end()
+        );
+        REQUIRE(std::ranges::none_of(inherited_prepared->lifecycle->mounts(), [](const auto& item) {
+            return item.alias == "local-services";
+        }));
+        REQUIRE(inherited_prepared->lifecycle->inherited_streams().size() == 1U);
+
+        auto spoofed_inputs = preparation_inputs(now_ms + 3U);
+        spoofed_inputs.session.session_id = "inherited-spoof";
+        spoofed_inputs.authorization_id = "approval-inherited-spoof";
+        spoofed_inputs.launch.environment.push_back("GLOVE_LOCAL_SERVICE_ROOT=/tmp/spoof");
+        REQUIRE(!capability_preparer->prepare(std::move(spoofed_inputs), now_ms + 3U).has_value());
+        auto mixed_inputs = preparation_inputs(now_ms + 4U);
+        mixed_inputs.session.session_id = "inherited-mixed-authority";
+        mixed_inputs.authorization_id = "approval-inherited-mixed-authority";
+        mixed_inputs.launch.environment.push_back("GLOVE_GUEST_CHANNEL_ENDPOINT=/legacy.sock");
+        REQUIRE(!capability_preparer->prepare(std::move(mixed_inputs), now_ms + 4U).has_value());
+
         auto runtime_result = glove::control::linux_detail::linux_session_runtime::create(
-            shared_registry, preparer, {}
+            shared_registry, capability_preparer, {}
         );
         REQUIRE(runtime_result.has_value());
         auto concrete_runtime =
@@ -1289,22 +1487,22 @@ auto run(bool privileged_only) -> int {
                 std::move(*runtime_result)
         };
         REQUIRE(::chmod(endpoint.c_str(), 0660) == 0);
-        auto stale_endpoint_capability = (*factory)->try_seal(concrete_runtime);
+        auto stale_endpoint_capability = (*inherited_factory)->try_seal(concrete_runtime);
         REQUIRE(!stale_endpoint_capability.has_value());
         REQUIRE(::chmod(endpoint.c_str(), 0600) == 0);
-        REQUIRE(::chmod(runtime.c_str(), 0755) == 0);
-        auto stale_root_capability = (*factory)->try_seal(concrete_runtime);
+        REQUIRE(::chmod(inherited_runtime.c_str(), 0755) == 0);
+        auto stale_root_capability = (*inherited_factory)->try_seal(concrete_runtime);
         REQUIRE(!stale_root_capability.has_value());
-        REQUIRE(::chmod(runtime.c_str(), 0700) == 0);
+        REQUIRE(::chmod(inherited_runtime.c_str(), 0700) == 0);
 
-        auto sealed_result = (*factory)->try_seal(concrete_runtime);
+        auto sealed_result = (*inherited_factory)->try_seal(concrete_runtime);
         REQUIRE(sealed_result.has_value());
         REQUIRE(sealed_result->has_value());
         auto sealed = std::move(**sealed_result);
         REQUIRE(sealed->operational_for(concrete_runtime.get(), shared_registry.get()));
 #if !GLOVE_LOCAL_PROXY_TSAN
         allocation_fault::remaining.store(0);
-        auto failed_capability = (*factory)->try_seal(concrete_runtime);
+        auto failed_capability = (*inherited_factory)->try_seal(concrete_runtime);
         allocation_fault::remaining.store(-1);
         REQUIRE(!failed_capability.has_value());
 #endif
@@ -1321,7 +1519,7 @@ auto run(bool privileged_only) -> int {
             std::shared_ptr<glove::control::session_registry>{std::move(*lifetime_registry_result)};
         auto registry_mismatch_runtime_result =
             glove::control::linux_detail::linux_session_runtime::create(
-                lifetime_registry, preparer, {}
+                lifetime_registry, capability_preparer, {}
             );
         REQUIRE(registry_mismatch_runtime_result.has_value());
         auto registry_mismatch_runtime =
@@ -1329,11 +1527,14 @@ auto run(bool privileged_only) -> int {
                 std::move(*registry_mismatch_runtime_result)
         };
         auto registry_mismatch_capability =
-            (*factory)->try_seal(std::move(registry_mismatch_runtime));
+            (*inherited_factory)->try_seal(std::move(registry_mismatch_runtime));
         REQUIRE(!registry_mismatch_capability.has_value());
 
+        const auto lifetime_runtime_root = temporary.root() / "lifetime-runtime";
+        REQUIRE(make_owner_directory(lifetime_runtime_root));
         auto lifetime_factory_result = local_service_proxy_factory::create(
-            options_for(runtime, endpoint, audit, *adapter), lifetime_registry
+            options_for(lifetime_runtime_root, endpoint, audit, *inherited_adapter),
+            lifetime_registry
         );
         REQUIRE(lifetime_factory_result.has_value());
         auto lifetime_factory = std::move(*lifetime_factory_result);
@@ -1432,8 +1633,11 @@ auto run(bool privileged_only) -> int {
         REQUIRE(non_pi_capability.has_value());
         REQUIRE(!non_pi_capability->has_value());
 
+        const auto mismatched_runtime_root = temporary.root() / "mismatched-runtime";
+        REQUIRE(make_owner_directory(mismatched_runtime_root));
         auto mismatched_factory = local_service_proxy_factory::create(
-            options_for(runtime, endpoint, audit, *adapter), shared_registry
+            options_for(mismatched_runtime_root, endpoint, audit, *inherited_adapter),
+            shared_registry
         );
         REQUIRE(mismatched_factory.has_value());
         auto mismatched_capability = (*mismatched_factory)->try_seal(concrete_runtime);
@@ -1682,7 +1886,7 @@ auto run(bool privileged_only) -> int {
     const auto symlink_endpoint = symlink_parent / "service.sock";
     REQUIRE(::symlink(endpoint.c_str(), symlink_endpoint.c_str()) == 0);
     REQUIRE(!local_service_proxy_factory::create(
-                 options_for(runtime, symlink_endpoint, audit, *adapter), shared_registry
+                 options_for(runtime, symlink_endpoint, audit, adapter), shared_registry
     )
                  .has_value());
 
@@ -1699,7 +1903,7 @@ auto run(bool privileged_only) -> int {
         std::shared_ptr<glove::control::session_registry>{std::move(*failed_registry)};
     auto failing_audit = std::make_shared<rejecting_sink>();
     auto failing_factory = local_service_proxy_factory::create(
-        options_for(runtime, endpoint, failing_audit, *adapter, 250), failed_registry_shared
+        options_for(runtime, endpoint, failing_audit, adapter, 250), failed_registry_shared
     );
     REQUIRE(failing_factory.has_value());
     auto failing_session = (*failing_factory)->prepare_session("audit-failure", "pi");

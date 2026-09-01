@@ -91,6 +91,8 @@ struct local_service_proxy_endpoint {
 struct guest_channel_adapter_config {
     std::string adapter_id;
     std::string channel_schema_id;
+    // Missing preserves the pathname compatibility transport.
+    std::optional<std::string> transport_id;
 
     auto operator==(const guest_channel_adapter_config&) const -> bool = default;
 };

@@ -59,6 +59,7 @@ struct local_service_proxy_endpoint_wire {
 struct guest_channel_adapter_wire {
     std::string adapter_id;
     std::string channel_schema_id;
+    std::optional<std::string> transport_id;
 };
 
 struct local_service_proxy_wire {
@@ -449,7 +450,9 @@ auto validate(const config& value) -> result<void> {
         }
         if (proxy.guest_channel_adapter &&
             (!valid_opaque_id(proxy.guest_channel_adapter->adapter_id) ||
-             !valid_opaque_id(proxy.guest_channel_adapter->channel_schema_id))) {
+             !valid_opaque_id(proxy.guest_channel_adapter->channel_schema_id) ||
+             (proxy.guest_channel_adapter->transport_id &&
+              *proxy.guest_channel_adapter->transport_id != "inherited-stream-v1"))) {
             return std::unexpected(
                 std::string{"local service guest channel adapter binding is invalid"}
             );
@@ -573,6 +576,8 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
                               encoded.local_service_proxy->guest_channel_adapter->adapter_id,
                           .channel_schema_id =
                               encoded.local_service_proxy->guest_channel_adapter->channel_schema_id,
+                          .transport_id =
+                              encoded.local_service_proxy->guest_channel_adapter->transport_id,
                       }}
                     : std::nullopt,
             .endpoints = {},
@@ -609,6 +614,8 @@ auto encode_config(const config& value) -> result<std::string> {
                               value.local_service_proxy->guest_channel_adapter->adapter_id,
                           .channel_schema_id =
                               value.local_service_proxy->guest_channel_adapter->channel_schema_id,
+                          .transport_id =
+                              value.local_service_proxy->guest_channel_adapter->transport_id,
                       }}
                     : std::nullopt,
             .endpoints = {},

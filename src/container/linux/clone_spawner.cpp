@@ -363,6 +363,64 @@ void close_pipe_pair(int (&fds)[2]) noexcept {
     close_fd(fds[1]);
 }
 
+auto install_inherited_streams(std::span<const linux_detail::inherited_stream_descriptor> streams)
+    -> std::expected<void, std::string> {
+    if (streams.empty()) {
+        return {};
+    }
+    const int temporary_min = streams.back().child_fd + 1;
+    std::vector<owned_fd> temporary;
+    temporary.reserve(streams.size());
+    for (const auto& stream : streams) {
+        const int duplicate = ::fcntl(stream.descriptor_fd, F_DUPFD_CLOEXEC, temporary_min);
+        if (duplicate < 0) {
+            return std::unexpected(
+                std::string{"duplicate inherited stream: "} + errno_message(errno)
+            );
+        }
+        temporary.emplace_back(duplicate);
+    }
+    for (std::size_t index = 0; index < streams.size(); ++index) {
+        if (::dup3(temporary[index].get(), streams[index].child_fd, 0) < 0) {
+            return std::unexpected(
+                std::string{"install inherited stream: "} + errno_message(errno)
+            );
+        }
+    }
+    return {};
+}
+
+void close_except_inherited(
+    std::span<const linux_detail::inherited_stream_descriptor> streams
+) noexcept {
+    const long configured_maximum = ::sysconf(_SC_OPEN_MAX);
+    const unsigned int maximum = configured_maximum > STDERR_FILENO + 1
+                                     ? static_cast<unsigned int>(configured_maximum - 1)
+                                     : 65'535U;
+    const auto close_interval = [maximum](unsigned int first, unsigned int last) {
+        if (first > last) {
+            return;
+        }
+#if defined(SYS_close_range)
+        if (::syscall(SYS_close_range, first, last, 0) == 0) {
+            return;
+        }
+#endif
+        const auto bounded_last = std::min(last, maximum);
+        for (unsigned int descriptor = first; descriptor <= bounded_last; ++descriptor) {
+            static_cast<void>(::close(static_cast<int>(descriptor)));
+        }
+    };
+
+    unsigned int first = STDERR_FILENO + 1U;
+    for (const auto& stream : streams) {
+        const auto preserved = static_cast<unsigned int>(stream.child_fd);
+        close_interval(first, preserved - 1U);
+        first = preserved + 1U;
+    }
+    close_interval(first, ~0U);
+}
+
 // Write `value` to the file at `path`, returning false on failure. Used for
 // the user-namespace uid_map/gid_map dance.
 auto write_file(const char* path, std::string_view value) -> bool {
@@ -953,6 +1011,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     int egress_channel_fd,
     const profile& prof,
     std::vector<std::string> argv,
+    std::span<const linux_detail::inherited_stream_descriptor> inherited_streams,
     std::span<const supervisor::linux_detail::session_mount> session_mounts
 ) {
     char ack = 0;
@@ -1049,13 +1108,13 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         std::_Exit(126);
     }
 
-    // Belt-and-braces over per-fd O_CLOEXEC: close anything else the host left
-    // open (sockets, upstream-server pipes) so the only descriptors crossing
-    // into the agent are stdio. Without this, a non-cloexec fd would hand the
-    // agent a channel that bypasses the kernel's policy and audit.
-#if defined(SYS_close_range)
-    ::syscall(SYS_close_range, STDERR_FILENO + 1, ~0U, 0);
-#endif
+    // Internal setup descriptors may occupy the reserved child numbers. Install only after
+    // all setup users have closed them, then preserve exactly the sealed streams across exec.
+    if (auto installed = install_inherited_streams(inherited_streams); !installed) {
+        std::fprintf(stderr, "glove child: %s\n", installed.error().c_str());
+        std::_Exit(125);
+    }
+    close_except_inherited(inherited_streams);
 
     std::vector<char*> argv_ptrs;
     argv_ptrs.reserve(argv.size() + 1);
@@ -1078,6 +1137,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     const profile& prof,
     std::vector<std::string> argv,
     std::span<const supervisor::linux_detail::session_mount> session_mounts,
+    std::span<const linux_detail::inherited_stream_descriptor> inherited_streams,
     int agent_program_fd,
     int egress_channel_fd,
     child_stdio_capture capture
@@ -1163,11 +1223,13 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         std::_Exit(126);
     }
 
-    // stdio (0/1/2) is inherited; drop every other inherited descriptor so no
-    // host fd leaks into the agent.
-#if defined(SYS_close_range)
-    ::syscall(SYS_close_range, STDERR_FILENO + 1, ~0U, 0);
-#endif
+    // Internal setup descriptors may occupy the reserved child numbers. Install only after
+    // all setup users have closed them, then preserve exactly the sealed streams across exec.
+    if (auto installed = install_inherited_streams(inherited_streams); !installed) {
+        std::fprintf(stderr, "glove child: %s\n", installed.error().c_str());
+        std::_Exit(125);
+    }
+    close_except_inherited(inherited_streams);
 
     std::vector<char*> argv_ptrs;
     argv_ptrs.reserve(argv.size() + 1);
@@ -1293,6 +1355,7 @@ public:
                 egress_sandbox_fd,
                 *checked,
                 launch_argv,
+                {},
                 {}
             );
         }
@@ -1481,7 +1544,12 @@ auto prepare_managed_launch(
         return std::unexpected(valid.error());
     }
     auto binding = linux_detail::bind_managed_launch_projection_from_fd(
-        *checked, launch_argv, mounts, controller_plan_digest, executable.get()
+        *checked,
+        launch_argv,
+        mounts,
+        controller_plan_digest,
+        executable.get(),
+        lifecycle.inherited_streams()
     );
     if (!binding) {
         return std::unexpected(binding.error());
@@ -1583,6 +1651,8 @@ auto launch_passthrough_child(
             prof,
             launch_argv,
             mounts,
+            lifecycle != nullptr ? std::span{lifecycle->inherited_streams()}
+                                 : std::span<const linux_detail::inherited_stream_descriptor>{},
             agent_program_fd,
             egress_sandbox_fd,
             {
@@ -1594,6 +1664,9 @@ auto launch_passthrough_child(
         );
     }
 
+    if (lifecycle != nullptr) {
+        lifecycle->close_inherited_streams_after_clone();
+    }
     const ::pid_t child = static_cast<::pid_t>(pid);
     ::close(sync_pipe[0]);
     ::close(pipe_out[1]);
@@ -1718,6 +1791,7 @@ auto launch_pty_child(
             prof,
             launch_argv,
             mounts,
+            std::span{lifecycle.inherited_streams()},
             agent_program_fd,
             egress_sandbox_fd,
             {
@@ -1727,6 +1801,7 @@ auto launch_pty_child(
         );
     }
 
+    lifecycle.close_inherited_streams_after_clone();
     const ::pid_t child = static_cast<::pid_t>(pid);
     ::close(sync_pipe[0]);
     sync_pipe[0] = -1;

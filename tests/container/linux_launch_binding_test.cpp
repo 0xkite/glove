@@ -6,6 +6,7 @@
 #include "linux_resource_lifecycle.hpp"
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -153,10 +154,11 @@ auto make_binding(
     const profile& prof,
     const std::vector<std::string>& argv,
     const std::vector<session_mount>& projection,
-    std::string_view plan_digest = controller_digest
+    std::string_view plan_digest = controller_digest,
+    std::span<const glove::container::linux_detail::inherited_stream_descriptor> streams = {}
 ) -> std::expected<managed_launch_binding, std::string> {
     return glove::container::linux_detail::bind_managed_launch_projection(
-        prof, argv, projection, plan_digest
+        prof, argv, projection, plan_digest, streams
     );
 }
 
@@ -205,6 +207,87 @@ auto run() -> int {
     REQUIRE(service_binding->profile_digest != first->profile_digest);
     REQUIRE(!make_binding(first_profile, argv, service_mounts).has_value());
     REQUIRE(!make_binding(service_profile, argv, first_mounts).has_value());
+    int stream_pair[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stream_pair) == 0);
+    REQUIRE(::fchmod(stream_pair[0], 0600) == 0);
+    REQUIRE(::fchmod(stream_pair[1], 0600) == 0);
+    struct stat stream_status{};
+    struct stat peer_status{};
+    REQUIRE(::fstat(stream_pair[0], &stream_status) == 0);
+    REQUIRE(::fstat(stream_pair[1], &peer_status) == 0);
+    const glove::container::linux_detail::inherited_stream_descriptor stream{
+        .alias = "status",
+        .descriptor_fd = stream_pair[0],
+        .child_fd = 3,
+        .device = static_cast<std::uint64_t>(stream_status.st_dev),
+        .inode = static_cast<std::uint64_t>(stream_status.st_ino),
+        .uid = static_cast<std::uint32_t>(stream_status.st_uid),
+        .mode = static_cast<std::uint32_t>(stream_status.st_mode),
+        .links = static_cast<std::uint64_t>(stream_status.st_nlink),
+        .peer_device = static_cast<std::uint64_t>(peer_status.st_dev),
+        .peer_inode = static_cast<std::uint64_t>(peer_status.st_ino),
+        .peer_uid = static_cast<std::uint32_t>(peer_status.st_uid),
+        .peer_mode = static_cast<std::uint32_t>(peer_status.st_mode),
+        .peer_links = static_cast<std::uint64_t>(peer_status.st_nlink),
+        .manifest_digest = std::string(64U, 'e'),
+    };
+    auto inherited_profile = first_profile;
+    inherited_profile.environment.push_back(R"(GLOVE_LOCAL_SERVICE_FDS_V1={"status":3})");
+    const std::vector inherited_streams = {stream};
+    auto inherited_binding =
+        make_binding(inherited_profile, argv, first_mounts, controller_digest, inherited_streams);
+    REQUIRE(inherited_binding.has_value());
+    REQUIRE(inherited_binding->service_proxy_manifest_digest == std::string(64U, 'e'));
+    REQUIRE(inherited_binding->profile_digest != first->profile_digest);
+    REQUIRE(
+        !make_binding(inherited_profile, argv, service_mounts, controller_digest, inherited_streams)
+             .has_value()
+    );
+    auto drifted_streams = inherited_streams;
+    ++drifted_streams[0].inode;
+    REQUIRE(!make_binding(inherited_profile, argv, first_mounts, controller_digest, drifted_streams)
+                 .has_value());
+    auto reserved_streams = inherited_streams;
+    reserved_streams[0].child_fd = 2;
+    REQUIRE(
+        !make_binding(inherited_profile, argv, first_mounts, controller_digest, reserved_streams)
+             .has_value()
+    );
+    auto duplicate_source_streams = inherited_streams;
+    auto duplicate_source = stream;
+    duplicate_source.alias = "z-status";
+    duplicate_source.child_fd = 4;
+    duplicate_source_streams.push_back(duplicate_source);
+    auto duplicate_source_profile = first_profile;
+    duplicate_source_profile.environment.push_back(
+        R"(GLOVE_LOCAL_SERVICE_FDS_V1={"status":3,"z-status":4})"
+    );
+    REQUIRE(!make_binding(
+                 duplicate_source_profile,
+                 argv,
+                 first_mounts,
+                 controller_digest,
+                 duplicate_source_streams
+    )
+                 .has_value());
+    auto duplicate_alias_streams = duplicate_source_streams;
+    duplicate_alias_streams[1].alias = "status";
+    REQUIRE(!make_binding(
+                 duplicate_source_profile,
+                 argv,
+                 first_mounts,
+                 controller_digest,
+                 duplicate_alias_streams
+    )
+                 .has_value());
+    auto missing_environment = first_profile;
+    REQUIRE(
+        !make_binding(missing_environment, argv, first_mounts, controller_digest, inherited_streams)
+             .has_value()
+    );
+    ::close(stream_pair[0]);
+    ::close(stream_pair[1]);
+
     auto changed_service = service_mounts;
     changed_service.back().service_proxy_manifest_digest = std::string(64U, 'c');
     auto changed_service_binding = make_binding(service_profile, argv, changed_service);

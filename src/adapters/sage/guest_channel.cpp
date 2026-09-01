@@ -41,9 +41,12 @@ auto guest_channel_host()
 }
 
 auto resolve_guest_channel_adapter(
-    std::string_view configured_adapter_id, std::string_view configured_channel_schema_id
+    std::string_view configured_adapter_id,
+    std::string_view configured_channel_schema_id,
+    std::string_view transport_id
 ) -> std::expected<std::shared_ptr<const control::guest_channel_adapter_binding>, std::string> {
-    if (configured_adapter_id != adapter_id || configured_channel_schema_id != observation_schema) {
+    if (configured_adapter_id != adapter_id || configured_channel_schema_id != observation_schema ||
+        (!transport_id.empty() && transport_id != "inherited-stream-v1")) {
         return std::unexpected(std::string{"unsupported guest channel adapter binding"});
     }
     auto channels = guest_channel_host();
@@ -54,8 +57,16 @@ auto resolve_guest_channel_adapter(
         control::guest_channel_adapter_binding{
             .adapter_id = std::string{adapter_id},
             .channel_schema_id = std::string{observation_schema},
+            .transport_id = std::string{transport_id},
             .runtime_ids = {"pi"},
             .channels = std::move(*channels),
+            .service_alias = transport_id == "inherited-stream-v1"
+                                 ? std::optional<std::string>{"sage-observe"}
+                                 : std::nullopt,
+            .service_alias_environment =
+                transport_id == "inherited-stream-v1"
+                    ? std::optional<std::string>{"GLOVE_GUEST_CHANNEL_SERVICE_ALIAS=sage-observe"}
+                    : std::nullopt,
         }
     );
 }
