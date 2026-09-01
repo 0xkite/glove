@@ -270,65 +270,100 @@ auto execute_managed(
 auto inherited_stream_survives_clone_exec_seccomp_test(
     cgroup_v2_root& root, const std::filesystem::path& materialization_root, std::uint64_t page
 ) -> int {
-    const auto limits = limits_for(page * 32U);
-    auto lifecycle =
-        make_lifecycle(root, materialization_root, {}, "managed-inherited-stream", limits);
-    REQUIRE(lifecycle.has_value());
-    int declared[2] = {-1, -1};
-    int undeclared[2] = {-1, -1};
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, declared) == 0);
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, undeclared) == 0);
-    REQUIRE(::fchmod(declared[0], 0600) == 0);
-    REQUIRE(::fchmod(declared[1], 0600) == 0);
-    struct stat child_status{};
-    struct stat peer_status{};
-    REQUIRE(::fstat(declared[1], &child_status) == 0);
-    REQUIRE(::fstat(declared[0], &peer_status) == 0);
-    const int undeclared_child_fd = undeclared[1];
-    std::vector<glove::container::linux_detail::inherited_stream_descriptor> descriptors;
-    descriptors.push_back({
-        .alias = "status",
-        .descriptor_fd = std::exchange(declared[1], -1),
-        .child_fd = 3,
-        .device = static_cast<std::uint64_t>(child_status.st_dev),
-        .inode = static_cast<std::uint64_t>(child_status.st_ino),
-        .uid = static_cast<std::uint32_t>(child_status.st_uid),
-        .mode = static_cast<std::uint32_t>(child_status.st_mode),
-        .links = static_cast<std::uint64_t>(child_status.st_nlink),
-        .peer_device = static_cast<std::uint64_t>(peer_status.st_dev),
-        .peer_inode = static_cast<std::uint64_t>(peer_status.st_ino),
-        .peer_uid = static_cast<std::uint32_t>(peer_status.st_uid),
-        .peer_mode = static_cast<std::uint32_t>(peer_status.st_mode),
-        .peer_links = static_cast<std::uint64_t>(peer_status.st_nlink),
-        .manifest_digest = std::string(64U, 'b'),
-    });
-    REQUIRE((*lifecycle)->install_inherited_streams(std::move(descriptors)).has_value());
-    auto prof = launch_profile(limits);
-    prof.environment.push_back(R"(GLOVE_LOCAL_SERVICE_FDS_V1={"status":3})");
-    const std::string script =
-        "test \"$GLOVE_LOCAL_SERVICE_FDS_V1\" = '{\"status\":3}'; "
-        "test -S /proc/self/fd/3; "
-        "test ! -e /proc/self/fd/" +
-        std::to_string(undeclared_child_fd) +
-        "; printf ping >&3; test \"$(dd bs=4 count=1 <&3 2>/dev/null)\" = pong";
-    std::thread peer{[descriptor = declared[0]] {
-        pollfd readiness{.fd = descriptor, .events = POLLIN, .revents = 0};
-        std::array<char, 4> request{};
-        if (::poll(&readiness, 1, 3'000) > 0 &&
-            ::recv(descriptor, request.data(), request.size(), MSG_WAITALL) == 4 &&
-            std::string_view{request.data(), request.size()} == "ping") {
-            static_cast<void>(::send(descriptor, "pong", 4, MSG_NOSIGNAL));
+    const auto run_probe = [&](std::string_view session_id,
+                               std::optional<std::filesystem::path> node_binary) -> int {
+        const auto limits = limits_for(page * 32U);
+        auto lifecycle = make_lifecycle(root, materialization_root, {}, session_id, limits);
+        REQUIRE(lifecycle.has_value());
+        int declared[2] = {-1, -1};
+        int undeclared[2] = {-1, -1};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, declared) == 0);
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, undeclared) == 0);
+        REQUIRE(::fchmod(declared[0], 0600) == 0);
+        REQUIRE(::fchmod(declared[1], 0600) == 0);
+        struct stat child_status{};
+        struct stat peer_status{};
+        REQUIRE(::fstat(declared[1], &child_status) == 0);
+        REQUIRE(::fstat(declared[0], &peer_status) == 0);
+        const int undeclared_child_fd = undeclared[1];
+        std::vector<glove::container::linux_detail::inherited_stream_descriptor> descriptors;
+        descriptors.push_back({
+            .alias = "status",
+            .descriptor_fd = std::exchange(declared[1], -1),
+            .child_fd = 3,
+            .device = static_cast<std::uint64_t>(child_status.st_dev),
+            .inode = static_cast<std::uint64_t>(child_status.st_ino),
+            .uid = static_cast<std::uint32_t>(child_status.st_uid),
+            .mode = static_cast<std::uint32_t>(child_status.st_mode),
+            .links = static_cast<std::uint64_t>(child_status.st_nlink),
+            .peer_device = static_cast<std::uint64_t>(peer_status.st_dev),
+            .peer_inode = static_cast<std::uint64_t>(peer_status.st_ino),
+            .peer_uid = static_cast<std::uint32_t>(peer_status.st_uid),
+            .peer_mode = static_cast<std::uint32_t>(peer_status.st_mode),
+            .peer_links = static_cast<std::uint64_t>(peer_status.st_nlink),
+            .manifest_digest = std::string(64U, 'b'),
+        });
+        REQUIRE((*lifecycle)->install_inherited_streams(std::move(descriptors)).has_value());
+        auto prof = launch_profile(limits);
+        prof.environment.push_back(R"(GLOVE_LOCAL_SERVICE_FDS_V1={"status":3})");
+        std::vector<std::string> argv;
+        if (node_binary) {
+            constexpr std::string_view node_script = R"JS(
+const net = require('node:net');
+if (process.env.GLOVE_LOCAL_SERVICE_FDS_V1 !== '{"status":3}') process.exit(201);
+const socket = new net.Socket({fd: 3, readable: true, writable: true});
+let response = Buffer.alloc(0);
+const timer = setTimeout(() => process.exit(202), 2000);
+socket.on('error', () => process.exit(203));
+socket.on('data', (chunk) => {
+  response = Buffer.concat([response, chunk]);
+  if (response.length >= 4) {
+    clearTimeout(timer);
+    socket.destroy();
+    process.exit(response.subarray(0, 4).toString() === 'pong' ? 0 : 204);
+  }
+});
+socket.write('ping');
+)JS";
+            argv = {node_binary->string(), "-e", std::string{node_script}};
+        } else {
+            const std::filesystem::path probe{GLOVE_INHERITED_SOCKET_PROBE_AGENT_BIN};
+            REQUIRE(!probe.empty());
+            argv = {probe.string(), std::to_string(undeclared_child_fd)};
         }
-        ::close(descriptor);
-    }};
-    declared[0] = -1;
-    auto receipt = execute_managed(prof, {"/usr/bin/sh", "-c", script}, std::move(*lifecycle));
-    peer.join();
-    ::close(undeclared[0]);
-    ::close(undeclared[1]);
-    REQUIRE(receipt.has_value());
-    REQUIRE(receipt->termination_cause == resource_termination_cause::exited);
-    REQUIRE(receipt->exit_code == 0);
+        std::thread peer{[descriptor = declared[0]] {
+            pollfd readiness{.fd = descriptor, .events = POLLIN, .revents = 0};
+            std::array<char, 4> request{};
+            if (::poll(&readiness, 1, 3'000) > 0 &&
+                ::recv(descriptor, request.data(), request.size(), MSG_WAITALL) == 4 &&
+                std::string_view{request.data(), request.size()} == "ping") {
+                static_cast<void>(::send(descriptor, "pong", 4, MSG_NOSIGNAL));
+            }
+            ::close(descriptor);
+        }};
+        declared[0] = -1;
+        auto receipt = execute_managed(prof, argv, std::move(*lifecycle));
+        peer.join();
+        ::close(undeclared[0]);
+        ::close(undeclared[1]);
+        REQUIRE(receipt.has_value());
+        REQUIRE(receipt->termination_cause == resource_termination_cause::exited);
+        if (receipt->exit_code != 0) {
+            std::fprintf(
+                stderr,
+                "inherited socket introspection probe exit: %d\n",
+                receipt->exit_code.value_or(-1)
+            );
+        }
+        REQUIRE(receipt->exit_code == 0);
+        return 0;
+    };
+
+    REQUIRE(run_probe("managed-inherited-stream", std::nullopt) == 0);
+    if (const char* node = std::getenv("GLOVE_TEST_NODE_BINARY");
+        node != nullptr && node[0] != '\0') {
+        REQUIRE(run_probe("managed-inherited-node", std::filesystem::path{node}) == 0);
+    }
     return 0;
 }
 

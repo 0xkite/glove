@@ -821,6 +821,73 @@ auto install_environment(const profile& prof) -> std::expected<void, std::string
     return {};
 }
 
+auto restrict_inherited_socket_inspection(
+    scmp_filter_ctx context,
+    std::span<const linux_detail::inherited_stream_descriptor> inherited_streams
+) -> std::expected<void, std::string> {
+    for (std::size_t index = 0; index < inherited_streams.size(); ++index) {
+        if (inherited_streams[index].child_fd != static_cast<int>(index + 3U)) {
+            return std::unexpected(std::string{"invalid inherited stream seccomp range"});
+        }
+    }
+    const auto deny = [&](int syscall) -> int {
+        return ::seccomp_rule_add(context, SCMP_ACT_ERRNO(EPERM), syscall, 0);
+    };
+    if (inherited_streams.empty()) {
+        for (int syscall : {SCMP_SYS(getsockname), SCMP_SYS(getsockopt)}) {
+            if (const int result = deny(syscall); result != 0) {
+                return std::unexpected(
+                    std::string{"deny offline socket inspection: "} + std::strerror(-result)
+                );
+            }
+        }
+        return {};
+    }
+
+    const auto first = static_cast<scmp_datum_t>(inherited_streams.front().child_fd);
+    const auto last = static_cast<scmp_datum_t>(inherited_streams.back().child_fd);
+    const std::array outside_inherited{
+        scmp_arg_cmp{.arg = 0, .op = SCMP_CMP_LT, .datum_a = first, .datum_b = 0},
+        scmp_arg_cmp{.arg = 0, .op = SCMP_CMP_GT, .datum_a = last, .datum_b = 0},
+    };
+    for (int syscall : {SCMP_SYS(getsockname), SCMP_SYS(getsockopt)}) {
+        for (const auto& comparison : outside_inherited) {
+            if (const int result =
+                    ::seccomp_rule_add(context, SCMP_ACT_ERRNO(EPERM), syscall, 1, comparison);
+                result != 0) {
+                return std::unexpected(
+                    std::string{"restrict inherited socket inspection: "} + std::strerror(-result)
+                );
+            }
+        }
+    }
+    const std::array unsupported_getsockopt{
+        scmp_arg_cmp{
+            .arg = 1,
+            .op = SCMP_CMP_NE,
+            .datum_a = static_cast<scmp_datum_t>(SOL_SOCKET),
+            .datum_b = 0,
+        },
+        scmp_arg_cmp{
+            .arg = 2,
+            .op = SCMP_CMP_NE,
+            .datum_a = static_cast<scmp_datum_t>(SO_TYPE),
+            .datum_b = 0,
+        },
+    };
+    for (const auto& comparison : unsupported_getsockopt) {
+        if (const int result = ::seccomp_rule_add(
+                context, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(getsockopt), 1, comparison
+            );
+            result != 0) {
+            return std::unexpected(
+                std::string{"restrict inherited socket type inspection: "} + std::strerror(-result)
+            );
+        }
+    }
+    return {};
+}
+
 // Install a seccomp-bpf filter that denies new-socket-creation syscalls and
 // other namespace-mutating operations. Existing fds (our inherited stdio
 // pipes) are unaffected — read/write still work.
@@ -831,7 +898,9 @@ auto install_environment(const profile& prof) -> std::expected<void, std::string
 // real agents need. Production-grade seccomp profiles must be data-driven;
 // premature minimisation breaks debuggers, sanitizers, and language
 // runtimes that grow new syscall use across releases.
-auto setup_seccomp(bool proxy_enabled) -> std::expected<void, std::string> {
+auto setup_seccomp(
+    bool proxy_enabled, std::span<const linux_detail::inherited_stream_descriptor> inherited_streams
+) -> std::expected<void, std::string> {
     ::scmp_filter_ctx ctx = ::seccomp_init(SCMP_ACT_ALLOW);
     if (ctx == nullptr) {
         return std::unexpected(std::string{"seccomp_init failed"});
@@ -862,10 +931,8 @@ auto setup_seccomp(bool proxy_enabled) -> std::expected<void, std::string> {
         const int offline_net_syscalls[] = {
             SCMP_SYS(socket),
             SCMP_SYS(connect),
-            SCMP_SYS(getsockname),
             SCMP_SYS(getpeername),
             SCMP_SYS(setsockopt),
-            SCMP_SYS(getsockopt),
         };
         for (int sc : offline_net_syscalls) {
             if (int rc = deny(sc); rc != 0) {
@@ -874,6 +941,12 @@ auto setup_seccomp(bool proxy_enabled) -> std::expected<void, std::string> {
                     std::string{"deny offline network syscall: "} + std::strerror(-rc)
                 );
             }
+        }
+
+        if (auto restricted = restrict_inherited_socket_inspection(ctx, inherited_streams);
+            !restricted) {
+            ::seccomp_release(ctx);
+            return std::unexpected(restricted.error());
         }
     } else {
         // The agent may create AF_INET stream sockets only inside its private
@@ -1075,7 +1148,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     // Seccomp filter goes after the rootfs pivot (so we don't accidentally
     // deny syscalls our setup needs) but before the agent's exec, so the
     // agent inherits the filter as its starting policy.
-    if (auto r = setup_seccomp(prof.proxy.has_value()); !r) {
+    if (auto r = setup_seccomp(prof.proxy.has_value(), inherited_streams); !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }
@@ -1205,7 +1278,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         close_fd(egress_channel_fd);
     }
 
-    if (auto r = setup_seccomp(prof.proxy.has_value()); !r) {
+    if (auto r = setup_seccomp(prof.proxy.has_value(), inherited_streams); !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }

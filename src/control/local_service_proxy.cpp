@@ -710,8 +710,8 @@ void inherited_worker(
             started,
             deadline
         );
-        if (!audit.recorded || !audit.within_deadline ||
-            !(*guest)->send_frame(*response, deadline, stop)) {
+        if (!audit.recorded || !audit.within_deadline || !request_boundary_clean() ||
+            !(*guest)->send_frame(*response, deadline, stop) || !request_boundary_clean()) {
             append_failure();
             return;
         }

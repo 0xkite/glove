@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -204,6 +205,43 @@ private:
     std::chrono::milliseconds delay_;
     std::mutex mutex_;
     std::vector<glove::audit::event> events_;
+};
+
+class gated_sink final : public glove::audit::sink {
+public:
+    auto record(const glove::audit::event& event) -> std::expected<void, std::string> override {
+        std::unique_lock lock{mutex_};
+        events_.push_back(event);
+        if (event.error_message == "delivery_pending") {
+            pending_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [this] { return released_; });
+        }
+        return {};
+    }
+
+    auto wait_for_pending(std::chrono::milliseconds timeout) -> bool {
+        std::unique_lock lock{mutex_};
+        return condition_.wait_for(lock, timeout, [this] { return pending_; });
+    }
+
+    void release() {
+        const std::scoped_lock lock{mutex_};
+        released_ = true;
+        condition_.notify_all();
+    }
+
+    auto take() -> std::vector<glove::audit::event> {
+        const std::scoped_lock lock{mutex_};
+        return events_;
+    }
+
+private:
+    std::condition_variable condition_;
+    std::mutex mutex_;
+    std::vector<glove::audit::event> events_;
+    bool pending_ = false;
+    bool released_ = false;
 };
 
 auto make_owner_directory(const std::filesystem::path& path) -> bool {
@@ -750,6 +788,43 @@ auto run(bool privileged_only) -> int {
     ::close(pipelined_fd);
     pipelined_session->reset();
     REQUIRE(inherited_audit->take().size() == 1U);
+
+    auto gated_audit = std::make_shared<gated_sink>();
+    auto gated_factory = local_service_proxy_factory::create(
+        options_for(inherited_runtime, endpoint, gated_audit, *inherited_adapter, 1'000, 1),
+        shared_registry
+    );
+    REQUIRE(gated_factory.has_value());
+    auto gated_session = (*gated_factory)->prepare_session("audit-gated-pipeline", "pi");
+    REQUIRE(gated_session.has_value());
+    auto gated_streams = (*gated_session)->release_inherited_streams();
+    REQUIRE(gated_streams.has_value());
+    auto gated_client = guest_channel_transport::adopt(
+        std::exchange(gated_streams->front().descriptor_fd, -1),
+        16U * 1024U,
+        static_cast<std::uint32_t>(::geteuid())
+    );
+    REQUIRE(gated_client.has_value());
+    std::atomic_bool gated_exact{false};
+    auto gated_exchange =
+        exchange_once(listener.get(), "gated-first", "gated-response", gated_exact);
+    const auto gated_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    REQUIRE((*gated_client)->send_frame("gated-first", gated_deadline).has_value());
+    REQUIRE(gated_audit->wait_for_pending(std::chrono::seconds{1}));
+    REQUIRE((*gated_client)->send_frame("gated-early", gated_deadline).has_value());
+    gated_audit->release();
+    REQUIRE(!(*gated_client)->receive_frame(gated_deadline).has_value());
+    gated_exchange.join();
+    REQUIRE(gated_exact.load());
+    gated_client->reset();
+    gated_session->reset();
+    const auto gated_events = gated_audit->take();
+    REQUIRE(std::ranges::count_if(gated_events, [](const auto& event) {
+                return event.error_message == "delivery_pending";
+            }) == 1);
+    REQUIRE(std::ranges::none_of(gated_events, [](const auto& event) {
+        return event.error_message == "delivered";
+    }));
 
     const auto expect_inherited_rejection = [&](std::string_view session_id,
                                                 std::span<const unsigned char> bytes) -> bool {

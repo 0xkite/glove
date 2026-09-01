@@ -463,14 +463,19 @@ adapter-bound alias. The child receives the guest endpoint at descriptor 3,
 `GLOVE_LOCAL_SERVICE_FDS_V1={"<alias>":3}`, and the adapter-owned alias selector.
 No local-service pathname, legacy endpoint/root/owner tuple, secret, network
 route, or other configured service descriptor is projected. The clone/exec lane
-installs only the committed descriptor and closes every undeclared descriptor.
-The supervisor retains the peer for sequential bounded exchanges; framing,
-upstream identity drift, timeout, cancellation, audit-gate, or transport failure
-permanently closes the stream. Mixed or operator-supplied reserved environment
-authority is rejected before launch. The managed-launch digest binds the
-transport, alias/FD map, both socket endpoint identities, and the existing
-upstream manifest. Capability version `1` requires this exact inherited
-composition; the compatibility pathname transport continues to advertise `0`.
+loads a filter bound to the exact contiguous child-FD range, installs only those
+committed descriptors after setup closes its internal FDs, and closes every
+undeclared descriptor. Offline `socket`, `connect`, and mutation syscalls remain
+denied; only `getsockname` and `getsockopt(SOL_SOCKET, SO_TYPE)` may inspect the
+committed streams for runtime adoption. The supervisor retains the peer for
+sequential bounded exchanges; framing, queued input at the request boundary or
+immediately around response release, upstream identity drift, timeout,
+cancellation, audit-gate, or transport failure permanently closes the stream.
+Mixed or operator-supplied reserved environment authority is rejected before
+launch. The managed-launch digest binds the transport, alias/FD map, both socket
+endpoint identities, and the existing upstream manifest. Capability version `1`
+requires this exact inherited composition; the compatibility pathname transport
+continues to advertise `0`.
 
 Before any path materialization, Glove compares each resolved grant descriptor
 with the descriptor-pinned endpoint parent and every actual ancestor descriptor. A grant
@@ -480,13 +485,17 @@ credential lane remains a Linux privileged environment gate.
 
 One opaque request and response, each at most 16 KiB, share one absolute
 deadline. Before release, Glove durably records non-success
-`delivery_pending`; it records `delivered` only after a successful guest send,
-and best-effort `delivery_failed` after a failed send. Records contain only the
-session ID, alias, phase, status, and latency. Audit appends check the same
-deadline before and after synchronous durability work. A kernel-blocked
-`fsync(2)` cannot be preempted cooperatively, so this is not a hard wall-clock
-bound; if it completes after the deadline, the response remains suppressed and
-the conservative pending record remains. Apple advertises no G6 capability.
+`delivery_pending` and rechecks that no next request arrived during durability
+work. It records `delivered` only after a successful guest send and an immediate
+post-send queue check, and best-effort `delivery_failed` after failure. Records
+contain only the session ID, alias, phase, status, and latency. Audit appends
+check the same deadline before and after synchronous durability work. A
+kernel-blocked `fsync(2)` cannot be preempted cooperatively, so this is not a hard
+wall-clock bound; if it completes after the deadline, the response remains
+suppressed and the conservative pending record remains. Bytes arriving after
+the final post-send peek are serialized as a possible next request; a causal
+no-pipelining claim would require a future credit/ack protocol. Apple advertises
+no G6 capability.
 
 ## Receipts and recovery
 
