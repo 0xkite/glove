@@ -26,11 +26,30 @@ class linux_session_runtime;
 inline constexpr std::string_view local_service_guest_directory = "/run/glove-services/local";
 inline constexpr std::string_view local_service_environment =
     "GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local";
+inline constexpr std::string_view inherited_stream_transport = "inherited-stream-v1";
+inline constexpr std::string_view inherited_stream_environment_name = "GLOVE_LOCAL_SERVICE_FDS_V1";
 
 struct local_service_endpoint {
     std::string alias;
     std::filesystem::path socket_path;
     std::vector<std::string> runtime_ids;
+};
+
+struct local_service_inherited_stream {
+    std::string alias;
+    int descriptor_fd = -1;
+    int child_fd = -1;
+    std::uint64_t device = 0;
+    std::uint64_t inode = 0;
+    std::uint32_t uid = 0;
+    std::uint32_t mode = 0;
+    std::uint64_t links = 0;
+    std::uint64_t peer_device = 0;
+    std::uint64_t peer_inode = 0;
+    std::uint32_t peer_uid = 0;
+    std::uint32_t peer_mode = 0;
+    std::uint64_t peer_links = 0;
+    std::string manifest_digest;
 };
 
 struct local_service_proxy_options {
@@ -54,6 +73,11 @@ public:
 
     [[nodiscard]] auto mount() const
         -> std::expected<supervisor::linux_detail::session_mount, std::string>;
+    [[nodiscard]] auto release_inherited_streams()
+        -> std::expected<std::vector<local_service_inherited_stream>, std::string>;
+    [[nodiscard]] auto adapter_environment() const -> std::optional<std::string>;
+    [[nodiscard]] auto inherited() const noexcept -> bool;
+    [[nodiscard]] auto inherited_environment() const -> std::expected<std::string, std::string>;
 
 private:
     friend class local_service_proxy_factory;

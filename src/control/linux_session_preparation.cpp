@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <new>
 #include <string_view>
 #include <utility>
 
@@ -446,6 +447,16 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
     }
     const bool local_services_enabled =
         local_services_ && local_services_->manages_runtime(owned_inputs.launch.runtime_id);
+    std::unique_ptr<local_service_proxy_session> local_service_proxy;
+    if (local_services_enabled) {
+        auto service_session = local_services_->prepare_session(
+            owned_inputs.session.session_id, owned_inputs.launch.runtime_id
+        );
+        if (!service_session) {
+            return std::unexpected(service_session.error());
+        }
+        local_service_proxy = std::move(*service_session);
+    }
 
     const auto limits = convert_limits(owned_inputs.launch.limits);
     container::profile requested_profile;
@@ -454,13 +465,35 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         requested_profile.runtime_filesystem.push_back({.path = path, .writable = false});
     }
     requested_profile.environment = owned_inputs.launch.environment;
-    if (local_services_enabled) {
-        if (std::ranges::any_of(requested_profile.environment, [](const auto& entry) {
-                return entry.starts_with("GLOVE_LOCAL_SERVICE_DIR=");
-            })) {
+    if (local_services_) {
+        const bool inherited = local_service_proxy && local_service_proxy->inherited();
+        const bool spoofed =
+            std::ranges::any_of(requested_profile.environment, [&](const auto& entry) {
+                const bool generated = entry.starts_with("GLOVE_LOCAL_SERVICE_") ||
+                                       entry.starts_with("GLOVE_GUEST_CHANNEL_SERVICE_ALIAS=");
+                const bool mixed_legacy =
+                    inherited && (entry.starts_with("GLOVE_GUEST_CHANNEL_ENDPOINT=") ||
+                                  entry.starts_with("GLOVE_GUEST_CHANNEL_ROOT=") ||
+                                  entry.starts_with("GLOVE_GUEST_CHANNEL_OWNER_UID="));
+                return generated || mixed_legacy;
+            });
+        if (spoofed) {
             return std::unexpected(std::string{"local service environment is managed by Glove"});
         }
-        requested_profile.environment.emplace_back(local_service_environment);
+    }
+    if (local_services_enabled) {
+        if (local_service_proxy->inherited()) {
+            auto environment = local_service_proxy->inherited_environment();
+            if (!environment) {
+                return std::unexpected(environment.error());
+            }
+            requested_profile.environment.push_back(std::move(*environment));
+            if (auto adapter_environment = local_service_proxy->adapter_environment()) {
+                requested_profile.environment.push_back(std::move(*adapter_environment));
+            }
+        } else {
+            requested_profile.environment.emplace_back(local_service_environment);
+        }
     }
     const auto adapter =
         supervisor::native_skill_runtime_adapter_for(owned_inputs.launch.runtime_id);
@@ -659,22 +692,56 @@ auto linux_session_preparer::prepare(session_start_inputs&& inputs, std::uint64_
         !installed) {
         return std::unexpected(installed.error());
     }
-    std::unique_ptr<local_service_proxy_session> local_service_proxy;
-    if (local_services_enabled) {
-        auto service_session = local_services_->prepare_session(
-            owned_inputs.session.session_id, owned_inputs.launch.runtime_id
-        );
-        if (!service_session) {
-            return std::unexpected(service_session.error());
+    if (local_services_enabled && local_service_proxy->inherited()) {
+        auto streams = local_service_proxy->release_inherited_streams();
+        if (!streams) {
+            return std::unexpected(streams.error());
         }
-        auto mount = (*service_session)->mount();
+        std::vector<container::linux_detail::inherited_stream_descriptor> descriptors;
+        try {
+            descriptors.reserve(streams->size());
+            for (const auto& stream : *streams) {
+                descriptors.push_back({
+                    .alias = stream.alias,
+                    .descriptor_fd = stream.descriptor_fd,
+                    .child_fd = stream.child_fd,
+                    .device = stream.device,
+                    .inode = stream.inode,
+                    .uid = stream.uid,
+                    .mode = stream.mode,
+                    .links = stream.links,
+                    .peer_device = stream.peer_device,
+                    .peer_inode = stream.peer_inode,
+                    .peer_uid = stream.peer_uid,
+                    .peer_mode = stream.peer_mode,
+                    .peer_links = stream.peer_links,
+                    .manifest_digest = stream.manifest_digest,
+                });
+            }
+        } catch (const std::bad_alloc&) {
+            for (auto& stream : *streams) {
+                if (stream.descriptor_fd >= 0) {
+                    ::close(stream.descriptor_fd);
+                    stream.descriptor_fd = -1;
+                }
+            }
+            return std::unexpected(std::string{"allocate inherited stream launch set"});
+        }
+        for (auto& stream : *streams) {
+            stream.descriptor_fd = -1;
+        }
+        if (auto installed = (*lifecycle)->install_inherited_streams(std::move(descriptors));
+            !installed) {
+            return std::unexpected(installed.error());
+        }
+    } else if (local_services_enabled) {
+        auto mount = local_service_proxy->mount();
         if (!mount) {
             return std::unexpected(mount.error());
         }
         if (auto installed = (*lifecycle)->install_service_mount(std::move(*mount)); !installed) {
             return std::unexpected(installed.error());
         }
-        local_service_proxy = std::move(*service_session);
     }
     auto binding = container::linux_detail::bind_managed_session(
         *profile, owned_inputs.launch.argv, **lifecycle, owned_inputs.session.controller_plan_digest

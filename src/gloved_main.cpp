@@ -532,7 +532,9 @@ auto run(const options& configured) -> std::expected<void, std::string> {
     if (configured.local_service_proxy && configured.local_service_proxy->guest_channel_adapter) {
         const auto& binding = *configured.local_service_proxy->guest_channel_adapter;
         auto resolved = glove::adapters::sage::resolve_guest_channel_adapter(
-            binding.adapter_id, binding.channel_schema_id
+            binding.adapter_id,
+            binding.channel_schema_id,
+            binding.transport_id.value_or(std::string{})
         );
         if (!resolved) {
             return std::unexpected(

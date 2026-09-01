@@ -1,12 +1,16 @@
 #include "linux_resource_lifecycle.hpp"
 
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <exception>
 #include <new>
+#include <set>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -42,6 +46,29 @@ public:
         return "terminate Linux resource cgroup";
     }
 };
+
+auto valid_digest(std::string_view value) -> bool {
+    return value.size() == 64U && std::ranges::all_of(value, [](char character) {
+               return std::isdigit(static_cast<unsigned char>(character)) != 0 ||
+                      (character >= 'a' && character <= 'f');
+           });
+}
+
+auto valid_stream_alias(std::string_view value) -> bool {
+    return !value.empty() && value.size() <= 64U && std::ranges::all_of(value, [](char character) {
+        return std::isalnum(static_cast<unsigned char>(character)) != 0 || character == '-' ||
+               character == '_' || character == '.';
+    });
+}
+
+void close_stream_descriptors(std::vector<inherited_stream_descriptor>& descriptors) noexcept {
+    for (auto& descriptor : descriptors) {
+        if (descriptor.descriptor_fd >= 0) {
+            ::close(descriptor.descriptor_fd);
+            descriptor.descriptor_fd = -1;
+        }
+    }
+}
 
 auto map_event(cgroup_limit_event event) noexcept -> resource_termination_cause {
     switch (event) {
@@ -134,6 +161,8 @@ void linux_resource_lifecycle::release_secret_resources() noexcept {
     secret_mounts_.clear();
     secret_lease_locks_.clear();
     service_mounts_.clear();
+    close_stream_descriptors(inherited_streams_);
+    inherited_streams_.clear();
 }
 
 auto linux_resource_lifecycle::install_secret_mounts(
@@ -187,6 +216,60 @@ auto linux_resource_lifecycle::install_service_mount(supervisor::linux_detail::s
     service_mounts_.push_back(std::move(mount));
     input.release();
     return {};
+}
+
+auto linux_resource_lifecycle::install_inherited_streams(
+    std::vector<inherited_stream_descriptor> descriptors
+) -> std::expected<void, std::string> {
+    const auto reject = [&]() -> std::expected<void, std::string> {
+        close_stream_descriptors(descriptors);
+        return std::unexpected(std::string{"invalid Linux inherited stream set"});
+    };
+    if (!inherited_streams_.empty() || descriptors.empty() || descriptors.size() > 16U ||
+        !std::ranges::is_sorted(descriptors, {}, &inherited_stream_descriptor::alias)) {
+        return reject();
+    }
+    std::set<int> source_fds;
+    std::string_view manifest;
+    for (std::size_t index = 0; index < descriptors.size(); ++index) {
+        const auto& descriptor = descriptors[index];
+        struct stat status{};
+        int domain = 0;
+        int type = 0;
+        socklen_t size = sizeof(int);
+        if (!valid_stream_alias(descriptor.alias) || descriptor.descriptor_fd < 3 ||
+            descriptor.child_fd != static_cast<int>(index + 3U) ||
+            !source_fds.insert(descriptor.descriptor_fd).second ||
+            ::fstat(descriptor.descriptor_fd, &status) != 0 || !S_ISSOCK(status.st_mode) ||
+            status.st_uid != ::geteuid() || status.st_nlink != 1 ||
+            static_cast<std::uint64_t>(status.st_dev) != descriptor.device ||
+            static_cast<std::uint64_t>(status.st_ino) != descriptor.inode ||
+            static_cast<std::uint32_t>(status.st_uid) != descriptor.uid ||
+            static_cast<std::uint32_t>(status.st_mode) != descriptor.mode ||
+            static_cast<std::uint64_t>(status.st_nlink) != descriptor.links ||
+            (static_cast<unsigned int>(status.st_mode) & 0777U) != 0600U ||
+            ::getsockopt(descriptor.descriptor_fd, SOL_SOCKET, SO_DOMAIN, &domain, &size) != 0 ||
+            domain != AF_UNIX ||
+            ::getsockopt(descriptor.descriptor_fd, SOL_SOCKET, SO_TYPE, &type, &size) != 0 ||
+            type != SOCK_STREAM || descriptor.peer_device == 0U || descriptor.peer_inode == 0U ||
+            descriptor.peer_uid != static_cast<std::uint32_t>(::geteuid()) ||
+            !S_ISSOCK(static_cast<mode_t>(descriptor.peer_mode)) || descriptor.peer_links != 1U ||
+            (descriptor.peer_mode & 0777U) != 0600U || !valid_digest(descriptor.manifest_digest) ||
+            (index != 0U && descriptor.manifest_digest != manifest)) {
+            return reject();
+        }
+        manifest = descriptor.manifest_digest;
+    }
+    try {
+        inherited_streams_ = std::move(descriptors);
+        return {};
+    } catch (const std::bad_alloc&) {
+        return reject();
+    }
+}
+
+void linux_resource_lifecycle::close_inherited_streams_after_clone() noexcept {
+    close_stream_descriptors(inherited_streams_);
 }
 
 auto linux_resource_lifecycle::create(

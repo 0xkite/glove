@@ -515,6 +515,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         SKIP_RETURN_CODE 77
     )
 
+    # This child models the exact socket introspection Node/libuv performs when
+    # adopting an already connected descriptor. Keep sanitizer runtime threads
+    # out of the contained process so the probe observes only that syscall seam.
+    add_executable(
+        glove_inherited_socket_probe_agent
+        container/inherited_socket_probe_agent.cpp
+    )
+    target_compile_features(glove_inherited_socket_probe_agent PRIVATE cxx_std_23)
+    glove_set_warnings(glove_inherited_socket_probe_agent)
+
     add_executable(
         container_linux_managed_session_test
         container/linux_managed_session_test.cpp
@@ -526,6 +536,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_include_directories(container_linux_managed_session_test PRIVATE
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container/linux>
     )
+    target_compile_definitions(container_linux_managed_session_test PRIVATE
+        GLOVE_INHERITED_SOCKET_PROBE_AGENT_BIN="$<TARGET_FILE:glove_inherited_socket_probe_agent>"
+    )
+    add_dependencies(container_linux_managed_session_test glove_inherited_socket_probe_agent)
     add_test(NAME container_linux_managed_session COMMAND container_linux_managed_session_test)
     set_tests_properties(container_linux_managed_session PROPERTIES
         TIMEOUT 30
