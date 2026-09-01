@@ -994,8 +994,51 @@ auto run() -> int {
     return 0;
 }
 
+auto probe_managed_capabilities(const std::filesystem::path& runtime_directory) -> int {
+    std::optional<std::string> secret;
+    for (int attempt = 0; attempt < 300 && !secret; ++attempt) {
+        secret = read_secret(runtime_directory / "bootstrap-secret");
+        if (!secret) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+    }
+    REQUIRE(secret.has_value());
+    auto frame = transact_with_retry(
+        runtime_directory / "gloved.sock",
+        make_request("systemd-capabilities", "capabilities", *secret, "null")
+    );
+    REQUIRE(frame.has_value());
+    auto response = decode_response(*frame);
+    REQUIRE(response.has_value());
+    REQUIRE(!response->error.has_value());
+    REQUIRE(response->result.has_value());
+    const auto& capabilities = response->result->str;
+    REQUIRE(capabilities.find("\"start_session\":true") != std::string::npos);
+    REQUIRE(capabilities.find("\"agent_runtime_adapter_schema_version\":1") != std::string::npos);
+    const auto managed_runtimes = capabilities.find("\"managed_runtime_ids\":[");
+    const auto managed_runtimes_end = capabilities.find(']', managed_runtimes);
+    const auto pi_runtime = capabilities.find("\"pi\"", managed_runtimes);
+    REQUIRE(managed_runtimes != std::string::npos);
+    REQUIRE(managed_runtimes_end != std::string::npos);
+    REQUIRE(pi_runtime != std::string::npos);
+    REQUIRE(pi_runtime < managed_runtimes_end);
+    REQUIRE(capabilities.find("\"backend\":\"linux_production\"") != std::string::npos);
+    REQUIRE(capabilities.find("\"cpu_time\":\"cgroup_v2\"") != std::string::npos);
+    REQUIRE(capabilities.find("\"memory\":\"cgroup_v2\"") != std::string::npos);
+    REQUIRE(capabilities.find("\"pids\":\"cgroup_v2\"") != std::string::npos);
+    REQUIRE(capabilities.find("\"receipt_schema_version\":1") != std::string::npos);
+    return 0;
+}
+
 } // namespace
 
-auto main() -> int {
-    return run();
+auto main(int argc, char* argv[]) -> int {
+    if (argc == 1) {
+        return run();
+    }
+    if (argc == 3 && std::string_view{argv[1]} == "--probe-managed-capabilities") {
+        return probe_managed_capabilities(argv[2]);
+    }
+    std::fprintf(stderr, "usage: %s [--probe-managed-capabilities RUNTIME_DIR]\n", argv[0]);
+    return 2;
 }

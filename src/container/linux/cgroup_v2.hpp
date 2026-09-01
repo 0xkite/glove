@@ -109,7 +109,8 @@ private:
         int directory_fd,
         std::filesystem::path path,
         std::string host_leaf_name,
-        bool enabled_controllers
+        bool enabled_controllers,
+        bool owns_host_leaf
     );
 
     void release();
@@ -118,6 +119,7 @@ private:
     std::filesystem::path path_;
     std::string host_leaf_name_;
     bool enabled_controllers_ = false;
+    bool owns_host_leaf_ = false;
 };
 
 } // namespace glove::container::linux_detail

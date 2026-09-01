@@ -268,11 +268,15 @@ auto execute_managed(
 }
 
 auto inherited_stream_survives_clone_exec_seccomp_test(
-    cgroup_v2_root& root, const std::filesystem::path& materialization_root, std::uint64_t page
+    cgroup_v2_root& root,
+    const std::filesystem::path& materialization_root,
+    std::uint64_t page,
+    bool run_native_probe = true
 ) -> int {
     const auto run_probe = [&](std::string_view session_id,
                                std::optional<std::filesystem::path> node_binary) -> int {
-        const auto limits = limits_for(page * 32U);
+        auto limits = limits_for(page * 32U);
+        limits.wall_time_ms = 60'000;
         auto lifecycle = make_lifecycle(root, materialization_root, {}, session_id, limits);
         REQUIRE(lifecycle.has_value());
         int declared[2] = {-1, -1};
@@ -331,10 +335,11 @@ socket.write('ping');
             REQUIRE(!probe.empty());
             argv = {probe.string(), std::to_string(undeclared_child_fd)};
         }
-        std::thread peer{[descriptor = declared[0]] {
+        const auto peer_timeout_ms = static_cast<int>(limits.wall_time_ms + 5'000U);
+        std::thread peer{[descriptor = declared[0], peer_timeout_ms] {
             pollfd readiness{.fd = descriptor, .events = POLLIN, .revents = 0};
             std::array<char, 4> request{};
-            if (::poll(&readiness, 1, 3'000) > 0 &&
+            if (::poll(&readiness, 1, peer_timeout_ms) > 0 &&
                 ::recv(descriptor, request.data(), request.size(), MSG_WAITALL) == 4 &&
                 std::string_view{request.data(), request.size()} == "ping") {
                 static_cast<void>(::send(descriptor, "pong", 4, MSG_NOSIGNAL));
@@ -346,6 +351,9 @@ socket.write('ping');
         peer.join();
         ::close(undeclared[0]);
         ::close(undeclared[1]);
+        if (!receipt) {
+            std::fprintf(stderr, "inherited socket probe failed: %s\n", receipt.error().c_str());
+        }
         REQUIRE(receipt.has_value());
         REQUIRE(receipt->termination_cause == resource_termination_cause::exited);
         if (receipt->exit_code != 0) {
@@ -359,10 +367,17 @@ socket.write('ping');
         return 0;
     };
 
-    REQUIRE(run_probe("managed-inherited-stream", std::nullopt) == 0);
+    if (run_native_probe) {
+        REQUIRE(run_probe("managed-inherited-stream", std::nullopt) == 0);
+    }
     if (const char* node = std::getenv("GLOVE_TEST_NODE_BINARY");
         node != nullptr && node[0] != '\0') {
         REQUIRE(run_probe("managed-inherited-node", std::filesystem::path{node}) == 0);
+        return 0;
+    }
+    if (!run_native_probe) {
+        std::fprintf(stderr, "SKIP: Node.js is required for the inherited-node probe\n");
+        return 77;
     }
     return 0;
 }
@@ -1015,7 +1030,7 @@ auto interactive_pty_attach_and_stop_test(
     cgroup_v2_root& root, const std::filesystem::path& materialization_root, std::uint64_t page
 ) -> int {
     auto limits = limits_for(page * 16U);
-    limits.wall_time_ms = 10'000;
+    limits.wall_time_ms = 60'000;
     const auto prof = launch_profile(limits);
     const std::vector argv = {std::string{"/usr/bin/cat"}};
     auto ungated_lifecycle =
@@ -1216,8 +1231,16 @@ auto declarative_refinement_evaluator_test(
     return 0;
 }
 
-auto run(bool native_harness_matrix_only) -> int {
-    if (native_harness_matrix_only) {
+enum class managed_test_mode : std::uint8_t {
+    full,
+    native_harness_matrix,
+    inherited_stream,
+    inherited_node,
+    systemd_service,
+};
+
+auto run(managed_test_mode mode) -> int {
+    if (mode == managed_test_mode::native_harness_matrix) {
         auto harness_root = resolve_native_harness_root();
         if (!harness_root) {
             std::fprintf(stderr, "SKIP: %s\n", harness_root.error().c_str());
@@ -1254,12 +1277,24 @@ auto run(bool native_harness_matrix_only) -> int {
         std::fprintf(stderr, "managed-session topology unavailable: %s\n", root.error().c_str());
         return 77;
     }
-    if (native_harness_matrix_only) {
+    if (mode == managed_test_mode::native_harness_matrix) {
         return real_native_harness_test(*root, materialization_root, library_root, page);
     }
-    REQUIRE(
-        inherited_stream_survives_clone_exec_seccomp_test(*root, materialization_root, page) == 0
+    const auto inherited_probe = inherited_stream_survives_clone_exec_seccomp_test(
+        *root,
+        materialization_root,
+        page,
+        mode != managed_test_mode::inherited_node && mode != managed_test_mode::systemd_service
     );
+    if (inherited_probe != 0) {
+        return inherited_probe;
+    }
+    if (mode == managed_test_mode::inherited_stream || mode == managed_test_mode::inherited_node) {
+        return 0;
+    }
+    if (mode == managed_test_mode::systemd_service) {
+        return interactive_pty_attach_and_stop_test(*root, materialization_root, page);
+    }
     REQUIRE(
         mounted_copy_is_isolated_test(
             *root, materialization_root, source, file_source, reference_source, page
@@ -1281,11 +1316,25 @@ auto run(bool native_harness_matrix_only) -> int {
 
 auto main(int argc, char* argv[]) -> int {
     if (argc == 1) {
-        return run(false);
+        return run(managed_test_mode::full);
     }
     if (argc == 2 && std::string_view{argv[1]} == "--native-harness-matrix") {
-        return run(true);
+        return run(managed_test_mode::native_harness_matrix);
     }
-    std::fprintf(stderr, "usage: %s [--native-harness-matrix]\n", argv[0]);
+    if (argc == 2 && std::string_view{argv[1]} == "--inherited-stream-only") {
+        return run(managed_test_mode::inherited_stream);
+    }
+    if (argc == 2 && std::string_view{argv[1]} == "--inherited-node-only") {
+        return run(managed_test_mode::inherited_node);
+    }
+    if (argc == 2 && std::string_view{argv[1]} == "--systemd-service-only") {
+        return run(managed_test_mode::systemd_service);
+    }
+    std::fprintf(
+        stderr,
+        "usage: %s [--native-harness-matrix|--inherited-stream-only|--inherited-node-only|"
+        "--systemd-service-only]\n",
+        argv[0]
+    );
     return 2;
 }

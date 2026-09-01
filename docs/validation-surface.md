@@ -22,6 +22,12 @@ it does not claim the diagnostic backlog is zero.
 
 Platform-specific kernel controls are reported as capabilities. A skipped or
 unavailable control never counts as a pass for another platform's boundary.
+On systemd 254+ Linux hosts,
+`container_linux_systemd_delegate_subgroup` must run without a skip: it starts
+actual `gloved` under the generated delegation/unshare topology, checks the
+advertised `pi` managed runtime and cgroup-v2 enforcement before and after a
+forced service restart, then executes the actual Node inherited-stream
+clone/exec/seccomp probe and managed PTY attach/stop path in the same topology.
 
 ## Real harness evidence
 

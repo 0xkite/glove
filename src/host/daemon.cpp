@@ -190,8 +190,8 @@ auto systemd_definition(
            std::string{unshare_executable} +
            "\" --user --map-root-user --mount --propagation private -- \"" + executable +
            "\" --config \"" + config +
-           "\"\nDelegate=cpu memory pids\nRestart=on-failure\nRestartSec=2s\nTimeoutStopSec=15s\n"
-           "UMask=0077\n\n"
+           "\"\nDelegate=cpu memory pids\nDelegateSubgroup=glove-host\nRestart=on-failure\n"
+           "RestartSec=2s\nTimeoutStopSec=15s\nUMask=0077\n\n"
            "[Install]\nWantedBy=default.target\n";
 }
 #endif
