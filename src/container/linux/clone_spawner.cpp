@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -443,6 +444,72 @@ auto write_file(const char* path, std::string_view value) -> bool {
     }
     ::close(fd);
     return ok;
+}
+
+// CLONE_INTO_CGROUP plus a new child user namespace prevents a mapped-root
+// supervisor from authoring the child's nested uid_map on supported kernels.
+// In that composition the child remains blocked on its private sync pipe while
+// the parent maps it and attaches it to the sealed session cgroup; the release
+// byte is sent only after attachment and the durable start gate succeed.
+auto current_user_namespace_has_full_identity_map() -> std::expected<bool, std::string> {
+    int descriptor = ::open("/proc/self/uid_map", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        return std::unexpected(std::string{"open /proc/self/uid_map: "} + std::strerror(errno));
+    }
+    std::array<char, 256> content{};
+    std::size_t size = 0;
+    while (size < content.size()) {
+        const auto count = ::read(descriptor, content.data() + size, content.size() - size);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            const int saved = errno;
+            ::close(descriptor);
+            return std::unexpected(std::string{"read /proc/self/uid_map: "} + std::strerror(saved));
+        }
+        if (count == 0) {
+            break;
+        }
+        size += static_cast<std::size_t>(count);
+    }
+    ::close(descriptor);
+    if (size == 0 || size == content.size()) {
+        return std::unexpected(std::string{"invalid /proc/self/uid_map"});
+    }
+    const std::string_view mapping{content.data(), size};
+    std::size_t offset = 0;
+    const auto parse_unsigned = [&]() -> std::optional<unsigned long long> {
+        while (offset < mapping.size()) {
+            const char value = mapping[offset];
+            if (value != ' ' && value != '\t' && value != '\r' && value != '\n') {
+                break;
+            }
+            ++offset;
+        }
+        unsigned long long parsed = 0;
+        const auto result =
+            std::from_chars(mapping.data() + offset, mapping.data() + mapping.size(), parsed, 10);
+        if (result.ec != std::errc{} || result.ptr == mapping.data() + offset) {
+            return std::nullopt;
+        }
+        offset = static_cast<std::size_t>(result.ptr - mapping.data());
+        return parsed;
+    };
+    const auto inside = parse_unsigned();
+    const auto outside = parse_unsigned();
+    const auto length = parse_unsigned();
+    if (!inside || !outside || !length) {
+        return std::unexpected(std::string{"invalid /proc/self/uid_map"});
+    }
+    while (offset < mapping.size()) {
+        const char value = mapping[offset];
+        if (value != ' ' && value != '\t' && value != '\r' && value != '\n') {
+            return false;
+        }
+        ++offset;
+    }
+    return *inside == 0 && *outside == 0 && *length == 0xffff'ffffULL;
 }
 
 auto setup_uid_map(::pid_t child) -> std::expected<void, std::string> {
@@ -1660,6 +1727,14 @@ auto launch_passthrough_child(
     if (capture_output && lifecycle == nullptr) {
         return std::unexpected(std::string{"captured output requires a resource lifecycle"});
     }
+    bool clone_directly_into_cgroup = false;
+    if (lifecycle != nullptr) {
+        auto compatible = current_user_namespace_has_full_identity_map();
+        if (!compatible) {
+            return std::unexpected(compatible.error());
+        }
+        clone_directly_into_cgroup = *compatible;
+    }
     int sync_pipe[2] = {-1, -1};
     if (::pipe2(sync_pipe, O_CLOEXEC) != 0) {
         return std::unexpected(std::string{"pipe2(sync): "} + errno_message(errno));
@@ -1702,8 +1777,10 @@ auto launch_passthrough_child(
             close_pipe_pair(pipe_error);
             return std::unexpected(std::string{"managed session cgroup is closed"});
         }
-        arguments.flags |= glove_clone_into_cgroup;
-        arguments.cgroup = static_cast<std::uint64_t>(lifecycle->cgroup_fd());
+        if (clone_directly_into_cgroup) {
+            arguments.flags |= glove_clone_into_cgroup;
+            arguments.cgroup = static_cast<std::uint64_t>(lifecycle->cgroup_fd());
+        }
     }
 
     const long pid = sys_clone3(&arguments, sizeof(arguments));
@@ -1823,6 +1900,10 @@ auto launch_pty_child(
     if (lifecycle.cgroup_fd() < 0) {
         return std::unexpected(std::string{"managed PTY session cgroup is closed"});
     }
+    auto clone_directly_into_cgroup = current_user_namespace_has_full_identity_map();
+    if (!clone_directly_into_cgroup) {
+        return std::unexpected(clone_directly_into_cgroup.error());
+    }
     auto terminal_pair = linux_detail::open_pty_pair();
     if (!terminal_pair) {
         return std::unexpected(terminal_pair.error());
@@ -1845,9 +1926,12 @@ auto launch_pty_child(
 
     clone_args_v3 arguments{};
     arguments.flags = static_cast<std::uint64_t>(CLONE_NEWUSER) | CLONE_NEWNS | CLONE_NEWPID |
-                      CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS | glove_clone_into_cgroup;
+                      CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS;
     arguments.exit_signal = SIGCHLD;
-    arguments.cgroup = static_cast<std::uint64_t>(lifecycle.cgroup_fd());
+    if (*clone_directly_into_cgroup) {
+        arguments.flags |= glove_clone_into_cgroup;
+        arguments.cgroup = static_cast<std::uint64_t>(lifecycle.cgroup_fd());
+    }
     const long pid = sys_clone3(&arguments, sizeof(arguments));
     if (pid < 0) {
         const int saved = errno;

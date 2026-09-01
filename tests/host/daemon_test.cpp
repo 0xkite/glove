@@ -106,6 +106,7 @@ auto run() -> int {
     );
     REQUIRE(plan->service_definition.find(gloved.string()) != std::string::npos);
     REQUIRE(plan->service_definition.find("Delegate=cpu memory pids\n") != std::string::npos);
+    REQUIRE(plan->service_definition.find("DelegateSubgroup=glove-host\n") != std::string::npos);
 #elif defined(__APPLE__)
     REQUIRE(plan->manager == daemon_service_manager::launchd_user);
     REQUIRE(plan->service_name == "org.sage-protocol.gloved");

@@ -29,6 +29,7 @@ namespace {
 constexpr std::size_t max_control_file_bytes = std::size_t{64} * 1024U;
 constexpr std::string_view required_controllers = "+cpu +memory +pids";
 constexpr std::string_view disabled_controllers = "-cpu -memory -pids";
+constexpr std::string_view systemd_delegate_subgroup = "glove-host";
 
 class unique_fd {
 public:
@@ -379,6 +380,116 @@ auto create_unique_host_leaf(int root_fd) -> std::expected<std::string, std::str
     return std::unexpected(std::string{"cannot allocate unique cgroup host leaf"});
 }
 
+struct systemd_delegated_parent {
+    unique_fd directory;
+    std::filesystem::path path;
+    bool enabled_controllers = false;
+};
+
+auto prepare_systemd_delegated_parent(const std::filesystem::path& current_path)
+    -> std::expected<std::optional<systemd_delegated_parent>, std::string> {
+    if (current_path.filename() != std::filesystem::path{systemd_delegate_subgroup}) {
+        return std::optional<systemd_delegated_parent>{};
+    }
+    const auto parent_path = current_path.parent_path();
+    if (parent_path.empty() || parent_path == current_path ||
+        parent_path == std::filesystem::path{"/sys/fs/cgroup"}) {
+        return std::unexpected(std::string{"systemd delegate subgroup parent is invalid"});
+    }
+    unique_fd current_fd{
+        ::open(current_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+    };
+    unique_fd parent_fd{
+        ::open(parent_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+    };
+    if (current_fd.get() < 0 || parent_fd.get() < 0) {
+        return std::unexpected(
+            std::string{"open systemd delegated cgroup: "} + std::strerror(errno)
+        );
+    }
+    struct stat current_status{};
+    struct stat parent_status{};
+    struct stat linked_status{};
+    if (::fstat(current_fd.get(), &current_status) != 0 ||
+        ::fstat(parent_fd.get(), &parent_status) != 0 ||
+        ::fstatat(
+            parent_fd.get(),
+            std::string{systemd_delegate_subgroup}.c_str(),
+            &linked_status,
+            AT_SYMLINK_NOFOLLOW
+        ) != 0) {
+        return std::unexpected(
+            std::string{"inspect systemd delegated cgroup: "} + std::strerror(errno)
+        );
+    }
+    const auto protected_directory = [](const struct stat& status) {
+        return S_ISDIR(status.st_mode) && status.st_uid == ::geteuid() &&
+               (static_cast<unsigned int>(status.st_mode) & 0022U) == 0U;
+    };
+    if (!protected_directory(current_status) || !protected_directory(parent_status) ||
+        current_status.st_dev != linked_status.st_dev ||
+        current_status.st_ino != linked_status.st_ino) {
+        return std::unexpected(std::string{"systemd delegate subgroup identity is invalid"});
+    }
+    auto exclusive = current_cgroup_is_exclusive(current_fd.get());
+    if (!exclusive) {
+        return std::unexpected(exclusive.error());
+    }
+    if (!*exclusive) {
+        return std::unexpected(std::string{"systemd delegate subgroup is not process-exclusive"});
+    }
+    auto parent_processes = read_at(parent_fd.get(), "cgroup.procs");
+    if (!parent_processes) {
+        return std::unexpected(parent_processes.error());
+    }
+    if (!parent_processes->empty()) {
+        return std::unexpected(std::string{"systemd delegated cgroup contains internal processes"});
+    }
+    auto controllers = read_at(parent_fd.get(), "cgroup.controllers");
+    if (!controllers) {
+        return std::unexpected(controllers.error());
+    }
+    for (const auto required : {"cpu", "memory", "pids"}) {
+        if (!contains_word(*controllers, required)) {
+            return std::unexpected(
+                std::string{"systemd delegated cgroup is missing controller: "} + required
+            );
+        }
+    }
+    auto subtree = read_at(parent_fd.get(), "cgroup.subtree_control");
+    if (!subtree) {
+        return std::unexpected(subtree.error());
+    }
+    const bool cpu = contains_word(*subtree, "cpu");
+    const bool memory = contains_word(*subtree, "memory");
+    const bool pids = contains_word(*subtree, "pids");
+    if ((cpu || memory || pids) && !(cpu && memory && pids)) {
+        return std::unexpected(std::string{"systemd delegated controllers are partially enabled"});
+    }
+    bool enabled_controllers = false;
+    if (!(cpu && memory && pids)) {
+        auto enabled = write_at(parent_fd.get(), "cgroup.subtree_control", required_controllers);
+        if (!enabled) {
+            return std::unexpected(enabled.error());
+        }
+        enabled_controllers = true;
+        subtree = read_at(parent_fd.get(), "cgroup.subtree_control");
+        if (!subtree || !contains_word(*subtree, "cpu") || !contains_word(*subtree, "memory") ||
+            !contains_word(*subtree, "pids")) {
+            (void)write_at(parent_fd.get(), "cgroup.subtree_control", disabled_controllers);
+            return std::unexpected(
+                subtree ? std::string{"systemd delegated controllers were not enabled"}
+                        : subtree.error()
+            );
+        }
+    }
+    return std::optional<systemd_delegated_parent>{systemd_delegated_parent{
+        .directory = std::move(parent_fd),
+        .path = parent_path,
+        .enabled_controllers = enabled_controllers,
+    }};
+}
+
 auto remove_directory_at(int parent_fd, const std::string& name) noexcept -> bool {
     return ::unlinkat(parent_fd, name.c_str(), AT_REMOVEDIR) == 0;
 }
@@ -685,18 +796,21 @@ cgroup_v2_root::cgroup_v2_root(
     int directory_fd,
     std::filesystem::path path,
     std::string host_leaf_name,
-    bool enabled_controllers
+    bool enabled_controllers,
+    bool owns_host_leaf
 )
     : directory_fd_{directory_fd},
       path_{std::move(path)},
       host_leaf_name_{std::move(host_leaf_name)},
-      enabled_controllers_{enabled_controllers} {}
+      enabled_controllers_{enabled_controllers},
+      owns_host_leaf_{owns_host_leaf} {}
 
 cgroup_v2_root::cgroup_v2_root(cgroup_v2_root&& other) noexcept
     : directory_fd_{std::exchange(other.directory_fd_, -1)},
       path_{std::move(other.path_)},
       host_leaf_name_{std::move(other.host_leaf_name_)},
-      enabled_controllers_{std::exchange(other.enabled_controllers_, false)} {}
+      enabled_controllers_{std::exchange(other.enabled_controllers_, false)},
+      owns_host_leaf_{std::exchange(other.owns_host_leaf_, false)} {}
 
 cgroup_v2_root::~cgroup_v2_root() {
     try {
@@ -714,6 +828,20 @@ auto cgroup_v2_root::prepare_for_current_process() -> std::expected<cgroup_v2_ro
     auto path = current_cgroup_path();
     if (!path) {
         return std::unexpected(path.error());
+    }
+    auto systemd_parent = prepare_systemd_delegated_parent(*path);
+    if (!systemd_parent) {
+        return std::unexpected(systemd_parent.error());
+    }
+    if (*systemd_parent) {
+        auto prepared = std::move(**systemd_parent);
+        return cgroup_v2_root{
+            prepared.directory.release(),
+            std::move(prepared.path),
+            std::string{systemd_delegate_subgroup},
+            prepared.enabled_controllers,
+            false,
+        };
     }
     unique_fd root_fd{::open(path->c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
     if (root_fd.get() < 0) {
@@ -765,7 +893,7 @@ auto cgroup_v2_root::prepare_for_current_process() -> std::expected<cgroup_v2_ro
         remove_directory_at(root_fd.get(), *host_name);
         return std::unexpected(enabled.error());
     }
-    return cgroup_v2_root{root_fd.release(), *path, std::move(*host_name), true};
+    return cgroup_v2_root{root_fd.release(), *path, std::move(*host_name), true, true};
 }
 
 cgroup_session_result
@@ -897,7 +1025,8 @@ void cgroup_v2_root::release() {
         return;
     }
     if (enabled_controllers_) {
-        if (write_at(directory_fd_, "cgroup.subtree_control", disabled_controllers)) {
+        if (write_at(directory_fd_, "cgroup.subtree_control", disabled_controllers) &&
+            owns_host_leaf_) {
             (void)write_at(directory_fd_, "cgroup.procs", std::to_string(::getpid()));
             (void)remove_directory_at(directory_fd_, host_leaf_name_);
         }
@@ -907,6 +1036,7 @@ void cgroup_v2_root::release() {
     path_.clear();
     host_leaf_name_.clear();
     enabled_controllers_ = false;
+    owns_host_leaf_ = false;
 }
 
 } // namespace glove::container::linux_detail

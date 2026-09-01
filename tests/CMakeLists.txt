@@ -553,6 +553,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         TIMEOUT 120
         SKIP_RETURN_CODE 77
     )
+    add_test(
+        NAME container_linux_systemd_delegate_subgroup
+        COMMAND
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/systemd_delegate_subgroup_test.sh
+            $<TARGET_FILE:container_linux_managed_session_test>
+            $<TARGET_FILE:gloved_lifecycle_test>
+            $<TARGET_FILE:gloved>
+    )
+    set_tests_properties(container_linux_systemd_delegate_subgroup PROPERTIES
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+    )
 
     add_executable(
         control_local_service_proxy_test

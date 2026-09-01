@@ -91,7 +91,9 @@ shows Glove-owned resources, and cleanup requires the preview's ledger digest.
 ## Platform limits
 
 Linux managed sessions require delegated cgroups, namespaces, mounts, and
-seccomp; see [build.md](build.md). macOS does not advertise the managed Linux
+seccomp; see [build.md](build.md). The tested user-service path uses systemd
+254+ so the generated `DelegateSubgroup=glove-host` leaf is created and owned
+before `gloved` enters its mapped-root user and private mount namespaces. macOS does not advertise the managed Linux
 resource-enforcement contract. Hostile-content analysis is Linux-only,
 deny-network, credential-free, and data-only; see
 [hostile-content-analysis.md](hostile-content-analysis.md).

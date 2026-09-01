@@ -59,9 +59,11 @@ ctest --preset release
 ## Managed Linux sessions
 
 A managed-session host also needs cgroup v2 (`cpu`, `memory`, `pids`), user and
-mount namespaces, mount support, seccomp, and systemd delegation. Those
-requirements exist because Glove must enforce resource and filesystem limits,
-not merely start a process. See [host-setup.md](host-setup.md) for the
+mount namespaces, mount support, seccomp, and systemd delegation. Systemd 254+
+is the tested service topology: `DelegateSubgroup=glove-host` keeps the
+supervisor in a systemd-owned leaf while Glove owns session siblings under the
+empty delegated parent. Those requirements exist because Glove must enforce
+resource and filesystem limits, not merely start a process. See [host-setup.md](host-setup.md) for the
 owner-local workflow and [session-policy.md](session-policy.md) for the policy
 contract.
 

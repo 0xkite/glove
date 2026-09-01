@@ -196,7 +196,18 @@ The Linux unit enters an unprivileged user namespace and a private mount
 namespace before executing `gloved`; that gives the current user namespace only
 the mount authority needed for quota-backed private session filesystems.
 Systemd separately delegates the `cpu`, `memory`, and `pids` controllers to the
-unit. Neither mechanism grants host-root authority.
+unit. On systemd 254 or newer the generated unit places `gloved` in the fixed
+`glove-host` delegate subgroup. Glove pins that subgroup and its parent cgroup,
+requires owner identity and process exclusivity, enables the three controllers
+only on the empty delegated parent, and creates session cgroups as siblings of
+the supervisor subgroup. This avoids moving the supervisor during service
+startup while preserving a process-free controller node. When the supervisor
+itself has a non-identity UID map, the kernel cannot combine nested UID mapping
+with `CLONE_INTO_CGROUP`; Glove instead creates a child whose first operation is
+a blocking read on a private sync pipe, writes the nested UID/GID maps, attaches
+the blocked child to its sealed session cgroup, and releases it only after the
+durable start gate succeeds. No child setup or agent instruction executes
+before cgroup attachment. Neither mechanism grants host-root authority.
 
 When Sage configures `glove_activation_mode = "user_service"`, `saged` first
 asks the platform user service manager to start the fixed local Glove unit. It
