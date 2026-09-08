@@ -33,7 +33,7 @@ version control, tests, and architecture documentation.
 | Remaining fault injection | Persisted journals share short-write/disk-full seams, and every lifecycle transition has crash/replay coverage. |
 | Multi-agent matrix | Complete every required row in [`client-adoption-matrix.md`](client-adoption-matrix.md): all five built-in adapters share filesystem, environment, tool-policy binding, terminal, cleanup, and recovery evidence; the installed-client lane includes Codex and reports missing distributions as skips rather than silently passing. |
 | Performance characterization | Startup cost, request latency, throughput, and memory overhead are measured with reproducible workloads and confidence intervals. |
-| Comparative evaluation | Claims are evaluated against comparable containment and gateway designs using the same threat model and workload. |
+| Comparative evaluation | Claims are evaluated against comparable containment and gateway designs using the same threat model and workload, including microVM isolators such as [`coop`](https://github.com/trailofbits/coop) (Firecracker on Linux, Lima on macOS). |
 
 ## P3: packaging and extensibility
 
@@ -44,6 +44,14 @@ version control, tests, and architecture documentation.
 - Revisit compile-time reflection when the required C++ support is available.
 - Add optional content-addressed audit export without making it part of the
   enforcement path.
+- Evaluate an optional strong-isolation tier that runs the agent inside a
+  microVM (a VM boundary rather than syscall filtering), for workloads whose
+  threat model does not trust the shared host kernel. Trail of Bits'
+  [`coop`](https://github.com/trailofbits/coop) is prior art: Firecracker on
+  Linux and Lima on macOS, selected per host. This would be a distinct backend
+  behind the existing profile/receipt contract, not a replacement for the
+  rootless namespace sandbox, which stays the default for its lower startup cost
+  and finer-grained filesystem, environment, and egress mediation.
 
 Public readiness requires the P0 gates and a security review of their composed
 behavior. P1–P3 items may independently block a deployment based on its threat
