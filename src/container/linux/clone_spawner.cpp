@@ -1109,6 +1109,53 @@ auto setup_seccomp(
         }
     }
 
+    // Escape-relevant surface the classic deny list above misses. Verified
+    // reachable inside a live sandbox (Debian 13, kernel 6.12): the filter
+    // denies mount(2)/pivot_root/chroot but NOT the successor mount API
+    // (fsopen/fsconfig/fsmount/fspick/move_mount/open_tree), so the stated
+    // intent "an already-contained agent has no legitimate need to mount
+    // things" was not enforced against the modern equivalents. io_uring is a
+    // large asynchronous-syscall surface with a long LPE history and no
+    // legitimate need inside the sandbox; open_by_handle_at bypasses
+    // path-based mediation via file handles; pidfd_getfd steals descriptors
+    // from other processes; userfaultfd and fanotify_init are privileged
+    // kernel surfaces. None of these are needed by a contained agent.
+    //
+    // NOTE (compatibility): a few language runtimes use io_uring for async
+    // I/O. Blocking it is the conservative sandbox default (matches common
+    // container hardening), but if a specific agent runtime requires it, drop
+    // the three io_uring entries here rather than weakening the whole filter.
+    const int escape_surface_syscalls[] = {
+        SCMP_SYS(io_uring_setup),
+        SCMP_SYS(io_uring_enter),
+        SCMP_SYS(io_uring_register),
+        SCMP_SYS(fsopen),
+        SCMP_SYS(fsconfig),
+        SCMP_SYS(fsmount),
+        SCMP_SYS(fspick),
+        SCMP_SYS(move_mount),
+        SCMP_SYS(open_tree),
+        // mount_setattr(2) is the successor to remount and can mutate mount
+        // flags (e.g. clear nosuid/nodev/read-only) inside the agent's mount
+        // namespace, so it belongs with the rest of the mount API. Glove's own
+        // read-only binds run in the child before this filter loads, so denying
+        // it post-exec does not affect setup.
+        SCMP_SYS(mount_setattr),
+        SCMP_SYS(open_by_handle_at),
+        SCMP_SYS(pidfd_getfd),
+        SCMP_SYS(userfaultfd),
+        SCMP_SYS(fanotify_init),
+    };
+    for (int sc : escape_surface_syscalls) {
+        if (int rc = deny(sc); rc != 0) {
+            ::seccomp_release(ctx);
+            return std::unexpected(
+                std::string{"deny escape-surface syscall "} + std::to_string(sc) + ": " +
+                std::strerror(-rc)
+            );
+        }
+    }
+
     if (int rc = ::seccomp_load(ctx); rc != 0) {
         ::seccomp_release(ctx);
         return std::unexpected(std::string{"seccomp_load: "} + std::strerror(-rc));

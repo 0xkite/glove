@@ -222,6 +222,8 @@ cp -R fuzz/corpus/change_manifest "${manifest_fuzz_corpus}"
 cp -R fuzz/corpus/session_plan "${session_plan_fuzz_corpus}"
 cp -R fuzz/corpus/change_apply_journal "${journal_fuzz_corpus}"
 cp -R fuzz/corpus/library_bundle "${bundle_fuzz_corpus}"
+apple_stats_fuzz_corpus="${fuzz_workspace}/apple_container_stats"
+cp -R fuzz/corpus/apple_container_stats "${apple_stats_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     build/fuzz/fuzz/glove_mcp_codec_fuzzer \
@@ -258,6 +260,16 @@ UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${bundle_fuzz_corpus}/" \
         "${bundle_fuzz_corpus}"
+# The Apple container-stats parser fuzzer is only built on platforms with that
+# runtime (macOS); run it when present so the target stops being built-but-idle.
+if [[ -x build/fuzz/fuzz/glove_apple_container_stats_fuzzer ]]; then
+    ASAN_OPTIONS="${asan_opts}" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+        build/fuzz/fuzz/glove_apple_container_stats_fuzzer \
+            -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+            -artifact_prefix="${apple_stats_fuzz_corpus}/" \
+            "${apple_stats_fuzz_corpus}"
+fi
 ok "asan ok"
 
 # 5. tsan -------------------------------------------------------------------
