@@ -1560,7 +1560,7 @@ auto run(bool privileged_only) -> int {
         auto concrete_runtime =
             std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
                 std::move(*runtime_result)
-        };
+            };
         REQUIRE(::chmod(endpoint.c_str(), 0660) == 0);
         auto stale_endpoint_capability = (*inherited_factory)->try_seal(concrete_runtime);
         REQUIRE(!stale_endpoint_capability.has_value());
@@ -1600,7 +1600,7 @@ auto run(bool privileged_only) -> int {
         auto registry_mismatch_runtime =
             std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
                 std::move(*registry_mismatch_runtime_result)
-        };
+            };
         auto registry_mismatch_capability =
             (*inherited_factory)->try_seal(std::move(registry_mismatch_runtime));
         REQUIRE(!registry_mismatch_capability.has_value());
@@ -1629,7 +1629,7 @@ auto run(bool privileged_only) -> int {
         auto lifetime_runtime =
             std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
                 std::move(*lifetime_runtime_result)
-        };
+            };
         auto lifetime_capability_result = lifetime_factory->try_seal(lifetime_runtime);
         REQUIRE(lifetime_capability_result.has_value());
         REQUIRE(lifetime_capability_result->has_value());
@@ -1681,7 +1681,7 @@ auto run(bool privileged_only) -> int {
         auto generic_runtime_shared =
             std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
                 std::move(*generic_runtime)
-        };
+            };
         auto generic_capability = (*generic_pi_factory)->try_seal(generic_runtime_shared);
         REQUIRE(generic_capability.has_value());
         REQUIRE(!generic_capability->has_value());
@@ -1701,7 +1701,7 @@ auto run(bool privileged_only) -> int {
         auto non_pi_runtime_shared =
             std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
                 std::move(*non_pi_runtime)
-        };
+            };
         REQUIRE((*non_pi_factory)->manages_runtime("codex"));
         REQUIRE((*non_pi_factory)->manages_runtime("opencode"));
         auto non_pi_capability = (*non_pi_factory)->try_seal(non_pi_runtime_shared);

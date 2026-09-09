@@ -1138,7 +1138,7 @@ auto run() -> int {
     auto capability_runtime_shared =
         std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
             std::move(*capability_runtime)
-    };
+        };
     REQUIRE(capability_runtime_shared->refinement_evaluation_protocol_schema_version() == 1);
     auto capability_protocol = glove::control::receipt_audit_protocol::create(
         bootstrap_secret,
