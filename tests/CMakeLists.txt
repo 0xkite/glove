@@ -635,6 +635,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(container_linux_exec_test PRIVATE glove_kernel)
     add_test(NAME container_linux_exec COMMAND container_linux_exec_test)
     set_tests_properties(container_linux_exec PROPERTIES TIMEOUT 30)
+
+    # Regression guard: the hardened seccomp deny list must block the
+    # escape-relevant syscalls (mount API, io_uring, handle/pidfd) inside a
+    # contained process.
+    add_executable(container_linux_seccomp_denial_test container/linux_seccomp_denial_test.cpp)
+    target_link_libraries(container_linux_seccomp_denial_test PRIVATE glove_kernel)
+    add_test(NAME container_linux_seccomp_denial COMMAND container_linux_seccomp_denial_test)
+    set_tests_properties(container_linux_seccomp_denial PROPERTIES TIMEOUT 30)
 endif()
 
 add_executable(reflect_codegen_availability_test reflect/codegen_availability_test.cpp)

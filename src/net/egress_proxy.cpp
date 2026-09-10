@@ -212,6 +212,20 @@ auto parse_connect(std::string_view request, std::string& host, std::uint16_t& p
     return true;
 }
 
+// Compare a caller-supplied credential against the fixed expected token in time
+// that depends only on the expected token's length, never on the attacker's
+// input or on where the first mismatch is. The loop runs `expected.size()`
+// times regardless of `provided`; a length mismatch is folded into the result.
+auto constant_time_equal(std::string_view provided, std::string_view expected) noexcept -> bool {
+    unsigned difference = static_cast<unsigned>(provided.size() ^ expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const unsigned provided_byte =
+            index < provided.size() ? static_cast<unsigned char>(provided[index]) : 0U;
+        difference |= (provided_byte ^ static_cast<unsigned char>(expected[index]));
+    }
+    return difference == 0U;
+}
+
 auto authenticated(std::string_view request, std::string_view expected) -> bool {
     const auto request_line_end = request.find("\r\n");
     if (request_line_end == std::string_view::npos) {
@@ -231,7 +245,7 @@ auto authenticated(std::string_view request, std::string_view expected) -> bool 
             while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
                 value.remove_prefix(1);
             }
-            return value == expected;
+            return constant_time_equal(value, expected);
         }
         cursor = end + 2;
     }
