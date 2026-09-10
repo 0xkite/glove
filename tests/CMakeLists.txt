@@ -580,7 +580,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container/linux>
     )
     add_test(NAME control_local_service_proxy COMMAND control_local_service_proxy_test)
-    set_tests_properties(control_local_service_proxy PROPERTIES TIMEOUT 20)
+    set_tests_properties(control_local_service_proxy PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
     add_test(
         NAME control_local_service_proxy_privileged
         COMMAND control_local_service_proxy_test --privileged
