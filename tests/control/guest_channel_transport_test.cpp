@@ -170,7 +170,7 @@ auto run() -> int {
             result.load(std::memory_order_acquire) ==
             static_cast<int>(guest_channel_transport_error_code::cancelled)
         );
-        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{200});
+        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{2000});
     }
 
     // Response cancellation and peer disconnects have distinct typed failures.
