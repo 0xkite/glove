@@ -1,4 +1,5 @@
 #include "../../include/glove/control/remote_protocol.hpp"
+#include "sanitizer_timing.hpp"
 
 #include <unistd.h>
 
@@ -167,7 +168,10 @@ auto run() -> int {
         read_remote_frame(deadline_pipe.read_end(), started + std::chrono::milliseconds{20});
     REQUIRE(!timed_out.has_value());
     REQUIRE(timed_out.error().find("deadline") != std::string::npos);
-    REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::seconds{1});
+    REQUIRE(
+        std::chrono::steady_clock::now() - started <
+        std::chrono::seconds{1 * glove_test::timeout_scale}
+    );
     return 0;
 }
 

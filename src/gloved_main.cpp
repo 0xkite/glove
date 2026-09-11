@@ -685,7 +685,7 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         auto concrete_runtime =
             std::shared_ptr<glove::control::linux_detail::linux_session_runtime>{
                 std::move(*runtime)
-        };
+            };
         if (local_service_factory) {
             auto sealed = local_service_factory->try_seal(concrete_runtime);
             if (!sealed) {
@@ -749,7 +749,7 @@ auto run(const options& configured) -> std::expected<void, std::string> {
         session_runtime =
             std::shared_ptr<glove::control::apple_detail::apple_container_session_runtime>{
                 std::move(*runtime)
-        };
+            };
     } else if (configured.materialization_root) {
         return std::unexpected(
             std::string{"managed session launch requires Apple Container configuration"}

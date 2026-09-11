@@ -164,12 +164,16 @@ target_link_libraries(
 )
 glove_configure_fuzzer(glove_library_bundle_fuzzer)
 
-add_executable(glove_apple_container_stats_fuzzer apple_container_stats_fuzzer.cpp)
-target_link_libraries(
-    glove_apple_container_stats_fuzzer
-    PRIVATE glove_control glaze::glaze
-)
-target_include_directories(glove_apple_container_stats_fuzzer PRIVATE
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
-)
-glove_configure_fuzzer(glove_apple_container_stats_fuzzer)
+# The Apple Container stats parser is compiled only on Apple platforms
+# (src/control/CMakeLists.txt), so this fuzzer only links there.
+if(APPLE)
+    add_executable(glove_apple_container_stats_fuzzer apple_container_stats_fuzzer.cpp)
+    target_link_libraries(
+        glove_apple_container_stats_fuzzer
+        PRIVATE glove_control glaze::glaze
+    )
+    target_include_directories(glove_apple_container_stats_fuzzer PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/control>
+    )
+    glove_configure_fuzzer(glove_apple_container_stats_fuzzer)
+endif()
