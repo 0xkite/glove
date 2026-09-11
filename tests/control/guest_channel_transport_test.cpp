@@ -1,5 +1,7 @@
 #include "glove/control/guest_channel_transport.hpp"
 
+#include "sanitizer_timing.hpp"
+
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -137,7 +139,7 @@ auto run() -> int {
         const auto elapsed = std::chrono::steady_clock::now() - started;
         REQUIRE(!received.has_value());
         REQUIRE(received.error().code == guest_channel_transport_error_code::deadline_exceeded);
-        REQUIRE(elapsed < std::chrono::milliseconds{150});
+        REQUIRE(elapsed < std::chrono::milliseconds{150 * glove_test::timeout_scale});
     }
 
     // Cancellation interrupts partial header and body reads within a fixed bound.
@@ -170,7 +172,10 @@ auto run() -> int {
             result.load(std::memory_order_acquire) ==
             static_cast<int>(guest_channel_transport_error_code::cancelled)
         );
-        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{2000});
+        REQUIRE(
+            std::chrono::steady_clock::now() - started <
+            std::chrono::milliseconds{2000 * glove_test::timeout_scale}
+        );
     }
 
     // Response cancellation and peer disconnects have distinct typed failures.
@@ -211,7 +216,10 @@ auto run() -> int {
         auto sent = (*channel)->send_frame(response, deadline_after(std::chrono::milliseconds{40}));
         REQUIRE(!sent.has_value());
         REQUIRE(sent.error().code == guest_channel_transport_error_code::deadline_exceeded);
-        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{200});
+        REQUIRE(
+            std::chrono::steady_clock::now() - started <
+            std::chrono::milliseconds{200 * glove_test::timeout_scale}
+        );
     }
 
     // Destruction shuts down and closes the endpoint deterministically.
@@ -222,7 +230,10 @@ auto run() -> int {
         REQUIRE(channel.has_value());
         const auto started = std::chrono::steady_clock::now();
         channel->reset();
-        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{100});
+        REQUIRE(
+            std::chrono::steady_clock::now() - started <
+            std::chrono::milliseconds{100 * glove_test::timeout_scale}
+        );
         char byte = 0;
         REQUIRE(::read(pair.get(1), &byte, sizeof(byte)) == 0);
     }

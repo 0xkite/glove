@@ -7,6 +7,8 @@
 #include "glove/supervisor/path_alias.hpp"
 #include "glove/supervisor/session_plan.hpp"
 
+#include "sanitizer_timing.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
@@ -638,7 +640,7 @@ auto server_config_for(
     const running_session_fixture& fixture,
     const std::filesystem::path& socket_path,
     std::uint64_t session_expires_at_ms,
-    std::uint64_t io_timeout_ms = 100
+    std::uint64_t io_timeout_ms = static_cast<std::uint64_t>(100 * glove_test::timeout_scale)
 ) -> glove::control::observation_intent_unix_server_config {
     return {
         .socket_path = socket_path,
@@ -930,7 +932,10 @@ auto run() -> int {
         idle_worker.join();
         REQUIRE(idle_result.has_value());
         REQUIRE(!*idle_result);
-        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{250});
+        REQUIRE(
+            std::chrono::steady_clock::now() - started <
+            std::chrono::milliseconds{250 * glove_test::timeout_scale}
+        );
         idle_server->reset();
 
         // A competing raw accept consumes readiness without taking public
@@ -978,7 +983,8 @@ auto run() -> int {
             }
             worker.join();
             return result.has_value() && !*result &&
-                   std::chrono::steady_clock::now() - started < std::chrono::milliseconds{250};
+                   std::chrono::steady_clock::now() - started <
+                       std::chrono::milliseconds{250 * glove_test::timeout_scale};
         };
 
         bool deadline_race_exercised = false;
@@ -1023,7 +1029,8 @@ auto run() -> int {
             REQUIRE(partial_result.has_value());
             REQUIRE(!*partial_result);
             REQUIRE(
-                std::chrono::steady_clock::now() - partial_started < std::chrono::milliseconds{250}
+                std::chrono::steady_clock::now() - partial_started <
+                std::chrono::milliseconds{250 * glove_test::timeout_scale}
             );
             partial_server->reset();
         }
@@ -1204,7 +1211,8 @@ auto run() -> int {
             REQUIRE(deadline_result.has_value());
             REQUIRE(!*deadline_result);
             REQUIRE(
-                std::chrono::steady_clock::now() - deadline_started < std::chrono::milliseconds{250}
+                std::chrono::steady_clock::now() - deadline_started <
+                std::chrono::milliseconds{250 * glove_test::timeout_scale}
             );
 
             // Cancellation also interrupts the transient accept backoff.
@@ -1220,7 +1228,8 @@ auto run() -> int {
             REQUIRE(stop_result.has_value());
             REQUIRE(!*stop_result);
             REQUIRE(
-                std::chrono::steady_clock::now() - stop_started < std::chrono::milliseconds{250}
+                std::chrono::steady_clock::now() - stop_started <
+                std::chrono::milliseconds{250 * glove_test::timeout_scale}
             );
 
             for (const int descriptor : exhausted) {
