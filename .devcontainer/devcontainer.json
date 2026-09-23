@@ -1,0 +1,19 @@
+{
+  "name": "Glove Development",
+  "dockerComposeFile": "../compose.yaml",
+  "service": "dev",
+  "workspaceFolder": "/glove",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "cmake.configureOnOpen": false,
+        "clangd.path": "/usr/bin/clangd-18"
+      },
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "llvm-vs-code-extensions.vscode-clangd"
+      ]
+    }
+  }
+}
