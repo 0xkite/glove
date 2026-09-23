@@ -10,11 +10,12 @@
 #include "glove/mcp/client.hpp"
 #include "glove/mcp/lazy_init.hpp"
 #include "glove/mcp/stdio_transport.hpp"
-#include "glove/mcp/transport.hpp"
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
 
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -30,6 +31,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+extern "C" char** environ;
 
 namespace glove::run {
 
@@ -335,6 +338,111 @@ auto start_egress(
     return std::move(*proxy);
 }
 
+class herdr_reporter final {
+public:
+    herdr_reporter(const herdr_reporter&) = delete;
+    herdr_reporter& operator=(const herdr_reporter&) = delete;
+    herdr_reporter(herdr_reporter&&) = delete;
+    herdr_reporter& operator=(herdr_reporter&&) = delete;
+
+    static auto create(bool enabled, std::string_view agent_name)
+        -> std::expected<std::unique_ptr<herdr_reporter>, std::string> {
+        if (!enabled) {
+            return std::unique_ptr<herdr_reporter>{};
+        }
+        const char* herdr_env = std::getenv("HERDR_ENV");
+        const char* pane_id = std::getenv("HERDR_PANE_ID");
+        if (herdr_env == nullptr || std::string_view{herdr_env} != "1" || pane_id == nullptr ||
+            *pane_id == '\0') {
+            return std::unexpected(
+                std::string{"--herdr requested but HERDR_ENV=1 and HERDR_PANE_ID are not set"}
+            );
+        }
+        std::string bin = "herdr";
+        if (const char* bin_path = std::getenv("HERDR_BIN_PATH");
+            bin_path != nullptr && *bin_path != '\0') {
+            bin = bin_path;
+        }
+        std::string normalized_name = std::filesystem::path{agent_name}.filename().string();
+        if (normalized_name.empty()) {
+            normalized_name = "agent";
+        }
+        auto reporter = std::unique_ptr<herdr_reporter>(
+            new herdr_reporter(std::move(bin), pane_id, std::move(normalized_name))
+        );
+        reporter->report("working");
+        return reporter;
+    }
+
+    ~herdr_reporter() {
+        if (!pane_id_.empty()) {
+            report("done");
+            release();
+        }
+    }
+
+    void report(std::string_view state) const {
+        run_command({
+            "pane",
+            "report-agent",
+            pane_id_,
+            "--source",
+            "glove:sandbox",
+            "--agent",
+            agent_name_,
+            "--state",
+            std::string{state},
+        });
+    }
+
+    void release() const {
+        run_command({
+            "pane",
+            "release-agent",
+            pane_id_,
+            "--source",
+            "glove:sandbox",
+            "--agent",
+            agent_name_,
+        });
+    }
+
+private:
+    herdr_reporter(std::string bin, std::string pane_id, std::string agent_name)
+        : bin_{std::move(bin)}, pane_id_{std::move(pane_id)}, agent_name_{std::move(agent_name)} {}
+
+    void run_command(const std::vector<std::string>& args) const {
+        std::vector<char*> c_args;
+        c_args.reserve(args.size() + 2);
+        c_args.push_back(const_cast<char*>(bin_.c_str()));
+        for (const auto& arg : args) {
+            c_args.push_back(const_cast<char*>(arg.c_str()));
+        }
+        c_args.push_back(nullptr);
+
+        pid_t pid = 0;
+        const int spawn_rc =
+            ::posix_spawnp(&pid, bin_.c_str(), nullptr, nullptr, c_args.data(), ::environ);
+        if (spawn_rc != 0) {
+            std::fprintf(
+                stderr, "glove: herdr report failed to spawn: %s\n", std::strerror(spawn_rc)
+            );
+            return;
+        }
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            std::fprintf(
+                stderr, "glove: herdr command returned non-zero exit status (%d)\n", status
+            );
+        }
+    }
+
+    std::string bin_;
+    std::string pane_id_;
+    std::string agent_name_;
+};
+
 } // namespace
 
 auto execute(const options& opts) -> std::expected<int, std::string> {
@@ -434,6 +542,10 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(proxy.error());
     }
 
+    auto reporter = herdr_reporter::create(opts.herdr, opts.agent_argv.front());
+    if (!reporter) {
+        return std::unexpected(reporter.error());
+    }
     std::string readable;
     std::string writable;
     for (const auto& rule : profile->filesystem) {

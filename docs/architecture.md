@@ -175,6 +175,14 @@ must add an explicit versioned credit or acknowledgement.
 their own tool protocol, so its security boundary is the OS sandbox and explicit
 filesystem/environment exposure.
 
+When `--herdr` is passed inside an outer Herdr terminal pane (`HERDR_ENV=1`, `HERDR_PANE_ID`),
+Glove's host runner reports lifecycle states (`working`, `done`) and releases authority
+via Herdr's CLI strictly from the host side using `posix_spawnp`. The contained child process
+receives neither `HERDR_SOCKET_PATH` nor `HERDR_BIN_PATH`, preserving fail-closed containment.
+Seccomp explicitly denies `TIOCSTI` and `TIOCLINUX` ioctl calls on the shared terminal descriptor
+to prevent synthetic keystroke injection into the host pane buffer, and installs `PR_SET_PDEATHSIG`
+to terminate the child if the supervisor dies.
+
 ## Sage session flow
 
 `gloved` uses an owner-only Unix socket and a per-start bootstrap secret. Its

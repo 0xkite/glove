@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -112,6 +113,51 @@ auto run() -> int {
         ) == 1
     );
     REQUIRE(!std::filesystem::exists(exposed_audit));
+
+    // --herdr fails closed when HERDR_ENV is not present.
+    ::unsetenv("HERDR_ENV");
+    ::unsetenv("HERDR_PANE_ID");
+    REQUIRE(run_glove({GLOVE_BIN, "exec", "--herdr", "--", "/usr/bin/true"}) == 1);
+
+    // --herdr succeeds and records host-side lifecycle transitions when HERDR_ENV=1,
+    // HERDR_PANE_ID, and HERDR_BIN_PATH are provided.
+    const auto mock_herdr = base / "mock_herdr.sh";
+    const auto herdr_log = base / "herdr_calls.log";
+    {
+        std::ofstream script{mock_herdr};
+        script << "#!/bin/sh\n";
+        script << "echo \"$@\" >> \"" << herdr_log.string() << "\"\n";
+        script << "exit 0\n";
+    }
+    std::filesystem::permissions(mock_herdr, std::filesystem::perms::owner_all);
+
+    ::setenv("HERDR_ENV", "1", 1);
+    ::setenv("HERDR_PANE_ID", "w1:p1", 1);
+    ::setenv("HERDR_BIN_PATH", mock_herdr.c_str(), 1);
+    REQUIRE(run_glove({GLOVE_BIN, "exec", "--herdr", "--", "/usr/bin/true"}) == 0);
+    ::unsetenv("HERDR_ENV");
+    ::unsetenv("HERDR_PANE_ID");
+    ::unsetenv("HERDR_BIN_PATH");
+
+    std::ifstream log_in{herdr_log};
+    REQUIRE(log_in.good());
+    std::string log_contents{
+        std::istreambuf_iterator<char>{log_in}, std::istreambuf_iterator<char>{}
+    };
+    REQUIRE(
+        log_contents.find(
+            "pane report-agent w1:p1 --source glove:sandbox --agent true --state working"
+        ) != std::string::npos
+    );
+    REQUIRE(
+        log_contents.find(
+            "pane report-agent w1:p1 --source glove:sandbox --agent true --state done"
+        ) != std::string::npos
+    );
+    REQUIRE(
+        log_contents.find("pane release-agent w1:p1 --source glove:sandbox --agent true") !=
+        std::string::npos
+    );
 
     std::filesystem::remove(marker, ec);
     std::filesystem::remove_all(base, ec);

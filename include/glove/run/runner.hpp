@@ -1,6 +1,5 @@
 #pragma once
 
-#include "glove/container/profile.hpp"
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/engine.hpp"
 
@@ -47,6 +46,9 @@ struct options {
     std::vector<std::string> environment_names;
     // Exact host+port grants through the authenticated egress proxy.
     std::vector<glove::net::egress_rule> egress;
+    // Report lifecycle (working/done) to host Herdr supervisor when running
+    // inside a Herdr pane.
+    bool herdr = false;
 };
 
 // Run the contained agent end-to-end: build the profile, spawn the agent,

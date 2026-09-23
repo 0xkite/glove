@@ -158,6 +158,8 @@ void print_exec_usage() {
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
         "                          the agent has no network.\n"
+        "  --herdr                 report lifecycle (working/done) to host Herdr when\n"
+        "                          running inside a Herdr pane\n"
         "  -h, --help              show this help and exit\n"
     );
 }
@@ -184,6 +186,11 @@ auto exec_subcommand(std::span<char* const> args) -> int {
             }
             opts.workspace = std::filesystem::path{args[i + 1]};
             i += 2;
+            continue;
+        }
+        if (a == "--herdr") {
+            opts.herdr = true;
+            ++i;
             continue;
         }
         if (a == "--read" || a == "--write" || a == "--env" || a == "--audit-log") {
