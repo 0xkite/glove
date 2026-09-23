@@ -9,6 +9,7 @@
 #include "glove/container/profile.hpp"
 #include "glove/container/spawner.hpp"
 
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -102,6 +103,45 @@ auto seccomp_probe(const std::filesystem::path& result) -> int {
             ++reachable;
         }
     }
+#ifdef TIOCSTI
+    {
+        errno = 0;
+        char c = 'x';
+        // Use an invalid fd (-1) to prove seccomp denied the syscall before
+        // the kernel checked the descriptor (seccomp yields EPERM; absence yields EBADF).
+        const long rc = ::ioctl(-1, TIOCSTI, &c);
+        const bool blocked = rc < 0 && errno == EPERM;
+        out << "ioctl_TIOCSTI" << (blocked ? " BLOCKED" : " REACHABLE") << '\n';
+        if (!blocked) {
+            ++reachable;
+        }
+    }
+    {
+        errno = 0;
+        char c = 'x';
+        // Prove that 64-bit sign/argument extension (CVE-2019-10063) is also blocked
+        // by SCMP_CMP_MASKED_EQ.
+        const long rc =
+            ::syscall(SYS_ioctl, -1L, static_cast<unsigned long>(TIOCSTI) | (1UL << 32), &c);
+        const bool blocked = rc < 0 && errno == EPERM;
+        out << "ioctl_TIOCSTI_64bit" << (blocked ? " BLOCKED" : " REACHABLE") << '\n';
+        if (!blocked) {
+            ++reachable;
+        }
+    }
+#endif
+#ifdef TIOCLINUX
+    {
+        errno = 0;
+        char subcode = 0;
+        const long rc = ::ioctl(-1, TIOCLINUX, &subcode);
+        const bool blocked = rc < 0 && errno == EPERM;
+        out << "ioctl_TIOCLINUX" << (blocked ? " BLOCKED" : " REACHABLE") << '\n';
+        if (!blocked) {
+            ++reachable;
+        }
+    }
+#endif
     out.flush();
     return reachable == 0 ? 0 : 3;
 }
@@ -142,6 +182,11 @@ auto run(const std::filesystem::path& self) -> int {
     REQUIRE(report.find("move_mount BLOCKED") != std::string::npos);
     REQUIRE(report.find("io_uring_setup BLOCKED") != std::string::npos);
     REQUIRE(report.find("mount BLOCKED") != std::string::npos);
+    REQUIRE(report.find("ioctl_TIOCSTI BLOCKED") != std::string::npos);
+    REQUIRE(report.find("ioctl_TIOCSTI_64bit BLOCKED") != std::string::npos);
+#ifdef TIOCLINUX
+    REQUIRE(report.find("ioctl_TIOCLINUX BLOCKED") != std::string::npos);
+#endif
 
     REQUIRE(std::filesystem::remove_all(ws, ec) > 0);
     REQUIRE(!ec);

@@ -29,6 +29,7 @@
 #include <seccomp.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -1156,6 +1157,36 @@ auto setup_seccomp(
         }
     }
 
+    // Terminal input injection: deny TIOCSTI and TIOCLINUX ioctl requests.
+    // In passthrough/direct exec mode, the child shares the host terminal.
+    // Masking the low 32 bits prevents the 64-bit sign/extension bypass
+    // (CVE-2019-10063) where syscall(SYS_ioctl, fd, TIOCSTI | (1UL << 32), &c)
+    // is treated as TIOCSTI by the kernel.
+    const scmp_arg_cmp tiocsti_cmp{
+        .arg = 1,
+        .op = SCMP_CMP_MASKED_EQ,
+        .datum_a = 0xFFFFFFFFULL,
+        .datum_b = static_cast<scmp_datum_t>(TIOCSTI),
+    };
+    if (int rc = ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ioctl), 1, tiocsti_cmp);
+        rc != 0) {
+        ::seccomp_release(ctx);
+        return std::unexpected(std::string{"deny ioctl TIOCSTI: "} + std::strerror(-rc));
+    }
+#if defined(TIOCLINUX)
+    const scmp_arg_cmp tioclinux_cmp{
+        .arg = 1,
+        .op = SCMP_CMP_MASKED_EQ,
+        .datum_a = 0xFFFFFFFFULL,
+        .datum_b = static_cast<scmp_datum_t>(TIOCLINUX),
+    };
+    if (int rc = ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ioctl), 1, tioclinux_cmp);
+        rc != 0) {
+        ::seccomp_release(ctx);
+        return std::unexpected(std::string{"deny ioctl TIOCLINUX: "} + std::strerror(-rc));
+    }
+#endif
+
     if (int rc = ::seccomp_load(ctx); rc != 0) {
         ::seccomp_release(ctx);
         return std::unexpected(std::string{"seccomp_load: "} + std::strerror(-rc));
@@ -1310,6 +1341,11 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     }
     argv_ptrs.push_back(nullptr);
 
+    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+        std::fprintf(stderr, "glove child: prctl(PR_SET_PDEATHSIG): %s\n", std::strerror(errno));
+        std::_Exit(125);
+    }
+
     ::execv(argv_ptrs[0], argv_ptrs.data());
     std::fprintf(stderr, "glove child: execv(%s): %s\n", argv_ptrs[0], std::strerror(errno));
     std::_Exit(127);
@@ -1424,6 +1460,11 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         argv_ptrs.push_back(a.data());
     }
     argv_ptrs.push_back(nullptr);
+
+    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+        std::fprintf(stderr, "glove child: prctl(PR_SET_PDEATHSIG): %s\n", std::strerror(errno));
+        std::_Exit(125);
+    }
 
     ::execv(argv_ptrs[0], argv_ptrs.data());
     std::fprintf(stderr, "glove child: execv(%s): %s\n", argv_ptrs[0], std::strerror(errno));
