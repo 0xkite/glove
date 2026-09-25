@@ -23,7 +23,8 @@ version control, tests, and architecture documentation.
 | Capability change notification | Long-lived clients can detect effective capability changes without reconnect races. |
 | Durable-state authentication | Session state and general activity logs are keyed or asymmetrically signed, with explicit recovery and key-rotation rules. |
 | Immutable dependency pinning | Glaze and CI actions are pinned to immutable revisions with recorded provenance and verification. |
-| Upstream containment | MCP upstream processes receive a separate sandbox profile or a documented isolated service boundary. |
+| Upstream containment | MCP upstream processes receive a separate sandbox profile (`contained_launcher`) or a documented isolated service boundary. |
+| Credentialed reverse proxy | Local reverse endpoint (`credentialed_endpoint`) with session nonce swap, unbundling credentials from sandbox; Aho-Corasick canary and Rabin-Karp rolling-hash exfiltration detection; token budget caps. |
 
 ## P2: validation evidence
 

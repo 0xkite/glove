@@ -96,6 +96,29 @@ For `glove run`:
 Malformed frames, unknown tools, policy failures, transport errors, and audit
 append failures fail closed.
 
+## Mediated credential proxy and upstream containment
+
+Glove mediates external network requests and MCP upstreams through an object-capability
+model that unbundles credentials from the agent sandbox (detailed in
+[`docs/credentialed-proxy-architecture.md`](credentialed-proxy-architecture.md)):
+
+1. **Virtual loopback reverse proxy**: Instead of mounting secret leases into `/home/agent`,
+   the agent communicates over its private loopback descriptor channel to a local reverse proxy
+   configured via standard base-URL overrides (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`).
+2. **Session nonce swap**: The agent is given an ephemeral session token (`glove-session-...`).
+   The host proxy validates the nonce, strips it, and attaches the genuine provider credential
+   held in host memory before dispatching over TLS to the upstream. Leaked environment variables
+   or transcripts expose no real credentials.
+3. **Mutual exclusion**: Any host configured as a credentialed reverse endpoint is strictly
+   denied from the raw TCP CONNECT egress allowlist to prevent bypasses.
+4. **Detection and validation**: Outbound requests pass through structural JSON schema checks,
+   Aho-Corasick canary detection (`glvc_<base32>`), and Rabin-Karp rolling-hash checks against
+   known project secret digests. High-entropy tokens are audited, and token budgets are enforced
+   directly from provider response metadata.
+5. **Contained MCP upstreams**: Upstream MCP tool servers are launched in dedicated,
+   least-privilege Glove profiles (`contained_launcher`), preventing unsandboxed tool processes
+   from acting with full host authority.
+
 ## Historical synthetic status milestone
 
 The former construction-only synthetic status stack and harness-shaped adapter were
