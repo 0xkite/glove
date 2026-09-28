@@ -84,6 +84,11 @@ target_link_libraries(net_egress_proxy_test PRIVATE glove_kernel)
 add_test(NAME net_egress_proxy COMMAND net_egress_proxy_test)
 set_tests_properties(net_egress_proxy PROPERTIES TIMEOUT 30)
 
+add_executable(net_credentialed_endpoint_test net/credentialed_endpoint_test.cpp)
+target_link_libraries(net_credentialed_endpoint_test PRIVATE glove_kernel)
+add_test(NAME net_credentialed_endpoint COMMAND net_credentialed_endpoint_test)
+set_tests_properties(net_credentialed_endpoint PROPERTIES TIMEOUT 15)
+
 add_executable(audit_client_test audit/audit_client_test.cpp)
 target_link_libraries(audit_client_test PRIVATE glove_kernel)
 add_test(NAME audit_client COMMAND audit_client_test)
