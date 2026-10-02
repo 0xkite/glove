@@ -16,6 +16,7 @@
 #include <cstring>
 #include <expected>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -66,6 +67,93 @@ auto write_all(int fd, std::string_view data) -> bool {
         remaining -= static_cast<std::size_t>(n);
     }
     return true;
+}
+
+// Hop-by-hop, routing, and credential fields are never forwarded. The
+// transport owns Host, framing, and the credential; anything that could let a
+// sandboxed agent pick a different destination, smuggle framing, or attach its
+// own credential is dropped here rather than trusted downstream.
+constexpr auto request_header_denylist = std::to_array<std::string_view>({
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "expect",
+    "x-api-key",
+    "authorization",
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "via",
+    "cookie",
+});
+
+constexpr auto response_header_denylist = std::to_array<std::string_view>({
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    // The endpoint sets its own Content-Length for the buffered body.
+    "content-length",
+});
+
+auto in_denylist(std::span<const std::string_view> denylist, std::string_view name) -> bool {
+    return std::ranges::find(denylist, name) != denylist.end();
+}
+
+auto is_forwardable_request_header(std::string_view name) -> bool {
+    return !in_denylist(request_header_denylist, name);
+}
+
+auto is_forwardable_response_header(std::string_view name) -> bool {
+    return !in_denylist(response_header_denylist, name);
+}
+
+// A reason phrase for the codes a provider API returns. An unknown code is sent
+// with an empty reason, which is valid (RFC 7230 3.1.2).
+auto reason_phrase(int status_code) -> std::string_view {
+    switch (status_code) {
+    case 200:
+        return "OK";
+    case 201:
+        return "Created";
+    case 204:
+        return "No Content";
+    case 400:
+        return "Bad Request";
+    case 401:
+        return "Unauthorized";
+    case 403:
+        return "Forbidden";
+    case 404:
+        return "Not Found";
+    case 409:
+        return "Conflict";
+    case 413:
+        return "Payload Too Large";
+    case 429:
+        return "Too Many Requests";
+    case 500:
+        return "Internal Server Error";
+    case 502:
+        return "Bad Gateway";
+    case 503:
+        return "Service Unavailable";
+    case 504:
+        return "Gateway Timeout";
+    default:
+        return "";
+    }
 }
 
 struct parsed_request_head {
@@ -600,26 +688,85 @@ private:
             return;
         }
 
-        drain_body(client_fd, head->content_length, stop);
+        // Read the declared body when there is a transport to hand it to, or
+        // discard it so closing does not reset the connection.
+        std::string body;
+        if (options_.forward && head->content_length > 0) {
+            body = buffer.substr(header_end + 4U);
+            if (body.size() > head->content_length) {
+                body.resize(head->content_length);
+            }
+            std::size_t remaining = head->content_length - body.size();
+            while (remaining > 0 && !stop.stop_requested()) {
+                std::array<char, 4096> chunk{};
+                const auto wanted = std::min(chunk.size(), remaining);
+                const auto got = ::read(client_fd, chunk.data(), wanted);
+                if (got <= 0) {
+                    break;
+                }
+                body.append(chunk.data(), static_cast<std::size_t>(got));
+                remaining -= static_cast<std::size_t>(got);
+            }
+            if (remaining != 0) {
+                // A truncated body is not something to forward as if complete.
+                write_status(client_fd, "HTTP/1.1 400 Bad Request");
+                return;
+            }
+        } else {
+            drain_body(client_fd, head->content_length, stop);
+        }
 
-        // For unit tests / mock mode: if upstream_host starts with "mock:", reply with 200 OK
-        if (matched_rule->upstream_host.starts_with("mock:")) {
-            constexpr std::string_view mock_response_body =
-                "{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{"
-                "\"type\":\"text\",\"text\":\"mock response\"}]}";
-            std::string resp =
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
-            resp += std::to_string(mock_response_body.size());
-            resp += "\r\nConnection: close\r\n\r\n";
-            resp += mock_response_body;
-            static_cast<void>(write_all(client_fd, resp));
+        if (!options_.forward) {
+            // No provider transport is configured (the TLS client is not built
+            // yet). Say so plainly rather than implying a forwarding attempt.
+            write_status(client_fd, "HTTP/1.1 501 Not Implemented");
             return;
         }
 
-        // Real upstream forwarding (bounded TLS client, request-body forward,
-        // and response streaming) is not constructed yet. Report that plainly
-        // rather than a 502, which would imply an upstream attempt occurred.
-        write_status(client_fd, "HTTP/1.1 501 Not Implemented");
+        upstream_request request;
+        request.provider = matched_rule->provider;
+        request.upstream_host = matched_rule->upstream_host;
+        request.upstream_port = matched_rule->upstream_port;
+        request.method = head->method;
+        request.target = rewritten_path;
+        if (query_pos != std::string::npos) {
+            request.target += head->uri.substr(query_pos);
+        }
+        request.body = std::move(body);
+        request.secret_token = matched_rule->secret_token;
+        for (const auto& [name, value] : head->headers) {
+            if (is_forwardable_request_header(name)) {
+                request.headers.emplace_back(name, value);
+            }
+        }
+
+        auto forwarded = options_.forward(request);
+        if (!forwarded) {
+            if (!audit_or_unavailable(
+                    client_fd,
+                    matched_rule->provider,
+                    head->method,
+                    head->uri,
+                    true,
+                    "upstream_error"
+                )) {
+                return;
+            }
+            write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
+            return;
+        }
+
+        std::string response = "HTTP/1.1 " + std::to_string(forwarded->status_code) + " " +
+                               std::string{reason_phrase(forwarded->status_code)} + "\r\n";
+        for (const auto& [name, value] : forwarded->headers) {
+            if (is_forwardable_response_header(lower_ascii(name))) {
+                response += name + ": " + value + "\r\n";
+            }
+        }
+        response += "Content-Length: " + std::to_string(forwarded->body.size()) + "\r\n";
+        response += "Connection: close\r\n\r\n";
+        response += forwarded->body;
+        static_cast<void>(write_all(client_fd, response));
     }
 
     auto record_event(
