@@ -1,6 +1,7 @@
 #include "glove/net/credentialed_endpoint.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -30,6 +31,7 @@ namespace {
 constexpr std::size_t max_request_headers_bytes = 16384;
 constexpr std::size_t max_request_body_bytes = 8U * 1024U * 1024U;
 constexpr std::size_t max_header_count = 100;
+constexpr std::size_t max_response_body_bytes = 32U * 1024U * 1024U;
 // One absolute deadline for reading a complete request head. A peer that
 // trickles bytes must not hold the single worker, or shutdown, indefinitely.
 constexpr int head_deadline_ms = 5000;
@@ -52,29 +54,132 @@ auto constant_time_equal(std::string_view provided, std::string_view expected) n
     return difference == 0U;
 }
 
-auto write_all(int fd, std::string_view data) -> bool {
+// Every read and write on this endpoint is bounded by one absolute deadline and
+// observes cancellation. The endpoint has a single worker, so a peer that
+// trickles bytes, declares a body it never sends, or stops reading the response
+// must not be able to pin that worker (or block the destructor's join).
+
+auto set_nonblocking(int fd) -> bool {
+    const int flags = ::fcntl(fd, F_GETFL);
+    return flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+auto wait_ready(
+    int fd, short events, std::stop_token stop, std::chrono::steady_clock::time_point deadline
+) -> bool {
+    while (!stop.stop_requested()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const int tick = static_cast<int>(std::min<long long>(left.count(), poll_tick_ms));
+        ::pollfd pfd{.fd = fd, .events = events, .revents = 0};
+        const int ready = ::poll(&pfd, 1, tick);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (ready > 0 && (pfd.revents & events) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto write_all_until(
+    int fd,
+    std::string_view data,
+    std::stop_token stop,
+    std::chrono::steady_clock::time_point deadline
+) -> bool {
     const char* cursor = data.data();
     std::size_t remaining = data.size();
     while (remaining > 0) {
+        if (!wait_ready(fd, POLLOUT, stop, deadline)) {
+            return false;
+        }
 #if defined(MSG_NOSIGNAL)
         // A peer that has already gone away raises SIGPIPE on write, whose
         // default action would terminate the entire Glove host process. The
         // agent controls this connection, so it must not be able to do that.
-        const auto n = ::send(fd, cursor, remaining, MSG_NOSIGNAL);
+        const auto written = ::send(fd, cursor, remaining, MSG_NOSIGNAL);
 #else
-        const auto n = ::write(fd, cursor, remaining);
+        const auto written = ::write(fd, cursor, remaining);
 #endif
-        if (n < 0) {
-            if (errno == EINTR) {
+        if (written < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
             // A disconnected peer is the end of this connection, not an error.
             return false;
         }
-        cursor += n;
-        remaining -= static_cast<std::size_t>(n);
+        cursor += written;
+        remaining -= static_cast<std::size_t>(written);
     }
     return true;
+}
+
+auto read_exact_until(
+    int fd,
+    std::size_t wanted,
+    std::string& out,
+    std::stop_token stop,
+    std::chrono::steady_clock::time_point deadline
+) -> bool {
+    out.clear();
+    while (out.size() < wanted) {
+        if (!wait_ready(fd, POLLIN, stop, deadline)) {
+            return false;
+        }
+        std::array<char, 4096> chunk{};
+        const auto got = ::read(fd, chunk.data(), std::min(chunk.size(), wanted - out.size()));
+        if (got < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            return false;
+        }
+        if (got == 0) {
+            return false;
+        }
+        out.append(chunk.data(), static_cast<std::size_t>(got));
+    }
+    return true;
+}
+
+// RFC 7230 6.1: fields named by Connection are hop-by-hop for this exchange and
+// must be removed in addition to the fixed set, or a peer can name an arbitrary
+// field and have it forwarded in either direction.
+auto connection_named_fields(const std::vector<std::pair<std::string, std::string>>& headers)
+    -> std::vector<std::string> {
+    std::vector<std::string> named;
+    for (const auto& [name, value] : headers) {
+        if (name != "connection") {
+            continue;
+        }
+        std::string_view rest{value};
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            auto token = rest.substr(0, comma);
+            while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) {
+                token.remove_prefix(1);
+            }
+            while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
+                token.remove_suffix(1);
+            }
+            if (!token.empty()) {
+                named.push_back(lower_ascii(std::string{token}));
+            }
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            rest.remove_prefix(comma + 1);
+        }
+    }
+    return named;
 }
 
 // Hop-by-hop, routing, and credential fields are never forwarded. The
@@ -498,6 +603,9 @@ private:
                 ::setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled))
             );
 #endif
+            // Nonblocking, so every later read and write is bounded by an
+            // absolute deadline rather than blocking the single worker.
+            static_cast<void>(set_nonblocking(client_fd));
 
             handle_client(client_fd, stop);
             ::close(client_fd);
@@ -506,10 +614,17 @@ private:
 
     // Every response closes the connection, so say so explicitly; an HTTP/1.1
     // client otherwise assumes keep-alive and may reuse a socket we are closing.
-    static void write_status(int client_fd, std::string_view status_line) {
+    // The write is bounded so a client that stops reading cannot pin the worker.
+    void write_status(int client_fd, std::string_view status_line) const {
         std::string response{status_line};
         response += "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        static_cast<void>(write_all(client_fd, response));
+        static_cast<void>(write_all_until(
+            client_fd,
+            response,
+            {},
+            std::chrono::steady_clock::now() +
+                std::chrono::milliseconds{options_.response_deadline_ms}
+        ));
     }
 
     // Discard an unread request body before closing. Closing a socket while the
@@ -518,15 +633,19 @@ private:
     static void drain_body(int client_fd, std::size_t length, std::stop_token stop) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{1000};
         std::size_t remaining = length;
-        while (remaining > 0 && !stop.stop_requested() &&
-               std::chrono::steady_clock::now() < deadline) {
-            ::pollfd pfd{.fd = client_fd, .events = POLLIN, .revents = 0};
-            if (::poll(&pfd, 1, poll_tick_ms) <= 0) {
-                continue;
+        while (remaining > 0) {
+            if (!wait_ready(client_fd, POLLIN, stop, deadline)) {
+                break;
             }
             std::array<char, 4096> chunk{};
             const auto got = ::read(client_fd, chunk.data(), std::min(chunk.size(), remaining));
-            if (got <= 0) {
+            if (got < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                break;
+            }
+            if (got == 0) {
                 break;
             }
             remaining -= static_cast<std::size_t>(got);
@@ -651,7 +770,13 @@ private:
             response += std::to_string(unauthorized_body.size());
             response += "\r\nConnection: close\r\n\r\n";
             response += unauthorized_body;
-            static_cast<void>(write_all(client_fd, response));
+            static_cast<void>(write_all_until(
+                client_fd,
+                response,
+                stop,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds{options_.response_deadline_ms}
+            ));
             return;
         }
 
@@ -705,27 +830,32 @@ private:
 
         // Read the declared body when there is a transport to hand it to, or
         // discard it so closing does not reset the connection.
+        // Read the declared body when there is a transport to hand it to, or
+        // discard it so closing does not reset the connection. Both paths are
+        // bounded: a client that declares a body and never sends it must not
+        // stall the single worker or block shutdown in the destructor's join().
         std::string body;
         if (options_.forward && head->content_length > 0) {
             body = buffer.substr(header_end + 4U);
             if (body.size() > head->content_length) {
                 body.resize(head->content_length);
             }
-            std::size_t remaining = head->content_length - body.size();
-            while (remaining > 0 && !stop.stop_requested()) {
-                std::array<char, 4096> chunk{};
-                const auto wanted = std::min(chunk.size(), remaining);
-                const auto got = ::read(client_fd, chunk.data(), wanted);
-                if (got <= 0) {
-                    break;
+            const std::size_t remaining = head->content_length - body.size();
+            if (remaining > 0) {
+                std::string rest;
+                if (!read_exact_until(
+                        client_fd,
+                        remaining,
+                        rest,
+                        stop,
+                        std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds{options_.body_deadline_ms}
+                    )) {
+                    // A truncated or stalled body is not forwarded as complete.
+                    write_status(client_fd, "HTTP/1.1 400 Bad Request");
+                    return;
                 }
-                body.append(chunk.data(), static_cast<std::size_t>(got));
-                remaining -= static_cast<std::size_t>(got);
-            }
-            if (remaining != 0) {
-                // A truncated body is not something to forward as if complete.
-                write_status(client_fd, "HTTP/1.1 400 Bad Request");
-                return;
+                body += rest;
             }
         } else {
             drain_body(client_fd, head->content_length, stop);
@@ -749,8 +879,11 @@ private:
         }
         request.body = std::move(body);
         request.secret_token = matched_rule->secret_token;
+        const auto request_connection_named = connection_named_fields(head->headers);
         for (const auto& [name, value] : head->headers) {
-            if (is_forwardable_request_header(name)) {
+            if (is_forwardable_request_header(name) &&
+                std::ranges::find(request_connection_named, name) ==
+                    request_connection_named.end()) {
                 request.headers.emplace_back(name, value);
             }
         }
@@ -771,17 +904,52 @@ private:
             return;
         }
 
+        if (forwarded->body.size() > max_response_body_bytes) {
+            write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
+            return;
+        }
+
+        // An upstream field must be a valid token with a value free of control
+        // characters before it is copied into the head we emit; otherwise a
+        // value carrying CRLF could frame a header we recomputed. Fail closed
+        // without writing any response bytes.
+        for (const auto& [name, value] : forwarded->headers) {
+            if (!is_token(name) || !is_valid_field_value(value)) {
+                write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
+                return;
+            }
+        }
+
+        // 204/304 and any response to HEAD carry no body, and must not carry a
+        // Content-Length framing a body that will never be sent.
+        const bool no_body = head->method == "HEAD" || forwarded->status_code == 204 ||
+                             forwarded->status_code == 304;
+        const auto connection_named = connection_named_fields(forwarded->headers);
+
         std::string response = "HTTP/1.1 " + std::to_string(forwarded->status_code) + " " +
                                std::string{reason_phrase(forwarded->status_code)} + "\r\n";
         for (const auto& [name, value] : forwarded->headers) {
-            if (is_forwardable_response_header(lower_ascii(name))) {
-                response += name + ": " + value + "\r\n";
+            const auto lowered = lower_ascii(name);
+            if (!is_forwardable_response_header(lowered) ||
+                std::ranges::find(connection_named, lowered) != connection_named.end()) {
+                continue;
             }
+            response += name + ": " + value + "\r\n";
         }
-        response += "Content-Length: " + std::to_string(forwarded->body.size()) + "\r\n";
+        if (!no_body) {
+            response += "Content-Length: " + std::to_string(forwarded->body.size()) + "\r\n";
+        }
         response += "Connection: close\r\n\r\n";
-        response += forwarded->body;
-        static_cast<void>(write_all(client_fd, response));
+        if (!no_body) {
+            response += forwarded->body;
+        }
+        static_cast<void>(write_all_until(
+            client_fd,
+            response,
+            stop,
+            std::chrono::steady_clock::now() +
+                std::chrono::milliseconds{options_.response_deadline_ms}
+        ));
     }
 
     auto record_event(
@@ -826,7 +994,7 @@ private:
         auto recorded =
             record_event(provider, method, path, allowed, detail, req_bytes, resp_bytes);
         if (!recorded) {
-            write_all(client_fd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+            write_status(client_fd, "HTTP/1.1 503 Service Unavailable");
             return false;
         }
         return true;

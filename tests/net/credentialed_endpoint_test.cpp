@@ -2,9 +2,13 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +25,47 @@ namespace {
             return 1;                                                                              \
         }                                                                                          \
     } while (0)
+
+// Send `request` and read the response without closing the write side, so a
+// server waiting for a declared body must time out rather than observe EOF.
+auto send_partial_and_receive(std::uint16_t port, std::string_view request, int wait_ms)
+    -> std::string {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return {};
+    }
+    ::sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (::connect(fd, reinterpret_cast<::sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return {};
+    }
+    if (::write(fd, request.data(), request.size()) < 0) {
+        ::close(fd);
+        return {};
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{wait_ms};
+    std::string response;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()
+        );
+        ::pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
+        if (::poll(&pfd, 1, static_cast<int>(std::max<long long>(left.count(), 1))) <= 0) {
+            continue;
+        }
+        std::array<char, 1024> buffer{};
+        const auto got = ::read(fd, buffer.data(), buffer.size());
+        if (got <= 0) {
+            break;
+        }
+        response.append(buffer.data(), static_cast<std::size_t>(got));
+    }
+    ::close(fd);
+    return response;
+}
 
 auto send_and_receive(std::uint16_t port, std::string_view request) -> std::string {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -377,6 +422,81 @@ auto run() -> int {
         };
         REQUIRE(send_and_receive(port, with_length("8388608")).starts_with("HTTP/1.1 405 "));
         REQUIRE(send_and_receive(port, with_length("8388609")).starts_with("HTTP/1.1 400 "));
+    }
+
+    // A client that declares a body and never sends it must not stall the
+    // worker or block shutdown: the body read is bounded, the request is
+    // refused, and the transport is never invoked with a partial body.
+    {
+        bool stalled_transport_called = false;
+        glove::net::credentialed_endpoint_options stalled;
+        stalled.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        stalled.body_deadline_ms = 300;
+        stalled.forward = [&](
+                              const glove::net::upstream_request&
+                          ) -> std::expected<glove::net::upstream_response, std::string> {
+            stalled_transport_called = true;
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            return response;
+        };
+        auto bounded = glove::net::start_credentialed_endpoint(std::move(stalled));
+        REQUIRE(bounded.has_value());
+        const auto resp = send_partial_and_receive(
+            (*bounded)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 10\r\n\r\n",
+            5000
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 400 Bad Request"));
+        REQUIRE(!stalled_transport_called);
+    }
+
+    // A transport response whose field value carries CRLF must not be copied
+    // into the head we emit: the endpoint fails closed and injects nothing.
+    {
+        glove::net::credentialed_endpoint_options bad_upstream;
+        bad_upstream.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        bad_upstream.forward = [](
+                                   const glove::net::upstream_request&
+                               ) -> std::expected<glove::net::upstream_response, std::string> {
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.headers.emplace_back("X-Bad", "v\r\nContent-Length: 99");
+            response.body = "x";
+            return response;
+        };
+        auto guarded = glove::net::start_credentialed_endpoint(std::move(bad_upstream));
+        REQUIRE(guarded.has_value());
+        const auto resp = send_and_receive(
+            (*guarded)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 502 Bad Gateway"));
+        REQUIRE(!resp.contains("Content-Length: 99"));
     }
 
     REQUIRE(!recorded_events.empty());
