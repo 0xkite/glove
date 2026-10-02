@@ -1245,6 +1245,16 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     std::span<const linux_detail::inherited_stream_descriptor> inherited_streams,
     std::span<const supervisor::linux_detail::session_mount> session_mounts
 ) {
+    // Install the parent-death signal before anything else. Doing it just
+    // before exec left a window: if the supervisor died after the clone ack
+    // but before that call, the signal was never armed and the agent survived
+    // as an orphan. The sync read below still covers the earlier window, where
+    // the supervisor dies before acknowledging and the pipe closes.
+    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+        std::fprintf(stderr, "glove child: prctl(PR_SET_PDEATHSIG): %s\n", std::strerror(errno));
+        std::_Exit(125);
+    }
+
     char ack = 0;
     while (true) {
         ::ssize_t n = ::read(sync_read_fd, &ack, 1);
@@ -1354,11 +1364,6 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     }
     argv_ptrs.push_back(nullptr);
 
-    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
-        std::fprintf(stderr, "glove child: prctl(PR_SET_PDEATHSIG): %s\n", std::strerror(errno));
-        std::_Exit(125);
-    }
-
     ::execv(argv_ptrs[0], argv_ptrs.data());
     std::fprintf(stderr, "glove child: execv(%s): %s\n", argv_ptrs[0], std::strerror(errno));
     std::_Exit(127);
@@ -1378,6 +1383,16 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     int egress_channel_fd,
     child_stdio_capture capture
 ) {
+    // Install the parent-death signal before anything else. Doing it just
+    // before exec left a window: if the supervisor died after the clone ack
+    // but before that call, the signal was never armed and the agent survived
+    // as an orphan. The sync read below still covers the earlier window, where
+    // the supervisor dies before acknowledging and the pipe closes.
+    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+        std::fprintf(stderr, "glove child: prctl(PR_SET_PDEATHSIG): %s\n", std::strerror(errno));
+        std::_Exit(125);
+    }
+
     char ack = 0;
     while (true) {
         ::ssize_t n = ::read(sync_read_fd, &ack, 1);
@@ -1473,11 +1488,6 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         argv_ptrs.push_back(a.data());
     }
     argv_ptrs.push_back(nullptr);
-
-    if (::prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
-        std::fprintf(stderr, "glove child: prctl(PR_SET_PDEATHSIG): %s\n", std::strerror(errno));
-        std::_Exit(125);
-    }
 
     ::execv(argv_ptrs[0], argv_ptrs.data());
     std::fprintf(stderr, "glove child: execv(%s): %s\n", argv_ptrs[0], std::strerror(errno));
