@@ -358,6 +358,53 @@ auto run() -> int {
         REQUIRE(resp.starts_with("HTTP/1.1 501 Not Implemented"));
     }
 
+    // Trust-boundary limits: the header count accepts exactly the cap and
+    // rejects the next one, so an off-by-one cannot silently widen the bound.
+    {
+        const auto build = [](std::size_t filler) {
+            std::string request = "POST /anthropic/v1/messages HTTP/1.1\r\n"
+                                  "Host: 127.0.0.1\r\n"
+                                  "x-api-key: glove-nonce-abc123xyz\r\n"
+                                  "Content-Length: 0\r\n";
+            for (std::size_t index = 0; index < filler; ++index) {
+                request += "X-Fill-" + std::to_string(index) + ": v\r\n";
+            }
+            request += "\r\n";
+            return request;
+        };
+        // 3 fixed headers plus 97 filler is exactly the cap of 100.
+        REQUIRE(send_and_receive(port, build(97)).starts_with("HTTP/1.1 200 OK"));
+        // The 101st header is over it.
+        REQUIRE(send_and_receive(port, build(98)).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    // A control character inside a header value must be rejected by the
+    // field-value check. The CR/LF cases above reach the framing check instead.
+    {
+        std::string request = "POST /anthropic/v1/messages HTTP/1.1\r\n"
+                              "Host: 127.0.0.1\r\n"
+                              "x-api-key: glove-nonce-abc123xyz\r\n"
+                              "X-Ctl: a\x01"
+                              "b\r\n"
+                              "Content-Length: 0\r\n\r\n";
+        REQUIRE(send_and_receive(port, request).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    // Content-Length cap boundary: the exact cap is accepted and the next value
+    // is rejected. GET keeps the request off the body-reading path, so the
+    // accepted case is decided by the parser rather than by the body.
+    {
+        const auto with_length = [](std::string_view length) {
+            return "GET /anthropic/v1/messages HTTP/1.1\r\n"
+                   "Host: 127.0.0.1\r\n"
+                   "x-api-key: glove-nonce-abc123xyz\r\n"
+                   "Content-Length: " +
+                   std::string{length} + "\r\n\r\n";
+        };
+        REQUIRE(send_and_receive(port, with_length("8388608")).starts_with("HTTP/1.1 405 "));
+        REQUIRE(send_and_receive(port, with_length("8388609")).starts_with("HTTP/1.1 400 "));
+    }
+
     REQUIRE(!recorded_events.empty());
     return 0;
 }

@@ -56,11 +56,19 @@ auto write_all(int fd, std::string_view data) -> bool {
     const char* cursor = data.data();
     std::size_t remaining = data.size();
     while (remaining > 0) {
+#if defined(MSG_NOSIGNAL)
+        // A peer that has already gone away raises SIGPIPE on write, whose
+        // default action would terminate the entire Glove host process. The
+        // agent controls this connection, so it must not be able to do that.
+        const auto n = ::send(fd, cursor, remaining, MSG_NOSIGNAL);
+#else
         const auto n = ::write(fd, cursor, remaining);
+#endif
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            // A disconnected peer is the end of this connection, not an error.
             return false;
         }
         cursor += n;
@@ -487,6 +495,13 @@ private:
             if (client_fd < 0) {
                 continue;
             }
+#if defined(SO_NOSIGPIPE)
+            // The counterpart of MSG_NOSIGNAL on platforms that lack it.
+            const int enabled = 1;
+            static_cast<void>(
+                ::setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled))
+            );
+#endif
 
             handle_client(client_fd, stop);
             ::close(client_fd);
