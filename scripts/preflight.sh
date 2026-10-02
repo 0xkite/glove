@@ -26,6 +26,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 skip_tidy=0
+format_not_authoritative=0
 # Two different policies, for two different kinds of tool:
 #
 #   * clang-format is a *formatter*. Its output is only stable for one exact
@@ -100,6 +101,8 @@ select_compiler() {
         if command -v clang >/dev/null && command -v clang++ >/dev/null; then
             export CC=clang CXX=clang++
             echo "  compiler: none set; selecting clang/clang++"
+        else
+            fail "no C++ compiler selected: set CC and CXX, or put clang and clang++ on PATH. Letting CMake choose its default would configure the presets with a different toolchain and fail the sanitizer stages."
         fi
     fi
 
@@ -218,6 +221,7 @@ if [[ "${clang_format_version}" != "${formatted_for_clang_format}" ]]; then
         [[ "${GLOVE_ALLOW_NEWER_CLANG_FORMAT:-0}" == "1" ]]; then
         echo "  ⚠ clang-format ${clang_format_version} is newer than the formatted-for ${formatted_for_clang_format}."
         echo "    Formatter output can differ between versions; this run's format result is NOT authoritative."
+        format_not_authoritative=1
     else
         fail "clang-format ${formatted_for_clang_format} required; found ${clang_format_version:-unknown}. A different version may format this tree differently. Set GLOVE_ALLOW_NEWER_CLANG_FORMAT=1 to proceed with a newer version anyway."
     fi
@@ -456,13 +460,16 @@ else
 fi
 ok "tsan ok"
 
-if [[ "${skip_tidy}" == "1" || "${lsan_skipped}" == "1" ]]; then
+if [[ "${skip_tidy}" == "1" || "${lsan_skipped}" == "1" || "${format_not_authoritative}" == "1" ]]; then
     bold "gates passed with a skipped stage"
     if [[ "${skip_tidy}" == "1" ]]; then
         echo "  ⚠ clang-tidy was skipped; this run is not evidence that tidy is clean."
     fi
     if [[ "${lsan_skipped}" == "1" ]]; then
         echo "  ⚠ LeakSanitizer was skipped; this run is not evidence of leak-freedom."
+    fi
+    if [[ "${format_not_authoritative}" == "1" ]]; then
+        echo "  ⚠ clang-format differs from the formatted-for version; the format result is not authoritative."
     fi
 else
     bold "all gates passed"
