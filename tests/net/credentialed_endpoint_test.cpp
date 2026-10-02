@@ -126,7 +126,9 @@ auto run() -> int {
     // the tests can assert what would reach a real provider.
     std::vector<glove::net::upstream_request> forwarded_requests;
     options.forward = [&](
-                          const glove::net::upstream_request& request
+                          const glove::net::upstream_request& request,
+                          std::stop_token,
+                          std::chrono::steady_clock::time_point
                       ) -> std::expected<glove::net::upstream_response, std::string> {
         forwarded_requests.push_back(request);
         glove::net::upstream_response response;
@@ -468,7 +470,9 @@ auto run() -> int {
         });
         stalled.body_deadline_ms = 300;
         stalled.forward = [&](
-                              const glove::net::upstream_request&
+                              const glove::net::upstream_request&,
+                              std::stop_token,
+                              std::chrono::steady_clock::time_point
                           ) -> std::expected<glove::net::upstream_response, std::string> {
             stalled_transport_called = true;
             glove::net::upstream_response response;
@@ -504,7 +508,9 @@ auto run() -> int {
             .allowed_paths = {"/v1/messages"},
         });
         bad_upstream.forward = [](
-                                   const glove::net::upstream_request&
+                                   const glove::net::upstream_request&,
+                                   std::stop_token,
+                                   std::chrono::steady_clock::time_point
                                ) -> std::expected<glove::net::upstream_response, std::string> {
             glove::net::upstream_response response;
             response.status_code = 200;
@@ -523,6 +529,79 @@ auto run() -> int {
         );
         REQUIRE(resp.starts_with("HTTP/1.1 502 Bad Gateway"));
         REQUIRE(!resp.contains("Content-Length: 99"));
+    }
+
+    // A transport response with a mixed-case Connection field must still have
+    // the named hop-by-hop field removed: HTTP field names are case-insensitive.
+    {
+        glove::net::credentialed_endpoint_options mixed;
+        mixed.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        mixed.forward = [](
+                            const glove::net::upstream_request&,
+                            std::stop_token,
+                            std::chrono::steady_clock::time_point
+                        ) -> std::expected<glove::net::upstream_response, std::string> {
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.headers.emplace_back("Connection", "X-Hop");
+            response.headers.emplace_back("X-Hop", "must-not-be-forwarded");
+            response.body = "ok";
+            return response;
+        };
+        auto case_insensitive = glove::net::start_credentialed_endpoint(std::move(mixed));
+        REQUIRE(case_insensitive.has_value());
+        const auto resp = send_and_receive(
+            (*case_insensitive)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 200 OK"));
+        REQUIRE(!resp.contains("must-not-be-forwarded"));
+    }
+
+    // A status that cannot be a final response must be refused, not serialized.
+    {
+        glove::net::credentialed_endpoint_options bad_status;
+        bad_status.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        bad_status.forward = [](
+                                 const glove::net::upstream_request&,
+                                 std::stop_token,
+                                 std::chrono::steady_clock::time_point
+                             ) -> std::expected<glove::net::upstream_response, std::string> {
+            glove::net::upstream_response response;
+            response.status_code = 100;
+            return response;
+        };
+        auto refused = glove::net::start_credentialed_endpoint(std::move(bad_status));
+        REQUIRE(refused.has_value());
+        const auto resp = send_and_receive(
+            (*refused)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 502 Bad Gateway"));
     }
 
     REQUIRE(!recorded_events.empty());

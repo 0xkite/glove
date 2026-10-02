@@ -1,9 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -64,10 +66,13 @@ struct upstream_response {
     std::vector<std::pair<std::string, std::string>> headers;
 };
 
-// Optional provider transport. When unset, the endpoint refuses with 501 Not
+// Optional provider transport. It receives the stop token and an absolute
+// deadline and must honour both: a stalled exchange must not pin the endpoint's
+// single worker or block shutdown. When unset, the endpoint refuses with 501 Not
 // Implemented rather than pretending it forwarded anything.
-using upstream_forwarder =
-    std::function<std::expected<upstream_response, std::string>(const upstream_request&)>;
+using upstream_forwarder = std::function<std::expected<upstream_response, std::string>(
+    const upstream_request&, std::stop_token, std::chrono::steady_clock::time_point
+)>;
 
 struct credentialed_endpoint_options {
     std::vector<credentialed_endpoint_rule> endpoints;
@@ -79,6 +84,9 @@ struct credentialed_endpoint_options {
     // a test can exercise the timeout path without waiting out the default.
     int body_deadline_ms = 30000;
     int response_deadline_ms = 30000;
+    // Absolute deadline for the provider exchange. The transport receives it and
+    // must not outlive it, so a stalled upstream cannot hold the worker.
+    int upstream_deadline_ms = 120000;
 };
 
 // Host-side local reverse proxy for mediating agent API requests.

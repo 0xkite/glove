@@ -157,7 +157,7 @@ auto connection_named_fields(const std::vector<std::pair<std::string, std::strin
     -> std::vector<std::string> {
     std::vector<std::string> named;
     for (const auto& [name, value] : headers) {
-        if (name != "connection") {
+        if (lower_ascii(name) != "connection") {
             continue;
         }
         std::string_view rest{value};
@@ -831,6 +831,22 @@ private:
             }
         }
 
+        // A client may withhold its body until it sees 100 Continue. An
+        // unsupported expectation is refused here rather than left to stall the
+        // body read to its deadline.
+        bool expects_continue = false;
+        for (const auto& [name, value] : head->headers) {
+            if (name != "expect") {
+                continue;
+            }
+            if (lower_ascii(value) != "100-continue") {
+                drain_body(client_fd, head->content_length, stop);
+                write_status(client_fd, "HTTP/1.1 417 Expectation Failed");
+                return;
+            }
+            expects_continue = true;
+        }
+
         // Audit the allow decision before any upstream work. A decision that
         // cannot be recorded is not served, so the trail can never understate
         // what the endpoint forwarded.
@@ -840,8 +856,16 @@ private:
             return;
         }
 
-        // Read the declared body when there is a transport to hand it to, or
-        // discard it so closing does not reset the connection.
+        if (expects_continue) {
+            static_cast<void>(write_all_until(
+                client_fd,
+                "HTTP/1.1 100 Continue\r\n\r\n",
+                stop,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds{options_.response_deadline_ms}
+            ));
+        }
+
         // Read the declared body when there is a transport to hand it to, or
         // discard it so closing does not reset the connection. Both paths are
         // bounded: a client that declares a body and never sends it must not
@@ -900,7 +924,9 @@ private:
             }
         }
 
-        auto forwarded = options_.forward(request);
+        const auto upstream_deadline = std::chrono::steady_clock::now() +
+                                       std::chrono::milliseconds{options_.upstream_deadline_ms};
+        auto forwarded = options_.forward(request, stop, upstream_deadline);
         if (!forwarded) {
             if (!audit_or_unavailable(
                     client_fd,
@@ -916,7 +942,27 @@ private:
             return;
         }
 
+        // Only a final response is representable: a 1xx would leave the client
+        // with no final status, and values outside 200-599 are not valid.
+        if (forwarded->status_code < 200 || forwarded->status_code > 599) {
+            write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
+            return;
+        }
         if (forwarded->body.size() > max_response_body_bytes) {
+            write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
+            return;
+        }
+        // Bound the field set before it is validated, Connection-parsed, or
+        // serialized, using the same budgets as the request side.
+        if (forwarded->headers.size() > max_header_count) {
+            write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
+            return;
+        }
+        std::size_t response_header_bytes = 0;
+        for (const auto& [name, value] : forwarded->headers) {
+            response_header_bytes += name.size() + value.size() + 4U;
+        }
+        if (response_header_bytes > max_request_headers_bytes) {
             write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
             return;
         }
