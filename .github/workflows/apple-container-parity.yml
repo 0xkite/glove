@@ -24,6 +24,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Install pinned clang-format
+        # This lane runs preflight on a self-hosted runner, which does not
+        # provision the toolchain the way ci.yml does. Install the formatter the
+        # tree is formatted for, so the lane does not depend on whatever the
+        # runner image happens to carry.
+        run: |
+          python3 -m venv "$RUNNER_TEMP/clang-format"
+          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check clang-format==23.1.1
+          echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
+
       - name: Run native macOS preflight
         run: scripts/preflight.sh
 
