@@ -5,7 +5,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace glove::net {
@@ -74,6 +73,12 @@ struct credentialed_endpoint_options {
     std::vector<credentialed_endpoint_rule> endpoints;
     std::function<std::expected<void, std::string>(const endpoint_event&)> on_event;
     upstream_forwarder forward;
+    // Absolute deadlines for the body and response phases. Both are bounded so a
+    // client that declares a body it never sends, or stops reading the response,
+    // cannot pin the endpoint's single worker or block shutdown. Configurable so
+    // a test can exercise the timeout path without waiting out the default.
+    int body_deadline_ms = 30000;
+    int response_deadline_ms = 30000;
 };
 
 // Host-side local reverse proxy for mediating agent API requests.
