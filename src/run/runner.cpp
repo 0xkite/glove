@@ -441,6 +441,25 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
         );
     }
     const std::string api_key_env{definition->api_key_env};
+    // Reject host-credential-shaped selections. `--env` cannot smuggle a real
+    // provider secret or a base-URL override past the mediated endpoint.
+    for (const std::string_view name : opts.environment_names) {
+        for (const std::string_view reserved : {
+                 std::string_view{"ANTHROPIC_API_KEY"},
+                 std::string_view{"ANTHROPIC_AUTH_TOKEN"},
+                 std::string_view{"ANTHROPIC_BASE_URL"},
+                 std::string_view{"OPENAI_API_KEY"},
+                 std::string_view{"OPENAI_BASE_URL"},
+             }) {
+            if (name == reserved) {
+                return std::unexpected(
+                    std::string{"--env "} + std::string{name} +
+                    " cannot be combined with "
+                    "--agent: the mediated endpoint owns provider credentials and base URLs"
+                );
+            }
+        }
+    }
     const char* secret = std::getenv(api_key_env.c_str());
     if (secret == nullptr || *secret == '\0') {
         return std::unexpected(
@@ -501,6 +520,11 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     startup.environment.push_back(std::string{definition->base_url_env} + "=" + *base_url);
     startup.environment.push_back(api_key_env + "=" + *nonce);
     startup.endpoint = std::move(*endpoint);
+    // Drop the real credential from this process's environment now that the
+    // endpoint owns it. Otherwise it lingers and is inherited by every child
+    // this process starts, including the optional herdr reporter, which is
+    // spawned with ::environ.
+    ::unsetenv(api_key_env.c_str());
     return startup;
 }
 

@@ -145,13 +145,16 @@ public:
     }
 
     ~credentialed_endpoint_impl() override {
-        stop_source_.request_stop();
+        // Stop and join the worker before touching listen_fd_. Closing the
+        // descriptor while the worker may still be polling it is both a data
+        // race and a descriptor-reuse hazard.
+        worker_.request_stop();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
         if (listen_fd_ >= 0) {
             ::close(listen_fd_);
             listen_fd_ = -1;
-        }
-        if (worker_.joinable()) {
-            worker_.join();
         }
     }
 
@@ -179,7 +182,7 @@ public:
 
 private:
     void run(std::stop_token stop) {
-        while (!stop.stop_requested() && !stop_source_.stop_requested()) {
+        while (!stop.stop_requested()) {
             ::pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
             const int rc = ::poll(&pfd, 1, poll_tick_ms);
             if (rc < 0) {
@@ -241,8 +244,6 @@ private:
         const auto query_pos = head->uri.find('?');
         const std::string path_only =
             query_pos == std::string::npos ? head->uri : head->uri.substr(0, query_pos);
-        const std::string query =
-            query_pos == std::string::npos ? std::string{} : head->uri.substr(query_pos);
 
         // Match against endpoint rules
         const credentialed_endpoint_rule* matched_rule = nullptr;
@@ -254,9 +255,16 @@ private:
         }
 
         if (matched_rule == nullptr) {
-            record_event(
-                endpoint_provider::custom, head->method, head->uri, false, "unknown_endpoint_prefix"
-            );
+            if (!audit_or_unavailable(
+                    client_fd,
+                    endpoint_provider::custom,
+                    head->method,
+                    head->uri,
+                    false,
+                    "unknown_endpoint_prefix"
+                )) {
+                return;
+            }
             write_all(client_fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
             return;
         }
@@ -270,9 +278,16 @@ private:
             }
         }
         if (!method_allowed) {
-            record_event(
-                matched_rule->provider, head->method, head->uri, false, "method_not_allowed"
-            );
+            if (!audit_or_unavailable(
+                    client_fd,
+                    matched_rule->provider,
+                    head->method,
+                    head->uri,
+                    false,
+                    "method_not_allowed"
+                )) {
+                return;
+            }
             write_all(client_fd, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
             return;
         }
@@ -280,9 +295,16 @@ private:
         // Validate session nonce
         if (head->provided_nonce.empty() ||
             !constant_time_equal(head->provided_nonce, matched_rule->session_nonce)) {
-            record_event(
-                matched_rule->provider, head->method, head->uri, false, "invalid_session_nonce"
-            );
+            if (!audit_or_unavailable(
+                    client_fd,
+                    matched_rule->provider,
+                    head->method,
+                    head->uri,
+                    false,
+                    "invalid_session_nonce"
+                )) {
+                return;
+            }
             constexpr std::string_view unauthorized_body =
                 "{\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid_session_"
                 "nonce\"}}";
@@ -313,36 +335,29 @@ private:
                 }
             }
             if (!path_allowed) {
-                record_event(
-                    matched_rule->provider, head->method, head->uri, false, "path_not_allowed"
-                );
+                if (!audit_or_unavailable(
+                        client_fd,
+                        matched_rule->provider,
+                        head->method,
+                        head->uri,
+                        false,
+                        "path_not_allowed"
+                    )) {
+                    return;
+                }
                 write_all(client_fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
                 return;
             }
         }
 
-        // Build authenticated upstream request line & headers
-        std::string forward_head = head->method + " " + rewritten_path + query + " HTTP/1.1\r\n";
-        forward_head += "Host: " + matched_rule->upstream_host + "\r\n";
-        if (matched_rule->provider == endpoint_provider::anthropic) {
-            forward_head += "x-api-key: " + matched_rule->secret_token + "\r\n";
-        } else {
-            forward_head += "Authorization: Bearer " + matched_rule->secret_token + "\r\n";
+        // Audit the allow decision before any upstream work. A decision that
+        // cannot be recorded is not served, so the trail can never understate
+        // what the endpoint forwarded.
+        if (!audit_or_unavailable(
+                client_fd, matched_rule->provider, head->method, head->uri, true, "allowed"
+            )) {
+            return;
         }
-
-        for (const auto& [name, val] : head->headers) {
-            if (name == "x-api-key" || name == "authorization" || name == "host" ||
-                name == "connection" || name == "upgrade") {
-                continue;
-            }
-            forward_head += name + ": " + val + "\r\n";
-        }
-        forward_head += "Connection: close\r\n\r\n";
-
-        // Record request event
-        record_event(
-            matched_rule->provider, head->method, head->uri, true, "forwarded", forward_head.size()
-        );
 
         // For unit tests / mock mode: if upstream_host starts with "mock:", reply with 200 OK
         if (matched_rule->upstream_host.starts_with("mock:")) {
@@ -358,11 +373,13 @@ private:
             return;
         }
 
-        // Normal upstream forwarding:
-        write_all(client_fd, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+        // Real upstream forwarding (bounded TLS client, request-body forward,
+        // and response streaming) is not constructed yet. Report that plainly
+        // rather than a 502, which would imply an upstream attempt occurred.
+        write_all(client_fd, "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n");
     }
 
-    void record_event(
+    auto record_event(
         endpoint_provider provider,
         std::string_view method,
         std::string_view path,
@@ -370,9 +387,12 @@ private:
         std::string_view detail,
         std::size_t req_bytes = 0,
         std::size_t resp_bytes = 0
-    ) {
-        if (options_.on_event) {
-            endpoint_event ev{
+    ) -> std::expected<void, std::string> {
+        if (!options_.on_event) {
+            return {};
+        }
+        return options_.on_event(
+            endpoint_event{
                 .provider = provider,
                 .method = std::string{method},
                 .path = std::string{path},
@@ -380,15 +400,36 @@ private:
                 .detail = std::string{detail},
                 .request_bytes = req_bytes,
                 .response_bytes = resp_bytes,
-            };
-            static_cast<void>(options_.on_event(ev));
+            }
+        );
+    }
+
+    // Audit the decision and fail closed when the sink rejects the event. A
+    // decision that cannot be recorded must not be served, or the audit trail
+    // could understate what the endpoint actually forwarded. Returns true only
+    // when the caller may proceed to emit its response.
+    auto audit_or_unavailable(
+        int client_fd,
+        endpoint_provider provider,
+        std::string_view method,
+        std::string_view path,
+        bool allowed,
+        std::string_view detail,
+        std::size_t req_bytes = 0,
+        std::size_t resp_bytes = 0
+    ) -> bool {
+        auto recorded =
+            record_event(provider, method, path, allowed, detail, req_bytes, resp_bytes);
+        if (!recorded) {
+            write_all(client_fd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+            return false;
         }
+        return true;
     }
 
     credentialed_endpoint_options options_;
     int listen_fd_ = -1;
     std::uint16_t port_ = 0;
-    std::stop_source stop_source_;
     std::jthread worker_;
 };
 
