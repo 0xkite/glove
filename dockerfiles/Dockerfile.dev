@@ -21,13 +21,13 @@
 #     -v "$PWD":/glove:rw \
 #     glove-dev
 
-FROM ubuntu:24.04 AS toolchain-base
+FROM ubuntu:24.04@sha256:a853f94d226358a79c740cfc7bce0c289748f3fe3488d921d038ccd752c61b60 AS toolchain-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        clang-18 clang-tidy-18 lld-18 llvm-18 \
+        clang-18 clang-tidy-18 clangd-18 lld-18 llvm-18 \
         libclang-rt-18-dev \
         libc++-18-dev libc++abi-18-dev \
         libseccomp-dev \
@@ -37,26 +37,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-# Symlink clang-18 as default compiler tools
+# Symlink clang-18 as default compiler tools. clangd is a separate package;
+# the devcontainer points the clangd extension at the symlink below.
 RUN ln -sf /usr/bin/clang-18 /usr/local/bin/clang \
  && ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++ \
  && ln -sf /usr/bin/clang-tidy-18 /usr/local/bin/clang-tidy \
+ && ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd \
  && ln -sf /usr/bin/llvm-ar-18 /usr/local/bin/llvm-ar \
  && ln -sf /usr/bin/llvm-ranlib-18 /usr/local/bin/llvm-ranlib
 
-# Install the required clang-format in a venv (Ubuntu 24.04 packages only 18)
+# Install clang-format in a dedicated venv, because Ubuntu 24.04 only packages
+# version 18. The version must equal formatted_for_clang_format in
+# scripts/preflight.sh: the tree is formatted for exactly that version and a
+# different one fails the gate's --dry-run -Werror.
 RUN python3 -m venv /opt/clang-format-venv \
  && /opt/clang-format-venv/bin/pip install --no-cache-dir clang-format==23.1.1 \
  && ln -sf /opt/clang-format-venv/bin/clang-format /usr/local/bin/clang-format
 
-# Install pinned actionlint 1.7.12
+# Install actionlint 1.7.12 and verify the archive against the publisher's
+# checksum for this architecture before executing anything from it.
 RUN ARCH="$(dpkg --print-architecture)" \
  && case "${ARCH}" in \
-        amd64) AL_ARCH="amd64" ;; \
-        arm64) AL_ARCH="arm64" ;; \
+        amd64) AL_ARCH="amd64"; AL_SHA256="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" ;; \
+        arm64) AL_ARCH="arm64"; AL_SHA256="325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6" ;; \
         *) echo "unsupported architecture for actionlint: ${ARCH}" >&2; exit 1 ;; \
     esac \
  && curl -sSLf "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_${AL_ARCH}.tar.gz" -o /tmp/actionlint.tar.gz \
+ && echo "${AL_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint \
  && chmod +x /usr/local/bin/actionlint \
  && rm -f /tmp/actionlint.tar.gz

@@ -98,26 +98,44 @@ append failures fail closed.
 
 ## Mediated credential proxy and upstream containment
 
-Glove mediates external network requests and MCP upstreams through an object-capability
-model that unbundles credentials from the agent sandbox (detailed in
-[`docs/credentialed-proxy-architecture.md`](credentialed-proxy-architecture.md)):
+Glove mediates external network requests through an object-capability model that
+unbundles credentials from the agent sandbox (detailed in
+[`docs/credentialed-proxy-architecture.md`](credentialed-proxy-architecture.md)).
+This section separates what is constructed today from what is planned, because a
+capability must never be described as active before it exists.
 
-1. **Virtual loopback reverse proxy**: Instead of mounting secret leases into `/home/agent`,
-   the agent communicates over its private loopback descriptor channel to a local reverse proxy
-   configured via standard base-URL overrides (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`).
-2. **Session nonce swap**: The agent is given an ephemeral session token (`glove-session-...`).
-   The host proxy validates the nonce, strips it, and attaches the genuine provider credential
-   held in host memory before dispatching over TLS to the upstream. Leaked environment variables
-   or transcripts expose no real credentials.
-3. **Mutual exclusion**: Any host configured as a credentialed reverse endpoint is strictly
-   denied from the raw TCP CONNECT egress allowlist to prevent bypasses.
-4. **Detection and validation**: Outbound requests pass through structural JSON schema checks,
-   Aho-Corasick canary detection (`glvc_<base32>`), and Rabin-Karp rolling-hash checks against
-   known project secret digests. High-entropy tokens are audited, and token budgets are enforced
-   directly from provider response metadata.
-5. **Contained MCP upstreams**: Upstream MCP tool servers are launched in dedicated,
-   least-privilege Glove profiles (`contained_launcher`), preventing unsandboxed tool processes
-   from acting with full host authority.
+**Constructed:**
+
+1. **Virtual loopback reverse proxy**: Instead of mounting secret leases into
+   `/home/agent`, the agent reaches a local reverse endpoint over its private
+   loopback bridge, addressed by a base-URL variable (`ANTHROPIC_BASE_URL`,
+   `OPENAI_BASE_URL`).
+2. **Session nonce swap**: The agent is given an ephemeral session token
+   (`glove-session-...`). The host endpoint validates it, discards it, and is
+   the only party that ever holds the real provider credential. A leaked
+   environment variable or transcript exposes nothing usable.
+3. **Mutual exclusion**: A profile may carry either a raw CONNECT egress proxy or
+   a bridged reverse endpoint, never both, so a credentialed upstream is not
+   also reachable over an uninspected tunnel.
+4. **Strict request admission**: The endpoint accepts origin-form HTTP/1.1 only,
+   rejects bare CR/LF framing and invalid tokens, requires a single
+   `Content-Length` or none, refuses `Transfer-Encoding`, rejects dot-segment
+   traversal, and enforces the rule's method and path allowlist. Forwarded
+   headers and the request target are validated; hop-by-hop, routing, and
+   credential fields are stripped before the transport sees them.
+
+**Not constructed yet.** The endpoint has no provider transport: with none
+injected it refuses with `501 Not Implemented`, and `glove exec --agent`
+therefore cannot yet complete a real request. The following are design intent,
+not enforcement:
+
+- a TLS transport that performs the upstream exchange;
+- Aho-Corasick canary detection and Rabin-Karp rolling-hash checks against known
+  secret digests;
+- structural JSON schema validation and token-budget enforcement derived from
+  provider response metadata;
+- **contained MCP upstreams** (`contained_launcher`). Upstream servers are still
+  started as unsandboxed host processes by `src/mcp/stdio_transport.cpp`.
 
 ## Historical synthetic status milestone
 
