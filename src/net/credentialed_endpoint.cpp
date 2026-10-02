@@ -674,7 +674,15 @@ private:
             }
             std::array<char, 1024> chunk{};
             const auto n = ::read(client_fd, chunk.data(), chunk.size());
-            if (n <= 0) {
+            if (n < 0) {
+                // The descriptor is nonblocking, so a spurious readiness event
+                // must not be mistaken for a truncated request.
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                break;
+            }
+            if (n == 0) {
                 break;
             }
             buffer.append(chunk.data(), static_cast<std::size_t>(n));
