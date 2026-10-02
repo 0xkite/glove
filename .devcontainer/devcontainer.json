@@ -7,7 +7,7 @@
     "vscode": {
       "settings": {
         "cmake.configureOnOpen": false,
-        "clangd.path": "/usr/bin/clangd-18"
+        "clangd.path": "/usr/local/bin/clangd"
       },
       "extensions": [
         "ms-vscode.cpptools",
