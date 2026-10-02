@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,8 +101,23 @@ auto append_selected_environment(
         if (name.empty() || name.find('=') != std::string::npos) {
             return std::unexpected(std::string{"--env requires a variable name, not NAME=VALUE"});
         }
-        for (const auto* reserved :
-             {"HOME", "TMPDIR", "GLOVE_SANDBOXED", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"}) {
+        // Glove-managed variables, plus the outer-harness control variables.
+        // The documented invariant is that the sandboxed child never receives
+        // Herdr's socket path or binary path; allowing them through `--env`
+        // would hand an agent the supervisor's control channel.
+        for (const auto* reserved : {
+                 "HOME",
+                 "TMPDIR",
+                 "GLOVE_SANDBOXED",
+                 "HTTPS_PROXY",
+                 "HTTP_PROXY",
+                 "ALL_PROXY",
+                 "HERDR_ENV",
+                 "HERDR_PANE_ID",
+                 "HERDR_BIN_PATH",
+                 "HERDR_SOCKET_PATH",
+                 "HERDR_AGENT",
+             }) {
             if (name == reserved) {
                 return std::unexpected(
                     std::string{"--env cannot override glove-managed variable "} + name
@@ -611,16 +628,49 @@ private:
         c_args.push_back(nullptr);
 
         pid_t pid = 0;
+        // Its own process group, so a signal aimed at glove (or a terminal
+        // hangup) is not also delivered to the reporter.
+        ::posix_spawnattr_t attr{};
+        if (::posix_spawnattr_init(&attr) != 0) {
+            std::fprintf(stderr, "glove: herdr spawn attributes could not be initialized\n");
+            return;
+        }
+        static_cast<void>(::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP));
+        static_cast<void>(::posix_spawnattr_setpgroup(&attr, 0));
         const int spawn_rc =
-            ::posix_spawnp(&pid, bin_.c_str(), nullptr, nullptr, c_args.data(), ::environ);
+            ::posix_spawnp(&pid, bin_.c_str(), nullptr, &attr, c_args.data(), ::environ);
+        ::posix_spawnattr_destroy(&attr);
         if (spawn_rc != 0) {
             std::fprintf(
                 stderr, "glove: herdr report failed to spawn: %s\n", std::strerror(spawn_rc)
             );
             return;
         }
+
+        // Report the state, but never block the agent on it. A hung herdr must
+        // not hold up launch or teardown, so the wait is bounded and the child
+        // is killed by process group if it overruns.
+        constexpr auto reporter_timeout = std::chrono::milliseconds{5000};
+        const auto deadline = std::chrono::steady_clock::now() + reporter_timeout;
         int status = 0;
-        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        bool reaped = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto result = ::waitpid(pid, &status, WNOHANG);
+            if (result == pid) {
+                reaped = true;
+                break;
+            }
+            if (result < 0 && errno != EINTR) {
+                break;
+            }
+            ::usleep(10'000);
+        }
+        if (!reaped) {
+            std::fprintf(stderr, "glove: herdr command exceeded its deadline; killing it\n");
+            static_cast<void>(::kill(-pid, SIGKILL));
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return;
+        }
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             std::fprintf(
                 stderr, "glove: herdr command returned non-zero exit status (%d)\n", status
