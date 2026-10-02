@@ -49,6 +49,9 @@ struct options {
     // Report lifecycle (working/done) to host Herdr supervisor when running
     // inside a Herdr pane.
     bool herdr = false;
+    // Preset agent profile (e.g. "claude-code", "codex", "pi") that selects a
+    // credentialed reverse endpoint and generates the matching environment.
+    std::optional<std::string> agent_preset;
 };
 
 // Run the contained agent end-to-end: build the profile, spawn the agent,

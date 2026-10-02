@@ -10,15 +10,18 @@
 #include "glove/mcp/client.hpp"
 #include "glove/mcp/lazy_init.hpp"
 #include "glove/mcp/stdio_transport.hpp"
+#include "glove/net/credentialed_endpoint.hpp"
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
 
 #include <spawn.h>
+#include <sys/random.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -338,6 +341,169 @@ auto start_egress(
     return std::move(*proxy);
 }
 
+// One built-in agent preset: the provider endpoint it talks to and the
+// environment variable names that steer the client at the mediated proxy.
+struct preset_definition {
+    glove::net::endpoint_provider provider;
+    std::string_view label;
+    std::string_view path_prefix;
+    std::string_view upstream_host;
+    std::string_view base_url_env;
+    std::string_view api_key_env;
+    std::vector<std::string> allowed_paths;
+};
+
+auto preset_definition_for(std::string_view name) -> std::optional<preset_definition> {
+    if (name == "claude-code" || name == "claude") {
+        return preset_definition{
+            .provider = glove::net::endpoint_provider::anthropic,
+            .label = "claude-code",
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .base_url_env = "ANTHROPIC_BASE_URL",
+            .api_key_env = "ANTHROPIC_API_KEY",
+            .allowed_paths = {"/v1/messages", "/v1/messages/count_tokens"},
+        };
+    }
+    if (name == "codex" || name == "openai") {
+        return preset_definition{
+            .provider = glove::net::endpoint_provider::openai,
+            .label = "codex",
+            .path_prefix = "/openai",
+            .upstream_host = "api.openai.com",
+            .base_url_env = "OPENAI_BASE_URL",
+            .api_key_env = "OPENAI_API_KEY",
+            .allowed_paths = {"/v1/chat/completions", "/v1/responses", "/v1/models"},
+        };
+    }
+    if (name == "pi") {
+        return preset_definition{
+            .provider = glove::net::endpoint_provider::anthropic,
+            .label = "pi",
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .base_url_env = "ANTHROPIC_BASE_URL",
+            .api_key_env = "ANTHROPIC_API_KEY",
+            .allowed_paths = {"/v1/messages", "/v1/messages/count_tokens"},
+        };
+    }
+    return std::nullopt;
+}
+
+// An ephemeral, non-actionable session token. The agent presents it as its API
+// key; only this session's host proxy accepts it, so a leaked environment or
+// transcript exposes nothing usable off-host.
+auto random_session_nonce() -> std::expected<std::string, std::string> {
+    std::array<unsigned char, 24> bytes{};
+    if (::getentropy(bytes.data(), bytes.size()) != 0) {
+        return std::unexpected(std::string{"getentropy: "} + std::strerror(errno));
+    }
+    constexpr char hex[] = "0123456789abcdef";
+    std::string nonce = "glove-session-";
+    for (const auto byte : bytes) {
+        nonce.push_back(hex[byte >> 4U]);
+        nonce.push_back(hex[byte & 0x0fU]);
+    }
+    return nonce;
+}
+
+struct preset_startup {
+    std::unique_ptr<glove::net::credentialed_endpoint> endpoint;
+    std::optional<glove::container::bridge_endpoint_settings> bridge;
+    std::vector<std::string> environment;
+};
+
+// Start the mediated reverse endpoint for `--agent <preset>` and compute the
+// environment that steers the client at it. The real provider secret is read
+// only here, on the host, and is never placed in the child environment.
+auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
+    -> std::expected<preset_startup, std::string> {
+    preset_startup startup;
+    if (!opts.agent_preset) {
+        return startup;
+    }
+    auto definition = preset_definition_for(*opts.agent_preset);
+    if (!definition) {
+        return std::unexpected(
+            std::string{"unknown --agent preset '"} + *opts.agent_preset +
+            "'; expected claude-code, codex, or pi"
+        );
+    }
+    // The sandbox exposes exactly one loopback bridge destination, so a
+    // credentialed endpoint cannot coexist with raw CONNECT egress. Allowing
+    // both would also let the agent bypass injection and inspection.
+    if (!opts.egress.empty()) {
+        return std::unexpected(
+            std::string{"--agent "} + std::string{definition->label} +
+            " cannot be combined with --egress-allow: the sandbox has one loopback bridge "
+            "destination, and a credentialed upstream must not also be reachable over raw "
+            "CONNECT egress"
+        );
+    }
+    const std::string api_key_env{definition->api_key_env};
+    const char* secret = std::getenv(api_key_env.c_str());
+    if (secret == nullptr || *secret == '\0') {
+        return std::unexpected(
+            std::string{"--agent "} + std::string{definition->label} +
+            " requires the host environment variable " + api_key_env
+        );
+    }
+    auto nonce = random_session_nonce();
+    if (!nonce) {
+        return std::unexpected(nonce.error());
+    }
+
+    glove::net::credentialed_endpoint_options endpoint_options;
+    endpoint_options.endpoints.push_back({
+        .provider = definition->provider,
+        .path_prefix = std::string{definition->path_prefix},
+        .upstream_host = std::string{definition->upstream_host},
+        .upstream_port = 443,
+        .secret_token = std::string{secret},
+        .session_nonce = *nonce,
+        .allowed_methods = {"POST"},
+        .allowed_paths = definition->allowed_paths,
+    });
+    endpoint_options.on_event =
+        [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
+        const std::string subject = event.method + " " + event.path;
+        const auto status = event.allowed ? glove::mcp::tool_call_status::ok
+                                          : glove::mcp::tool_call_status::invalid_arguments;
+        if (auto audited =
+                record(sink, glove::audit::action::egress, subject, status, event.detail);
+            !audited) {
+            return std::unexpected(audited.error());
+        }
+        if (!event.allowed) {
+            std::fprintf(
+                stderr,
+                "glove credential proxy: DENY %s — %s\n",
+                subject.c_str(),
+                event.detail.c_str()
+            );
+        }
+        return {};
+    };
+
+    auto endpoint = glove::net::start_credentialed_endpoint(std::move(endpoint_options));
+    if (!endpoint) {
+        return std::unexpected(std::string{"credentialed endpoint: "} + endpoint.error());
+    }
+    auto base_url = (*endpoint)->base_url(definition->provider);
+    if (!base_url) {
+        return std::unexpected(base_url.error());
+    }
+    // The sandbox loopback bridge advertises the same port number in the
+    // child's private network namespace, so one port describes both ends.
+    startup.bridge = glove::container::bridge_endpoint_settings{
+        .port = (*endpoint)->port(),
+    };
+    startup.environment.push_back(std::string{definition->base_url_env} + "=" + *base_url);
+    startup.environment.push_back(api_key_env + "=" + *nonce);
+    startup.endpoint = std::move(*endpoint);
+    return startup;
+}
+
 class herdr_reporter final {
 public:
     herdr_reporter(const herdr_reporter&) = delete;
@@ -540,6 +706,24 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     auto proxy = start_egress(opts, *profile, *sink);
     if (!proxy) {
         return std::unexpected(proxy.error());
+    }
+
+    auto preset = start_agent_preset(opts, *sink);
+    if (!preset) {
+        return std::unexpected(preset.error());
+    }
+    if (preset->bridge) {
+        profile->bridge_endpoint = *preset->bridge;
+        profile->environment.insert(
+            profile->environment.end(), preset->environment.begin(), preset->environment.end()
+        );
+        // Re-validate so the credentialed-endpoint/egress mutual exclusion and
+        // environment rules are enforced on the exact launch profile.
+        auto revalidated = glove::container::validate(*profile);
+        if (!revalidated) {
+            return std::unexpected(std::string{"profile: "} + revalidated.error());
+        }
+        *profile = std::move(*revalidated);
     }
 
     auto reporter = herdr_reporter::create(opts.herdr, opts.agent_argv.front());

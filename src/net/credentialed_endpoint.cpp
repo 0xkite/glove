@@ -236,10 +236,18 @@ private:
             return;
         }
 
+        // Split the origin-form request target so a query string cannot bypass
+        // the prefix match or the path allowlist (for example ?beta=true).
+        const auto query_pos = head->uri.find('?');
+        const std::string path_only =
+            query_pos == std::string::npos ? head->uri : head->uri.substr(0, query_pos);
+        const std::string query =
+            query_pos == std::string::npos ? std::string{} : head->uri.substr(query_pos);
+
         // Match against endpoint rules
         const credentialed_endpoint_rule* matched_rule = nullptr;
         for (const auto& rule : options_.endpoints) {
-            if (head->uri.starts_with(rule.path_prefix)) {
+            if (path_only.starts_with(rule.path_prefix)) {
                 matched_rule = &rule;
                 break;
             }
@@ -288,7 +296,7 @@ private:
         }
 
         // Target path after stripping prefix
-        std::string rewritten_path = head->uri.substr(matched_rule->path_prefix.size());
+        std::string rewritten_path = path_only.substr(matched_rule->path_prefix.size());
         if (rewritten_path.empty() || rewritten_path.front() != '/') {
             rewritten_path.insert(rewritten_path.begin(), '/');
         }
@@ -314,7 +322,7 @@ private:
         }
 
         // Build authenticated upstream request line & headers
-        std::string forward_head = head->method + " " + rewritten_path + " HTTP/1.1\r\n";
+        std::string forward_head = head->method + " " + rewritten_path + query + " HTTP/1.1\r\n";
         forward_head += "Host: " + matched_rule->upstream_host + "\r\n";
         if (matched_rule->provider == endpoint_provider::anthropic) {
             forward_head += "x-api-key: " + matched_rule->secret_token + "\r\n";

@@ -160,6 +160,12 @@ void print_exec_usage() {
         "                          the agent has no network.\n"
         "  --herdr                 report lifecycle (working/done) to host Herdr when\n"
         "                          running inside a Herdr pane\n"
+        "  --agent <preset>        mediate provider credentials for a built-in client\n"
+        "                          (claude-code, codex, or pi). Reads the provider key\n"
+        "                          from the host environment, bridges a local reverse\n"
+        "                          endpoint into the sandbox, and injects the real key\n"
+        "                          on the host side; the sandbox sees only an ephemeral\n"
+        "                          session nonce.\n"
         "  -h, --help              show this help and exit\n"
     );
 }
@@ -191,6 +197,15 @@ auto exec_subcommand(std::span<char* const> args) -> int {
         if (a == "--herdr") {
             opts.herdr = true;
             ++i;
+            continue;
+        }
+        if (a == "--agent") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "glove exec: --agent needs an argument\n");
+                return 2;
+            }
+            opts.agent_preset = std::string{args[i + 1]};
+            i += 2;
             continue;
         }
         if (a == "--read" || a == "--write" || a == "--env" || a == "--audit-log") {

@@ -159,6 +159,45 @@ auto run() -> int {
         std::string::npos
     );
 
+    // --agent fails closed when the host provider credential is absent.
+    ::unsetenv("ANTHROPIC_API_KEY");
+    REQUIRE(run_glove({GLOVE_BIN, "exec", "--agent", "claude-code", "--", "/usr/bin/true"}) == 1);
+
+    // --agent must never put the host credential in the child environment. The
+    // sandbox sees only an ephemeral session nonce and a loopback base URL.
+    const auto preset_dir = base / "preset";
+    std::filesystem::create_directories(preset_dir, ec);
+    REQUIRE(!ec);
+    const auto observed = preset_dir / "observed.txt";
+    ::setenv("ANTHROPIC_API_KEY", "sk-ant-host-credential-must-not-leak", 1);
+    REQUIRE(
+        run_glove(
+            {GLOVE_BIN,
+             "exec",
+             "--agent",
+             "claude-code",
+             "--workspace",
+             preset_dir.string(),
+             "--",
+             "/bin/sh",
+             "-c",
+             "printf 'key=%s\\nbase=%s\\n' \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_BASE_URL\" > \"$1\"",
+             "glove-test",
+             observed.string()}
+        ) == 0
+    );
+    ::unsetenv("ANTHROPIC_API_KEY");
+    {
+        std::ifstream obs{observed};
+        REQUIRE(obs.good());
+        const std::string contents{
+            std::istreambuf_iterator<char>{obs}, std::istreambuf_iterator<char>{}
+        };
+        REQUIRE(contents.find("sk-ant-host-credential-must-not-leak") == std::string::npos);
+        REQUIRE(contents.find("key=glove-session-") != std::string::npos);
+        REQUIRE(contents.find("base=http://127.0.0.1:") != std::string::npos);
+    }
+
     std::filesystem::remove(marker, ec);
     std::filesystem::remove_all(base, ec);
     return 0;
