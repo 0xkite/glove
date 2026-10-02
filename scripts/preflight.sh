@@ -4,12 +4,21 @@
 # Runs:
 #   1. actionlint across GitHub Actions workflows
 #   2. clang-format --dry-run -Werror across src/ include/ tests/ benchmarks/ fuzz/
-#   3. clang-tidy on the dev compile_commands.json (if available)
+#   3. clang-tidy over the dev compilation database
 #   4. asan preset: configure, build, ctest
 #   5. tsan preset: configure, build, ctest
 #
-# Exits non-zero on the first failure. Re-run with --skip-tidy to bypass tidy
-# locally if it is not installed.
+# Tool versions: actionlint and clang-tidy must be at or above their minimum.
+# clang-format must match the tree's formatted-for version exactly, because
+# formatter output is only stable per version. Override a binary with
+# GLOVE_ACTIONLINT, GLOVE_CLANG_FORMAT, or GLOVE_CLANG_TIDY. The sanitizer
+# presets select clang unless CC/CXX are already set, so a rolling distribution
+# whose default compiler is GCC still runs the validated toolchain.
+#
+# Exits non-zero on the first failure. Stages may be skipped only explicitly:
+# --skip-tidy bypasses clang-tidy (a missing clang-tidy is otherwise fatal), and
+# GLOVE_ALLOW_NO_LSAN=1 runs ASan/UBSan without leak detection on a host whose
+# yama ptrace_scope blocks ptrace. The final banner names any skipped stage.
 
 set -euo pipefail
 
@@ -17,8 +26,19 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
 skip_tidy=0
-required_actionlint_version="1.7.12"
-required_clang_format_version="22.1.8"
+# Two different policies, for two different kinds of tool:
+#
+#   * clang-format is a *formatter*. Its output is only stable for one exact
+#     version — 22.1.8 and 23.1.1 disagree on this tree — so the check requires
+#     exactly `formatted_for_clang_format`, which CI also pins. A newer local
+#     version can run with GLOVE_ALLOW_NEWER_CLANG_FORMAT=1, but its format
+#     result is not authoritative. Bumping this value and the reformat belong in
+#     one PR.
+#   * Everything else runs on whatever the host provides, at or above a minimum.
+#
+# Override a binary with GLOVE_ACTIONLINT / GLOVE_CLANG_FORMAT / GLOVE_CLANG_TIDY.
+formatted_for_clang_format="23.1.1"
+min_actionlint_version="1.7.12"
 for arg in "$@"; do
     case "${arg}" in
         --skip-tidy) skip_tidy=1 ;;
@@ -29,6 +49,100 @@ done
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
+
+# True when $1 >= $2 for dotted numeric versions such as 23.1.1 vs 22.1.8.
+version_ge() {
+    local have="$1" want="$2"
+    [[ "${have}" == "${want}" ]] && return 0
+    local -a h w
+    IFS='.' read -r -a h <<<"${have}"
+    IFS='.' read -r -a w <<<"${want}"
+    local i
+    for ((i = 0; i < ${#w[@]} || i < ${#h[@]}; i++)); do
+        local a="${h[i]:-0}" b="${w[i]:-0}"
+        [[ "${a}" =~ ^[0-9]+$ ]] || a=0
+        [[ "${b}" =~ ^[0-9]+$ ]] || b=0
+        if ((10#${a} > 10#${b})); then return 0; fi
+        if ((10#${a} < 10#${b})); then return 1; fi
+    done
+    return 0
+}
+
+# Resolve a tool from an explicit override, then PATH. Prints the path or
+# nothing. Callers decide whether absence is fatal.
+resolve_tool() {
+    local override="$1" name="$2"
+    if [[ -n "${override}" ]]; then
+        if [[ ! -x "${override}" ]]; then
+            fail "${name} override is not executable: ${override}"
+        fi
+        printf '%s\n' "${override}"
+        return
+    fi
+    command -v "${name}" 2>/dev/null || true
+}
+
+# First word of a possibly launcher-wrapped command, e.g. "ccache clang++".
+first_word() { printf '%s\n' "${1%% *}"; }
+
+# Select the compiler the presets and sanitizer builds were validated against.
+# The repository requires C++23 with a consistent warning set; the default
+# system compiler on rolling distributions is not always clang, and a
+# GCC-configured tree emits module flags that clang-tidy rejects.
+select_compiler() {
+    # Fill CC and CXX together or not at all: clang beside g++ (or the reverse)
+    # mixes toolchains in one build. A half-set pair is almost certainly a
+    # mistake, and CMake would silently fill the gap with its default.
+    if [[ -n "${CC:-}" && -z "${CXX:-}" ]] || [[ -z "${CC:-}" && -n "${CXX:-}" ]]; then
+        fail "set both CC and CXX, or neither (CC=${CC:-unset} CXX=${CXX:-unset})"
+    fi
+    if [[ -z "${CC:-}" && -z "${CXX:-}" ]]; then
+        if command -v clang >/dev/null && command -v clang++ >/dev/null; then
+            export CC=clang CXX=clang++
+            echo "  compiler: none set; selecting clang/clang++"
+        fi
+    fi
+
+    local cxx_bin cc_bin
+    # A launcher wrapper (CXX="ccache clang++") cannot be resolved or compared
+    # meaningfully here, and CMake treats it as the compiler rather than a
+    # launcher. Point the operator at the supported mechanism instead.
+    if [[ "${CC:-}" == *" "* || "${CXX:-}" == *" "* ]]; then
+        fail "CC/CXX must name a single compiler, not a launcher (CC='${CC:-}' CXX='${CXX:-}'). Use -DCMAKE_CXX_COMPILER_LAUNCHER=... instead."
+    fi
+    cc_bin="$(first_word "${CC:-}")"
+    cxx_bin="$(first_word "${CXX:-}")"
+    if [[ -n "${cc_bin}" ]] && ! command -v "${cc_bin}" >/dev/null; then
+        fail "selected C compiler is not on PATH: ${CC}"
+    fi
+    if [[ -n "${cxx_bin}" ]] && ! command -v "${cxx_bin}" >/dev/null; then
+        fail "selected C++ compiler is not on PATH: ${CXX}"
+    fi
+    if [[ -n "${cxx_bin}" ]]; then
+        printf '  compiler: %s\n' "$("${cxx_bin}" --version 2>/dev/null | head -1)"
+    fi
+
+    # CMake reads CC/CXX only on a tree's first configure, so an existing build
+    # directory keeps whatever compiler it was created with. That silently
+    # reproduces the stale-toolchain failures this selection exists to prevent,
+    # so refuse to run against a tree built by a different compiler.
+    [[ -n "${cxx_bin}" ]] || return 0
+    local resolved
+    resolved="$(command -v "${cxx_bin}")"
+    local cache
+    for cache in build/dev/CMakeCache.txt build/asan/CMakeCache.txt build/tsan/CMakeCache.txt; do
+        [[ -f "${cache}" ]] || continue
+        local cached
+        cached="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "${cache}" | head -1)"
+        [[ -n "${cached}" ]] || continue
+        local cached_real resolved_real
+        cached_real="$(readlink -f "${cached}" 2>/dev/null || printf '%s' "${cached}")"
+        resolved_real="$(readlink -f "${resolved}" 2>/dev/null || printf '%s' "${resolved}")"
+        if [[ "${cached_real}" != "${resolved_real}" ]]; then
+            fail "${cache} was configured with ${cached}, but CXX is ${resolved}. Remove that build tree (rm -rf ${cache%/CMakeCache.txt}) and re-run."
+        fi
+    done
+}
 
 prepare_linux_userns_tests() {
     if [[ "${GLOVE_PREPARE_LINUX_USERNS:-0}" == "1" ]]; then
@@ -63,7 +177,8 @@ find_fuzzer_compiler() {
             fi
         done
     fi
-    for candidate in clang++-22 clang++-21 clang++-20 clang++-19 clang++-18 clang++; do
+    for candidate in clang++-26 clang++-25 clang++-24 clang++-23 clang++-22 clang++-21 \
+                     clang++-20 clang++-19 clang++-18 clang++; do
         if command -v "${candidate}" >/dev/null; then
             command -v "${candidate}"
             return
@@ -72,27 +187,40 @@ find_fuzzer_compiler() {
     fail "a Clang compiler with libFuzzer support is required"
 }
 
+# Select the toolchain before any CMake preset is configured. The clang-tidy
+# stage configures the dev preset, and a GCC-configured database emits module
+# flags (-fmodules-ts) that clang-tidy rejects, so this must happen first.
+select_compiler
+
 # 1. GitHub Actions ---------------------------------------------------------
 bold "[1/5] actionlint"
-if ! command -v actionlint >/dev/null; then
-    fail "actionlint not on PATH"
+actionlint_bin="$(resolve_tool "${GLOVE_ACTIONLINT:-}" actionlint)"
+if [[ -z "${actionlint_bin}" ]]; then
+    fail "actionlint not on PATH (set GLOVE_ACTIONLINT to an explicit binary)"
 fi
-actionlint_version="$(actionlint -version | sed -n '1{s/^v//;p;}')"
-if [[ "${actionlint_version}" != "${required_actionlint_version}" ]]; then
-    fail "actionlint ${required_actionlint_version} required; found ${actionlint_version}"
+actionlint_version="$("${actionlint_bin}" -version | sed -n '1{s/^v//;p;}')"
+if ! version_ge "${actionlint_version}" "${min_actionlint_version}"; then
+    fail "actionlint >= ${min_actionlint_version} required; found ${actionlint_version}"
 fi
-actionlint
+"${actionlint_bin}"
 sh -n setup.sh
-ok "GitHub Actions workflows clean"
+ok "GitHub Actions workflows clean (actionlint ${actionlint_version})"
 
 # 2. format -----------------------------------------------------------------
 bold "[2/5] clang-format --dry-run"
-if ! command -v clang-format >/dev/null; then
-    fail "clang-format not on PATH"
+clang_format_bin="$(resolve_tool "${GLOVE_CLANG_FORMAT:-}" clang-format)"
+if [[ -z "${clang_format_bin}" ]]; then
+    fail "clang-format not on PATH (set GLOVE_CLANG_FORMAT to an explicit binary)"
 fi
-clang_format_version="$(clang-format --version)"
-if [[ "${clang_format_version}" != *"version ${required_clang_format_version}"* ]]; then
-    fail "clang-format ${required_clang_format_version} required; found ${clang_format_version}"
+clang_format_version="$("${clang_format_bin}" --version | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p')"
+if [[ "${clang_format_version}" != "${formatted_for_clang_format}" ]]; then
+    if version_ge "${clang_format_version}" "${formatted_for_clang_format}" &&
+        [[ "${GLOVE_ALLOW_NEWER_CLANG_FORMAT:-0}" == "1" ]]; then
+        echo "  ⚠ clang-format ${clang_format_version} is newer than the formatted-for ${formatted_for_clang_format}."
+        echo "    Formatter output can differ between versions; this run's format result is NOT authoritative."
+    else
+        fail "clang-format ${formatted_for_clang_format} required; found ${clang_format_version:-unknown}. A different version may format this tree differently. Set GLOVE_ALLOW_NEWER_CLANG_FORMAT=1 to proceed with a newer version anyway."
+    fi
 fi
 fmt_files=()
 while IFS= read -r -d '' f; do
@@ -104,8 +232,8 @@ done < <(
 if [[ ${#fmt_files[@]} -eq 0 ]]; then
     ok "no source files yet"
 else
-    clang-format --dry-run -Werror "${fmt_files[@]}"
-    ok "format clean (${#fmt_files[@]} files)"
+    "${clang_format_bin}" --dry-run -Werror "${fmt_files[@]}"
+    ok "format clean (${#fmt_files[@]} files, clang-format ${clang_format_version})"
 fi
 
 # 3. tidy -------------------------------------------------------------------
@@ -114,14 +242,19 @@ tidy_bin=""
 if [[ ${skip_tidy} -eq 1 ]]; then
     echo "  (skipped via --skip-tidy)"
 else
-    if command -v clang-tidy >/dev/null; then
+    if [[ -n "${GLOVE_CLANG_TIDY:-}" ]]; then
+        tidy_bin="$(resolve_tool "${GLOVE_CLANG_TIDY}" clang-tidy)"
+    elif command -v clang-tidy >/dev/null; then
         tidy_bin="$(command -v clang-tidy)"
     elif command -v brew >/dev/null && [[ -x "$(brew --prefix llvm 2>/dev/null)/bin/clang-tidy" ]]; then
         tidy_bin="$(brew --prefix llvm)/bin/clang-tidy"
     fi
 
     if [[ -z "${tidy_bin}" ]]; then
-        echo "  clang-tidy not installed; skipping (install via 'brew install llvm' for the gate)"
+        # clang-tidy is a required stage. Silently skipping it would let the
+        # script end with "all gates passed" while one gate never ran, so make
+        # the operator opt out explicitly with --skip-tidy.
+        fail "clang-tidy not found; install it, set GLOVE_CLANG_TIDY, or pass --skip-tidy"
     else
         # Benchmarks are opt-in for ordinary builds, but their source remains
         # part of the style gate and must appear in the compilation database.
@@ -189,13 +322,40 @@ fi
 # 4. asan -------------------------------------------------------------------
 bold "[4/5] asan preset"
 prepare_linux_userns_tests
+# Resolve the sanitizer options before building, so a host that cannot provide
+# leak evidence fails fast instead of after a full instrumented build.
+asan_opts="halt_on_error=1:abort_on_error=1"
+lsan_skipped=0
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    # LSan ships with ASan on Linux but not on Apple platforms, and it needs
+    # ptrace. yama ptrace_scope 0 and 1 both work: LSan grants its own tracer
+    # thread permission through PR_SET_PTRACER. Scopes 2 and 3 do not, and every
+    # instrumented binary then fails at exit instead of reporting a leak.
+    #
+    # This gate fails closed: a host that cannot produce leak evidence fails the
+    # run unless the operator explicitly accepts the gap with
+    # GLOVE_ALLOW_NO_LSAN=1. Requiring an opt-in to *strictness* would let the
+    # gate pass with silently missing evidence.
+    ptrace_scope="$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)"
+    # A non-numeric value would compare as 0 and fail open; require digits.
+    if [[ ! "${ptrace_scope}" =~ ^[0-9]+$ ]]; then
+        fail "unexpected /proc/sys/kernel/yama/ptrace_scope value: '${ptrace_scope}'"
+    fi
+    if [[ "${ptrace_scope}" -lt 2 ]]; then
+        asan_opts="${asan_opts}:detect_leaks=1"
+    elif [[ "${GLOVE_ALLOW_NO_LSAN:-0}" == "1" ]]; then
+        lsan_skipped=1
+        # Omission is not enough: ASan defaults detect_leaks=1 on Linux, so it
+        # must be turned off explicitly.
+        asan_opts="${asan_opts}:detect_leaks=0"
+        echo "  ⚠ LeakSanitizer disabled by GLOVE_ALLOW_NO_LSAN=1: yama ptrace_scope=${ptrace_scope} blocks ptrace."
+        echo "    This run collects NO leak evidence. Do not treat it as an ASan leak pass."
+    else
+        fail "LeakSanitizer cannot run: yama ptrace_scope=${ptrace_scope} blocks ptrace. Set GLOVE_ALLOW_NO_LSAN=1 to run ASan/UBSan without leak detection, or fix the host sysctl."
+    fi
+fi
 cmake --preset asan -DGLOVE_BUILD_FUZZERS=OFF
 cmake --build --preset asan
-asan_opts="halt_on_error=1:abort_on_error=1"
-if [[ "$(uname -s)" != "Darwin" ]]; then
-    # LSan ships with ASan on Linux but not on Apple platforms.
-    asan_opts="${asan_opts}:detect_leaks=1"
-fi
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     ctest --preset asan
@@ -270,14 +430,36 @@ if [[ -x build/fuzz/fuzz/glove_apple_container_stats_fuzzer ]]; then
             -artifact_prefix="${apple_stats_fuzz_corpus}/" \
             "${apple_stats_fuzz_corpus}"
 fi
-ok "asan ok"
+if [[ "${lsan_skipped}" == "1" ]]; then
+    ok "asan ok (leak detection NOT collected: ptrace restricted)"
+else
+    ok "asan ok"
+fi
 
 # 5. tsan -------------------------------------------------------------------
 bold "[5/5] tsan preset"
 cmake --preset tsan -DGLOVE_BUILD_FUZZERS=OFF
 cmake --build --preset tsan
+# Some kernels ship vm.mmap_rnd_bits=32, which makes TSan abort at startup with
+# "unexpected memory mapping". Disabling ASLR for the test process keeps the
+# sanitizer usable without touching a host sysctl. This does not weaken the
+# check: TSan still runs with the same options and the full suite.
+tsan_runner=()
+if [[ "$(uname -s)" == "Linux" ]] && command -v setarch >/dev/null; then
+    tsan_runner=(setarch -R)
+fi
 TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
-    ctest --preset tsan
+    "${tsan_runner[@]}" ctest --preset tsan
 ok "tsan ok"
 
-bold "all gates passed"
+if [[ "${skip_tidy}" == "1" || "${lsan_skipped}" == "1" ]]; then
+    bold "gates passed with a skipped stage"
+    if [[ "${skip_tidy}" == "1" ]]; then
+        echo "  ⚠ clang-tidy was skipped; this run is not evidence that tidy is clean."
+    fi
+    if [[ "${lsan_skipped}" == "1" ]]; then
+        echo "  ⚠ LeakSanitizer was skipped; this run is not evidence of leak-freedom."
+    fi
+else
+    bold "all gates passed"
+fi
