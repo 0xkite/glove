@@ -727,15 +727,20 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     if (!sink) {
         return std::unexpected(sink.error());
     }
+    // Resolve the agent preset before starting the egress proxy. This is the
+    // step that rejects a preset combined with --egress-allow, so doing it first
+    // means a rejected request never briefly binds and then discards a CONNECT
+    // listener.
+    auto preset = start_agent_preset(opts, *sink);
+    if (!preset) {
+        return std::unexpected(preset.error());
+    }
+
     auto proxy = start_egress(opts, *profile, *sink);
     if (!proxy) {
         return std::unexpected(proxy.error());
     }
 
-    auto preset = start_agent_preset(opts, *sink);
-    if (!preset) {
-        return std::unexpected(preset.error());
-    }
     if (preset->bridge) {
         profile->bridge_endpoint = *preset->bridge;
         profile->environment.insert(
