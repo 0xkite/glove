@@ -444,12 +444,16 @@ cmake --build --preset tsan
 # "unexpected memory mapping". Disabling ASLR for the test process keeps the
 # sanitizer usable without touching a host sysctl. This does not weaken the
 # check: TSan still runs with the same options and the full suite.
-tsan_runner=()
+# Note: no array expansion here. macOS still ships bash 3.2, where an empty
+# "${arr[@]}" is an unbound variable under set -u, so an empty array would abort
+# the lane on a platform where setarch does not apply.
 if [[ "$(uname -s)" == "Linux" ]] && command -v setarch >/dev/null; then
-    tsan_runner=(setarch -R)
+    TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
+        setarch -R ctest --preset tsan
+else
+    TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
+        ctest --preset tsan
 fi
-TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
-    "${tsan_runner[@]}" ctest --preset tsan
 ok "tsan ok"
 
 if [[ "${skip_tidy}" == "1" || "${lsan_skipped}" == "1" ]]; then
