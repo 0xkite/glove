@@ -1771,7 +1771,7 @@ auto session_plan_validator::resolve_runtime_launch_json(
                 .base = plan.refinement->base,
                 .candidate = plan.refinement->candidate,
                 .matched_context_digest = plan.refinement->matched_context_digest,
-            };
+        };
         execution.plan_context_digest = std::move(*plan_context);
         refinement = std::move(execution);
     }

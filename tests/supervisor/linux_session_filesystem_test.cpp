@@ -277,7 +277,7 @@ auto run() -> int {
         expected_partitions = {
             {.alias = "first", .quota_bytes = alias_quota},
             {.alias = "second", .quota_bytes = alias_quota},
-        };
+    };
     REQUIRE(filesystem->recovery_partitions() == expected_partitions);
     REQUIRE(fill_until_quota(tmp_mount->descriptor_fd, session_quota));
     usage = filesystem->observe();
@@ -344,7 +344,7 @@ auto run() -> int {
         {
             {.alias = "first", .quota_bytes = alias_quota + page},
             {.alias = "second", .quota_bytes = alias_quota},
-        };
+    };
     REQUIRE(!glove::supervisor::linux_detail::linux_session_filesystem::cleanup_recovered(
                  materialization_root.string(), "session-recovered", session_quota, wrong_partitions
     )
