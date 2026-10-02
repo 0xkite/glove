@@ -1,5 +1,24 @@
 # Mediated Credential Proxy & Upstream Containment Architecture
 
+> **Implementation status: design document, largely not built.** This page
+> describes intended architecture. Do not read it as a description of current
+> behaviour; `docs/architecture.md` and `docs/threat-model.md` record the split
+> between what exists and what is planned.
+>
+> **Built:** the loopback reverse endpoint, the session nonce swap, the mutual
+> exclusion between a bridged endpoint and CONNECT egress, and HTTP-level request
+> admission (origin-form HTTP/1.1, token-validated header names and values, a
+> single numeric `Content-Length`, no `Transfer-Encoding`, no dot-segment
+> traversal, method and path allowlists).
+>
+> **Not built:** the TLS transport to the provider — so every admitted request
+> currently returns `501 Not Implemented` and `glove exec --agent` cannot complete
+> a real request; canary scanning and known-secret matching; entropy heuristics;
+> token and byte budgets; inbound response sanitisation; and `contained_launcher`
+> for upstream MCP servers.
+>
+> Sections 3 and 4 in particular describe unbuilt stages.
+
 ## 1. Problem Statement & Motivation
 
 Traditional cloud sandboxes and disposable VMs isolate the host machine's filesystem from accidental destruction (`rm -rf /`), but they fail to solve the primary threat in autonomous agent workflows: **credential exfiltration and privilege abuse**.
@@ -73,7 +92,13 @@ Agents are configured via standard base-URL environment overrides:
 
 ## 3. Detection & Semantic Validation Pipeline
 
-The host-side proxy processes outbound requests and inbound responses through a deterministic, bounded validation pipeline:
+**Not built — design intent.** None of this pipeline exists. The only admission
+control today is at the HTTP layer (target form, header token/value validation,
+single numeric `Content-Length`, no `Transfer-Encoding`, no dot-segment
+traversal, method and path allowlists); there is no JSON inspection, scanning,
+heuristics, or budgeting. The table describes the intended design.
+
+The host-side proxy is intended to process outbound requests and inbound responses through a deterministic, bounded validation pipeline:
 
 | Tier | Technique | Action on Match | Rationale |
 |---|---|---|---|
@@ -89,6 +114,10 @@ The host-side proxy processes outbound requests and inbound responses through a 
 ---
 
 ## 4. Sandboxed Upstream MCP Servers
+
+**Not built — design intent.** `contained_launcher` does not exist. Upstream MCP
+servers are still started as unsandboxed host processes by
+`src/mcp/stdio_transport.cpp`.
 
 In the existing architecture, `glove run` sandboxes the agent process, while upstream MCP servers run as unsandboxed host processes (`docs/threat-model.md`). 
 
