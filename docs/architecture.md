@@ -96,6 +96,47 @@ For `glove run`:
 Malformed frames, unknown tools, policy failures, transport errors, and audit
 append failures fail closed.
 
+## Mediated credential proxy and upstream containment
+
+Glove mediates external network requests through an object-capability model that
+unbundles credentials from the agent sandbox (detailed in
+[`docs/credentialed-proxy-architecture.md`](credentialed-proxy-architecture.md)).
+This section separates what is constructed today from what is planned, because a
+capability must never be described as active before it exists.
+
+**Constructed:**
+
+1. **Virtual loopback reverse proxy**: Instead of mounting secret leases into
+   `/home/agent`, the agent reaches a local reverse endpoint over its private
+   loopback bridge, addressed by a base-URL variable (`ANTHROPIC_BASE_URL`,
+   `OPENAI_BASE_URL`).
+2. **Session nonce swap**: The agent is given an ephemeral session token
+   (`glove-session-...`). The host endpoint validates it, discards it, and is
+   the only party that ever holds the real provider credential. A leaked
+   environment variable or transcript exposes nothing usable.
+3. **Mutual exclusion**: A profile may carry either a raw CONNECT egress proxy or
+   a bridged reverse endpoint, never both, so a credentialed upstream is not
+   also reachable over an uninspected tunnel.
+4. **Strict request admission**: The endpoint accepts origin-form HTTP/1.1 only,
+   rejects bare CR/LF framing and invalid tokens, requires a single
+   `Content-Length` or none, refuses `Transfer-Encoding`, rejects dot-segment
+   traversal, and enforces the rule's method and path allowlist. Forwarded
+   headers and the request target are validated; hop-by-hop, routing, and
+   credential fields are stripped before the transport sees them.
+
+**Not constructed yet.** The endpoint has no provider transport: with none
+injected it refuses with `501 Not Implemented`, and `glove exec --agent`
+therefore cannot yet complete a real request. The following are design intent,
+not enforcement:
+
+- a TLS transport that performs the upstream exchange;
+- Aho-Corasick canary detection and Rabin-Karp rolling-hash checks against known
+  secret digests;
+- structural JSON schema validation and token-budget enforcement derived from
+  provider response metadata;
+- **contained MCP upstreams** (`contained_launcher`). Upstream servers are still
+  started as unsandboxed host processes by `src/mcp/stdio_transport.cpp`.
+
 ## Historical synthetic status milestone
 
 The former construction-only synthetic status stack and harness-shaped adapter were
@@ -174,6 +215,14 @@ must add an explicit versioned credit or acknowledgement.
 `glove exec` bypasses the MCP kernel. It is intended for agents that manage
 their own tool protocol, so its security boundary is the OS sandbox and explicit
 filesystem/environment exposure.
+
+When `--herdr` is passed inside an outer Herdr terminal pane (`HERDR_ENV=1`, `HERDR_PANE_ID`),
+Glove's host runner reports lifecycle states (`working`, `done`) and releases authority
+via Herdr's CLI strictly from the host side using `posix_spawnp`. The contained child process
+receives neither `HERDR_SOCKET_PATH` nor `HERDR_BIN_PATH`, preserving fail-closed containment.
+Seccomp explicitly denies `TIOCSTI` and `TIOCLINUX` ioctl calls on the shared terminal descriptor
+to prevent synthetic keystroke injection into the host pane buffer, and installs `PR_SET_PDEATHSIG`
+to terminate the child if the supervisor dies.
 
 ## Sage session flow
 

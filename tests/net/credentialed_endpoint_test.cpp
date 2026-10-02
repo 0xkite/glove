@@ -1,0 +1,589 @@
+#include "glove/net/credentialed_endpoint.hpp"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+#define REQUIRE(cond)                                                                              \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            std::fprintf(stderr, "REQUIRE failed: %s @ %s:%d\n", #cond, __FILE__, __LINE__);       \
+            return 1;                                                                              \
+        }                                                                                          \
+    } while (0)
+
+// Send `request` and read the response without closing the write side, so a
+// server waiting for a declared body must time out rather than observe EOF.
+auto send_partial_and_receive(std::uint16_t port, std::string_view request, int wait_ms)
+    -> std::string {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return {};
+    }
+    ::sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (::connect(fd, reinterpret_cast<::sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return {};
+    }
+    if (::write(fd, request.data(), request.size()) < 0) {
+        ::close(fd);
+        return {};
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{wait_ms};
+    std::string response;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()
+        );
+        ::pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
+        if (::poll(&pfd, 1, static_cast<int>(std::max<long long>(left.count(), 1))) <= 0) {
+            continue;
+        }
+        std::array<char, 1024> buffer{};
+        const auto got = ::read(fd, buffer.data(), buffer.size());
+        if (got <= 0) {
+            break;
+        }
+        response.append(buffer.data(), static_cast<std::size_t>(got));
+    }
+    ::close(fd);
+    return response;
+}
+
+auto send_and_receive(std::uint16_t port, std::string_view request) -> std::string {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return {};
+    }
+    ::sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+
+    if (::connect(fd, reinterpret_cast<::sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return {};
+    }
+
+    const auto written = ::write(fd, request.data(), request.size());
+    if (written < 0 || static_cast<std::size_t>(written) != request.size()) {
+        ::close(fd);
+        return {};
+    }
+
+    std::string response;
+    std::array<char, 1024> buffer{};
+    while (true) {
+        const auto n = ::read(fd, buffer.data(), buffer.size());
+        if (n <= 0) {
+            break;
+        }
+        response.append(buffer.data(), static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    return response;
+}
+
+auto run() -> int {
+    std::vector<glove::net::endpoint_event> recorded_events;
+
+    glove::net::credentialed_endpoint_options options;
+    options.endpoints.push_back({
+        .provider = glove::net::endpoint_provider::anthropic,
+        .path_prefix = "/anthropic",
+        .upstream_host = "api.anthropic.com",
+        .upstream_port = 443,
+        .secret_token = "sk-ant-real-super-secret-token",
+        .session_nonce = "glove-nonce-abc123xyz",
+        .allowed_methods = {"POST"},
+        .allowed_paths = {"/v1/messages"},
+    });
+    options.on_event =
+        [&](const glove::net::endpoint_event& ev) -> std::expected<void, std::string> {
+        recorded_events.push_back(ev);
+        return {};
+    };
+
+    // The provider transport is injected, so the production path holds no
+    // test-only behaviour. This stub records what the endpoint handed over so
+    // the tests can assert what would reach a real provider.
+    std::vector<glove::net::upstream_request> forwarded_requests;
+    options.forward = [&](
+                          const glove::net::upstream_request& request,
+                          std::stop_token,
+                          std::chrono::steady_clock::time_point
+                      ) -> std::expected<glove::net::upstream_response, std::string> {
+        forwarded_requests.push_back(request);
+        glove::net::upstream_response response;
+        response.status_code = 200;
+        response.headers.emplace_back("Content-Type", "application/json");
+        response.body = "{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\","
+                        "\"content\":[{\"type\":\"text\",\"text\":\"mock response\"}]}";
+        return response;
+    };
+
+    auto endpoint = glove::net::start_credentialed_endpoint(std::move(options));
+    REQUIRE(endpoint.has_value());
+    const auto port = (*endpoint)->port();
+    REQUIRE(port > 0);
+
+    auto base_url = (*endpoint)->base_url(glove::net::endpoint_provider::anthropic);
+    REQUIRE(base_url.has_value());
+    REQUIRE(base_url->find(std::to_string(port)) != std::string::npos);
+    REQUIRE(base_url->ends_with("/anthropic"));
+
+    auto nonce = (*endpoint)->session_nonce(glove::net::endpoint_provider::anthropic);
+    REQUIRE(nonce.has_value());
+    REQUIRE(*nonce == "glove-nonce-abc123xyz");
+
+    // Case 1: Valid session nonce -> success (200 OK)
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 200 OK"));
+        REQUIRE(resp.find("mock response") != std::string::npos);
+    }
+
+    // The transport saw exactly one request, with the real credential, the
+    // rewritten target, and none of the agent-supplied credential or routing
+    // fields that the endpoint strips before forwarding.
+    REQUIRE(forwarded_requests.size() == 1);
+    {
+        const auto& request = forwarded_requests.front();
+        REQUIRE(request.upstream_host == "api.anthropic.com");
+        REQUIRE(request.upstream_port == 443);
+        REQUIRE(request.method == "POST");
+        REQUIRE(request.target == "/v1/messages");
+        REQUIRE(request.secret_token == "sk-ant-real-super-secret-token");
+        for (const auto& [name, value] : request.headers) {
+            REQUIRE(name != "x-api-key");
+            REQUIRE(name != "authorization");
+            REQUIRE(name != "host");
+            REQUIRE(name != "content-length");
+            REQUIRE(name != "connection");
+        }
+    }
+
+    // Case 2: Invalid session nonce -> 401 Unauthorized
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: wrong-nonce\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 401 Unauthorized"));
+        REQUIRE(resp.find("invalid_session_nonce") != std::string::npos);
+    }
+
+    // Case 3: Missing session nonce -> 401 Unauthorized
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 401 Unauthorized"));
+    }
+
+    // Case 4: Disallowed HTTP method -> 405 Method Not Allowed
+    {
+        const auto resp = send_and_receive(
+            port,
+            "GET /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 405 Method Not Allowed"));
+    }
+
+    // Case 5: Disallowed path -> 403 Forbidden
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/forbidden/path HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    // Case 6: Unknown endpoint prefix -> 404 Not Found
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /unknown/service HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    // Malformed framing and smuggling shapes must be rejected before any
+    // routing or credential decision. Each returns 400 Bad Request. Every
+    // request carries a valid Host and nonce unless the case under test is the
+    // Host requirement itself, so the 400 is attributable to the named defect.
+    const std::vector<std::pair<const char*, std::string>> malformed = {
+        {"bare LF in request line",
+         "POST /anthropic/v1/messages HTTP/1.1\nHost: 127.0.0.1\r\n\r\n"},
+        {"bare LF in header line",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"bare CR in header value",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-\rnonce\r\n\r\n"},
+        {"header name with a space",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nBad Name: x\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"empty header name",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n: x\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"header without a colon",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nnot-a-header\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"duplicate content-length",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n"
+         "Content-Length: 0\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"non-numeric content-length",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1a2\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"oversized content-length",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "Content-Length: 99999999999999999999\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"transfer-encoding",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "Transfer-Encoding: chunked\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"absolute-form target",
+         "POST http://evil.example/anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"unsupported HTTP version",
+         "POST /anthropic/v1/messages HTTP/2.0\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"invalid method token",
+         "P(ST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"tab in request target",
+         "POST /anthropic/v1/mess\tages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"dot-segment traversal",
+         "POST /anthropic/v1/../messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"percent-encoded traversal",
+         "POST /anthropic/v1/%2e%2e/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"duplicate x-api-key",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"both credential headers",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n"
+         "Authorization: Bearer glove-nonce-abc123xyz\r\n\r\n"},
+        {"missing host on HTTP/1.1",
+         "POST /anthropic/v1/messages HTTP/1.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"duplicate host",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+    };
+    for (const auto& [label, request] : malformed) {
+        const auto resp = send_and_receive(port, request);
+        if (!resp.starts_with("HTTP/1.1 400 Bad Request")) {
+            std::fprintf(
+                stderr, "REQUIRE failed: %s should be 400, got: %.40s\n", label, resp.c_str()
+            );
+            return 1;
+        }
+    }
+
+    // A query string must reach the same path rule as the bare path: the
+    // allowed path with a query is served, and a disallowed path with a query
+    // that contains the allowed path is still refused. Without splitting the
+    // target, the second case would be the one that accidentally passed.
+    {
+        const auto allowed_with_query = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages?beta=true HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(allowed_with_query.starts_with("HTTP/1.1 200 OK"));
+        // The query string is preserved on the forwarded target.
+        REQUIRE(!forwarded_requests.empty());
+        REQUIRE(forwarded_requests.back().target == "/v1/messages?beta=true");
+    }
+    {
+        const auto disallowed_with_query = send_and_receive(
+            port,
+            "POST /anthropic/v1/forbidden?x=/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(disallowed_with_query.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    // With no provider transport configured, an otherwise-valid request must be
+    // refused with 501 rather than silently stubbed: the production default has
+    // no test-only shortcut.
+    {
+        glove::net::credentialed_endpoint_options no_transport;
+        no_transport.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        auto bare = glove::net::start_credentialed_endpoint(std::move(no_transport));
+        REQUIRE(bare.has_value());
+        const auto resp = send_and_receive(
+            (*bare)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 501 Not Implemented"));
+    }
+
+    // Trust-boundary limits: the header count accepts exactly the cap and
+    // rejects the next one, so an off-by-one cannot silently widen the bound.
+    {
+        const auto build = [](std::size_t filler) {
+            std::string request = "POST /anthropic/v1/messages HTTP/1.1\r\n"
+                                  "Host: 127.0.0.1\r\n"
+                                  "x-api-key: glove-nonce-abc123xyz\r\n"
+                                  "Content-Length: 0\r\n";
+            for (std::size_t index = 0; index < filler; ++index) {
+                request += "X-Fill-" + std::to_string(index) + ": v\r\n";
+            }
+            request += "\r\n";
+            return request;
+        };
+        // 3 fixed headers plus 97 filler is exactly the cap of 100.
+        REQUIRE(send_and_receive(port, build(97)).starts_with("HTTP/1.1 200 OK"));
+        // The 101st header is over it.
+        REQUIRE(send_and_receive(port, build(98)).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    // A control character inside a header value must be rejected by the
+    // field-value check. The CR/LF cases above reach the framing check instead.
+    {
+        std::string request = "POST /anthropic/v1/messages HTTP/1.1\r\n"
+                              "Host: 127.0.0.1\r\n"
+                              "x-api-key: glove-nonce-abc123xyz\r\n"
+                              "X-Ctl: a\x01"
+                              "b\r\n"
+                              "Content-Length: 0\r\n\r\n";
+        REQUIRE(send_and_receive(port, request).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    // Content-Length cap boundary: the exact cap is accepted and the next value
+    // is rejected. GET keeps the request off the body-reading path, so the
+    // accepted case is decided by the parser rather than by the body.
+    {
+        const auto with_length = [](std::string_view length) {
+            return "GET /anthropic/v1/messages HTTP/1.1\r\n"
+                   "Host: 127.0.0.1\r\n"
+                   "x-api-key: glove-nonce-abc123xyz\r\n"
+                   "Content-Length: " +
+                   std::string{length} + "\r\n\r\n";
+        };
+        REQUIRE(send_and_receive(port, with_length("8388608")).starts_with("HTTP/1.1 405 "));
+        REQUIRE(send_and_receive(port, with_length("8388609")).starts_with("HTTP/1.1 400 "));
+    }
+
+    // A client that declares a body and never sends it must not stall the
+    // worker or block shutdown: the body read is bounded, the request is
+    // refused, and the transport is never invoked with a partial body.
+    {
+        bool stalled_transport_called = false;
+        glove::net::credentialed_endpoint_options stalled;
+        stalled.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        stalled.body_deadline_ms = 300;
+        stalled.forward = [&](
+                              const glove::net::upstream_request&,
+                              std::stop_token,
+                              std::chrono::steady_clock::time_point
+                          ) -> std::expected<glove::net::upstream_response, std::string> {
+            stalled_transport_called = true;
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            return response;
+        };
+        auto bounded = glove::net::start_credentialed_endpoint(std::move(stalled));
+        REQUIRE(bounded.has_value());
+        const auto resp = send_partial_and_receive(
+            (*bounded)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 10\r\n\r\n",
+            5000
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 400 Bad Request"));
+        REQUIRE(!stalled_transport_called);
+    }
+
+    // A transport response whose field value carries CRLF must not be copied
+    // into the head we emit: the endpoint fails closed and injects nothing.
+    {
+        glove::net::credentialed_endpoint_options bad_upstream;
+        bad_upstream.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        bad_upstream.forward = [](
+                                   const glove::net::upstream_request&,
+                                   std::stop_token,
+                                   std::chrono::steady_clock::time_point
+                               ) -> std::expected<glove::net::upstream_response, std::string> {
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.headers.emplace_back("X-Bad", "v\r\nContent-Length: 99");
+            response.body = "x";
+            return response;
+        };
+        auto guarded = glove::net::start_credentialed_endpoint(std::move(bad_upstream));
+        REQUIRE(guarded.has_value());
+        const auto resp = send_and_receive(
+            (*guarded)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 502 Bad Gateway"));
+        REQUIRE(!resp.contains("Content-Length: 99"));
+    }
+
+    // A transport response with a mixed-case Connection field must still have
+    // the named hop-by-hop field removed: HTTP field names are case-insensitive.
+    {
+        glove::net::credentialed_endpoint_options mixed;
+        mixed.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        mixed.forward = [](
+                            const glove::net::upstream_request&,
+                            std::stop_token,
+                            std::chrono::steady_clock::time_point
+                        ) -> std::expected<glove::net::upstream_response, std::string> {
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.headers.emplace_back("Connection", "X-Hop");
+            response.headers.emplace_back("X-Hop", "must-not-be-forwarded");
+            response.body = "ok";
+            return response;
+        };
+        auto case_insensitive = glove::net::start_credentialed_endpoint(std::move(mixed));
+        REQUIRE(case_insensitive.has_value());
+        const auto resp = send_and_receive(
+            (*case_insensitive)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 200 OK"));
+        REQUIRE(!resp.contains("must-not-be-forwarded"));
+    }
+
+    // A status that cannot be a final response must be refused, not serialized.
+    {
+        glove::net::credentialed_endpoint_options bad_status;
+        bad_status.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        bad_status.forward = [](
+                                 const glove::net::upstream_request&,
+                                 std::stop_token,
+                                 std::chrono::steady_clock::time_point
+                             ) -> std::expected<glove::net::upstream_response, std::string> {
+            glove::net::upstream_response response;
+            response.status_code = 100;
+            return response;
+        };
+        auto refused = glove::net::start_credentialed_endpoint(std::move(bad_status));
+        REQUIRE(refused.has_value());
+        const auto resp = send_and_receive(
+            (*refused)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 502 Bad Gateway"));
+    }
+
+    REQUIRE(!recorded_events.empty());
+    return 0;
+}
+
+} // namespace
+
+auto main() -> int {
+    return run();
+}

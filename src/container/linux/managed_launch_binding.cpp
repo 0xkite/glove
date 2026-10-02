@@ -541,6 +541,15 @@ auto bind_managed_launch_projection_from_fd(
     if (!checked->required_limits) {
         return std::unexpected(std::string{"managed launch requires resource limits"});
     }
+    // The mediated credential endpoint is wired only through `glove exec`.
+    // The managed session path has no receipt or capability representation for
+    // it yet, so refuse it here rather than launch a session whose authenticated
+    // receipt would not describe the forwarded endpoint.
+    if (checked->bridge_endpoint) {
+        return std::unexpected(
+            std::string{"managed launch does not support bridge_endpoint; use glove exec"}
+        );
+    }
     if (!checked->filesystem.empty() || checked->home_dir || checked->temp_dir ||
         std::ranges::any_of(checked->runtime_filesystem, [](const auto& rule) {
             return rule.writable;
@@ -714,6 +723,14 @@ auto bind_managed_launch_projection_from_fd(
         encoder.append_string("glove.managed-launch-egress");
         encoder.append_u32(checked->proxy->port);
         encoder.append_string(checked->proxy->url);
+    }
+    // Bind a plain bridged endpoint too. Managed launch rejects bridge_endpoint
+    // above, so this is defence in depth: if that rejection is ever relaxed,
+    // the digest already commits to the endpoint and cannot be replayed as an
+    // offline profile.
+    if (checked->bridge_endpoint) {
+        encoder.append_string("glove.managed-launch-bridge-endpoint");
+        encoder.append_u32(checked->bridge_endpoint->port);
     }
     if (!encoder.valid()) {
         return std::unexpected(

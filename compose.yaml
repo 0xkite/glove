@@ -1,0 +1,26 @@
+name: glove
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.dev
+    volumes:
+      - .:/glove:rw
+      - ccache-data:/root/.cache/ccache:rw
+    cap_add:
+      - SYS_ADMIN
+      - SETUID
+      - SETGID
+    security_opt:
+      - systempaths=unconfined
+      - seccomp=unconfined
+      - apparmor=unconfined
+    cgroup: private
+    stdin_open: true
+    tty: true
+    working_dir: /glove
+    command: /bin/bash
+
+volumes:
+  ccache-data:

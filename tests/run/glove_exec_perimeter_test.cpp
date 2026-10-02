@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -112,6 +113,101 @@ auto run() -> int {
         ) == 1
     );
     REQUIRE(!std::filesystem::exists(exposed_audit));
+
+    // --herdr fails closed when HERDR_ENV is not present.
+    ::unsetenv("HERDR_ENV");
+    ::unsetenv("HERDR_PANE_ID");
+    REQUIRE(run_glove({GLOVE_BIN, "exec", "--herdr", "--", "/usr/bin/true"}) == 1);
+
+    // --herdr succeeds and records host-side lifecycle transitions when HERDR_ENV=1,
+    // HERDR_PANE_ID, and HERDR_BIN_PATH are provided.
+    const auto mock_herdr = base / "mock_herdr.sh";
+    const auto herdr_log = base / "herdr_calls.log";
+    {
+        std::ofstream script{mock_herdr};
+        script << "#!/bin/sh\n";
+        script << "echo \"$@\" >> \"" << herdr_log.string() << "\"\n";
+        script << "exit 0\n";
+    }
+    std::filesystem::permissions(mock_herdr, std::filesystem::perms::owner_all);
+
+    ::setenv("HERDR_ENV", "1", 1);
+    ::setenv("HERDR_PANE_ID", "w1:p1", 1);
+    ::setenv("HERDR_BIN_PATH", mock_herdr.c_str(), 1);
+    REQUIRE(run_glove({GLOVE_BIN, "exec", "--herdr", "--", "/usr/bin/true"}) == 0);
+    ::unsetenv("HERDR_ENV");
+    ::unsetenv("HERDR_PANE_ID");
+    ::unsetenv("HERDR_BIN_PATH");
+
+    std::ifstream log_in{herdr_log};
+    REQUIRE(log_in.good());
+    std::string log_contents{
+        std::istreambuf_iterator<char>{log_in}, std::istreambuf_iterator<char>{}
+    };
+    REQUIRE(
+        log_contents.find(
+            "pane report-agent w1:p1 --source glove:sandbox --agent true --state working"
+        ) != std::string::npos
+    );
+    REQUIRE(
+        log_contents.find(
+            "pane report-agent w1:p1 --source glove:sandbox --agent true --state done"
+        ) != std::string::npos
+    );
+    REQUIRE(
+        log_contents.find("pane release-agent w1:p1 --source glove:sandbox --agent true") !=
+        std::string::npos
+    );
+
+    // --agent fails closed when the host provider credential is absent.
+    ::unsetenv("ANTHROPIC_API_KEY");
+    REQUIRE(run_glove({GLOVE_BIN, "exec", "--agent", "claude-code", "--", "/usr/bin/true"}) == 1);
+
+    // --agent must never put the host credential in the child environment. The
+    // sandbox sees only an ephemeral session nonce and a loopback base URL.
+    const auto preset_dir = base / "preset";
+    std::filesystem::create_directories(preset_dir, ec);
+    REQUIRE(!ec);
+    const auto observed = preset_dir / "observed.txt";
+    ::setenv("ANTHROPIC_API_KEY", "sk-ant-host-credential-must-not-leak", 1);
+#if defined(__APPLE__)
+    // The macOS backend has no private-loopback descriptor bridge, so a
+    // credentialed endpoint cannot be projected into the sandbox. `--agent`
+    // must fail closed rather than launch an agent that cannot reach its
+    // provider, and no observation file may be produced.
+    REQUIRE(run_glove({GLOVE_BIN, "exec", "--agent", "claude-code", "--", "/usr/bin/true"}) == 1);
+    REQUIRE(!std::filesystem::exists(observed));
+#else
+    REQUIRE(
+        run_glove(
+            {GLOVE_BIN,
+             "exec",
+             "--agent",
+             "claude-code",
+             "--workspace",
+             preset_dir.string(),
+             "--",
+             "/bin/sh",
+             "-c",
+             "printf 'key=%s\\nbase=%s\\n' \"$ANTHROPIC_API_KEY\" \"$ANTHROPIC_BASE_URL\" > \"$1\"",
+             "glove-test",
+             observed.string()}
+        ) == 0
+    );
+#endif
+    ::unsetenv("ANTHROPIC_API_KEY");
+#if !defined(__APPLE__)
+    {
+        std::ifstream obs{observed};
+        REQUIRE(obs.good());
+        const std::string contents{
+            std::istreambuf_iterator<char>{obs}, std::istreambuf_iterator<char>{}
+        };
+        REQUIRE(contents.find("sk-ant-host-credential-must-not-leak") == std::string::npos);
+        REQUIRE(contents.find("key=glove-session-") != std::string::npos);
+        REQUIRE(contents.find("base=http://127.0.0.1:") != std::string::npos);
+    }
+#endif
 
     std::filesystem::remove(marker, ec);
     std::filesystem::remove_all(base, ec);

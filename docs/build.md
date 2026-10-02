@@ -67,7 +67,23 @@ resource and filesystem limits, not merely start a process. See [host-setup.md](
 owner-local workflow and [session-policy.md](session-policy.md) for the policy
 contract.
 
-The privileged Docker command is only a test environment; it is not production
+## Containerized development environment
+
+A fast, cached devcontainer environment is provided via Docker Compose and
+`dockerfiles/Dockerfile.dev`. It uses targeted capabilities (`SYS_ADMIN`, `SETUID`,
+`SETGID`) with persistent ccache storage instead of monolithic `--privileged` rebuilds:
+
+```sh
+# Start interactive dev shell
+docker compose run --rm dev
+
+# Inside container:
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
+```
+
+The Docker environment is for development and iteration; it is not production
 isolation evidence:
 
 ```sh

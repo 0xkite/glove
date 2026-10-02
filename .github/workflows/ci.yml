@@ -49,10 +49,15 @@ jobs:
           echo "CC=/usr/bin/clang" >> "$GITHUB_ENV"
           echo "CXX=/usr/bin/clang++" >> "$GITHUB_ENV"
 
-      - name: Pin clang-format
+      - name: Install clang-format
+        # Pinned to the exact version scripts/preflight.sh names as
+        # formatted_for_clang_format. A formatter's output is only stable for one
+        # version, so CI must not float: an unpinned install would reformat the
+        # tree under us and turn every open PR red. Bumping this value, the
+        # minimum in preflight.sh, and the resulting reformat belong in one PR.
         run: |
           python3 -m venv "$RUNNER_TEMP/clang-format"
-          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check clang-format==22.1.8
+          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check clang-format==23.1.1
           echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
 
       - name: Install actionlint

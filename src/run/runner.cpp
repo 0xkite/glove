@@ -10,15 +10,21 @@
 #include "glove/mcp/client.hpp"
 #include "glove/mcp/lazy_init.hpp"
 #include "glove/mcp/stdio_transport.hpp"
-#include "glove/mcp/transport.hpp"
+#include "glove/net/credentialed_endpoint.hpp"
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
 
+#include <spawn.h>
+#include <sys/random.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +36,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+extern "C" char** environ;
 
 namespace glove::run {
 
@@ -93,8 +101,23 @@ auto append_selected_environment(
         if (name.empty() || name.find('=') != std::string::npos) {
             return std::unexpected(std::string{"--env requires a variable name, not NAME=VALUE"});
         }
-        for (const auto* reserved :
-             {"HOME", "TMPDIR", "GLOVE_SANDBOXED", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"}) {
+        // Glove-managed variables, plus the outer-harness control variables.
+        // The documented invariant is that the sandboxed child never receives
+        // Herdr's socket path or binary path; allowing them through `--env`
+        // would hand an agent the supervisor's control channel.
+        for (const auto* reserved : {
+                 "HOME",
+                 "TMPDIR",
+                 "GLOVE_SANDBOXED",
+                 "HTTPS_PROXY",
+                 "HTTP_PROXY",
+                 "ALL_PROXY",
+                 "HERDR_ENV",
+                 "HERDR_PANE_ID",
+                 "HERDR_BIN_PATH",
+                 "HERDR_SOCKET_PATH",
+                 "HERDR_AGENT",
+             }) {
             if (name == reserved) {
                 return std::unexpected(
                     std::string{"--env cannot override glove-managed variable "} + name
@@ -335,6 +358,331 @@ auto start_egress(
     return std::move(*proxy);
 }
 
+// One built-in agent preset: the provider endpoint it talks to and the
+// environment variable names that steer the client at the mediated proxy.
+struct preset_definition {
+    glove::net::endpoint_provider provider;
+    std::string_view label;
+    std::string_view path_prefix;
+    std::string_view upstream_host;
+    std::string_view base_url_env;
+    std::string_view api_key_env;
+    std::vector<std::string> allowed_paths;
+};
+
+auto preset_definition_for(std::string_view name) -> std::optional<preset_definition> {
+    if (name == "claude-code" || name == "claude") {
+        return preset_definition{
+            .provider = glove::net::endpoint_provider::anthropic,
+            .label = "claude-code",
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .base_url_env = "ANTHROPIC_BASE_URL",
+            .api_key_env = "ANTHROPIC_API_KEY",
+            .allowed_paths = {"/v1/messages", "/v1/messages/count_tokens"},
+        };
+    }
+    if (name == "codex" || name == "openai") {
+        return preset_definition{
+            .provider = glove::net::endpoint_provider::openai,
+            .label = "codex",
+            .path_prefix = "/openai",
+            .upstream_host = "api.openai.com",
+            .base_url_env = "OPENAI_BASE_URL",
+            .api_key_env = "OPENAI_API_KEY",
+            .allowed_paths = {"/v1/chat/completions", "/v1/responses", "/v1/models"},
+        };
+    }
+    if (name == "pi") {
+        return preset_definition{
+            .provider = glove::net::endpoint_provider::anthropic,
+            .label = "pi",
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .base_url_env = "ANTHROPIC_BASE_URL",
+            .api_key_env = "ANTHROPIC_API_KEY",
+            .allowed_paths = {"/v1/messages", "/v1/messages/count_tokens"},
+        };
+    }
+    return std::nullopt;
+}
+
+// An ephemeral, non-actionable session token. The agent presents it as its API
+// key; only this session's host proxy accepts it, so a leaked environment or
+// transcript exposes nothing usable off-host.
+auto random_session_nonce() -> std::expected<std::string, std::string> {
+    std::array<unsigned char, 24> bytes{};
+    if (::getentropy(bytes.data(), bytes.size()) != 0) {
+        return std::unexpected(std::string{"getentropy: "} + std::strerror(errno));
+    }
+    constexpr char hex[] = "0123456789abcdef";
+    std::string nonce = "glove-session-";
+    for (const auto byte : bytes) {
+        nonce.push_back(hex[byte >> 4U]);
+        nonce.push_back(hex[byte & 0x0fU]);
+    }
+    return nonce;
+}
+
+struct preset_startup {
+    std::unique_ptr<glove::net::credentialed_endpoint> endpoint;
+    std::optional<glove::container::bridge_endpoint_settings> bridge;
+    std::vector<std::string> environment;
+};
+
+// Start the mediated reverse endpoint for `--agent <preset>` and compute the
+// environment that steers the client at it. The real provider secret is read
+// only here, on the host, and is never placed in the child environment.
+auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
+    -> std::expected<preset_startup, std::string> {
+    preset_startup startup;
+    if (!opts.agent_preset) {
+        return startup;
+    }
+    auto definition = preset_definition_for(*opts.agent_preset);
+    if (!definition) {
+        return std::unexpected(
+            std::string{"unknown --agent preset '"} + *opts.agent_preset +
+            "'; expected claude-code, codex, or pi"
+        );
+    }
+    // The sandbox exposes exactly one loopback bridge destination, so a
+    // credentialed endpoint cannot coexist with raw CONNECT egress. Allowing
+    // both would also let the agent bypass injection and inspection.
+    if (!opts.egress.empty()) {
+        return std::unexpected(
+            std::string{"--agent "} + std::string{definition->label} +
+            " cannot be combined with --egress-allow: the sandbox has one loopback bridge "
+            "destination, and a credentialed upstream must not also be reachable over raw "
+            "CONNECT egress"
+        );
+    }
+    const std::string api_key_env{definition->api_key_env};
+    // Reject host-credential-shaped selections. `--env` cannot smuggle a real
+    // provider secret or a base-URL override past the mediated endpoint.
+    for (const std::string_view name : opts.environment_names) {
+        for (const std::string_view reserved : {
+                 std::string_view{"ANTHROPIC_API_KEY"},
+                 std::string_view{"ANTHROPIC_AUTH_TOKEN"},
+                 std::string_view{"ANTHROPIC_BASE_URL"},
+                 std::string_view{"OPENAI_API_KEY"},
+                 std::string_view{"OPENAI_BASE_URL"},
+             }) {
+            if (name == reserved) {
+                return std::unexpected(
+                    std::string{"--env "} + std::string{name} +
+                    " cannot be combined with "
+                    "--agent: the mediated endpoint owns provider credentials and base URLs"
+                );
+            }
+        }
+    }
+    const char* secret = std::getenv(api_key_env.c_str());
+    if (secret == nullptr || *secret == '\0') {
+        return std::unexpected(
+            std::string{"--agent "} + std::string{definition->label} +
+            " requires the host environment variable " + api_key_env
+        );
+    }
+    auto nonce = random_session_nonce();
+    if (!nonce) {
+        return std::unexpected(nonce.error());
+    }
+
+    glove::net::credentialed_endpoint_options endpoint_options;
+    endpoint_options.endpoints.push_back({
+        .provider = definition->provider,
+        .path_prefix = std::string{definition->path_prefix},
+        .upstream_host = std::string{definition->upstream_host},
+        .upstream_port = 443,
+        .secret_token = std::string{secret},
+        .session_nonce = *nonce,
+        .allowed_methods = {"POST"},
+        .allowed_paths = definition->allowed_paths,
+    });
+    endpoint_options.on_event =
+        [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
+        const std::string subject = event.method + " " + event.path;
+        const auto status = event.allowed ? glove::mcp::tool_call_status::ok
+                                          : glove::mcp::tool_call_status::invalid_arguments;
+        if (auto audited =
+                record(sink, glove::audit::action::egress, subject, status, event.detail);
+            !audited) {
+            return std::unexpected(audited.error());
+        }
+        if (!event.allowed) {
+            std::fprintf(
+                stderr,
+                "glove credential proxy: DENY %s — %s\n",
+                subject.c_str(),
+                event.detail.c_str()
+            );
+        }
+        return {};
+    };
+
+    auto endpoint = glove::net::start_credentialed_endpoint(std::move(endpoint_options));
+    if (!endpoint) {
+        return std::unexpected(std::string{"credentialed endpoint: "} + endpoint.error());
+    }
+    auto base_url = (*endpoint)->base_url(definition->provider);
+    if (!base_url) {
+        return std::unexpected(base_url.error());
+    }
+    // The sandbox loopback bridge advertises the same port number in the
+    // child's private network namespace, so one port describes both ends.
+    startup.bridge = glove::container::bridge_endpoint_settings{
+        .port = (*endpoint)->port(),
+    };
+    startup.environment.push_back(std::string{definition->base_url_env} + "=" + *base_url);
+    startup.environment.push_back(api_key_env + "=" + *nonce);
+    startup.endpoint = std::move(*endpoint);
+    // Drop the real credential from this process's environment now that the
+    // endpoint owns it. Otherwise it lingers and is inherited by every child
+    // this process starts, including the optional herdr reporter, which is
+    // spawned with ::environ.
+    ::unsetenv(api_key_env.c_str());
+    return startup;
+}
+
+class herdr_reporter final {
+public:
+    herdr_reporter(const herdr_reporter&) = delete;
+    herdr_reporter& operator=(const herdr_reporter&) = delete;
+    herdr_reporter(herdr_reporter&&) = delete;
+    herdr_reporter& operator=(herdr_reporter&&) = delete;
+
+    static auto create(bool enabled, std::string_view agent_name)
+        -> std::expected<std::unique_ptr<herdr_reporter>, std::string> {
+        if (!enabled) {
+            return std::unique_ptr<herdr_reporter>{};
+        }
+        const char* herdr_env = std::getenv("HERDR_ENV");
+        const char* pane_id = std::getenv("HERDR_PANE_ID");
+        if (herdr_env == nullptr || std::string_view{herdr_env} != "1" || pane_id == nullptr ||
+            *pane_id == '\0') {
+            return std::unexpected(
+                std::string{"--herdr requested but HERDR_ENV=1 and HERDR_PANE_ID are not set"}
+            );
+        }
+        std::string bin = "herdr";
+        if (const char* bin_path = std::getenv("HERDR_BIN_PATH");
+            bin_path != nullptr && *bin_path != '\0') {
+            bin = bin_path;
+        }
+        std::string normalized_name = std::filesystem::path{agent_name}.filename().string();
+        if (normalized_name.empty()) {
+            normalized_name = "agent";
+        }
+        auto reporter = std::unique_ptr<herdr_reporter>(
+            new herdr_reporter(std::move(bin), pane_id, std::move(normalized_name))
+        );
+        reporter->report("working");
+        return reporter;
+    }
+
+    ~herdr_reporter() {
+        if (!pane_id_.empty()) {
+            report("done");
+            release();
+        }
+    }
+
+    void report(std::string_view state) const {
+        run_command({
+            "pane",
+            "report-agent",
+            pane_id_,
+            "--source",
+            "glove:sandbox",
+            "--agent",
+            agent_name_,
+            "--state",
+            std::string{state},
+        });
+    }
+
+    void release() const {
+        run_command({
+            "pane",
+            "release-agent",
+            pane_id_,
+            "--source",
+            "glove:sandbox",
+            "--agent",
+            agent_name_,
+        });
+    }
+
+private:
+    herdr_reporter(std::string bin, std::string pane_id, std::string agent_name)
+        : bin_{std::move(bin)}, pane_id_{std::move(pane_id)}, agent_name_{std::move(agent_name)} {}
+
+    void run_command(const std::vector<std::string>& args) const {
+        std::vector<char*> c_args;
+        c_args.reserve(args.size() + 2);
+        c_args.push_back(const_cast<char*>(bin_.c_str()));
+        for (const auto& arg : args) {
+            c_args.push_back(const_cast<char*>(arg.c_str()));
+        }
+        c_args.push_back(nullptr);
+
+        pid_t pid = 0;
+        // Its own process group, so a signal aimed at glove (or a terminal
+        // hangup) is not also delivered to the reporter.
+        ::posix_spawnattr_t attr{};
+        if (::posix_spawnattr_init(&attr) != 0) {
+            std::fprintf(stderr, "glove: herdr spawn attributes could not be initialized\n");
+            return;
+        }
+        static_cast<void>(::posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP));
+        static_cast<void>(::posix_spawnattr_setpgroup(&attr, 0));
+        const int spawn_rc =
+            ::posix_spawnp(&pid, bin_.c_str(), nullptr, &attr, c_args.data(), ::environ);
+        ::posix_spawnattr_destroy(&attr);
+        if (spawn_rc != 0) {
+            std::fprintf(
+                stderr, "glove: herdr report failed to spawn: %s\n", std::strerror(spawn_rc)
+            );
+            return;
+        }
+
+        // Report the state, but never block the agent on it. A hung herdr must
+        // not hold up launch or teardown, so the wait is bounded and the child
+        // is killed by process group if it overruns.
+        constexpr auto reporter_timeout = std::chrono::milliseconds{5000};
+        const auto deadline = std::chrono::steady_clock::now() + reporter_timeout;
+        int status = 0;
+        bool reaped = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto result = ::waitpid(pid, &status, WNOHANG);
+            if (result == pid) {
+                reaped = true;
+                break;
+            }
+            if (result < 0 && errno != EINTR) {
+                break;
+            }
+            ::usleep(10'000);
+        }
+        if (!reaped) {
+            std::fprintf(stderr, "glove: herdr command exceeded its deadline; killing it\n");
+            static_cast<void>(::kill(-pid, SIGKILL));
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return;
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            std::fprintf(
+                stderr, "glove: herdr command returned non-zero exit status (%d)\n", status
+            );
+        }
+    }
+
+    std::string bin_;
+    std::string pane_id_;
+    std::string agent_name_;
+};
+
 } // namespace
 
 auto execute(const options& opts) -> std::expected<int, std::string> {
@@ -434,6 +782,28 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(proxy.error());
     }
 
+    auto preset = start_agent_preset(opts, *sink);
+    if (!preset) {
+        return std::unexpected(preset.error());
+    }
+    if (preset->bridge) {
+        profile->bridge_endpoint = *preset->bridge;
+        profile->environment.insert(
+            profile->environment.end(), preset->environment.begin(), preset->environment.end()
+        );
+        // Re-validate so the credentialed-endpoint/egress mutual exclusion and
+        // environment rules are enforced on the exact launch profile.
+        auto revalidated = glove::container::validate(*profile);
+        if (!revalidated) {
+            return std::unexpected(std::string{"profile: "} + revalidated.error());
+        }
+        *profile = std::move(*revalidated);
+    }
+
+    auto reporter = herdr_reporter::create(opts.herdr, opts.agent_argv.front());
+    if (!reporter) {
+        return std::unexpected(reporter.error());
+    }
     std::string readable;
     std::string writable;
     for (const auto& rule : profile->filesystem) {
