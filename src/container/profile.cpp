@@ -296,6 +296,15 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
     if (copy.proxy && (copy.proxy->port == 0 || copy.proxy->url.empty())) {
         return std::unexpected(std::string{"proxy requires a non-zero port and URL"});
     }
+    if (copy.proxy && copy.bridge_endpoint) {
+        return std::unexpected(
+            std::string{"proxy and bridge_endpoint are mutually exclusive: a credentialed "
+                        "reverse endpoint must not also be reachable over raw CONNECT egress"}
+        );
+    }
+    if (copy.bridge_endpoint && copy.bridge_endpoint->port == 0) {
+        return std::unexpected(std::string{"bridge_endpoint requires a non-zero port"});
+    }
     if (copy.required_limits) {
         const auto& limits = *copy.required_limits;
         if (limits.cpu_time_ms == 0 || limits.memory_bytes == 0 || limits.pids == 0 ||

@@ -857,6 +857,19 @@ auto resolve_program(const profile& prof, std::string_view program)
     return std::unexpected(std::string{"cannot resolve executable: "} + std::string{program});
 }
 
+// The single host-loopback destination the egress bridge may reach for this
+// profile. A credentialed reverse endpoint and a raw CONNECT proxy are
+// mutually exclusive by construction, so at most one applies.
+auto bridged_loopback_port(const profile& prof) -> std::optional<std::uint16_t> {
+    if (prof.proxy) {
+        return prof.proxy->port;
+    }
+    if (prof.bridge_endpoint) {
+        return prof.bridge_endpoint->port;
+    }
+    return std::nullopt;
+}
+
 auto install_environment(const profile& prof) -> std::expected<void, std::string> {
     if (::clearenv() != 0) {
         return std::unexpected(std::string{"clearenv: "} + std::strerror(errno));
@@ -1279,9 +1292,9 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         std::fprintf(stderr, "glove child: pivot: %s\n", r.error().c_str());
         std::_Exit(124);
     }
-    if (prof.proxy) {
+    if (const auto bridged = bridged_loopback_port(prof)) {
         if (auto installed =
-                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, prof.proxy->port);
+                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, *bridged);
             !installed) {
             std::fprintf(stderr, "glove child: egress bridge: %s\n", installed.error().c_str());
             std::_Exit(125);
@@ -1293,7 +1306,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     // Seccomp filter goes after the rootfs pivot (so we don't accidentally
     // deny syscalls our setup needs) but before the agent's exec, so the
     // agent inherits the filter as its starting policy.
-    if (auto r = setup_seccomp(prof.proxy.has_value(), inherited_streams); !r) {
+    if (auto r = setup_seccomp(bridged_loopback_port(prof).has_value(), inherited_streams); !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }
@@ -1417,9 +1430,9 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         std::_Exit(126);
     }
 
-    if (prof.proxy) {
+    if (const auto bridged = bridged_loopback_port(prof)) {
         if (auto installed =
-                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, prof.proxy->port);
+                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, *bridged);
             !installed) {
             std::fprintf(stderr, "glove child: egress bridge: %s\n", installed.error().c_str());
             std::_Exit(125);
@@ -1428,7 +1441,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         close_fd(egress_channel_fd);
     }
 
-    if (auto r = setup_seccomp(prof.proxy.has_value(), inherited_streams); !r) {
+    if (auto r = setup_seccomp(bridged_loopback_port(prof).has_value(), inherited_streams); !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }
@@ -1533,7 +1546,7 @@ public:
             close_pipe_pair(pipe_error);
             return std::unexpected(std::string{"pipe2(sync): "} + std::strerror(saved));
         }
-        if (checked->proxy) {
+        if (bridged_loopback_port(*checked)) {
             auto channel = linux_detail::create_egress_channel();
             if (!channel) {
                 close_pipe_pair(pipe_in);
@@ -1609,9 +1622,8 @@ public:
         }
 
         std::unique_ptr<linux_detail::host_egress_bridge> egress;
-        if (checked->proxy) {
-            auto started =
-                linux_detail::start_host_egress_bridge(egress_host_fd, checked->proxy->port);
+        if (const auto bridged = bridged_loopback_port(*checked)) {
+            auto started = linux_detail::start_host_egress_bridge(egress_host_fd, *bridged);
             egress_host_fd = -1;
             if (!started) {
                 ::close(pipe_in[1]);
@@ -1842,7 +1854,7 @@ auto launch_passthrough_child(
         close_pipe_pair(pipe_out);
         return std::unexpected(std::string{"pipe2(managed stderr): "} + errno_message(saved));
     }
-    if (prof.proxy) {
+    if (bridged_loopback_port(prof)) {
         auto channel = linux_detail::create_egress_channel();
         if (!channel) {
             close_pipe_pair(sync_pipe);
@@ -1932,8 +1944,8 @@ auto launch_passthrough_child(
             return fail(attached.error());
         }
     }
-    if (prof.proxy) {
-        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, prof.proxy->port);
+    if (const auto bridged = bridged_loopback_port(prof)) {
+        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, *bridged);
         egress_host_fd = -1;
         if (!started) {
             return fail(started.error());
@@ -2002,7 +2014,7 @@ auto launch_pty_child(
     }
     int egress_host_fd = -1;
     int egress_sandbox_fd = -1;
-    if (prof.proxy) {
+    if (bridged_loopback_port(prof)) {
         auto channel = linux_detail::create_egress_channel();
         if (!channel) {
             close_pipe_pair(sync_pipe);
@@ -2070,8 +2082,8 @@ auto launch_pty_child(
     if (auto attached = lifecycle.attach(child); !attached) {
         return fail(attached.error());
     }
-    if (prof.proxy) {
-        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, prof.proxy->port);
+    if (const auto bridged = bridged_loopback_port(prof)) {
+        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, *bridged);
         egress_host_fd = -1;
         if (!started) {
             return fail(started.error());

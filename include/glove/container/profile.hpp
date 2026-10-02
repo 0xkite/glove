@@ -25,6 +25,15 @@ struct proxy_settings {
     std::string url;
 };
 
+// A plain (non-CONNECT) host-loopback reverse endpoint forwarded into the
+// sandbox loopback by the egress bridge. Unlike `proxy_settings`, no proxy
+// environment variable is derived from it; callers name it explicitly.
+struct bridge_endpoint_settings {
+    std::uint16_t port = 0;
+
+    auto operator==(const bridge_endpoint_settings&) const -> bool = default;
+};
+
 // Hard limits required by an external session planner. Supplying this block
 // is an all-or-nothing request: a platform spawner must prove it enforces all
 // six limits before it may launch the process.
@@ -189,6 +198,15 @@ struct profile {
 
     // Set only by the runner after starting the authenticated egress proxy.
     std::optional<proxy_settings> proxy;
+
+    // Set only by the runner after starting a plain host-loopback reverse
+    // endpoint (for example the mediated credential proxy). The egress bridge
+    // forwards this port into the sandbox loopback, but no proxy environment
+    // variables are injected: the agent reaches the endpoint through an
+    // explicit base-URL variable. Mutually exclusive with `proxy`, which
+    // enforces the rule that a credentialed upstream is never also reachable
+    // over a raw CONNECT tunnel.
+    std::optional<bridge_endpoint_settings> bridge_endpoint;
 
     // When present, launch is rejected unless the selected spawner reports
     // complete enforcement and observable receipts for every limit.

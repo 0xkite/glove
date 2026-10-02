@@ -566,6 +566,15 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     if (!checked) {
         return std::unexpected(std::string{"profile: "} + checked.error());
     }
+    // The macOS backend has no private-loopback descriptor bridge, so a profile
+    // that names a reverse endpoint cannot reach it. Reject rather than launch
+    // an agent that silently cannot authenticate, matching the fail-closed rule
+    // that a backend must not advertise enforcement it did not construct.
+    if (checked->bridge_endpoint) {
+        return std::unexpected(
+            std::string{"bridge_endpoint is not implemented on the macOS backend"}
+        );
+    }
     if (auto limits = require_resource_enforcement(*checked, macos_resource_capabilities());
         !limits) {
         return std::unexpected(limits.error());
