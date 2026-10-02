@@ -305,12 +305,16 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
             if (has_api_key || has_authorization) {
                 return std::unexpected(std::string{"duplicate credential header"});
             }
-            constexpr std::string_view bearer_prefix = "Bearer ";
-            if (!val.starts_with(bearer_prefix)) {
+            // The authentication scheme is case-insensitive (RFC 7235 2.1), so
+            // accept any casing of "Bearer". Only the scheme is folded; the
+            // token is taken verbatim.
+            constexpr std::string_view bearer_scheme = "bearer";
+            if (val.size() <= bearer_scheme.size() || val[bearer_scheme.size()] != ' ' ||
+                lower_ascii(std::string{val.substr(0, bearer_scheme.size())}) != bearer_scheme) {
                 return std::unexpected(std::string{"unsupported authorization scheme"});
             }
             has_authorization = true;
-            parsed.provided_nonce = std::string{val.substr(bearer_prefix.size())};
+            parsed.provided_nonce = std::string{val.substr(bearer_scheme.size() + 1)};
         } else if (name == "host") {
             if (has_host) {
                 return std::unexpected(std::string{"duplicate host header"});

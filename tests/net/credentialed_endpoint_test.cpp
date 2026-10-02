@@ -241,6 +241,32 @@ auto run() -> int {
         }
     }
 
+    // The authentication scheme is case-insensitive (RFC 7235 2.1), so every
+    // casing of "bearer" must carry the nonce. Only the scheme is folded; the
+    // token is not.
+    for (const char* scheme : {"bearer", "Bearer", "BEARER", "BeArEr"}) {
+        const std::string request = std::string{"POST /anthropic/v1/messages HTTP/1.1\r\n"} +
+                                    "Host: 127.0.0.1\r\n" + "Authorization: " + scheme +
+                                    " glove-nonce-abc123xyz\r\n" + "Content-Length: 0\r\n\r\n";
+        const auto resp = send_and_receive(port, request);
+        if (!resp.starts_with("HTTP/1.1 200 OK")) {
+            std::fprintf(stderr, "REQUIRE failed: scheme '%s' should be accepted\n", scheme);
+            return 1;
+        }
+    }
+
+    // A scheme other than Bearer is refused rather than ignored.
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Basic Z2xvdmU=\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
     // A query string must reach the same path rule as the bare path: the
     // allowed path with a query is served, and a disallowed path with a query
     // that contains the allowed path is still refused. Without splitting the
