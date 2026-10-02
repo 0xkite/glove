@@ -40,11 +40,27 @@ Run:
 
 It must complete all stages:
 
-1. actionlint 1.7.12;
-2. clang-format 22.1.8;
+1. actionlint >= 1.7.12;
+2. clang-format at the version named `formatted_for_clang_format` in the script
+   (currently 23.1.1); the tree is formatted for exactly that version, and CI
+   pins the same one;
 3. clang-tidy over the configured compilation database;
 4. ASan and UBSan build and tests;
 5. TSan build and tests.
+
+The gate uses whatever toolchain the host provides at or above those minimums
+rather than downloading pinned builds. Override a specific binary with
+`GLOVE_ACTIONLINT`, `GLOVE_CLANG_FORMAT`, or `GLOVE_CLANG_TIDY`. The sanitizer
+presets select clang unless `CC`/`CXX` are already set, and refuse to run against
+a build tree configured with a different compiler.
+
+Two stages can be reported as skipped, and the final banner says so instead of
+claiming every gate passed:
+
+- `--skip-tidy` skips clang-tidy; a missing clang-tidy is fatal otherwise.
+- On a host whose `yama ptrace_scope` is 2 or higher, LeakSanitizer cannot run.
+  The gate fails closed; set `GLOVE_ALLOW_NO_LSAN=1` to run ASan/UBSan without
+  leak detection, which is **not** evidence of leak-freedom. CI must not set it.
 
 For narrow iteration:
 
