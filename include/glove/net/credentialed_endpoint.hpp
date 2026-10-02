@@ -38,9 +38,42 @@ struct endpoint_event {
     std::size_t response_bytes = 0;
 };
 
+// One request that has already been authenticated, matched to a rule, and had
+// its target validated; only the exchange with the provider remains. The
+// endpoint never reaches the network itself, so the transport can be a real TLS
+// client in production and a stub under test without the production path
+// carrying any test-only behaviour.
+struct upstream_request {
+    endpoint_provider provider = endpoint_provider::anthropic;
+    std::string upstream_host;
+    std::uint16_t upstream_port = 443;
+    std::string method;
+    // Request target after the endpoint prefix is stripped, including any query.
+    std::string target;
+    // Sanitised end-to-end headers. Hop-by-hop, routing, and credential fields
+    // are already removed: the transport sets Host and the credential itself.
+    std::vector<std::pair<std::string, std::string>> headers;
+    std::string body;
+    // The provider credential to present. Host memory only; never leaves it as
+    // plain agent-visible state.
+    std::string secret_token;
+};
+
+struct upstream_response {
+    int status_code = 502;
+    std::string body;
+    std::vector<std::pair<std::string, std::string>> headers;
+};
+
+// Optional provider transport. When unset, the endpoint refuses with 501 Not
+// Implemented rather than pretending it forwarded anything.
+using upstream_forwarder =
+    std::function<std::expected<upstream_response, std::string>(const upstream_request&)>;
+
 struct credentialed_endpoint_options {
     std::vector<credentialed_endpoint_rule> endpoints;
     std::function<std::expected<void, std::string>(const endpoint_event&)> on_event;
+    upstream_forwarder forward;
 };
 
 // Host-side local reverse proxy for mediating agent API requests.

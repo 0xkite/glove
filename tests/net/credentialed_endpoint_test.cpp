@@ -63,7 +63,7 @@ auto run() -> int {
     options.endpoints.push_back({
         .provider = glove::net::endpoint_provider::anthropic,
         .path_prefix = "/anthropic",
-        .upstream_host = "mock:api.anthropic.com",
+        .upstream_host = "api.anthropic.com",
         .upstream_port = 443,
         .secret_token = "sk-ant-real-super-secret-token",
         .session_nonce = "glove-nonce-abc123xyz",
@@ -74,6 +74,22 @@ auto run() -> int {
         [&](const glove::net::endpoint_event& ev) -> std::expected<void, std::string> {
         recorded_events.push_back(ev);
         return {};
+    };
+
+    // The provider transport is injected, so the production path holds no
+    // test-only behaviour. This stub records what the endpoint handed over so
+    // the tests can assert what would reach a real provider.
+    std::vector<glove::net::upstream_request> forwarded_requests;
+    options.forward = [&](
+                          const glove::net::upstream_request& request
+                      ) -> std::expected<glove::net::upstream_response, std::string> {
+        forwarded_requests.push_back(request);
+        glove::net::upstream_response response;
+        response.status_code = 200;
+        response.headers.emplace_back("Content-Type", "application/json");
+        response.body = "{\"id\":\"msg_mock\",\"type\":\"message\",\"role\":\"assistant\","
+                        "\"content\":[{\"type\":\"text\",\"text\":\"mock response\"}]}";
+        return response;
     };
 
     auto endpoint = glove::net::start_credentialed_endpoint(std::move(options));
@@ -101,6 +117,26 @@ auto run() -> int {
         );
         REQUIRE(resp.starts_with("HTTP/1.1 200 OK"));
         REQUIRE(resp.find("mock response") != std::string::npos);
+    }
+
+    // The transport saw exactly one request, with the real credential, the
+    // rewritten target, and none of the agent-supplied credential or routing
+    // fields that the endpoint strips before forwarding.
+    REQUIRE(forwarded_requests.size() == 1);
+    {
+        const auto& request = forwarded_requests.front();
+        REQUIRE(request.upstream_host == "api.anthropic.com");
+        REQUIRE(request.upstream_port == 443);
+        REQUIRE(request.method == "POST");
+        REQUIRE(request.target == "/v1/messages");
+        REQUIRE(request.secret_token == "sk-ant-real-super-secret-token");
+        for (const auto& [name, value] : request.headers) {
+            REQUIRE(name != "x-api-key");
+            REQUIRE(name != "authorization");
+            REQUIRE(name != "host");
+            REQUIRE(name != "content-length");
+            REQUIRE(name != "connection");
+        }
     }
 
     // Case 2: Invalid session nonce -> 401 Unauthorized
@@ -280,6 +316,9 @@ auto run() -> int {
             "Content-Length: 0\r\n\r\n"
         );
         REQUIRE(allowed_with_query.starts_with("HTTP/1.1 200 OK"));
+        // The query string is preserved on the forwarded target.
+        REQUIRE(!forwarded_requests.empty());
+        REQUIRE(forwarded_requests.back().target == "/v1/messages?beta=true");
     }
     {
         const auto disallowed_with_query = send_and_receive(
@@ -290,6 +329,33 @@ auto run() -> int {
             "Content-Length: 0\r\n\r\n"
         );
         REQUIRE(disallowed_with_query.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    // With no provider transport configured, an otherwise-valid request must be
+    // refused with 501 rather than silently stubbed: the production default has
+    // no test-only shortcut.
+    {
+        glove::net::credentialed_endpoint_options no_transport;
+        no_transport.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-real-super-secret-token",
+            .session_nonce = "glove-nonce-abc123xyz",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/messages"},
+        });
+        auto bare = glove::net::start_credentialed_endpoint(std::move(no_transport));
+        REQUIRE(bare.has_value());
+        const auto resp = send_and_receive(
+            (*bare)->port(),
+            "POST /anthropic/v1/messages HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 501 Not Implemented"));
     }
 
     REQUIRE(!recorded_events.empty());
