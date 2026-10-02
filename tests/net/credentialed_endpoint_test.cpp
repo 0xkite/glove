@@ -161,6 +161,68 @@ auto run() -> int {
         REQUIRE(resp.starts_with("HTTP/1.1 404 Not Found"));
     }
 
+    // Malformed framing and smuggling shapes must be rejected before any
+    // routing or credential decision. Each returns 400 Bad Request.
+    const std::vector<std::pair<const char*, std::string>> malformed = {
+        {"bare LF in header",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"bare CR in header value",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+         "x-api-key: glove-\rnonce\r\n\r\n"},
+        {"header name with a space",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nBad Name: x\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"empty header name",
+         "POST /anthropic/v1/messages HTTP/1.1\r\n: x\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"header without a colon",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nnot-a-header\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"duplicate content-length",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nContent-Length: 0\r\n"
+         "Content-Length: 0\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"non-numeric content-length",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nContent-Length: 1a2\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"oversized content-length",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"transfer-encoding",
+         "POST /anthropic/v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"absolute-form target",
+         "POST http://evil.example/anthropic/v1/messages HTTP/1.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"unsupported HTTP version",
+         "POST /anthropic/v1/messages HTTP/2.0\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+        {"invalid method token",
+         "PO ST /anthropic/v1/messages HTTP/1.1\r\n"
+         "x-api-key: glove-nonce-abc123xyz\r\n\r\n"},
+    };
+    for (const auto& [label, request] : malformed) {
+        const auto resp = send_and_receive(port, request);
+        if (!resp.starts_with("HTTP/1.1 400 Bad Request")) {
+            std::fprintf(
+                stderr, "REQUIRE failed: %s should be 400, got: %.40s\n", label, resp.c_str()
+            );
+            return 1;
+        }
+    }
+
+    // The query string must not bypass the prefix match or the path allowlist.
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/forbidden?x=/v1/messages HTTP/1.1\r\n"
+            "x-api-key: glove-nonce-abc123xyz\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
     REQUIRE(!recorded_events.empty());
     return 0;
 }

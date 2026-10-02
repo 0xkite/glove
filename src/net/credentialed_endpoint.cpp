@@ -27,6 +27,8 @@ namespace glove::net {
 namespace {
 
 constexpr std::size_t max_request_headers_bytes = 16384;
+constexpr std::size_t max_request_body_bytes = 8U * 1024U * 1024U;
+constexpr std::size_t max_header_count = 100;
 constexpr int poll_tick_ms = 100;
 
 auto lower_ascii(std::string value) -> std::string {
@@ -70,9 +72,71 @@ struct parsed_request_head {
     std::vector<std::pair<std::string, std::string>> headers;
     std::string provided_nonce;
     std::size_t content_length = 0;
+    bool has_content_length = false;
 };
 
+// RFC 7230 tchar. Header names must be tokens, or a name containing a space or
+// a control character could be smuggled past the forwarder's field list.
+constexpr auto is_tchar(char c) noexcept -> bool {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+        return true;
+    }
+    switch (c) {
+    case '!':
+    case '#':
+    case '$':
+    case '%':
+    case '&':
+    case '\'':
+    case '*':
+    case '+':
+    case '-':
+    case '.':
+    case '^':
+    case '_':
+    case '`':
+    case '|':
+    case '~':
+        return true;
+    default:
+        return false;
+    }
+}
+
+auto is_token(std::string_view value) -> bool {
+    return !value.empty() && std::ranges::all_of(value, [](char c) { return is_tchar(c); });
+}
+
+// Message framing is CRLF only. A bare CR or LF inside the head is either a
+// request-smuggling primitive or an injection into the upstream request, so
+// reject it rather than normalising it.
+auto has_bare_line_break(std::string_view raw) -> bool {
+    for (std::size_t index = 0; index < raw.size(); ++index) {
+        if (raw[index] == '\r') {
+            if (index + 1 >= raw.size() || raw[index + 1] != '\n') {
+                return true;
+            }
+            ++index;
+        } else if (raw[index] == '\n') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A field value may contain visible characters, space, horizontal tab, and
+// obs-text; nothing else (no CR, LF, or other control characters).
+auto is_valid_field_value(std::string_view value) -> bool {
+    return std::ranges::all_of(value, [](char c) {
+        const auto byte = static_cast<unsigned char>(c);
+        return c == '\t' || (byte >= 0x20U && byte != 0x7fU);
+    });
+}
+
 auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head, std::string> {
+    if (has_bare_line_break(raw)) {
+        return std::unexpected(std::string{"bare CR or LF in request head"});
+    }
     const auto line_end = raw.find("\r\n");
     if (line_end == std::string_view::npos) {
         return std::unexpected(std::string{"malformed request line"});
@@ -91,6 +155,18 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
     parsed.uri = std::string{request_line.substr(first_space + 1, second_space - first_space - 1)};
     parsed.http_version = std::string{request_line.substr(second_space + 1)};
 
+    if (!is_token(parsed.method)) {
+        return std::unexpected(std::string{"invalid HTTP method"});
+    }
+    // Origin-form only: this is a direct HTTP server, not a forward proxy, so
+    // an absolute-form target or an authority-form CONNECT is not accepted.
+    if (parsed.uri.empty() || parsed.uri.front() != '/' || !is_valid_field_value(parsed.uri)) {
+        return std::unexpected(std::string{"invalid request target"});
+    }
+    if (parsed.http_version != "HTTP/1.1" && parsed.http_version != "HTTP/1.0") {
+        return std::unexpected(std::string{"unsupported HTTP version"});
+    }
+
     auto cursor = line_end + 2U;
     while (cursor < raw.size()) {
         const auto next = raw.find("\r\n", cursor);
@@ -100,11 +176,18 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
         const auto header_line = raw.substr(cursor, next - cursor);
         cursor = next + 2U;
 
+        if (parsed.headers.size() >= max_header_count) {
+            return std::unexpected(std::string{"too many header fields"});
+        }
         const auto colon = header_line.find(':');
         if (colon == std::string_view::npos) {
-            continue;
+            return std::unexpected(std::string{"header field without a colon"});
         }
-        auto name = lower_ascii(std::string{header_line.substr(0, colon)});
+        const auto raw_name = header_line.substr(0, colon);
+        if (!is_token(raw_name)) {
+            return std::unexpected(std::string{"invalid header field name"});
+        }
+        auto name = lower_ascii(std::string{raw_name});
         auto val = header_line.substr(colon + 1);
         while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) {
             val.remove_prefix(1);
@@ -112,22 +195,43 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
         while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) {
             val.remove_suffix(1);
         }
+        if (!is_valid_field_value(val)) {
+            return std::unexpected(std::string{"invalid header field value"});
+        }
 
-        if (name == "x-api-key") {
+        // Content-Length is single-valued and numeric, with a hard cap. Chunked
+        // framing is not accepted: mixing it with a length is a smuggling
+        // primitive, and this endpoint always knows the request size.
+        if (name == "transfer-encoding") {
+            return std::unexpected(std::string{"transfer-encoding is not accepted"});
+        }
+        if (name == "content-length") {
+            if (parsed.has_content_length) {
+                return std::unexpected(std::string{"duplicate content-length"});
+            }
+            if (val.empty()) {
+                return std::unexpected(std::string{"empty content-length"});
+            }
+            std::size_t length = 0;
+            for (const char c : val) {
+                if (c < '0' || c > '9') {
+                    return std::unexpected(std::string{"non-numeric content-length"});
+                }
+                const auto digit = static_cast<std::size_t>(c - '0');
+                if (length > (max_request_body_bytes - digit) / 10U) {
+                    return std::unexpected(std::string{"content-length out of range"});
+                }
+                length = length * 10U + digit;
+            }
+            parsed.content_length = length;
+            parsed.has_content_length = true;
+        } else if (name == "x-api-key") {
             parsed.provided_nonce = std::string{val};
         } else if (name == "authorization") {
             constexpr std::string_view bearer_prefix = "Bearer ";
             if (val.starts_with(bearer_prefix)) {
                 parsed.provided_nonce = std::string{val.substr(bearer_prefix.size())};
             }
-        } else if (name == "content-length") {
-            std::size_t cl = 0;
-            for (char c : val) {
-                if (c >= '0' && c <= '9') {
-                    cl = cl * 10U + static_cast<std::size_t>(c - '0');
-                }
-            }
-            parsed.content_length = cl;
         }
         parsed.headers.emplace_back(std::move(name), std::string{val});
     }
