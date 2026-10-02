@@ -44,9 +44,9 @@ RUN ln -sf /usr/bin/clang-18 /usr/local/bin/clang \
  && ln -sf /usr/bin/llvm-ar-18 /usr/local/bin/llvm-ar \
  && ln -sf /usr/bin/llvm-ranlib-18 /usr/local/bin/llvm-ranlib
 
-# Install pinned clang-format 22.1.8 via dedicated venv (apt only has 18)
+# Install the required clang-format in a venv (Ubuntu 24.04 packages only 18)
 RUN python3 -m venv /opt/clang-format-venv \
- && /opt/clang-format-venv/bin/pip install --no-cache-dir clang-format==22.1.8 \
+ && /opt/clang-format-venv/bin/pip install --no-cache-dir clang-format==23.1.1 \
  && ln -sf /opt/clang-format-venv/bin/clang-format /usr/local/bin/clang-format
 
 # Install pinned actionlint 1.7.12
