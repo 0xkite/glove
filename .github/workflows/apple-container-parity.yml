@@ -31,7 +31,7 @@ jobs:
         # runner image happens to carry.
         run: |
           python3 -m venv "$RUNNER_TEMP/clang-format"
-          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check clang-format==23.1.1
+          "$RUNNER_TEMP/clang-format/bin/pip" install --disable-pip-version-check clang-format==22.1.8
           echo "$RUNNER_TEMP/clang-format/bin" >> "$GITHUB_PATH"
 
       - name: Run native macOS preflight
