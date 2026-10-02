@@ -8,9 +8,9 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -29,6 +29,9 @@ namespace {
 constexpr std::size_t max_request_headers_bytes = 16384;
 constexpr std::size_t max_request_body_bytes = 8U * 1024U * 1024U;
 constexpr std::size_t max_header_count = 100;
+// One absolute deadline for reading a complete request head. A peer that
+// trickles bytes must not hold the single worker, or shutdown, indefinitely.
+constexpr int head_deadline_ms = 5000;
 constexpr int poll_tick_ms = 100;
 
 auto lower_ascii(std::string value) -> std::string {
@@ -74,6 +77,67 @@ struct parsed_request_head {
     std::size_t content_length = 0;
     bool has_content_length = false;
 };
+
+// RFC 3986 path/query characters, with no dot segment an upstream would
+// normalise away. The target is not a header value: tab, other controls, and
+// bytes >= 0x80 have no place in a path, and a path that normalises to a
+// different route would defeat the path allowlist.
+auto is_valid_request_target(std::string_view target) -> bool {
+    if (target.empty() || target.front() != '/') {
+        return false;
+    }
+    for (const char c : target) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte <= 0x20U || byte >= 0x7fU) {
+            return false;
+        }
+        switch (c) {
+        case '#':
+        case '"':
+        case '<':
+        case '>':
+        case '\\':
+        case '{':
+        case '}':
+        case '^':
+        case '`':
+        case '|':
+            return false;
+        default:
+            break;
+        }
+    }
+    std::string lowered;
+    lowered.reserve(target.size());
+    for (const char c : target) {
+        lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    // Reject encoded separators and dot segments: the upstream decodes and
+    // normalises them, so the allowlist would be checking a different path than
+    // the one that is fetched.
+    if (lowered.find("%2e") != std::string::npos || lowered.find("%2f") != std::string::npos ||
+        lowered.find("%5c") != std::string::npos) {
+        return false;
+    }
+    std::size_t start = 1;
+    while (start <= target.size()) {
+        const auto slash = target.find('/', start);
+        auto segment = target.substr(
+            start, slash == std::string_view::npos ? std::string_view::npos : slash - start
+        );
+        if (const auto query = segment.find('?'); query != std::string_view::npos) {
+            segment = segment.substr(0, query);
+        }
+        if (segment == "." || segment == "..") {
+            return false;
+        }
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    return true;
+}
 
 // RFC 7230 tchar. Header names must be tokens, or a name containing a space or
 // a control character could be smuggled past the forwarder's field list.
@@ -168,6 +232,9 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
     }
 
     auto cursor = line_end + 2U;
+    bool has_host = false;
+    bool has_api_key = false;
+    bool has_authorization = false;
     while (cursor < raw.size()) {
         const auto next = raw.find("\r\n", cursor);
         if (next == std::string_view::npos || next == cursor) {
@@ -226,14 +293,36 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
             parsed.content_length = length;
             parsed.has_content_length = true;
         } else if (name == "x-api-key") {
+            // Exactly one credential source may name the nonce. A second one is
+            // ambiguous, and a request carrying both would forward two
+            // credentials once injection is implemented.
+            if (has_api_key || has_authorization) {
+                return std::unexpected(std::string{"duplicate credential header"});
+            }
+            has_api_key = true;
             parsed.provided_nonce = std::string{val};
         } else if (name == "authorization") {
-            constexpr std::string_view bearer_prefix = "Bearer ";
-            if (val.starts_with(bearer_prefix)) {
-                parsed.provided_nonce = std::string{val.substr(bearer_prefix.size())};
+            if (has_api_key || has_authorization) {
+                return std::unexpected(std::string{"duplicate credential header"});
             }
+            constexpr std::string_view bearer_prefix = "Bearer ";
+            if (!val.starts_with(bearer_prefix)) {
+                return std::unexpected(std::string{"unsupported authorization scheme"});
+            }
+            has_authorization = true;
+            parsed.provided_nonce = std::string{val.substr(bearer_prefix.size())};
+        } else if (name == "host") {
+            if (has_host) {
+                return std::unexpected(std::string{"duplicate host header"});
+            }
+            has_host = true;
         }
         parsed.headers.emplace_back(std::move(name), std::string{val});
+    }
+
+    // HTTP/1.1 requires exactly one Host field (RFC 7230 5.4).
+    if (parsed.http_version == "HTTP/1.1" && !has_host) {
+        return std::unexpected(std::string{"missing host header"});
     }
 
     return parsed;
@@ -307,18 +396,55 @@ private:
                 continue;
             }
 
-            handle_client(client_fd);
+            handle_client(client_fd, stop);
             ::close(client_fd);
         }
     }
 
-    void handle_client(int client_fd) {
+    // Every response closes the connection, so say so explicitly; an HTTP/1.1
+    // client otherwise assumes keep-alive and may reuse a socket we are closing.
+    static void write_status(int client_fd, std::string_view status_line) {
+        std::string response{status_line};
+        response += "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        static_cast<void>(write_all(client_fd, response));
+    }
+
+    // Discard an unread request body before closing. Closing a socket while the
+    // peer is still sending makes the kernel send RST, which can destroy the
+    // response we just wrote. Bounded by the declared length and the deadline.
+    static void drain_body(int client_fd, std::size_t length, std::stop_token stop) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{1000};
+        std::size_t remaining = length;
+        while (remaining > 0 && !stop.stop_requested() &&
+               std::chrono::steady_clock::now() < deadline) {
+            ::pollfd pfd{.fd = client_fd, .events = POLLIN, .revents = 0};
+            if (::poll(&pfd, 1, poll_tick_ms) <= 0) {
+                continue;
+            }
+            std::array<char, 4096> chunk{};
+            const auto got = ::read(client_fd, chunk.data(), std::min(chunk.size(), remaining));
+            if (got <= 0) {
+                break;
+            }
+            remaining -= static_cast<std::size_t>(got);
+        }
+    }
+
+    void handle_client(int client_fd, std::stop_token stop) {
         std::string buffer;
         std::size_t header_end = std::string::npos;
+        // One absolute deadline for the whole head. Without it a peer that
+        // trickles one byte per poll interval holds the single worker (and
+        // shutdown) for as long as it likes.
+        const auto head_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{head_deadline_ms};
         while (buffer.size() < max_request_headers_bytes) {
-            ::pollfd pfd{.fd = client_fd, .events = POLLIN, .revents = 0};
-            if (::poll(&pfd, 1, 1000) <= 0) {
+            if (stop.stop_requested() || std::chrono::steady_clock::now() >= head_deadline) {
                 break;
+            }
+            ::pollfd pfd{.fd = client_fd, .events = POLLIN, .revents = 0};
+            if (::poll(&pfd, 1, poll_tick_ms) <= 0) {
+                continue;
             }
             std::array<char, 1024> chunk{};
             const auto n = ::read(client_fd, chunk.data(), chunk.size());
@@ -332,14 +458,16 @@ private:
             }
         }
 
-        if (header_end == std::string_view::npos) {
-            write_all(client_fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+        // The cap must cover the terminator too, or a head slightly over the
+        // limit is accepted (the size check is only evaluated between reads).
+        if (header_end == std::string_view::npos || header_end + 4U > max_request_headers_bytes) {
+            write_status(client_fd, "HTTP/1.1 400 Bad Request");
             return;
         }
 
         auto head = parse_http_head(buffer.substr(0, header_end + 2));
-        if (!head) {
-            write_all(client_fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+        if (!head || !is_valid_request_target(head->uri)) {
+            write_status(client_fd, "HTTP/1.1 400 Bad Request");
             return;
         }
 
@@ -349,10 +477,11 @@ private:
         const std::string path_only =
             query_pos == std::string::npos ? head->uri : head->uri.substr(0, query_pos);
 
-        // Match against endpoint rules
+        // Match against endpoint rules. A prefix must end at a segment
+        // boundary, or "/anthropic" would also claim "/anthropicX".
         const credentialed_endpoint_rule* matched_rule = nullptr;
         for (const auto& rule : options_.endpoints) {
-            if (path_only.starts_with(rule.path_prefix)) {
+            if (path_only == rule.path_prefix || path_only.starts_with(rule.path_prefix + "/")) {
                 matched_rule = &rule;
                 break;
             }
@@ -369,7 +498,7 @@ private:
                 )) {
                 return;
             }
-            write_all(client_fd, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            write_status(client_fd, "HTTP/1.1 404 Not Found");
             return;
         }
 
@@ -392,7 +521,8 @@ private:
                 )) {
                 return;
             }
-            write_all(client_fd, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
+            drain_body(client_fd, head->content_length, stop);
+            write_status(client_fd, "HTTP/1.1 405 Method Not Allowed");
             return;
         }
 
@@ -409,15 +539,16 @@ private:
                 )) {
                 return;
             }
+            drain_body(client_fd, head->content_length, stop);
             constexpr std::string_view unauthorized_body =
                 "{\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid_session_"
                 "nonce\"}}";
             std::string response =
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: ";
             response += std::to_string(unauthorized_body.size());
-            response += "\r\n\r\n";
+            response += "\r\nConnection: close\r\n\r\n";
             response += unauthorized_body;
-            write_all(client_fd, response);
+            static_cast<void>(write_all(client_fd, response));
             return;
         }
 
@@ -427,13 +558,18 @@ private:
             rewritten_path.insert(rewritten_path.begin(), '/');
         }
 
-        // Check path allowlist
+        // Check path allowlist. The wildcard keeps its trailing slash so
+        // "/v1/*" means a child of /v1/, not a string prefix of "/v1".
         if (!matched_rule->allowed_paths.empty()) {
             bool path_allowed = false;
             for (const auto& ap : matched_rule->allowed_paths) {
-                if (rewritten_path == ap ||
-                    (ap.ends_with("/*") &&
-                     rewritten_path.starts_with(ap.substr(0, ap.size() - 2)))) {
+                if (ap.ends_with("/*")) {
+                    const auto stem = ap.substr(0, ap.size() - 1);
+                    if (rewritten_path.starts_with(stem)) {
+                        path_allowed = true;
+                        break;
+                    }
+                } else if (rewritten_path == ap) {
                     path_allowed = true;
                     break;
                 }
@@ -449,7 +585,8 @@ private:
                     )) {
                     return;
                 }
-                write_all(client_fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+                drain_body(client_fd, head->content_length, stop);
+                write_status(client_fd, "HTTP/1.1 403 Forbidden");
                 return;
             }
         }
@@ -463,6 +600,8 @@ private:
             return;
         }
 
+        drain_body(client_fd, head->content_length, stop);
+
         // For unit tests / mock mode: if upstream_host starts with "mock:", reply with 200 OK
         if (matched_rule->upstream_host.starts_with("mock:")) {
             constexpr std::string_view mock_response_body =
@@ -471,16 +610,16 @@ private:
             std::string resp =
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
             resp += std::to_string(mock_response_body.size());
-            resp += "\r\n\r\n";
+            resp += "\r\nConnection: close\r\n\r\n";
             resp += mock_response_body;
-            write_all(client_fd, resp);
+            static_cast<void>(write_all(client_fd, resp));
             return;
         }
 
         // Real upstream forwarding (bounded TLS client, request-body forward,
         // and response streaming) is not constructed yet. Report that plainly
         // rather than a 502, which would imply an upstream attempt occurred.
-        write_all(client_fd, "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n");
+        write_status(client_fd, "HTTP/1.1 501 Not Implemented");
     }
 
     auto record_event(
