@@ -1,5 +1,7 @@
 #include "glove/net/credentialed_endpoint.hpp"
 
+#include "http_syntax.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -28,21 +30,19 @@ namespace glove::net {
 
 namespace {
 
-constexpr std::size_t max_request_headers_bytes = 16384;
+using http::has_bare_line_break;
+using http::is_token;
+using http::is_valid_field_value;
+using http::lower_ascii;
+using http::max_header_count;
+using http::max_response_body_bytes;
+
+constexpr std::size_t max_request_headers_bytes = http::max_head_bytes;
 constexpr std::size_t max_request_body_bytes = 8U * 1024U * 1024U;
-constexpr std::size_t max_header_count = 100;
-constexpr std::size_t max_response_body_bytes = 32U * 1024U * 1024U;
 // One absolute deadline for reading a complete request head. A peer that
 // trickles bytes must not hold the single worker, or shutdown, indefinitely.
 constexpr int head_deadline_ms = 5000;
 constexpr int poll_tick_ms = 100;
-
-auto lower_ascii(std::string value) -> std::string {
-    std::transform(value.begin(), value.end(), value.begin(), [](char c) {
-        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    });
-    return value;
-}
 
 auto constant_time_equal(std::string_view provided, std::string_view expected) noexcept -> bool {
     unsigned difference = static_cast<unsigned>(provided.size() ^ expected.size());
@@ -163,13 +163,7 @@ auto connection_named_fields(const std::vector<std::pair<std::string, std::strin
         std::string_view rest{value};
         while (!rest.empty()) {
             const auto comma = rest.find(',');
-            auto token = rest.substr(0, comma);
-            while (!token.empty() && (token.front() == ' ' || token.front() == '\t')) {
-                token.remove_prefix(1);
-            }
-            while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) {
-                token.remove_suffix(1);
-            }
+            const auto token = http::trim_ows(rest.substr(0, comma));
             if (!token.empty()) {
                 named.push_back(lower_ascii(std::string{token}));
             }
@@ -340,64 +334,6 @@ auto is_valid_request_target(std::string_view target) -> bool {
     return true;
 }
 
-// RFC 7230 tchar. Header names must be tokens, or a name containing a space or
-// a control character could be smuggled past the forwarder's field list.
-constexpr auto is_tchar(char c) noexcept -> bool {
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-        return true;
-    }
-    switch (c) {
-    case '!':
-    case '#':
-    case '$':
-    case '%':
-    case '&':
-    case '\'':
-    case '*':
-    case '+':
-    case '-':
-    case '.':
-    case '^':
-    case '_':
-    case '`':
-    case '|':
-    case '~':
-        return true;
-    default:
-        return false;
-    }
-}
-
-auto is_token(std::string_view value) -> bool {
-    return !value.empty() && std::ranges::all_of(value, [](char c) { return is_tchar(c); });
-}
-
-// Message framing is CRLF only. A bare CR or LF inside the head is either a
-// request-smuggling primitive or an injection into the upstream request, so
-// reject it rather than normalising it.
-auto has_bare_line_break(std::string_view raw) -> bool {
-    for (std::size_t index = 0; index < raw.size(); ++index) {
-        if (raw[index] == '\r') {
-            if (index + 1 >= raw.size() || raw[index + 1] != '\n') {
-                return true;
-            }
-            ++index;
-        } else if (raw[index] == '\n') {
-            return true;
-        }
-    }
-    return false;
-}
-
-// A field value may contain visible characters, space, horizontal tab, and
-// obs-text; nothing else (no CR, LF, or other control characters).
-auto is_valid_field_value(std::string_view value) -> bool {
-    return std::ranges::all_of(value, [](char c) {
-        const auto byte = static_cast<unsigned char>(c);
-        return c == '\t' || (byte >= 0x20U && byte != 0x7fU);
-    });
-}
-
 auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head, std::string> {
     if (has_bare_line_break(raw)) {
         return std::unexpected(std::string{"bare CR or LF in request head"});
@@ -456,13 +392,7 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
             return std::unexpected(std::string{"invalid header field name"});
         }
         auto name = lower_ascii(std::string{raw_name});
-        auto val = header_line.substr(colon + 1);
-        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) {
-            val.remove_prefix(1);
-        }
-        while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) {
-            val.remove_suffix(1);
-        }
+        const auto val = http::trim_ows(header_line.substr(colon + 1));
         if (!is_valid_field_value(val)) {
             return std::unexpected(std::string{"invalid header field value"});
         }
@@ -477,21 +407,11 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
             if (parsed.has_content_length) {
                 return std::unexpected(std::string{"duplicate content-length"});
             }
-            if (val.empty()) {
-                return std::unexpected(std::string{"empty content-length"});
+            auto length = http::parse_content_length(val, max_request_body_bytes);
+            if (!length) {
+                return std::unexpected(length.error());
             }
-            std::size_t length = 0;
-            for (const char c : val) {
-                if (c < '0' || c > '9') {
-                    return std::unexpected(std::string{"non-numeric content-length"});
-                }
-                const auto digit = static_cast<std::size_t>(c - '0');
-                if (length > (max_request_body_bytes - digit) / 10U) {
-                    return std::unexpected(std::string{"content-length out of range"});
-                }
-                length = length * 10U + digit;
-            }
-            parsed.content_length = length;
+            parsed.content_length = *length;
             parsed.has_content_length = true;
         } else if (name == "x-api-key") {
             // Exactly one credential source may name the nonce. A second one is
