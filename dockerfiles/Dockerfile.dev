@@ -5,7 +5,7 @@
 #   - Clang 18 with libc++
 #   - Pinned clang-format 22.1.8 (required by scripts/preflight.sh)
 #   - Pinned actionlint 1.7.12 (required by scripts/preflight.sh)
-#   - CMake, Ninja, pkg-config, libseccomp-dev, ccache, git, curl
+#   - CMake, Ninja, pkg-config, libseccomp-dev, libssl-dev, ccache, git, curl
 #   - Container entrypoint configuring cgroup v2 controllers when available
 #
 # Usage:
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang-18 clang-tidy-18 clangd-18 lld-18 llvm-18 \
         libclang-rt-18-dev \
         libc++-18-dev libc++abi-18-dev \
-        libseccomp-dev \
+        libseccomp-dev libssl-dev \
         cmake ninja-build pkg-config \
         git curl jq ccache \
         python3 python3-venv \
