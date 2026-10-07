@@ -227,6 +227,30 @@ auto fail_closed_cases() -> int {
     return 0;
 }
 
+// A request whose caller is already cancelled, or already out of time, must
+// not dial at all: nothing reaches the network, so the credential cannot
+// either.
+auto pre_cancelled_cases() -> int {
+    loopback_server server{false};
+    REQUIRE(server.port() != 0);
+    auto forward = glove::net::make_tls_forwarder({
+        .allowed_upstreams = {{"localhost", server.port()}},
+    });
+    std::stop_source source;
+    source.request_stop();
+    auto cancelled =
+        forward(request_for("localhost", server.port()), source.get_token(), soon(5000));
+    REQUIRE(!cancelled);
+    REQUIRE(cancelled.error().find("cancelled") != std::string::npos);
+    auto expired =
+        forward(request_for("localhost", server.port()), {}, std::chrono::steady_clock::now());
+    REQUIRE(!expired);
+    REQUIRE(expired.error().find("deadline") != std::string::npos);
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    REQUIRE(server.accepted() == 0);
+    return 0;
+}
+
 auto send_and_receive(std::uint16_t port, std::string_view request) -> std::string {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -318,6 +342,9 @@ auto run() -> int {
         return failed;
     }
     if (const int failed = fail_closed_cases(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = pre_cancelled_cases(); failed != 0) {
         return failed;
     }
     if (const int failed = endpoint_case(); failed != 0) {

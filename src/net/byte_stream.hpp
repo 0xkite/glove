@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -33,5 +34,21 @@ public:
     [[nodiscard]] virtual auto read_some(std::span<char> into, std::stop_token stop, deadline until)
         -> std::expected<std::size_t, std::string> = 0;
 };
+
+// Checked before any operation that can put bytes on the wire. A stream must
+// not start a send (which may carry the provider credential) or a dial once
+// the caller has been cancelled or has run out of time; waiting would only
+// report the failure after the bytes had already left.
+[[nodiscard]] inline auto already_unavailable(
+    const std::stop_token& stop, byte_stream::deadline until, std::string_view phase
+) -> std::optional<std::string> {
+    if (stop.stop_requested()) {
+        return std::string{phase} + ": cancelled";
+    }
+    if (std::chrono::steady_clock::now() >= until) {
+        return std::string{phase} + ": deadline exceeded";
+    }
+    return std::nullopt;
+}
 
 } // namespace glove::net

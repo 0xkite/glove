@@ -180,6 +180,9 @@ auto dial(
     const std::stop_token& stop,
     byte_stream::deadline until
 ) -> std::expected<unique_fd, std::string> {
+    if (auto refused = already_unavailable(stop, until, "connect")) {
+        return std::unexpected(*refused);
+    }
     ::addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -191,6 +194,9 @@ auto dial(
     std::unique_ptr<::addrinfo, decltype(&::freeaddrinfo)> owned{results, &::freeaddrinfo};
     std::string last_error = "no usable address";
     for (auto* item = results; item != nullptr; item = item->ai_next) {
+        if (auto refused = already_unavailable(stop, until, "connect")) {
+            return std::unexpected(*refused);
+        }
         unique_fd fd{
             ::socket(item->ai_family, item->ai_socktype | SOCK_CLOEXEC, item->ai_protocol)
         };
@@ -242,6 +248,11 @@ auto drive(
     byte_stream::deadline until
 ) -> std::expected<int, std::string> {
     while (true) {
+        // Before every attempt, not only between waits: an SSL_write that can
+        // complete immediately would otherwise send after cancellation.
+        if (auto refused = already_unavailable(stop, until, phase)) {
+            return std::unexpected(*refused);
+        }
         ERR_clear_error();
         const int result = operation();
         if (result > 0) {

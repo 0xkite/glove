@@ -165,6 +165,22 @@ auto framing_cases() -> int {
         REQUIRE(head);
         REQUIRE(head->body.empty());
     }
+    // An empty reason phrase is valid as long as the separator is present.
+    {
+        auto response = parse("HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n");
+        REQUIRE(response);
+        REQUIRE(response->status_code == 200);
+    }
+    // Exactly the interim budget is accepted; one more is refused below.
+    {
+        std::string interim;
+        for (int index = 0; index < 8; ++index) {
+            interim += "HTTP/1.1 100 Continue\r\n\r\n";
+        }
+        auto response =
+            parse(interim + "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", "POST", 4096);
+        REQUIRE(response);
+    }
     // Redirects are returned, not followed.
     {
         auto response = parse(
@@ -198,6 +214,9 @@ auto rejection_cases() -> int {
     // Head syntax.
     REQUIRE(!parse("HTTP/2 200 OK\r\n\r\n"));
     REQUIRE(!parse("HTTP/1.1 20 OK\r\n\r\n"));
+    // The SP after the status code is mandatory.
+    REQUIRE(!parse("HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n"));
+    REQUIRE(!parse("HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n"));
     REQUIRE(!parse("HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n"));
     REQUIRE(!parse("HTTP/1.1 200 OK\r\nX-Smuggle: a\nb\r\n\r\n"));
     REQUIRE(!parse("HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\n"));

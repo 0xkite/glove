@@ -114,6 +114,9 @@ public:
 
     auto write_all(std::string_view data, std::stop_token stop, deadline until)
         -> std::expected<void, std::string> override {
+        if (auto refused = already_unavailable(stop, until, "write")) {
+            return std::unexpected(*refused);
+        }
         {
             const std::scoped_lock lock{shared_->mutex};
             shared_->send_complete = false;
@@ -156,6 +159,9 @@ public:
 
     auto read_some(std::span<char> into, std::stop_token stop, deadline until)
         -> std::expected<std::size_t, std::string> override {
+        if (auto refused = already_unavailable(stop, until, "read")) {
+            return std::unexpected(*refused);
+        }
         std::unique_lock lock{shared_->mutex};
         // A completion can carry neither data nor end-of-stream; that is not
         // EOF, so ask again rather than report a clean close.
@@ -225,6 +231,9 @@ private:
 auto connect_tls(
     const std::string& host, std::uint16_t port, std::stop_token stop, byte_stream::deadline until
 ) -> std::expected<std::unique_ptr<byte_stream>, std::string> {
+    if (auto refused = already_unavailable(stop, until, "connect")) {
+        return std::unexpected(*refused);
+    }
     const std::string port_string = std::to_string(port);
     nw_endpoint_t endpoint = nw_endpoint_create_host(host.c_str(), port_string.c_str());
     if (endpoint == nullptr) {

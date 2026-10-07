@@ -133,11 +133,12 @@ auto parse_response_head(std::string_view raw) -> std::expected<response_head, s
     if (!status_line.starts_with("HTTP/1.1 ") && !status_line.starts_with("HTTP/1.0 ")) {
         return std::unexpected(std::string{"unsupported response version"});
     }
+    // The SP after the code is mandatory even when the reason phrase is empty.
     const auto code = parse_status_code(status_line.substr(9, 3));
-    if (!code || (status_line.size() > 12 && status_line[12] != ' ')) {
+    if (!code || status_line.size() < 13 || status_line[12] != ' ') {
         return std::unexpected(std::string{"malformed status line"});
     }
-    if (!is_valid_field_value(status_line.substr(std::min<std::size_t>(status_line.size(), 13)))) {
+    if (!is_valid_field_value(status_line.substr(13))) {
         return std::unexpected(std::string{"malformed reason phrase"});
     }
 
@@ -408,7 +409,7 @@ auto read_response(
     buffered_reader reader{stream, std::move(stop), until};
 
     response_head head;
-    for (int interim = 0;; ++interim) {
+    for (int interim = 0;;) {
         auto raw = reader.read_until("\r\n\r\n", max_head_bytes);
         if (!raw) {
             return std::unexpected(raw.error());
@@ -426,7 +427,7 @@ auto read_response(
         if (parsed->status_code == 101) {
             return std::unexpected(std::string{"unexpected protocol upgrade"});
         }
-        if (interim + 1 >= max_interim_responses) {
+        if (++interim > max_interim_responses) {
             return std::unexpected(std::string{"too many interim responses"});
         }
     }
