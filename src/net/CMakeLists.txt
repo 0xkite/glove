@@ -1,6 +1,7 @@
 add_library(glove_net STATIC
     credentialed_endpoint.cpp
     egress_proxy.cpp
+    http1_client.cpp
 )
 add_library(glove::net ALIAS glove_net)
 
