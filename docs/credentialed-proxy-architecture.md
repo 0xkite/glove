@@ -124,6 +124,7 @@ auto launch_contained_upstream(const upstream_launch_options& options)
   Measure latency and token metrics across Claude Code and Pi using the existing CONNECT egress proxy. Establish a benchmark corpus of prompt-injection exfiltration attacks.
 * **Phase 1: Credentialed Reverse Endpoint (`glove::net::credentialed_endpoint`)**:
   Implement the HTTP/1.1 parser, session nonce validator, host-side lease store, and SSE streaming proxy for Anthropic. Remove credentialed hosts from the CONNECT allowlist.
+  *Status:* the endpoint, nonce validation, and the provider transport (`glove::net::make_tls_forwarder`: platform-native TLS, a per-forwarder host allowlist, no redirects, buffered responses) are built. SSE passthrough and the lease store are not; `--agent` runs on the Linux backend only, because the macOS backend has no loopback bridge yet.
 * **Phase 2: Detection Engine v1**:
   Implement canary generation and Aho-Corasick matching, Rabin-Karp secret hash scanning, and transport-level token/byte budget enforcement.
 * **Phase 3: Multi-Provider Expansion**:

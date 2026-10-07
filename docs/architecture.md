@@ -124,12 +124,30 @@ capability must never be described as active before it exists.
    headers and the request target are validated; hop-by-hop, routing, and
    credential fields are stripped before the transport sees them.
 
-**Not constructed yet.** The endpoint has no provider transport: with none
-injected it refuses with `501 Not Implemented`, and `glove exec --agent`
-therefore cannot yet complete a real request. The following are design intent,
-not enforcement:
+5. **Provider transport**: `glove exec --agent` installs
+   `make_tls_forwarder` (`src/net/tls_forwarder.cpp`). Each allowed request is
+   one HTTP/1.1 exchange over a fresh TLS 1.2+ connection using the platform's
+   native stack and trust store: Network.framework on macOS, the system OpenSSL
+   on Linux. The peer must chain to a system anchor and match the upstream host
+   (also sent as SNI). There is no plaintext fallback and no knob to relax
+   verification. The forwarder carries its own `(host, port)` allowlist, set to
+   the preset's provider and checked before resolution, and it injects the
+   credential in the provider's field (`x-api-key` for Anthropic,
+   `Authorization: Bearer` for OpenAI and GitHub). It never follows redirects,
+   and it de-frames chunked and length-framed bodies under the endpoint's
+   32 MiB cap, refusing unframed (close-delimited) bodies because they cannot
+   be told apart from truncated ones. The provider exchange has a 10-minute
+   deadline because the whole response is buffered. Responses are buffered, not streamed: a streaming
+   (SSE) request completes, but the agent receives it in one piece.
 
-- a TLS transport that performs the upstream exchange;
+`--agent` needs the loopback bridge, which only the Linux backend implements;
+the macOS backend refuses a profile with `bridge_endpoint`. Name resolution on
+Linux uses blocking `getaddrinfo` and is not bounded by the request deadline.
+The endpoint serves one connection at a time, so concurrent agent requests
+queue behind a long generation.
+
+**Not constructed yet.** The following are design intent, not enforcement:
+
 - Aho-Corasick canary detection and Rabin-Karp rolling-hash checks against known
   secret digests;
 - structural JSON schema validation and token-budget enforcement derived from
