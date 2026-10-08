@@ -12,6 +12,7 @@
 #include "glove/mcp/stdio_transport.hpp"
 #include "glove/net/credentialed_endpoint.hpp"
 #include "glove/net/egress_proxy.hpp"
+#include "glove/net/tls_forwarder.hpp"
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
 
@@ -500,6 +501,16 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
         .allowed_methods = {"POST"},
         .allowed_paths = definition->allowed_paths,
     });
+    // The forwarder may dial exactly the preset's provider and nothing else,
+    // independently of the rule the endpoint matched.
+    endpoint_options.forward = glove::net::make_tls_forwarder({
+        .allowed_upstreams = {{std::string{definition->upstream_host}, 443}},
+    });
+    // The transport buffers the whole response, so its deadline must cover a
+    // complete generation, including a streamed one. Providers bound a single
+    // request at about ten minutes; a shorter deadline turns a long but healthy
+    // generation into a 502 after the provider has already billed it.
+    endpoint_options.upstream_deadline_ms = 10 * 60 * 1000;
     endpoint_options.on_event =
         [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
         const std::string subject = event.method + " " + event.path;

@@ -32,7 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libclang-rt-18-dev \
         cmake ninja-build pkg-config \
         libc++-18-dev libc++abi-18-dev \
-        libseccomp-dev \
+        libseccomp-dev libssl-dev \
         git curl \
     && rm -rf /var/lib/apt/lists/*
 

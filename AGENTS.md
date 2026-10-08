@@ -127,3 +127,8 @@ For a new control method or capability:
 For a new MCP tool, add the typed descriptor, registration, policy tests,
 dispatch tests, and audit assertions. Glaze remains a private implementation
 dependency; public headers must not require it.
+
+The provider transport in `glove_net` uses the platform TLS stack:
+Network.framework and Security on macOS, system OpenSSL 3 on Linux (install
+`libssl-dev`). Both are private link dependencies; `include/glove/net` must not
+require either.

@@ -89,6 +89,18 @@ target_link_libraries(net_credentialed_endpoint_test PRIVATE glove_kernel)
 add_test(NAME net_credentialed_endpoint COMMAND net_credentialed_endpoint_test)
 set_tests_properties(net_credentialed_endpoint PROPERTIES TIMEOUT 15)
 
+add_executable(net_http1_client_test net/http1_client_test.cpp)
+target_link_libraries(net_http1_client_test PRIVATE glove_net)
+target_include_directories(net_http1_client_test PRIVATE $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>)
+add_test(NAME net_http1_client COMMAND net_http1_client_test)
+set_tests_properties(net_http1_client PROPERTIES TIMEOUT 15)
+
+# Offline by default. GLOVE_LIVE_TLS=1 adds a real handshake with the provider.
+add_executable(net_tls_forwarder_test net/tls_forwarder_test.cpp)
+target_link_libraries(net_tls_forwarder_test PRIVATE glove_net)
+add_test(NAME net_tls_forwarder COMMAND net_tls_forwarder_test)
+set_tests_properties(net_tls_forwarder PROPERTIES TIMEOUT 30)
+
 add_executable(audit_client_test audit/audit_client_test.cpp)
 target_link_libraries(audit_client_test PRIVATE glove_kernel)
 add_test(NAME audit_client COMMAND audit_client_test)
