@@ -1513,6 +1513,11 @@ public:
         if (argv.empty()) {
             return std::unexpected(std::string{"spawner: empty argv"});
         }
+        if (!prof.immutable_files.empty() || !prof.reserved_entries.empty()) {
+            return std::unexpected(
+                std::string{"immutable files and reserved entries are unavailable on Linux"}
+            );
+        }
         auto checked = validate(prof);
         if (!checked) {
             return std::unexpected(std::string{"profile: "} + checked.error());
@@ -1765,6 +1770,11 @@ auto prepare_managed_launch(
     // not present in the ordinary profile filesystem rules. Validate the
     // base profile first; bind_managed_launch_projection_from_fd performs the
     // authoritative backing-mount check below before any child is released.
+    if (!prof.immutable_files.empty() || !prof.reserved_entries.empty()) {
+        return std::unexpected(
+            std::string{"immutable files and reserved entries are unavailable on Linux"}
+        );
+    }
     auto profile_without_managed_work_dir = prof;
     const auto managed_work_dir = profile_without_managed_work_dir.work_dir;
     profile_without_managed_work_dir.work_dir.reset();
@@ -2509,6 +2519,11 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     -> std::expected<int, std::string> {
     if (argv.empty()) {
         return std::unexpected(std::string{"spawner: empty argv"});
+    }
+    if (!prof.immutable_files.empty() || !prof.reserved_entries.empty()) {
+        return std::unexpected(
+            std::string{"immutable files and reserved entries are unavailable on Linux"}
+        );
     }
     auto checked = validate(prof);
     if (!checked) {

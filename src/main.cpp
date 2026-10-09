@@ -4,6 +4,7 @@
 #include "glove/version.hpp"
 
 #include "host/cli.hpp"
+#include "run/pi_cli.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -417,6 +418,11 @@ auto main(int argc, char** argv) -> int {
         std::printf("glove %.*s\n", static_cast<int>(glove::version.size()), glove::version.data());
         return 0;
     }
+    if (sub == "pi") {
+        return glove::run::pi_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
     if (sub == "run") {
         return run_subcommand(std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)});
     }
@@ -465,6 +471,7 @@ auto main(int argc, char** argv) -> int {
         std::fprintf(
             stderr,
             "\nsubcommands:\n"
+            "  pi      launch native macOS Pi with protected runtime and host-only API keys\n"
             "  run     spawn an MCP-client agent inside the container\n"
             "  exec    contain a real self-driving agent (e.g. pi); stdio + egress\n"
             "  setup   create trusted machine-local configuration and state\n"

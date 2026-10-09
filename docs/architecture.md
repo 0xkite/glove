@@ -2,16 +2,19 @@
 
 ## Scope
 
-Glove provides three execution surfaces:
+Glove provides these execution surfaces:
 
 | Surface      | Purpose                                                     | Current boundary            |
 | ------------ | ----------------------------------------------------------- | --------------------------- |
 | `glove run`  | Contain an agent and mediate MCP tool calls                 | Public CLI                  |
 | `glove exec` | Contain a direct agent process                              | Public CLI                  |
+| `glove pi`   | Native macOS Pi with host-only provider credentials         | Prototype CLI; unqualified installed compatibility |
 | `gloved`     | Validate Sage plans, persist sessions, and deliver receipts | Owner-local control service |
 
-The public CLI is usable for local containment. The distributed Sage session
-surface is incomplete and must not advertise remote-launch readiness. A
+The `run` and `exec` CLI surfaces support local containment. Native Pi has
+synthetic fixture coverage, not installed-harness or live-provider acceptance.
+The distributed Sage session surface is incomplete and must not advertise
+remote-launch readiness. A
 `remote_linux_container` runtime can be constructed from validated operator
 configuration, but it is deliberately non-operational and advertises no
 lifecycle, runtime-adapter, resource-enforcement, or receipt capability.
@@ -75,7 +78,7 @@ the child.
 | `policy`     | tool and argument authorization                                                    |
 | `kernel`     | extension registration and dispatch                                                |
 | `audit`      | structured local activity records                                                  |
-| `run`        | CLI orchestration for `run` and `exec`                                             |
+| `run`        | CLI orchestration for `run`, `exec`, and native Pi                                 |
 | `host`       | strict XDG configuration, machine setup, diagnostics, and local project enrollment |
 | `reflect`    | compile-time extension metadata experiments                                        |
 
@@ -106,14 +109,14 @@ capability must never be described as active before it exists.
 
 **Constructed:**
 
-1. **Virtual loopback reverse proxy**: Instead of mounting secret leases into
-   `/home/agent`, the agent reaches a local reverse endpoint over its private
-   loopback bridge, addressed by a base-URL variable (`ANTHROPIC_BASE_URL`,
-   `OPENAI_BASE_URL`).
-2. **Session nonce swap**: The agent is given an ephemeral session token
-   (`glove-session-...`). The host endpoint validates it, discards it, and is
-   the only party that ever holds the real provider credential. A leaked
-   environment variable or transcript exposes nothing usable.
+1. **Credentialed loopback endpoint**: Linux uses a private-loopback bridge.
+   macOS permits one exact AF_INET loopback TCP port through SBPL. Legacy
+   presets use base-URL variables (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`);
+   native Pi writes the selected provider URL into private configuration.
+2. **Session nonce swap**: The agent receives an ephemeral session token
+   (`glove-session-...`). The host endpoint validates it and substitutes the
+   real provider credential. The nonce authorizes only the bound live endpoint;
+   it is not a durable provider credential.
 3. **Mutual exclusion**: A profile may carry either a raw CONNECT egress proxy or
    a bridged reverse endpoint, never both, so a credentialed upstream is not
    also reachable over an uninspected tunnel.
@@ -124,8 +127,8 @@ capability must never be described as active before it exists.
    headers and the request target are validated; hop-by-hop, routing, and
    credential fields are stripped before the transport sees them.
 
-5. **Provider transport**: `glove exec --agent` installs
-   `make_tls_forwarder` (`src/net/tls_forwarder.cpp`). Each allowed request is
+5. **Provider transport**: Legacy `glove exec --agent` presets and the native
+   Pi adapter install `make_tls_forwarder` (`src/net/tls_forwarder.cpp`). Each allowed request is
    one HTTP/1.1 exchange over a fresh TLS 1.2+ connection using the platform's
    native stack and trust store: Network.framework on macOS, the system OpenSSL
    on Linux. The peer must chain to a system anchor and match the upstream host
@@ -137,12 +140,13 @@ capability must never be described as active before it exists.
    and it de-frames chunked and length-framed bodies under the endpoint's
    32 MiB cap, refusing unframed (close-delimited) bodies because they cannot
    be told apart from truncated ones. The provider exchange has a 10-minute
-   deadline because the whole response is buffered. Responses are buffered, not streamed: a streaming
-   (SSE) request completes, but the agent receives it in one piece.
+   deadline because the whole response is buffered. Responses are not streamed;
+   native Pi's installed-harness SSE compatibility remains unqualified.
 
-`--agent` needs the loopback bridge, which only the Linux backend implements;
-the macOS backend refuses a profile with `bridge_endpoint`. Name resolution on
-Linux uses blocking `getaddrinfo` and is not bounded by the request deadline.
+Both backends admit the per-run credentialed endpoint. Linux uses its namespace
+bridge; macOS admits only the exact host-loopback port, not neighboring ports,
+UDP, IPv6, or direct upstream access. Name resolution on Linux uses blocking
+`getaddrinfo` and is not bounded by the request deadline.
 The endpoint serves one connection at a time, so concurrent agent requests
 queue behind a long generation.
 
@@ -154,6 +158,33 @@ queue behind a long generation.
   provider response metadata;
 - **contained MCP upstreams** (`contained_launcher`). Upstream servers are still
   started as unsandboxed host processes by `src/mcp/stdio_transport.cpp`.
+
+## Native macOS Pi
+
+CLI usage and limits: [Native macOS Pi](native-pi.md).
+
+`glove pi setup` copies an approved Pi/Node runtime and records a builtin
+provider/model selection. `refresh` replaces that protected runtime and
+selection with explicit consent. Launch does not perform automatic setup.
+Only OpenAI Responses and Anthropic Messages API-key authentication are in
+scope; Codex CLI and Claude Code remain proposed peer adapters.
+
+Launch validates the workspace, protected runtime, copied builtin catalog and
+private operator configuration before creating a per-run home. Generated
+configuration uses a nonce, preserves builtin model metadata, and disables
+external resource discovery. The child receives captured terminal stdio and
+an owned original process group. Cleanup follows endpoint revocation and
+checked lifecycle handling; uncertain ownership retains private state.
+
+The default private audit sink retains at most 1,024 events and 1 MiB of logical
+event/string charge. Refusal is an error, not eviction or accepted event loss.
+The charge is not an allocator or RSS limit. This path does not provide the
+managed Linux six-limit contract or authenticated terminal receipts.
+
+Synthetic containment and lifecycle tests do not establish installed Pi startup,
+request/edit behavior, buffered-response compatibility, or live-provider access.
+Same-UID namespace mutation and detached descendants are not covered by an
+atomic snapshot or general process-tree death guarantee.
 
 ## Historical synthetic status milestone
 

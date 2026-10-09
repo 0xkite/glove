@@ -170,14 +170,6 @@ auto run() -> int {
     REQUIRE(!ec);
     const auto observed = preset_dir / "observed.txt";
     ::setenv("ANTHROPIC_API_KEY", "sk-ant-host-credential-must-not-leak", 1);
-#if defined(__APPLE__)
-    // The macOS backend has no private-loopback descriptor bridge, so a
-    // credentialed endpoint cannot be projected into the sandbox. `--agent`
-    // must fail closed rather than launch an agent that cannot reach its
-    // provider, and no observation file may be produced.
-    REQUIRE(run_glove({GLOVE_BIN, "exec", "--agent", "claude-code", "--", "/usr/bin/true"}) == 1);
-    REQUIRE(!std::filesystem::exists(observed));
-#else
     REQUIRE(
         run_glove(
             {GLOVE_BIN,
@@ -194,9 +186,7 @@ auto run() -> int {
              observed.string()}
         ) == 0
     );
-#endif
     ::unsetenv("ANTHROPIC_API_KEY");
-#if !defined(__APPLE__)
     {
         std::ifstream obs{observed};
         REQUIRE(obs.good());
@@ -207,7 +197,6 @@ auto run() -> int {
         REQUIRE(contents.find("key=glove-session-") != std::string::npos);
         REQUIRE(contents.find("base=http://127.0.0.1:") != std::string::npos);
     }
-#endif
 
     std::filesystem::remove(marker, ec);
     std::filesystem::remove_all(base, ec);
