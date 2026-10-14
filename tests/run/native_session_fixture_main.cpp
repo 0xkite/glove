@@ -35,6 +35,7 @@ auto usage() -> int {
         "  native_session_fixture ctl --control DIR --session ns-ID --op OP\n"
         "      [--generation N] [--checkpoint HEX] [--request HEX]\n"
         "  native_session_fixture wait --control DIR --session ns-ID --state PHASE --timeout-ms N\n"
+        "  native_session_fixture wait --requests-file FILE --count N --timeout-ms N\n"
     );
     return 2;
 }
@@ -95,6 +96,7 @@ auto serve(std::vector<std::string> args) -> int {
     const auto prompt = argument(args, "--prompt");
     const auto release_file = argument(args, "--release-file");
     const auto announce = argument(args, "--announce");
+    const auto requests_file = argument(args, "--requests-file");
     const bool hold_first = flag(args, "--hold-first");
     const bool auto_start = flag(args, "--auto-start");
     std::vector<std::string> replies;
@@ -102,7 +104,8 @@ auto serve(std::vector<std::string> args) -> int {
         replies.push_back(*reply);
     }
     if (!root || !executable || !sha256 || !version || !args.empty() ||
-        (mode != "headless" && mode != "interactive") || (hold_first && !release_file)) {
+        (mode != "headless" && mode != "interactive" && mode != "headless-write-tool") ||
+        (hold_first && !release_file)) {
         return usage();
     }
     const fs::path base{*root};
@@ -133,7 +136,9 @@ auto serve(std::vector<std::string> args) -> int {
          .sha256 = *sha256,
          .version = *version,
          .payload = base / "payload"},
-        mode == "headless" ? claude_launch_mode::headless : claude_launch_mode::interactive
+        mode == "headless"      ? claude_launch_mode::headless
+        : mode == "interactive" ? claude_launch_mode::interactive
+                                : claude_launch_mode::headless_write_tool
     };
     if (prompt) {
         harness.prompt = *prompt;
@@ -212,7 +217,27 @@ auto serve(std::vector<std::string> args) -> int {
              .body_digest = std::string(64, '0')}
         );
     }
+    // Optional request witness for frontend drivers: one line per responder
+    // request, appended by a bounded observer thread (no shell polling).
+    std::jthread witness;
+    if (requests_file) {
+        witness = std::jthread([&](std::stop_token stop) {
+            std::size_t written = 0;
+            while (!stop.stop_requested()) {
+                const auto requests = harness.responder.requests();
+                if (requests.size() > written) {
+                    std::ofstream output{*requests_file, std::ios::app};
+                    for (; written < requests.size(); ++written) {
+                        output << requests[written].method << ' ' << requests[written].target
+                               << " messages=" << requests[written].messages << '\n';
+                    }
+                }
+                std::this_thread::sleep_for(100ms);
+            }
+        });
+    }
     auto generations = supervisor.run();
+    witness.request_stop();
     if (releaser.joinable()) {
         harness.responder.release();
         releaser.join();
@@ -278,7 +303,39 @@ auto ctl(std::vector<std::string> args) -> int {
     return 0;
 }
 
+auto wait_requests(std::vector<std::string> args) -> int {
+    const auto file = argument(args, "--requests-file");
+    const auto count = argument(args, "--count").value_or("1");
+    const auto timeout = argument(args, "--timeout-ms").value_or("30000");
+    if (!file || !args.empty()) {
+        return usage();
+    }
+    const auto wanted = static_cast<std::size_t>(std::strtoull(count.c_str(), nullptr, 10));
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds{std::strtoll(timeout.c_str(), nullptr, 10)};
+    for (;;) {
+        std::ifstream input{*file};
+        std::size_t lines = 0;
+        std::string line;
+        while (std::getline(input, line)) {
+            ++lines;
+        }
+        if (lines >= wanted) {
+            std::printf("{\"requests\":%zu}\n", lines);
+            return 0;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::printf("{\"error\":\"request count not reached\",\"requests\":%zu}\n", lines);
+            return 4;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+}
+
 auto wait(std::vector<std::string> args) -> int {
+    if (std::find(args.begin(), args.end(), "--requests-file") != args.end()) {
+        return wait_requests(std::move(args));
+    }
     auto control = argument(args, "--control");
     auto session = argument(args, "--session");
     const auto announce = argument(args, "--announce");

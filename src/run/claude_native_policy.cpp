@@ -30,6 +30,7 @@ auto claude_native_startup_policy(claude_launch_mode mode) -> native_startup_pol
     native_startup_policy policy{
         .runtime_id = std::string{claude_runtime_id},
         .configuration_names = {"settings.json"},
+        .writable_configuration_names = {},
         .environment =
             {{.name = "CLAUDE_CONFIG_DIR",
               .location = native_private_location::agent,
@@ -65,8 +66,12 @@ auto claude_native_startup_policy(claude_launch_mode mode) -> native_startup_pol
     // --bare: ANTHROPIC_API_KEY-only authentication, no OAuth/keychain/hook/
     // plugin/CLAUDE.md discovery. Tools, MCP and slash commands are disabled
     // and anything that would prompt is denied.
+    if (mode == claude_launch_mode::interactive) {
+        policy.configuration_names.emplace_back(claude_global_config_leaf);
+        policy.writable_configuration_names.emplace_back(claude_global_config_leaf);
+    }
     policy.arguments = {literal("--bare")};
-    if (mode == claude_launch_mode::headless) {
+    if (mode != claude_launch_mode::interactive) {
         policy.arguments.push_back(literal("--print"));
         policy.arguments.push_back(literal("--output-format"));
         policy.arguments.push_back(literal("json"));
@@ -74,7 +79,13 @@ auto claude_native_startup_policy(claude_launch_mode mode) -> native_startup_pol
         policy.arguments.push_back(literal("none"));
     }
     policy.arguments.push_back(literal("--tools"));
-    policy.arguments.push_back(literal(""));
+    if (mode == claude_launch_mode::headless_write_tool) {
+        policy.arguments.push_back(literal("Edit,Read"));
+        policy.arguments.push_back(literal("--permission-mode"));
+        policy.arguments.push_back(literal("acceptEdits"));
+    } else {
+        policy.arguments.push_back(literal(""));
+    }
     policy.arguments.push_back(literal("--strict-mcp-config"));
     policy.arguments.push_back(literal("--disable-slash-commands"));
     policy.arguments.push_back(literal("--model"));

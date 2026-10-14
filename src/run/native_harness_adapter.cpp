@@ -227,6 +227,21 @@ auto validate_native_startup_policy(const native_startup_policy& policy)
         policy.arguments.size() > 64) {
         return std::unexpected(std::string{"invalid native startup policy bounds"});
     }
+    if (policy.writable_configuration_names.size() > policy.configuration_names.size()) {
+        return std::unexpected(std::string{"invalid native writable configuration bounds"});
+    }
+    for (std::size_t index = 0; index < policy.writable_configuration_names.size(); ++index) {
+        const auto& name = policy.writable_configuration_names[index];
+        if (std::ranges::find(policy.configuration_names, name) ==
+            policy.configuration_names.end()) {
+            return std::unexpected(std::string{"writable configuration must be a policy leaf"});
+        }
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            if (name == policy.writable_configuration_names[prior]) {
+                return std::unexpected(std::string{"duplicate native writable configuration"});
+            }
+        }
+    }
     for (const auto* names : {&policy.configuration_names, &policy.reserved_entries}) {
         for (std::size_t index = 0; index < names->size(); ++index) {
             if (!leaf((*names)[index])) {
@@ -383,7 +398,11 @@ auto validate_native_startup_recipe(
         return checked;
     }
     for (std::size_t index = 0; index < recipe.configuration.size(); ++index) {
-        if (recipe.configuration[index].name != input.policy.configuration_names[index]) {
+        const auto& file = recipe.configuration[index];
+        const bool writable =
+            std::ranges::find(input.policy.writable_configuration_names, file.name) !=
+            input.policy.writable_configuration_names.end();
+        if (file.name != input.policy.configuration_names[index] || file.writable != writable) {
             return std::unexpected(std::string{"native configuration differs from host policy"});
         }
     }
@@ -470,6 +489,10 @@ auto native_startup_policy_digest(
     put(model);
     put(std::to_string(policy.configuration_names.size()));
     for (const auto& name : policy.configuration_names) {
+        put(name);
+    }
+    put(std::to_string(policy.writable_configuration_names.size()));
+    for (const auto& name : policy.writable_configuration_names) {
         put(name);
     }
     put(std::to_string(policy.environment.size()));

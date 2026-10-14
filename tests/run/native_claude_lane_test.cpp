@@ -16,6 +16,14 @@
 
 namespace {
 
+#define REQUIRE_CREATED(created)                                                                   \
+    do {                                                                                           \
+        if (!(created)) {                                                                          \
+            std::fprintf(stderr, "create failed: %s @ %d\n", (created).error().c_str(), __LINE__); \
+            return 1;                                                                              \
+        }                                                                                          \
+    } while (false)
+
 #define REQUIRE(condition)                                                                         \
     do {                                                                                           \
         if (!(condition)) {                                                                        \
@@ -209,6 +217,14 @@ void dump_transcripts(claude_lane_harness& harness) {
 
 void dump_requests(const anthropic_fixture_responder& responder) {
     for (const auto& request : responder.requests()) {
+        // Tool table offered by the real process (diagnostic only).
+        std::string names;
+        for (std::size_t at = request.body.find("\"name\":\""); at != std::string::npos;
+             at = request.body.find("\"name\":\"", at + 8)) {
+            const auto end = request.body.find('"', at + 8);
+            names += request.body.substr(at + 8, end - at - 8) + ",";
+        }
+        std::fprintf(stderr, "[responder] offered tool names: %s\n", names.c_str());
         std::fprintf(
             stderr,
             "[responder] %s %s model=%s version=%s stream=%d messages=%zu bytes=%zu\n",
@@ -421,6 +437,84 @@ auto held_stream_detach_stop_and_listener(const claude_lane_binding& binding, co
     return 0;
 }
 
+// Tool-interruption lane: the real process executes one host-scripted Write
+// into the fixture workspace, is stopped while its follow-up reply is held,
+// and the resumed generation must carry the tool result without a second
+// execution. Effects stay `unassessed`: Glove records the stop, the
+// published history and the on-disk effect as three separate observations.
+auto tool_interruption(const claude_lane_binding& binding, const fs::path& base) -> int {
+    lane_root lane;
+    REQUIRE(lane.prepare(base / "tool"));
+    claude_lane_harness harness{binding, claude_launch_mode::headless_write_tool};
+    const auto note = lane.root / "ws/note.txt";
+    REQUIRE(write_file(note, "before\n", 0600));
+    harness.prompt = "Change note.txt so it contains alpha instead of before, then reply done.";
+    // Edit requires a prior Read of the exact file; both are host-scripted.
+    harness.responder.script_tool_then(
+        {{.name = "Read", .input_json = "{\"file_path\":\"" + note.string() + "\"}"},
+         {.name = "Edit",
+          .input_json = "{\"file_path\":\"" + note.string() +
+                        "\",\"old_string\":\"before\",\"new_string\":\"alpha\"}"}},
+        {"done"}
+    );
+    auto created = native_session_supervisor::create(lane.options(binding.sha256), harness);
+    REQUIRE_CREATED(created);
+    auto& supervisor = **created;
+    running_supervisor runner{supervisor};
+    // Hold the reply to the third request (the one carrying the Edit result)
+    // so the turn is interrupted after the effect exists.
+    harness.responder.hold_request(3);
+    REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
+    REQUIRE(harness.responder.wait_held(90s));
+    REQUIRE(read_file(note) == "alpha\n");
+    struct stat first{};
+    REQUIRE(::stat(note.c_str(), &first) == 0);
+    REQUIRE(harness.responder.requests().size() == 3);
+    REQUIRE(harness.responder.requests()[2].body.find("tool_result") != std::string::npos);
+    auto stop = control(supervisor, session_operation::stop, 1);
+    REQUIRE(stop && stop->code == result_code::accepted);
+    REQUIRE(supervisor.wait_for(settled(session_phase::stopped), 120s));
+    dump_requests(harness.responder);
+    dump_transcripts(harness);
+    const auto snapshot = supervisor.snapshot();
+    REQUIRE(harness.responder.cancelled_holds() == 1);
+    REQUIRE(snapshot.projection.effects == effects_status::unassessed);
+    REQUIRE(snapshot.projection.history == history_status::published);
+    REQUIRE(snapshot.projection.checkpoint);
+    const auto history = read_file(
+        supervisor.session_root() / "checkpoints" / *snapshot.projection.checkpoint /
+        "history.jsonl"
+    );
+    REQUIRE(history.find("tool_use") != std::string::npos);
+    REQUIRE(history.find("tool_result") != std::string::npos);
+    // Resume: the real process continues from the tool result; the host never
+    // replays the prompt or the tool, and the responder answers with text.
+    harness.prompt = "Continue.";
+    auto resumed =
+        control(supervisor, session_operation::resume, 1, *snapshot.projection.checkpoint);
+    REQUIRE(resumed && resumed->code == result_code::accepted);
+    REQUIRE(supervisor.wait_for(settled(session_phase::stopped), 120s));
+    dump_requests(harness.responder);
+    const auto requests = harness.responder.requests();
+    REQUIRE(requests.size() == 4);
+    REQUIRE(requests.back().body.find("tool_result") != std::string::npos);
+    REQUIRE(requests.back().messages >= 6);
+    struct stat second{};
+    REQUIRE(::stat(note.c_str(), &second) == 0);
+    REQUIRE(read_file(note) == "alpha\n");
+    REQUIRE(
+        first.st_mtimespec.tv_sec == second.st_mtimespec.tv_sec &&
+        first.st_mtimespec.tv_nsec == second.st_mtimespec.tv_nsec
+    );
+    REQUIRE(first.st_ino == second.st_ino);
+    REQUIRE(supervisor.snapshot().projection.checkpoint != snapshot.projection.checkpoint);
+    REQUIRE(lane.run_count() == 0);
+    REQUIRE(control(supervisor, session_operation::shutdown, 2)->code == result_code::ok);
+    REQUIRE(runner.join());
+    std::fprintf(stderr, "[lane] tool-interruption row complete; one Edit, unchanged on resume\n");
+    return 0;
+}
+
 } // namespace
 
 auto main() -> int {
@@ -450,5 +544,7 @@ auto main() -> int {
     REQUIRE(headless_first_turn_and_resume(binding, base) == 0);
     binding.payload = base / "held/payload";
     REQUIRE(held_stream_detach_stop_and_listener(binding, base) == 0);
+    binding.payload = base / "tool/payload";
+    REQUIRE(tool_interruption(binding, base) == 0);
     return 0;
 }

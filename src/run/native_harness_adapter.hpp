@@ -44,9 +44,13 @@ struct native_environment_binding {
     auto operator==(const native_environment_binding&) const -> bool = default;
 };
 
+// A leaf is sealed read-only unless the host policy lists it as writable;
+// a writable leaf is generated once per generation and then owned by the
+// harness (never identity-tracked, never a credential).
 struct native_configuration_file {
     std::string name;
     std::string bytes;
+    bool writable = false;
 };
 
 [[nodiscard]] auto
@@ -81,6 +85,8 @@ struct native_argument_binding {
 struct native_startup_policy {
     std::string runtime_id;
     std::vector<std::string> configuration_names;
+    // Subset of configuration_names materialized writable (0600) instead of sealed.
+    std::vector<std::string> writable_configuration_names;
     std::vector<native_environment_binding> environment;
     std::vector<std::string> reserved_entries;
     std::vector<native_argument_binding> arguments;
@@ -103,6 +109,9 @@ struct native_startup_input {
     // policy binds conversation slots. Empty/false for Pi's closed projection.
     std::string_view conversation_id{};
     bool resume = false;
+    // Canonical host-admitted workspace, for harnesses whose configuration
+    // must name the working directory (e.g. per-project trust). Never a grant.
+    std::string_view workspace{};
 };
 
 // All results own their bytes. Configuration names are leaves below the owned

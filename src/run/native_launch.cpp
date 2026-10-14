@@ -262,7 +262,9 @@ auto profile_for(
     }
     if (materialized) {
         for (const auto& file : recipe.configuration) {
-            profile.immutable_files.push_back((paths.agent / file.name).string());
+            if (!file.writable) {
+                profile.immutable_files.push_back((paths.agent / file.name).string());
+            }
         }
     }
     for (const auto& name : recipe.reserved_entries) {
@@ -438,7 +440,8 @@ auto launch_native_with_context(
         .nonce = *nonce,
         .paths = plan->paths(),
         .conversation_id = context.conversation_id,
-        .resume = context.resume
+        .resume = context.resume,
+        .workspace = workspace->native()
     };
     // Placeholder port is pure preflight only: no bytes are written or endpoint
     // created until the host has admitted the entire compiled startup projection.
