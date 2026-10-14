@@ -7,6 +7,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -102,7 +103,9 @@ public:
             if (::poll(&pfd, 1, 50) > 0) {
                 char byte = 0;
                 const auto got = ::read(fd_, &byte, 1);
-                return got == 0;
+                // Linux reports ECONNRESET when the peer closed with request
+                // bytes still unread; no byte was delivered either way.
+                return got == 0 || (got < 0 && errno == ECONNRESET);
             }
         }
         return false;

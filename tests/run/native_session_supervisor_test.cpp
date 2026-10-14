@@ -99,6 +99,25 @@ auto phase_is(session_phase phase) {
     };
 }
 
+// A missed phase reports the supervisor's own last error alongside the
+// settled snapshot, so a remote failure carries more than the timeout.
+template<typename Supervisor>
+auto reached(Supervisor& supervisor, session_phase phase, std::chrono::seconds wait) -> bool {
+    if (supervisor.wait_for(phase_is(phase), wait)) {
+        return true;
+    }
+    const auto snapshot = supervisor.snapshot();
+    std::fprintf(
+        stderr,
+        "phase %d not reached: phase=%d generation_active=%d last_error=%s\n",
+        static_cast<int>(phase),
+        static_cast<int>(snapshot.projection.phase),
+        snapshot.generation_active ? 1 : 0,
+        snapshot.last_error ? snapshot.last_error->c_str() : "(none)"
+    );
+    return false;
+}
+
 auto kinds(const std::vector<journal_event>& events) -> std::vector<std::string> {
     std::vector<std::string> out;
     for (const auto& event : events) {
@@ -201,7 +220,7 @@ auto full_sleep_wake_cycle(const fs::path& root) -> int {
     auto started = control(supervisor, session_operation::start, 0, std::nullopt, start_id);
     REQUIRE(started && started->code == result_code::accepted && !started->final);
     REQUIRE(started->state == session_phase::preparing && started->generation == 1);
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+    REQUIRE(reached(supervisor, session_phase::running, 60s));
     REQUIRE(f.harness.wait_running(10s));
     REQUIRE(f.harness.observed.births == 1);
     REQUIRE(f.harness.observed.argv.size() > 3 && f.harness.observed.argv[1] == "--bare");
@@ -248,7 +267,7 @@ auto full_sleep_wake_cycle(const fs::path& root) -> int {
         stopping->state == session_phase::stopping ||
         stopping->state == session_phase::finalizing || stopping->state == session_phase::stopped
     );
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+    REQUIRE(reached(supervisor, session_phase::stopped, 60s));
     auto again = management_request_raw(supervisor.control_directory(), session, *body);
     REQUIRE(
         again && again->code == result_code::ok && again->final &&
@@ -289,7 +308,7 @@ auto full_sleep_wake_cycle(const fs::path& root) -> int {
     const auto resume_id = next_request();
     auto resumed = control(supervisor, session_operation::resume, 1, first_checkpoint, resume_id);
     REQUIRE(resumed && resumed->code == result_code::accepted && resumed->generation == 2);
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+    REQUIRE(reached(supervisor, session_phase::running, 60s));
     REQUIRE(f.harness.wait_running(10s));
     REQUIRE(f.harness.observed.births == 2 && f.harness.observed.resumed);
     REQUIRE(
@@ -311,7 +330,7 @@ auto full_sleep_wake_cycle(const fs::path& root) -> int {
     auto stale_mutation = control(supervisor, session_operation::stop, 1);
     REQUIRE(stale_mutation && stale_mutation->code == result_code::stale_generation);
     REQUIRE(control(supervisor, session_operation::stop, 2)->code == result_code::accepted);
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+    REQUIRE(reached(supervisor, session_phase::stopped, 60s));
     const auto second = supervisor.snapshot();
     REQUIRE(second.projection.checkpoint && *second.projection.checkpoint != first_checkpoint);
     const auto second_history = read_file(
@@ -385,7 +404,7 @@ auto preparation_cancellation(const fs::path& root) -> int {
     auto stop = control(supervisor, session_operation::stop, 1);
     REQUIRE(stop && stop->code == result_code::accepted && stop->state == session_phase::stopping);
     f.harness.release();
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+    REQUIRE(reached(supervisor, session_phase::stopped, 60s));
     REQUIRE(f.harness.observed.births == 0 && f.run_count() == 0);
     REQUIRE(f.harness.revocations.empty());
     const auto order = kinds(supervisor.journal());
@@ -398,9 +417,9 @@ auto preparation_cancellation(const fs::path& root) -> int {
     f.harness.reset_barriers();
     auto restart = control(supervisor, session_operation::start, 1);
     REQUIRE(restart && restart->code == result_code::accepted && restart->generation == 2);
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+    REQUIRE(reached(supervisor, session_phase::running, 60s));
     REQUIRE(control(supervisor, session_operation::stop, 2)->code == result_code::accepted);
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+    REQUIRE(reached(supervisor, session_phase::stopped, 60s));
     REQUIRE(control(supervisor, session_operation::shutdown, 2)->code == result_code::ok);
     REQUIRE(runner.join());
     return 0;
@@ -417,20 +436,20 @@ auto persistence_and_uncertainty(const fs::path& root) -> int {
         auto& supervisor = **created;
         running_supervisor runner{supervisor};
         REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
         REQUIRE(control(supervisor, session_operation::stop, 1)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+        REQUIRE(reached(supervisor, session_phase::stopped, 60s));
         const auto prior = supervisor.snapshot().projection.checkpoint;
         REQUIRE(prior);
         f.harness.reset_barriers();
         REQUIRE(
             control(supervisor, session_operation::resume, 1, *prior)->code == result_code::accepted
         );
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
         supervisor.inject_store_fault(store_fault::history_fsync);
         auto stop = control(supervisor, session_operation::stop, 2);
         REQUIRE(stop && stop->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::recovery_required), 60s));
+        REQUIRE(reached(supervisor, session_phase::recovery_required, 60s));
         const auto snapshot = supervisor.snapshot();
         REQUIRE(snapshot.projection.history == history_status::failed);
         REQUIRE(snapshot.projection.effects == effects_status::incomplete);
@@ -475,10 +494,10 @@ auto persistence_and_uncertainty(const fs::path& root) -> int {
         auto& supervisor = **created;
         running_supervisor runner{supervisor};
         REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
         supervisor.inject_store_fault(store_fault::journal_append);
         REQUIRE(control(supervisor, session_operation::stop, 1)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::recovery_required), 60s));
+        REQUIRE(reached(supervisor, session_phase::recovery_required, 60s));
         REQUIRE(!supervisor.snapshot().projection.checkpoint);
         REQUIRE(f.run_count() == 1);
         REQUIRE(control(supervisor, session_operation::shutdown, 1)->code == result_code::ok);
@@ -494,10 +513,10 @@ auto persistence_and_uncertainty(const fs::path& root) -> int {
         auto& supervisor = **created;
         running_supervisor runner{supervisor};
         REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
         auto stop = control(supervisor, session_operation::stop, 1);
         REQUIRE(stop && stop->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::recovery_required), 60s));
+        REQUIRE(reached(supervisor, session_phase::recovery_required, 60s));
         auto settled = control(supervisor, session_operation::stop, 1, std::nullopt, stop->request);
         REQUIRE(settled && settled->code == result_code::outcome_uncertain);
         REQUIRE(supervisor.snapshot().projection.effects == effects_status::incomplete);
@@ -540,9 +559,9 @@ auto history_classification(const fs::path& root) -> int {
         auto& supervisor = **created;
         running_supervisor runner{supervisor};
         REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
         REQUIRE(control(supervisor, session_operation::stop, 1)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+        REQUIRE(reached(supervisor, session_phase::stopped, 60s));
         const auto snapshot = supervisor.snapshot();
         REQUIRE(snapshot.projection.history == item.expected);
         REQUIRE(!snapshot.projection.checkpoint);
@@ -568,9 +587,9 @@ auto corrupted_checkpoint_and_unknown_ownership(const fs::path& root) -> int {
         auto& supervisor = **created;
         running_supervisor runner{supervisor};
         REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
         REQUIRE(control(supervisor, session_operation::stop, 1)->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+        REQUIRE(reached(supervisor, session_phase::stopped, 60s));
         const auto checkpoint = *supervisor.snapshot().projection.checkpoint;
         const auto directory = supervisor.session_root() / "checkpoints" / checkpoint;
         // Corrupt the stored history bytes; resume must refuse before any effect.
@@ -581,7 +600,7 @@ auto corrupted_checkpoint_and_unknown_ownership(const fs::path& root) -> int {
         f.harness.reset_barriers();
         auto resume = control(supervisor, session_operation::resume, 1, checkpoint);
         REQUIRE(resume && resume->code == result_code::accepted);
-        REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+        REQUIRE(reached(supervisor, session_phase::stopped, 60s));
         auto settled =
             control(supervisor, session_operation::resume, 1, checkpoint, resume->request);
         REQUIRE(settled && settled->code == result_code::admission_failed && settled->final);
@@ -702,7 +721,7 @@ auto listener_recovery(const fs::path& root) -> int {
     auto& supervisor = **created;
     running_supervisor runner{supervisor};
     REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::running), 60s));
+    REQUIRE(reached(supervisor, session_phase::running, 60s));
     const auto identity = supervisor.management().listener_identity();
     const auto path = supervisor.control_directory() / "s";
     REQUIRE(::unlink(path.c_str()) == 0);
@@ -721,7 +740,7 @@ auto listener_recovery(const fs::path& root) -> int {
     const auto order = kinds(supervisor.journal());
     REQUIRE(index_of(order, "listener_recreated") < order.size());
     REQUIRE(control(supervisor, session_operation::stop, 1)->code == result_code::accepted);
-    REQUIRE(supervisor.wait_for(phase_is(session_phase::stopped), 60s));
+    REQUIRE(reached(supervisor, session_phase::stopped, 60s));
     REQUIRE(control(supervisor, session_operation::shutdown, 1)->code == result_code::ok);
     REQUIRE(runner.join());
     // Stale pathname after the owner exits: a client refuses, nothing restarts.

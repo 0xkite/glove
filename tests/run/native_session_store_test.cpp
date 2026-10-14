@@ -290,6 +290,9 @@ auto publication_and_admission(const fs::path& root) -> int {
     auto published = store->publish_checkpoint(
         record_for(metadata, 1), source.fd(), "history.jsonl", line_validator
     );
+    if (!published) {
+        std::fprintf(stderr, "publish_checkpoint: %s\n", published.error().message.c_str());
+    }
     REQUIRE(published && valid_checkpoint_id(*published));
     const auto checkpoint = store->root() / "checkpoints" / *published;
     REQUIRE(mode_of(checkpoint) == 0500);
