@@ -4,10 +4,23 @@
 #include <cstdlib>
 #include <new>
 
+// Linux TSan links libclang_rt.tsan_cxx, whose C++ allocation interposers are
+// strong symbols: a second definition fails to link. The rejection lane is
+// skipped there; the capacity lane below still runs under every sanitizer.
+#if defined(__has_feature)
+#    if defined(__linux__) && __has_feature(thread_sanitizer)
+#        define GLOVE_PI_AUDIT_ALLOCATION_INTERCEPT 0
+#    endif
+#endif
+#ifndef GLOVE_PI_AUDIT_ALLOCATION_INTERCEPT
+#    define GLOVE_PI_AUDIT_ALLOCATION_INTERCEPT 1
+#endif
+
 namespace {
 thread_local bool reject_allocations = false;
 }
 
+#if GLOVE_PI_AUDIT_ALLOCATION_INTERCEPT
 // Test-only ABI allocation interception, not raw application ownership. This
 // isolated binary rejects C++ allocations on its one test thread; malloc/free
 // remain sanitizer-instrumented. No limits, suppressions or host services change.
@@ -40,6 +53,7 @@ void operator delete(void* memory, std::size_t) noexcept {
 void operator delete[](void* memory, std::size_t) noexcept {
     std::free(memory);
 }
+#endif
 
 namespace {
 
@@ -74,6 +88,7 @@ auto run() -> int {
     glove::audit::event populated{};
     populated.tool_name.assign(256U, 'x');
     REQUIRE((*capacity)->record(empty));
+#if GLOVE_PI_AUDIT_ALLOCATION_INTERCEPT
     bool capacity_threw = false;
     bool factory_threw = false;
     bool invalid_threw = false;
@@ -107,11 +122,13 @@ auto run() -> int {
             invalid_threw = true;
         }
     }
+#endif
     REQUIRE(!reject_allocations);
     // A failed append must leave the exact one-event byte allowance untouched.
     REQUIRE((*copy)->record(populated));
     auto exhausted = (*copy)->record(empty);
     REQUIRE(!exhausted && exhausted.error() == "Pi audit capacity reached");
+#if GLOVE_PI_AUDIT_ALLOCATION_INTERCEPT
     std::fprintf(
         stderr,
         "allocation failure escapes: capacity=%d copy=%d factory=%d invalid=%d\n",
@@ -122,6 +139,7 @@ auto run() -> int {
     );
     REQUIRE(!capacity_threw && !copy_threw && !factory_threw && !invalid_threw);
     REQUIRE(!capacity_result && !copy_result && !factory_result && !invalid_result);
+#endif
     return 0;
 }
 
