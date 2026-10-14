@@ -1,5 +1,13 @@
 # Typed launch uses native macOS constraints; no Linux execution parity is claimed.
 if(APPLE)
+    add_executable(run_native_launch_test run/native_launch_test.cpp)
+    target_link_libraries(run_native_launch_test PRIVATE glove_run glove_host)
+    target_include_directories(run_native_launch_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_native_launch COMMAND run_native_launch_test)
+    set_tests_properties(run_native_launch PROPERTIES TIMEOUT 30)
+
     add_executable(run_pi_launch_test run/pi_launch_test.cpp)
     target_link_libraries(run_pi_launch_test PRIVATE glove_run glove_host)
     target_include_directories(run_pi_launch_test PRIVATE
@@ -39,6 +47,14 @@ if(APPLE)
     set_tests_properties(run_pi_launch_admission PROPERTIES TIMEOUT 60)
 endif()
 
+add_executable(run_native_harness_adapter_test run/native_harness_adapter_test.cpp)
+target_link_libraries(run_native_harness_adapter_test PRIVATE glove_run)
+target_include_directories(run_native_harness_adapter_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/run
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME run_native_harness_adapter COMMAND run_native_harness_adapter_test)
+set_tests_properties(run_native_harness_adapter PROPERTIES TIMEOUT 10)
+
 add_executable(run_pi_audit_test run/pi_audit_test.cpp)
 target_link_libraries(run_pi_audit_test PRIVATE glove_run)
 target_include_directories(run_pi_audit_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
@@ -62,6 +78,12 @@ target_link_libraries(run_pi_catalog_test PRIVATE glove_run)
 target_include_directories(run_pi_catalog_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
 add_test(NAME run_pi_catalog COMMAND run_pi_catalog_test)
 set_tests_properties(run_pi_catalog PROPERTIES TIMEOUT 20)
+
+add_executable(run_native_private_state_test run/native_private_state_test.cpp)
+target_link_libraries(run_native_private_state_test PRIVATE glove_run)
+target_include_directories(run_native_private_state_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_private_state COMMAND run_native_private_state_test)
+set_tests_properties(run_native_private_state PROPERTIES TIMEOUT 15)
 
 add_executable(run_pi_private_state_test run/pi_private_state_test.cpp)
 target_link_libraries(run_pi_private_state_test PRIVATE glove_run)

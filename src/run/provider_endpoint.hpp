@@ -8,9 +8,16 @@
 
 namespace glove::run::detail {
 
-// Closed internal surfaces preserve legacy routes without letting the Pi
-// adapter acquire those presets' additional provider APIs.
-enum class provider_surface { legacy_anthropic, legacy_openai, pi_anthropic, pi_openai };
+// Native API surfaces are independent of the harness startup adapter. Legacy
+// routes keep their original ordinals; old Pi names remain compatibility aliases.
+enum class provider_surface {
+    legacy_anthropic,
+    legacy_openai,
+    pi_anthropic,
+    pi_openai,
+    native_anthropic = pi_anthropic,
+    native_openai = pi_openai
+};
 
 using provider_event_handler =
     std::function<std::expected<void, std::string>(const net::endpoint_event&)>;

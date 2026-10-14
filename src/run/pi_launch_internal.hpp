@@ -33,6 +33,17 @@ struct pi_launch_context {
     std::shared_ptr<audit::sink> audit;
 };
 
+class native_harness_adapter;
+
+// Internal compiled-host seam for synthetic fault projections through the SAME
+// native core. It is not an operator/project-selected adapter or plugin surface.
+[[nodiscard]] auto launch_pi_with_adapter(
+    const pi_launch_request& request,
+    const pi_launch_context& context,
+    const native_harness_adapter& adapter,
+    std::stop_token stop = {}
+) -> std::expected<int, std::string>;
+
 [[nodiscard]] auto launch_pi_with_context(
     const pi_launch_request& request, const pi_launch_context& context, std::stop_token stop = {}
 ) -> std::expected<int, std::string>;
