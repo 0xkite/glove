@@ -63,9 +63,12 @@ A checkpoint identity is the SHA-256 of its canonical record, which commits
 the history digest, producing epoch/generation and the session bindings.
 Publication reads the generation-local history twice through descriptors,
 admits it with the harness validator, writes an exclusive staging directory,
-fsyncs each file, renames it into place, fsyncs the parent and journals
+fsyncs each file, renames the owner-only directory into place, seals it to
+0500 through the retained descriptor (macOS 15 refuses to rename a directory
+the caller cannot write), fsyncs the parent and journals
 `checkpoint_published`. Any failure leaves the previous checkpoint and the
-journal unchanged; an unjournaled directory is never admitted for resume.
+journal unchanged; an unjournaled or unsealed directory is never admitted for
+resume.
 Checkpoint count/aggregate exhaustion and journal failure during finalization
 are persistence failures: the generation enters recovery_required with its
 private run retained, never a silent "invalid history" cleanup.
