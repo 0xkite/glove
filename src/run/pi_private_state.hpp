@@ -1,16 +1,16 @@
 #pragma once
 
+#include "native_private_state.hpp"
 #include "pi_guest_config.hpp"
 
 #include <cstddef>
 #include <expected>
 #include <filesystem>
-#include <memory>
 #include <string>
 
 namespace glove::run::detail {
 
-// Borrowed only during create(). The adapter stops and joins its endpoint here
+// Borrowed only during create(). The core stops and joins its endpoint here
 // before owned construction rollback can remove nonce-bearing private state.
 // The callback must not mutate that state; it is never retained for later cleanup.
 struct pi_creation_rollback_barrier {
@@ -58,9 +58,8 @@ public:
     [[nodiscard]] auto cleanup() -> std::expected<void, std::string>;
 
 private:
-    struct implementation;
-    explicit pi_private_state(std::unique_ptr<implementation>) noexcept;
-    std::unique_ptr<implementation> state_;
+    explicit pi_private_state(native_private_state) noexcept;
+    native_private_state state_;
 };
 
 } // namespace glove::run::detail
