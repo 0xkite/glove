@@ -1,6 +1,7 @@
 #include "glove/host/runtime_policy.hpp"
 
 #include "glove/container/digest.hpp"
+#include "glove/detail/symlink_acl.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
 #include "runtime_policy_wire.hpp"
@@ -457,6 +458,29 @@ auto stage_runtime_harness_impl(
         }
         adoption_manifest_digest = std::move(*manifest);
     }
+    if (options.source_exclusions.size() > 64U ||
+        (!options.source_exclusions.empty() && options.runtime_id != "pi")) {
+        return std::unexpected(std::string{"source exclusions require bounded Pi staging"});
+    }
+    for (const auto& path : options.source_exclusions) {
+        const auto& bytes = path.native();
+        if (bytes.empty() || bytes.size() > 4096U || bytes.contains('\0') || !path.is_absolute() ||
+            path.lexically_normal() != path || path == path.root_path()) {
+            return std::unexpected(std::string{"Pi source exclusion path is invalid"});
+        }
+    }
+    if (options.runtime_id == "pi") {
+        for (const auto& path : {options.source_executable, options.protected_directory}) {
+            const auto& bytes = path.native();
+            if (bytes.empty() || bytes.size() > 4096U || bytes.find('\0') != std::string::npos ||
+                !path.is_absolute() || path.lexically_normal() != path ||
+                path == path.root_path()) {
+                return std::unexpected(
+                    std::string{"Pi staging paths must be bounded normalized absolute paths"}
+                );
+            }
+        }
+    }
     if (!options.source_executable.is_absolute()) {
         return std::unexpected(std::string{"source executable path must be absolute"});
     }
@@ -489,6 +513,18 @@ auto stage_runtime_harness_impl(
     if (!dependency_closure) {
         return std::unexpected(dependency_closure.error());
     }
+    if (options.runtime_id == "pi") {
+        if (auto valid = snapshot::validate_pi_source_closure(
+                options.source_executable,
+                source,
+                *dependency_closure,
+                directory,
+                options.source_exclusions
+            );
+            !valid) {
+            return std::unexpected(valid.error());
+        }
+    }
     std::optional<planned_runtime_snapshot> snapshot;
     if ((adapter->adoption_manifest && adapter->adoption_manifest->require_snapshot) ||
         !closure_launch_is_trusted(*dependency_closure)) {
@@ -500,10 +536,86 @@ auto stage_runtime_harness_impl(
     }
     const auto expected_entry_target = snapshot ? snapshot->mapped_source : source;
     const auto& launch_closure = snapshot ? snapshot->closure : *dependency_closure;
+
+    struct alias_directory {
+        int fd = -1;
+        alias_directory() = default;
+        alias_directory(const alias_directory&) = delete;
+        auto operator=(const alias_directory&) -> alias_directory& = delete;
+
+        ~alias_directory() {
+            if (fd >= 0) {
+                (void)::close(fd);
+            }
+        }
+    } alias_store;
+
+    const auto check_alias_store = [&]() -> result<void> {
+        struct stat opened{}, named{};
+        if (alias_store.fd < 0 || ::fstat(alias_store.fd, &opened) != 0 ||
+            ::lstat(directory.c_str(), &named) != 0 || !S_ISDIR(opened.st_mode) ||
+            !S_ISDIR(named.st_mode) || opened.st_dev != named.st_dev ||
+            opened.st_ino != named.st_ino || opened.st_uid != ::geteuid() ||
+            named.st_uid != opened.st_uid || opened.st_gid != named.st_gid ||
+            opened.st_mode != named.st_mode || (opened.st_mode & 07777U) != 0700U ||
+            opened.st_nlink == 0 || opened.st_nlink != named.st_nlink) {
+            return std::unexpected(std::string{"Pi discovery alias store binding changed"});
+        }
+        return glove::detail::check_descriptor_acl(
+            alias_store.fd, glove::detail::acl_scope::owner_private
+        );
+    };
+    const auto pin_alias_store = [&]() -> result<void> {
+        if (alias_store.fd < 0) {
+            alias_store.fd = ::open(
+                directory.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+            );
+        }
+        return check_alias_store();
+    };
     struct stat existing{};
+    std::optional<struct stat> new_pi_entry;
     bool entry_exists = false;
     bool entry_requires_update = false;
+    const auto check_alias_binding = [&]() -> result<void> {
+        if (auto checked = check_alias_store(); !checked) {
+            return checked;
+        }
+        if (entry_exists) {
+            return glove::detail::check_symlink_acl_at(
+                alias_store.fd, adapter->executable_name, existing
+            );
+        }
+        struct stat unexpected{};
+        if (::fstatat(
+                alias_store.fd, adapter->executable_name.c_str(), &unexpected, AT_SYMLINK_NOFOLLOW
+            ) == 0 ||
+            errno != ENOENT) {
+            return std::unexpected(std::string{"Pi discovery alias appeared before publication"});
+        }
+        return {};
+    };
     if (::lstat(entry_point.c_str(), &existing) == 0) {
+        if (options.runtime_id == "pi") {
+            if (!S_ISLNK(existing.st_mode) || existing.st_uid != ::geteuid() ||
+                existing.st_nlink != 1 || (existing.st_mode & (S_ISUID | S_ISGID | S_ISVTX)) != 0) {
+                return std::unexpected(std::string{"unsafe existing Pi discovery alias"});
+            }
+            // Reject the existing alias before materializing even a new snapshot.
+            // Its inode lies outside the immutable payload tree's admission walk.
+            if (auto prepared = ensure_protected_directory(directory, true); !prepared) {
+                return std::unexpected(prepared.error());
+            }
+            if (auto pinned = pin_alias_store(); !pinned) {
+                return std::unexpected(pinned.error());
+            }
+            if (auto checked = glove::detail::check_symlink_acl_at(
+                    alias_store.fd, adapter->executable_name, existing
+                );
+                !checked) {
+                return std::unexpected(checked.error());
+            }
+        }
         const auto resolved = std::filesystem::canonical(entry_point, error);
         if (!error && resolved == expected_entry_target) {
             entry_exists = true;
@@ -527,10 +639,31 @@ auto stage_runtime_harness_impl(
     }
     bool changed = false;
     if (!options.dry_run) {
-        if (auto prepared = ensure_protected_directory(directory); !prepared) {
+        if (auto prepared = ensure_protected_directory(directory, options.runtime_id == "pi");
+            !prepared) {
             return std::unexpected(prepared.error());
         }
+        if (options.runtime_id == "pi") {
+            if (auto pinned = pin_alias_store(); !pinned) {
+                return std::unexpected(pinned.error());
+            }
+            if (auto checked = check_alias_binding(); !checked) {
+                return std::unexpected(checked.error());
+            }
+        }
         if (snapshot) {
+            if (options.runtime_id == "pi") {
+                if (auto valid = snapshot::validate_pi_source_closure(
+                        options.source_executable,
+                        source,
+                        *dependency_closure,
+                        directory,
+                        options.source_exclusions
+                    );
+                    !valid) {
+                    return std::unexpected(valid.error());
+                }
+            }
             auto materialized = materialize_runtime_snapshot(*snapshot);
             if (!materialized) {
                 return std::unexpected(materialized.error());
@@ -540,24 +673,105 @@ auto stage_runtime_harness_impl(
         if (!entry_exists || entry_requires_update) {
             const auto staged_entry = directory / ("." + adapter->executable_name + ".next-" +
                                                    std::to_string(::getpid()));
-            if (::symlink(expected_entry_target.c_str(), staged_entry.c_str()) != 0) {
-                return std::unexpected(system_error("stage protected harness entry point"));
-            }
-            if (::rename(staged_entry.c_str(), entry_point.c_str()) != 0) {
-                const auto message = system_error("activate protected harness entry point");
-                (void)::unlink(staged_entry.c_str());
-                return std::unexpected(message);
-            }
-            const int directory_fd =
-                ::open(directory.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-            if (directory_fd < 0 || ::fsync(directory_fd) != 0) {
-                const auto message = system_error("sync protected harness entry point");
-                if (directory_fd >= 0) {
-                    (void)::close(directory_fd);
+            if (options.runtime_id == "pi") {
+                if (auto checked = check_alias_binding(); !checked) {
+                    return std::unexpected(checked.error());
                 }
-                return std::unexpected(message);
+                const auto next_name = staged_entry.filename().string();
+                if (::symlinkat(expected_entry_target.c_str(), alias_store.fd, next_name.c_str()) !=
+                    0) {
+                    return std::unexpected(system_error("stage protected Pi discovery alias"));
+                }
+                struct stat created{};
+                if (::fstatat(alias_store.fd, next_name.c_str(), &created, AT_SYMLINK_NOFOLLOW) !=
+                    0) {
+                    return std::unexpected(
+                        std::string{"cannot pin new Pi discovery alias; staged alias retained"}
+                    );
+                }
+                if (auto checked = glove::detail::check_symlink_acl_at(
+                        alias_store.fd, next_name, created, glove::detail::acl_scope::owner_private
+                    );
+                    !checked) {
+                    return std::unexpected(checked.error() + "; staged alias retained");
+                }
+                if (auto checked = check_alias_binding(); !checked) {
+                    return std::unexpected(checked.error() + "; staged alias retained");
+                }
+                if (::renameat(
+                        alias_store.fd,
+                        next_name.c_str(),
+                        alias_store.fd,
+                        adapter->executable_name.c_str()
+                    ) != 0) {
+                    const auto message = system_error("activate protected Pi discovery alias");
+                    if (auto checked =
+                            glove::detail::check_symlink_acl_at(alias_store.fd, next_name, created);
+                        !checked) {
+                        return std::unexpected(
+                            message + "; staged alias cleanup refused: " + checked.error()
+                        );
+                    }
+                    if (::unlinkat(alias_store.fd, next_name.c_str(), 0) != 0) {
+                        return std::unexpected(
+                            message +
+                            "; staged alias cleanup failed: " + system_error("unlink alias")
+                        );
+                    }
+                    return std::unexpected(message);
+                }
+                struct stat published{};
+                if (::fstatat(
+                        alias_store.fd,
+                        adapter->executable_name.c_str(),
+                        &published,
+                        AT_SYMLINK_NOFOLLOW
+                    ) != 0 ||
+                    published.st_dev != created.st_dev || published.st_ino != created.st_ino ||
+                    published.st_uid != created.st_uid || published.st_gid != created.st_gid ||
+                    published.st_mode != created.st_mode ||
+                    published.st_nlink != created.st_nlink ||
+                    published.st_size != created.st_size) {
+                    return std::unexpected(
+                        std::string{"published Pi discovery alias binding changed"}
+                    );
+                }
+                if (auto checked = glove::detail::check_symlink_acl_at(
+                        alias_store.fd, adapter->executable_name, published
+                    );
+                    !checked) {
+                    return std::unexpected(checked.error());
+                }
+                new_pi_entry = published;
+            } else {
+                if (::symlink(expected_entry_target.c_str(), staged_entry.c_str()) != 0) {
+                    return std::unexpected(system_error("stage protected harness entry point"));
+                }
+                if (::rename(staged_entry.c_str(), entry_point.c_str()) != 0) {
+                    const auto message = system_error("activate protected harness entry point");
+                    (void)::unlink(staged_entry.c_str());
+                    return std::unexpected(message);
+                }
             }
-            (void)::close(directory_fd);
+            if (options.runtime_id == "pi") {
+                if (auto checked = check_alias_store(); !checked) {
+                    return std::unexpected(checked.error());
+                }
+                if (::fsync(alias_store.fd) != 0) {
+                    return std::unexpected(system_error("sync protected Pi discovery alias"));
+                }
+            } else {
+                const int directory_fd =
+                    ::open(directory.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+                if (directory_fd < 0 || ::fsync(directory_fd) != 0) {
+                    const auto message = system_error("sync protected harness entry point");
+                    if (directory_fd >= 0) {
+                        (void)::close(directory_fd);
+                    }
+                    return std::unexpected(message);
+                }
+                (void)::close(directory_fd);
+            }
             changed = true;
         }
         supervisor::runtime_launch_template launch{
@@ -570,19 +784,40 @@ auto stage_runtime_harness_impl(
         };
         auto resolved = supervisor::resolve_runtime_executable(launch);
         if (!resolved || std::filesystem::path{*resolved} != expected_entry_target) {
-            if (!entry_exists) {
+            const auto message =
+                resolved ? std::string{"staged entry point resolved to an unexpected executable"}
+                         : resolved.error();
+            if (!entry_exists && options.runtime_id == "pi") {
+                if (auto checked = check_alias_store(); !checked) {
+                    return std::unexpected(message + "; alias cleanup refused: " + checked.error());
+                }
+                if (!new_pi_entry) {
+                    return std::unexpected(message + "; alias cleanup ownership unknown");
+                }
+                if (auto checked = glove::detail::check_symlink_acl_at(
+                        alias_store.fd, adapter->executable_name, *new_pi_entry
+                    );
+                    !checked) {
+                    return std::unexpected(message + "; alias cleanup refused: " + checked.error());
+                }
+                if (::unlinkat(alias_store.fd, adapter->executable_name.c_str(), 0) != 0) {
+                    return std::unexpected(
+                        message + "; alias cleanup failed: " + system_error("unlink alias")
+                    );
+                }
+            } else if (!entry_exists) {
                 (void)::unlink(entry_point.c_str());
             }
-            return std::unexpected(
-                resolved ? std::string{"staged entry point resolved to an unexpected executable"}
-                         : resolved.error()
-            );
+            return std::unexpected(message);
         }
     }
-    return staged_runtime_harness{
+    staged_runtime_harness staged{
         .runtime_id = options.runtime_id,
         .executable_name = adapter->executable_name,
         .source_executable = options.source_executable.lexically_normal(),
+        .canonical_source_executable = source,
+        .source_launch_executable = dependency_closure->executable,
+        .source_read_only_paths = dependency_closure->read_only_paths,
         .protected_entry_point = entry_point,
         .launch_executable = launch_closure.executable,
         .launch_arguments = launch_closure.arguments,
@@ -593,6 +828,14 @@ auto stage_runtime_harness_impl(
         .snapshot_entries = snapshot ? snapshot->entries : 0,
         .changed = changed,
     };
+    if (options.runtime_id == "pi" && !options.dry_run) {
+        if (auto checked =
+                detail::validate_pi_runtime_with_exclusions(staged, options.source_exclusions);
+            !checked) {
+            return std::unexpected(checked.error());
+        }
+    }
+    return staged;
 }
 
 } // namespace

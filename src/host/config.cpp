@@ -3,6 +3,8 @@
 #include "glove/container/image_identity.hpp"
 #include "glove/host/remote_backend.hpp"
 
+#include "config_codec.hpp"
+
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
 #include <sys/stat.h>
@@ -502,13 +504,12 @@ auto validate(const config& value) -> result<void> {
     return {};
 }
 
-auto load_config(const std::filesystem::path& path) -> result<config> {
-    auto contents = read_owner_only_file(path);
-    if (!contents) {
-        return std::unexpected(contents.error());
+auto detail::decode_config(std::string_view contents) -> result<config> {
+    if (contents.empty() || contents.size() > max_config_bytes) {
+        return std::unexpected(std::string{"configuration JSON exceeds bounds"});
     }
     config_wire encoded;
-    if (const auto error = glz::read<strict_read_options>(encoded, *contents); error) {
+    if (const auto error = glz::read<strict_read_options>(encoded, contents); error) {
         return std::unexpected(std::string{"configuration JSON is invalid"});
     }
     config decoded{
@@ -596,6 +597,14 @@ auto load_config(const std::filesystem::path& path) -> result<config> {
         return std::unexpected(valid.error());
     }
     return decoded;
+}
+
+auto load_config(const std::filesystem::path& path) -> result<config> {
+    auto contents = read_owner_only_file(path);
+    if (!contents) {
+        return std::unexpected(contents.error());
+    }
+    return detail::decode_config(*contents);
 }
 
 auto encode_config(const config& value) -> result<std::string> {

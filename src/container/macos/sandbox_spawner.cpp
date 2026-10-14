@@ -5,8 +5,13 @@
 #include "glove/container/spawner.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include "launch_command.hpp"
+#include "runtime_filesystem.hpp"
+
 #include <spawn.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -266,9 +271,35 @@ void append_parent_metadata_rules(std::string& policy, std::string_view path) {
     }
 }
 
+auto regex_literal(std::string_view text, bool fold_case = false) -> std::string {
+    std::string out;
+    for (const char c : text) {
+        if (fold_case && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+            const char lower = c >= 'a' && c <= 'z' ? c : static_cast<char>(c - 'A' + 'a');
+            out += '[';
+            out += lower;
+            out += static_cast<char>(lower - 'a' + 'A');
+            out += ']';
+        } else {
+            if (std::string_view{R"(\.^$|()[]{}*+?)"}.contains(c)) {
+                out += '\\';
+            }
+            out += c;
+        }
+    }
+    return out;
+}
+
+auto append_grant_root_guard(std::string& policy, std::string_view root) -> void {
+    // Grant children write access without allowing the grant root's namespace
+    // or security metadata to move out from under immutable/reserved paths.
+    policy +=
+        "(deny file-write-unlink file-write-mode file-write-owner file-write-flags (literal \"";
+    policy += sbpl_escape(root);
+    policy += "\"))\n";
+}
+
 // system.sb provides the platform's dynamic-loader and Mach-service plumbing.
-// Glove adds only immutable command/runtime directories, the selected agent
-// executable, and the operator's explicit filesystem grants.
 auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::string {
     std::string p = "(version 1)\n(deny default)\n(import \"system.sb\")\n";
     p += "(allow process-exec*)\n(allow process-fork)\n(allow sysctl-read)\n";
@@ -286,7 +317,18 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         append_read_rule(p, rule.path);
         append_parent_metadata_rules(p, rule.path);
     }
+    for (const auto& rule : prof.runtime_filesystem) {
+        append_read_rule(p, rule.path);
+        append_parent_metadata_rules(p, rule.path);
+    }
     p += "(deny network*)\n";
+    if (prof.bridge_endpoint) {
+        // SBPL rejects numeric hosts. Its localhost filter plus AF_INET selects
+        // 127.0.0.1 only; TCP excludes an unrelated UDP service on the same port.
+        p += "(allow network-outbound (require-all (remote tcp \"localhost:";
+        p += std::to_string(prof.bridge_endpoint->port);
+        p += "\") (socket-domain AF_INET)))\n";
+    }
     if (prof.proxy) {
         p += "(allow network-outbound (remote ip \"localhost:";
         p += std::to_string(prof.proxy->port);
@@ -301,6 +343,22 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
             p += sbpl_escape(rule.path);
             p += "\"))\n";
         }
+    }
+    for (const auto& file : prof.immutable_files) {
+        p += "(deny file-write* (literal \"";
+        p += sbpl_escape(file);
+        p += "\"))\n";
+        append_grant_root_guard(p, std::filesystem::path{file}.parent_path().string());
+    }
+    for (const auto& entry : prof.reserved_entries) {
+        const auto pattern =
+            "^" + regex_literal(entry.parent) + "/" + regex_literal(entry.name, true) + "(/|$)";
+        // Ordinary string syntax handles both quote and backslash path bytes;
+        // raw #"regex" syntax cannot safely encode an embedded quote.
+        p += "(deny file-read* file-write* (regex \"";
+        p += sbpl_escape(pattern);
+        p += "\"))\n";
+        append_grant_root_guard(p, entry.parent);
     }
     return p;
 }
@@ -366,10 +424,12 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
     if (!checked) {
         return std::unexpected(std::string{"profile: "} + checked.error());
     }
-    if (checked->bridge_endpoint) {
-        return std::unexpected(
-            std::string{"bridge_endpoint is not implemented on the macOS backend"}
-        );
+    if (auto runtime = macos_detail::validate_runtime_filesystem(checked->runtime_filesystem);
+        !runtime) {
+        return std::unexpected(runtime.error());
+    }
+    if (auto constraints = macos_detail::validate_launch_constraints(*checked); !constraints) {
+        return std::unexpected(constraints.error());
     }
     const auto& effective = *checked;
     auto resolved = resolve_program(effective, argv.front());
@@ -459,18 +519,16 @@ public:
         if (!checked) {
             return std::unexpected(std::string{"profile: "} + checked.error());
         }
-        // The macOS backend has no private-loopback descriptor bridge, so a
-        // profile that names a reverse endpoint cannot reach it. Reject at every
-        // entry point rather than launch an agent that silently cannot
-        // authenticate.
-        if (checked->bridge_endpoint) {
-            return std::unexpected(
-                std::string{"bridge_endpoint is not implemented on the macOS backend"}
-            );
-        }
         if (auto limits = require_resource_enforcement(*checked, resource_capabilities());
             !limits) {
             return std::unexpected(limits.error());
+        }
+        if (auto runtime = macos_detail::validate_runtime_filesystem(checked->runtime_filesystem);
+            !runtime) {
+            return std::unexpected(runtime.error());
+        }
+        if (auto constraints = macos_detail::validate_launch_constraints(*checked); !constraints) {
+            return std::unexpected(constraints.error());
         }
         const auto& effective = *checked;
         auto resolved = resolve_program(effective, argv.front());
@@ -570,6 +628,48 @@ public:
 
 } // namespace
 
+auto macos_detail::prepare_launch_command(
+    const profile& prof, const std::vector<std::string>& argv, bool terminal_stdio
+) -> std::expected<macos_detail::launch_command, std::string> {
+    if (argv.empty()) {
+        return std::unexpected(std::string{"spawner: empty argv"});
+    }
+    auto checked = validate(prof);
+    if (!checked) {
+        return std::unexpected(std::string{"profile: "} + checked.error());
+    }
+    if (auto limits = require_resource_enforcement(*checked, macos_resource_capabilities());
+        !limits) {
+        return std::unexpected(limits.error());
+    }
+    if (auto runtime = validate_runtime_filesystem(checked->runtime_filesystem); !runtime) {
+        return std::unexpected(runtime.error());
+    }
+    if (auto constraints = validate_launch_constraints(*checked); !constraints) {
+        return std::unexpected(constraints.error());
+    }
+    auto program = resolve_program(*checked, argv.front());
+    if (!program) {
+        return std::unexpected(program.error());
+    }
+    auto arguments = sandboxed_argv(*checked, argv, std::move(*program));
+    if (terminal_stdio) {
+        // Opening terminal paths stays denied. CLOEXEC_DEFAULT leaves only
+        // inherited stdio, whose terminal inspection/raw-mode commands are needed.
+        arguments[2] += "(allow file-ioctl (require-all (vnode-type TTY) (require-any";
+        for (const auto command :
+             {TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF, TIOCGPGRP, TIOCGWINSZ}) {
+            arguments[2] += " (ioctl-command " + std::to_string(command) + ")";
+        }
+        arguments[2] += ")))\n";
+    }
+    return macos_detail::launch_command{
+        .arguments = std::move(arguments),
+        .environment = sandboxed_env(*checked),
+        .start_directory = checked->work_dir ? checked->work_dir : checked->home_dir,
+    };
+}
+
 auto make_default_spawner() -> std::unique_ptr<spawner> {
     return std::make_unique<macos_spawner>();
 }
@@ -579,15 +679,6 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     auto checked = validate(prof);
     if (!checked) {
         return std::unexpected(std::string{"profile: "} + checked.error());
-    }
-    // The macOS backend has no private-loopback descriptor bridge, so a profile
-    // that names a reverse endpoint cannot reach it. Reject rather than launch
-    // an agent that silently cannot authenticate, matching the fail-closed rule
-    // that a backend must not advertise enforcement it did not construct.
-    if (checked->bridge_endpoint) {
-        return std::unexpected(
-            std::string{"bridge_endpoint is not implemented on the macOS backend"}
-        );
     }
     if (auto limits = require_resource_enforcement(*checked, macos_resource_capabilities());
         !limits) {

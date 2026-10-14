@@ -4,14 +4,18 @@ add_library(glove_host STATIC
     config.cpp
     control_client.cpp
     daemon.cpp
+    dependency_command.cpp
     doctor.cpp
     doctor_wire.cpp
     operator_experience.cpp
     onboarding_plan.cpp
     policy_wire.cpp
+    pi_runtime.cpp
     remote_backend.cpp
     runtime_policy.cpp
     runtime_snapshot.cpp
+    snapshot_copy.cpp
+    snapshot_cleanup.cpp
     setup.cpp
 )
 add_library(glove::host ALIAS glove_host)
