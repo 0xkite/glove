@@ -195,16 +195,32 @@ auto native_session_store::publish_checkpoint(
     if (!sealed_record) {
         return discard(sealed_record.error());
     }
-    if (::fchmod(directory->get(), 0500) != 0 || ::fsync(directory->get()) != 0) {
-        return discard(failure("seal native checkpoint directory").error());
+    if (::fsync(directory->get()) != 0) {
+        return discard(failure("persist native checkpoint staging").error());
     }
     if (fault == store_fault::publish_rename) {
         return discard("publish native checkpoint (injected rename failure)");
     }
+    // macOS 15 refuses to rename a directory the caller cannot write (EACCES),
+    // so the owner-only staging tree moves first and is sealed in place through
+    // the retained descriptor. Nothing records the checkpoint until the journal
+    // append below, and admission requires the sealed mode, so a crash between
+    // the rename and the seal leaves an inert orphan rather than a checkpoint.
     if (::renameat(
             state_->checkpoints_fd.get(), staging.c_str(), state_->checkpoints_fd.get(), id->c_str()
         ) != 0) {
         return discard(failure("publish native checkpoint").error());
+    }
+    const auto discard_moved =
+        [&](std::string error) -> std::expected<std::string, publish_failure> {
+        (void)::fchmod(directory->get(), 0700);
+        (void)::unlinkat(directory->get(), "history.jsonl", 0);
+        (void)::unlinkat(directory->get(), "record.json", 0);
+        (void)::unlinkat(state_->checkpoints_fd.get(), id->c_str(), AT_REMOVEDIR);
+        return fail(std::move(error));
+    };
+    if (::fchmod(directory->get(), 0500) != 0 || ::fsync(directory->get()) != 0) {
+        return discard_moved(failure("seal native checkpoint directory").error());
     }
     if (fault == store_fault::parent_sync) {
         errno = EIO;
