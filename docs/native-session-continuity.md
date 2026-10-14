@@ -122,6 +122,21 @@ UUIDs, parent links that resolve within the file and terminate, and at least
 one user and one assistant entry. A stopped initial turn is `invalid` and
 produces no checkpoint; no new conversation is substituted.
 
+## Interactive and tool lanes
+
+`claude_launch_mode::interactive` adds a writable generated `.claude.json`
+carrying only onboarding completion, approval of the generation's own nonce
+tail and trust for exactly the admitted workspace; Claude rewrites that leaf
+itself, so it is never identity-tracked or sealed. `headless_write_tool`
+enables only the built-in Read and Edit tools with edits auto-accepted inside
+the workspace; the real 2.1.296 bare tool pool offers Bash, Edit and Read and
+no Write tool. The tool-interruption lane scripts Read then Edit through the
+responder, holds the reply that follows the Edit result, stops the owned
+process, publishes the transcript with the tool_use/tool_result pair, and
+resumes: the real process continues from the tool result without a second
+Edit (file content, inode and mtime unchanged). Effects remain `unassessed`;
+Glove records stop, publication and the on-disk effect separately.
+
 ## Evidence boundaries
 
 Fake-owner tests (`native_session_supervisor_test`) prove the lifecycle,
@@ -131,5 +146,6 @@ stock-tmux lane (`tests/run/claude_tmux_lane.sh`) prove the contained real
 executable against the in-process fixture responder, which never dials. They
 do not prove live-provider compatibility, interactive key approval, tool
 interruption, exactly-once tool effects, universal descendant death or
-host-reboot recovery. Interactive mode starts and stops under supervision but
-blocks on Claude's first-use API-key approval prompt, which is not fabricated.
+host-reboot recovery. Interactive mode is qualified for first turn, stop/publish and in-TUI
+resume with a second turn through the stock-tmux lane; no operator state is
+imported for its key approval or workspace trust.

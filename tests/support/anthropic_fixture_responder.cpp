@@ -1,6 +1,7 @@
 #include "anthropic_fixture_responder.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 
 namespace glove::run::test_support {
@@ -79,9 +80,27 @@ void anthropic_fixture_responder::script(std::vector<std::string> replies) {
     }
 }
 
+void anthropic_fixture_responder::script_tool_then(
+    std::vector<tool_reply> tools, std::vector<std::string> texts
+) {
+    std::scoped_lock lock{mutex_};
+    tools_ = std::move(tools);
+    if (!texts.empty()) {
+        replies_ = std::move(texts);
+    }
+    next_reply_ = 0;
+}
+
 void anthropic_fixture_responder::hold_next() {
     std::scoped_lock lock{mutex_};
     hold_ = true;
+    held_ = false;
+    released_ = false;
+}
+
+void anthropic_fixture_responder::hold_request(std::size_t index) {
+    std::scoped_lock lock{mutex_};
+    hold_at_ = index;
     held_ = false;
     released_ = false;
 }
@@ -141,6 +160,7 @@ auto anthropic_fixture_responder::respond(
         .secret_seen = request.secret_token
     };
     std::string reply;
+    std::optional<tool_reply> tool;
     bool hold = false;
     {
         std::scoped_lock lock{mutex_};
@@ -156,9 +176,13 @@ auto anthropic_fixture_responder::respond(
                 }
             };
         }
-        reply = replies_[std::min(next_reply_, replies_.size() - 1)];
+        if (next_reply_ < tools_.size()) {
+            tool = tools_[next_reply_];
+        } else {
+            reply = replies_[std::min(next_reply_ - tools_.size(), replies_.size() - 1)];
+        }
         ++next_reply_;
-        hold = std::exchange(hold_, false);
+        hold = std::exchange(hold_, false) || (hold_at_ != 0 && requests_.size() == hold_at_);
     }
     if (hold) {
         std::unique_lock lock{mutex_};
@@ -177,6 +201,59 @@ auto anthropic_fixture_responder::respond(
     }
     const std::string model = record.model.empty() ? "fixture-model" : record.model;
     const std::string id = "msg_fixture_" + std::to_string(requests_.size());
+    if (tool) {
+        const std::string block =
+            "{\"type\":\"tool_use\",\"id\":\"toolu_fixture_" + std::to_string(requests_.size()) +
+            "\",\"name\":\"" + json_escape(tool->name) + "\",\"input\":" + tool->input_json + "}";
+        if (!stream) {
+            return net::upstream_response{
+                .status_code = 200,
+                .body = "{\"id\":\"" + id +
+                        "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" +
+                        json_escape(model) + "\",\"content\":[" + block +
+                        "],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{"
+                        "\"input_tokens\":12,\"output_tokens\":9}}",
+                .headers = {{"Content-Type", "application/json"}, {"request-id", "req_fixture"}}
+            };
+        }
+        std::string body;
+        body += sse_event(
+            "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"id\":\"" + id +
+                "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"" + json_escape(model) +
+                "\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{"
+                "\"input_tokens\":12,\"output_tokens\":1}}}"
+        );
+        body += sse_event(
+            "content_block_start",
+            "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_"
+            "use\","
+            "\"id\":\"toolu_fixture_" +
+                std::to_string(requests_.size()) + "\",\"name\":\"" + json_escape(tool->name) +
+                "\",\"input\":{}}}"
+        );
+        body += sse_event(
+            "content_block_delta",
+            "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_"
+            "delta\","
+            "\"partial_json\":\"" +
+                json_escape(tool->input_json) + "\"}}"
+        );
+        body += sse_event("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}");
+        body += sse_event(
+            "message_delta",
+            "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":"
+            "null},\"usage\":{\"output_tokens\":9}}"
+        );
+        body += sse_event("message_stop", "{\"type\":\"message_stop\"}");
+        return net::upstream_response{
+            .status_code = 200,
+            .body = std::move(body),
+            .headers = {
+                {"Content-Type", "text/event-stream; charset=utf-8"}, {"request-id", "req_fixture"}
+            }
+        };
+    }
     if (!stream) {
         return net::upstream_response{
             .status_code = 200,

@@ -518,6 +518,17 @@ auto native_private_state::create_impl(
         if (auto written = write_bytes(file.get(), bytes); !written) {
             return rollback(written.error());
         }
+        if (payload.writable) {
+            // Harness-owned from here: the guest may rewrite or replace it, so
+            // no identity or byte stability is tracked for this leaf.
+            if (::fsync(file.get()) != 0) {
+                return rollback(failure("persist generated writable configuration").error());
+            }
+            if (auto checked = check_agent(); !checked) {
+                return rollback(checked.error());
+            }
+            continue;
+        }
         if (::fchmod(file.get(), 0400) != 0 || ::fsync(file.get()) != 0) {
             return rollback(failure("seal generated Pi configuration").error());
         }

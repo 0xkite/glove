@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <mutex>
@@ -48,7 +49,40 @@ struct lane_observation {
 class claude_lane_harness final : public detail::native_session_harness {
 public:
     claude_lane_harness(claude_lane_binding binding, detail::claude_launch_mode mode)
-        : binding_{std::move(binding)}, policy_{detail::claude_native_startup_policy(mode)} {}
+        : binding_{std::move(binding)}, policy_{detail::claude_native_startup_policy(mode)} {
+        // Test-only qualification knob: GLOVE_TEST_CLAUDE_TOOLS_EXPERIMENT replaces
+        // the closed `--tools` literal and GLOVE_TEST_CLAUDE_EXTRA_ARGS (space
+        // separated) inserts literals before the forwarded suffix, so a lane can
+        // probe the exact runtime's flag semantics without editing the policy.
+        if (const char* tools = std::getenv("GLOVE_TEST_CLAUDE_TOOLS_EXPERIMENT")) {
+            for (std::size_t index = 0; index + 1 < policy_.arguments.size(); ++index) {
+                if (policy_.arguments[index].literal == "--tools") {
+                    policy_.arguments[index + 1].literal = tools;
+                }
+            }
+        }
+        if (const char* extra = std::getenv("GLOVE_TEST_CLAUDE_EXTRA_ARGS")) {
+            std::string_view rest{extra};
+            auto before = policy_.arguments.end() - 2; // "--" then forwarded suffix
+            std::vector<detail::native_argument_binding> inserted;
+            while (!rest.empty()) {
+                const auto space = rest.find(' ');
+                const auto token = rest.substr(0, space);
+                if (!token.empty()) {
+                    inserted.push_back(
+                        {.source = detail::native_argument_source::literal,
+                         .literal = std::string{token},
+                         .resume_literal = {}}
+                    );
+                }
+                if (space == std::string_view::npos) {
+                    break;
+                }
+                rest.remove_prefix(space + 1);
+            }
+            policy_.arguments.insert(before, inserted.begin(), inserted.end());
+        }
+    }
 
     auto harness_id() const -> std::string_view override { return "claude"; }
 

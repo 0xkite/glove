@@ -1,6 +1,7 @@
 #include "native_harness_adapter.hpp"
 #include "native_private_state.hpp"
 
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstddef>
@@ -55,6 +56,37 @@ struct temporary_directory {
 auto read_bytes(const fs::path& path) -> std::string {
     std::ifstream stream{path, std::ios::binary};
     return {std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
+}
+
+auto writable_leaf_case() -> int {
+    temporary_directory parent;
+    REQUIRE(!parent.path.empty());
+    auto plan = prepare_native_private_run(parent.path);
+    REQUIRE(plan);
+    const std::vector<native_configuration_file> files{
+        {.name = "sealed.json", .bytes = "{}", .writable = false},
+        {.name = "mutable.json", .bytes = "{\"a\":1}", .writable = true}
+    };
+    auto state = native_private_state::create(*plan, files);
+    REQUIRE(state);
+    REQUIRE(fs::status(state->agent() / "sealed.json").permissions() == fs::perms::owner_read);
+    REQUIRE(
+        fs::status(state->agent() / "mutable.json").permissions() ==
+        (fs::perms::owner_read | fs::perms::owner_write)
+    );
+    // A harness-owned rewrite or replacement of the writable leaf does not
+    // disturb the sealed-payload invariants or cleanup eligibility.
+    {
+        std::ofstream rewrite{state->agent() / "mutable.json.tmp", std::ios::binary};
+        rewrite << "{\"a\":2}";
+    }
+    REQUIRE(::chmod((state->agent() / "mutable.json.tmp").c_str(), 0600) == 0);
+    fs::rename(state->agent() / "mutable.json.tmp", state->agent() / "mutable.json");
+    REQUIRE(state->mark_launching());
+    REQUIRE(state->mark_quiescent());
+    REQUIRE(state->cleanup());
+    REQUIRE(!fs::exists(state->root()));
+    return 0;
 }
 
 auto generic_payload_case() -> int {
@@ -150,6 +182,7 @@ auto launching_retention_case() -> int {
 } // namespace
 
 auto main() -> int {
+    REQUIRE(writable_leaf_case() == 0);
     REQUIRE(generic_payload_case() == 0);
     REQUIRE(refusal_case() == 0);
     REQUIRE(launching_retention_case() == 0);

@@ -58,7 +58,8 @@ struct fixture {
             .nonce = nonce,
             .paths = paths(),
             .conversation_id = conversation_id,
-            .resume = resume
+            .resume = resume,
+            .workspace = "/private/fixture/ws"
         };
     }
 };
@@ -69,15 +70,25 @@ auto find_value(const std::vector<std::string>& argv, std::string_view flag) -> 
 }
 
 auto policy_shape() -> int {
-    for (const auto mode : {claude_launch_mode::headless, claude_launch_mode::interactive}) {
+    for (const auto mode :
+         {claude_launch_mode::headless,
+          claude_launch_mode::headless_write_tool,
+          claude_launch_mode::interactive}) {
         const auto policy = claude_native_startup_policy(mode);
         REQUIRE(validate_native_startup_policy(policy));
         REQUIRE(policy.runtime_id == "claude");
-        REQUIRE(policy.configuration_names == std::vector<std::string>{"settings.json"});
+        const bool interactive = mode == claude_launch_mode::interactive;
+        REQUIRE(policy.configuration_names.front() == "settings.json");
+        REQUIRE(policy.configuration_names.size() == (interactive ? 2U : 1U));
+        REQUIRE(policy.writable_configuration_names.size() == (interactive ? 1U : 0U));
+        if (interactive) {
+            REQUIRE(policy.configuration_names.back() == ".claude.json");
+            REQUIRE(policy.writable_configuration_names.front() == ".claude.json");
+        }
         REQUIRE(policy.environment.size() == 12);
         REQUIRE(policy.environment[1].source == native_environment_source::endpoint_base_url);
         REQUIRE(policy.environment[2].source == native_environment_source::endpoint_nonce);
-        const bool headless = mode == claude_launch_mode::headless;
+        const bool headless = !interactive;
         const auto has = [&](std::string_view literal) {
             return std::ranges::any_of(policy.arguments, [&](const native_argument_binding& b) {
                 return b.source == native_argument_source::literal && b.literal == literal;
@@ -86,6 +97,9 @@ auto policy_shape() -> int {
         REQUIRE(has("--bare") && has("--tools") && has("--strict-mcp-config"));
         REQUIRE(has("--print") == headless && has("--permission-prompts") == headless);
         REQUIRE(!has("--dangerously-skip-permissions") && !has("--continue"));
+        const bool write_tool = mode == claude_launch_mode::headless_write_tool;
+        REQUIRE(has("Edit,Read") == write_tool && has("acceptEdits") == write_tool);
+        REQUIRE(has("bypassPermissions") == false);
     }
     // A policy digest excludes launch mode (start vs resume) but binds the
     // harness mode, model and provider.
@@ -143,6 +157,57 @@ auto policy_shape() -> int {
         }
         REQUIRE(!validate_native_startup_policy(policy));
     }
+    auto writable = claude_native_startup_policy(claude_launch_mode::interactive);
+    writable.writable_configuration_names = {"settings.json", "settings.json"};
+    REQUIRE(!validate_native_startup_policy(writable));
+    writable.writable_configuration_names = {"auth.json"};
+    REQUIRE(!validate_native_startup_policy(writable));
+    REQUIRE(
+        *native_startup_policy_digest(headless, endpoint_provider::anthropic, "m1") !=
+        *native_startup_policy_digest(
+            claude_native_startup_policy(claude_launch_mode::headless_write_tool),
+            endpoint_provider::anthropic,
+            "m1"
+        )
+    );
+    return 0;
+}
+
+auto interactive_encoding() -> int {
+    fixture f;
+    f.policy = claude_native_startup_policy(claude_launch_mode::interactive);
+    f.arguments.clear();
+    const glove::run::adapters::claude_harness_adapter adapter;
+    auto recipe = adapter.encode_startup(f.input());
+    if (!recipe) {
+        std::fprintf(stderr, "interactive encode: %s\n", recipe.error().c_str());
+    }
+    REQUIRE(recipe);
+    REQUIRE(validate_native_startup_recipe(f.input(), *recipe));
+    REQUIRE(recipe->configuration.size() == 2);
+    REQUIRE(!recipe->configuration[0].writable);
+    REQUIRE(recipe->configuration[1].name == ".claude.json" && recipe->configuration[1].writable);
+    // Only the nonce tail that Claude uses to key its approval is embedded,
+    // never the whole nonce, and nothing else from the host.
+    const auto& bytes = recipe->configuration[1].bytes;
+    REQUIRE(bytes.find(f.nonce.substr(f.nonce.size() - 20)) != std::string::npos);
+    REQUIRE(bytes.find(f.nonce) == std::string::npos);
+    REQUIRE(bytes.find("hasCompletedOnboarding") != std::string::npos);
+    REQUIRE(
+        bytes.find("\"/private/fixture/ws\":{\"hasTrustDialogAccepted\":true") != std::string::npos
+    );
+    auto no_workspace = f.input();
+    no_workspace.workspace = {};
+    REQUIRE(!adapter.encode_startup(no_workspace));
+    REQUIRE(bytes.find("oauth") == std::string::npos && bytes.find("/Users") == std::string::npos);
+    REQUIRE(std::ranges::find(recipe->argv, "--print") == recipe->argv.end());
+    // Writable flag mismatches are refused by the core validator.
+    auto mutated = *recipe;
+    mutated.configuration[1].writable = false;
+    REQUIRE(!validate_native_startup_recipe(f.input(), mutated));
+    mutated = *recipe;
+    mutated.configuration[0].writable = true;
+    REQUIRE(!validate_native_startup_recipe(f.input(), mutated));
     return 0;
 }
 
@@ -267,5 +332,6 @@ auto encoding() -> int {
 auto main() -> int {
     REQUIRE(policy_shape() == 0);
     REQUIRE(encoding() == 0);
+    REQUIRE(interactive_encoding() == 0);
     return 0;
 }
