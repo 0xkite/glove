@@ -245,6 +245,7 @@ auto profile_for(
     const native_startup_recipe& recipe,
     const std::vector<std::string>& libraries,
     std::uint16_t port,
+    std::string_view nonce,
     bool materialized = true
 ) -> result<container::profile> {
     const auto paths = plan.paths();
@@ -275,6 +276,27 @@ auto profile_for(
     // HOME/TMPDIR are profile-owned; libraries cannot shadow core/adapter names.
     std::set<std::string> names{"PATH", "HOME", "TMPDIR"};
     for (const auto& binding : recipe.environment) {
+        if (binding.source != native_environment_source::private_location) {
+            std::string value;
+            switch (binding.source) {
+            case native_environment_source::endpoint_base_url:
+                value = recipe.base_url;
+                break;
+            case native_environment_source::endpoint_nonce:
+                value = std::string{nonce};
+                break;
+            case native_environment_source::literal:
+                value = binding.literal;
+                break;
+            default:
+                return std::unexpected("invalid native environment source");
+            }
+            if (value.empty() || !names.emplace(binding.name).second) {
+                return std::unexpected("native environment name collision");
+            }
+            profile.environment.push_back(binding.name + "=" + value);
+            continue;
+        }
         fs::path value;
         switch (binding.location) {
         case native_private_location::agent:
@@ -361,6 +383,11 @@ auto launch_native_with_context(
     if (!approved) {
         return std::unexpected(approved.error());
     }
+    // Admission may block on host work; a cancellation admitted meanwhile
+    // ends preparation here, before any endpoint or private state exists.
+    if (stop.stop_requested()) {
+        return std::unexpected(context.display_name + " launch cancelled");
+    }
     if (approved->runtime.runtime_id != context.policy.runtime_id ||
         (approved->provider != net::endpoint_provider::openai &&
          approved->provider != net::endpoint_provider::anthropic)) {
@@ -409,7 +436,9 @@ auto launch_native_with_context(
         .catalog_json = assets->catalog_json,
         .endpoint_port = 1,
         .nonce = *nonce,
-        .paths = plan->paths()
+        .paths = plan->paths(),
+        .conversation_id = context.conversation_id,
+        .resume = context.resume
     };
     // Placeholder port is pure preflight only: no bytes are written or endpoint
     // created until the host has admitted the entire compiled startup projection.
@@ -421,7 +450,7 @@ auto launch_native_with_context(
         return std::unexpected(checked.error());
     }
     if (auto checked = profile_for(
-            *workspace, *approved, *plan, *preflight, assets->library_environment, 1, false
+            *workspace, *approved, *plan, *preflight, assets->library_environment, 1, *nonce, false
         );
         !checked) {
         return std::unexpected(checked.error());
@@ -519,10 +548,15 @@ auto launch_native_with_context(
         return fail_before_launch("native private state differs from its admitted plan");
     }
     auto profile = profile_for(
-        *workspace, *approved, *plan, *recipe, assets->library_environment, endpoint->port()
+        *workspace, *approved, *plan, *recipe, assets->library_environment, endpoint->port(), *nonce
     );
     if (!profile) {
         return fail_before_launch(profile.error());
+    }
+    if (context.materialize) {
+        if (auto materialized = context.materialize(*state); !materialized) {
+            return fail_before_launch(materialized.error());
+        }
     }
     if (auto audited = record(sink, context.policy.runtime_id, audit::action::agent_launch);
         !audited) {
@@ -579,6 +613,9 @@ auto launch_native_with_context(
             context.display_name + " launch state uncertain; retained: " + launching.error()
         );
     }
+    if (context.on_launching) {
+        context.on_launching();
+    }
     auto exited = context.execute_owned
                       ? context.execute_owned(*checked_profile, recipe->argv, stop)
                       : container::exec_contained_owned(*checked_profile, recipe->argv, stop);
@@ -588,6 +625,17 @@ auto launch_native_with_context(
             context.display_name +
             " launch outcome uncertain; private state retained: " + exited.error()
         );
+    }
+    // Retained finalization: history publication happens here, with the owned
+    // process outcome known and the endpoint revoked, before the quiescent
+    // marker makes disposable nonce-bearing state eligible for cleanup.
+    if (context.finalize) {
+        if (auto finalized = context.finalize(*state, *exited); !finalized) {
+            return std::unexpected(
+                context.display_name +
+                " finalization failed; private state retained: " + finalized.error()
+            );
+        }
     }
     if (auto quiescent = state->mark_quiescent(); !quiescent) {
         return std::unexpected(

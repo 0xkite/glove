@@ -1,7 +1,11 @@
 #include "native_harness_adapter.hpp"
 
+#include "../container/sha256.hpp"
+
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <span>
 #include <string_view>
 
 namespace glove::run::detail {
@@ -84,6 +88,46 @@ auto environment_name(std::string_view name) -> bool {
            name.find("PASSWORD") == std::string_view::npos;
 }
 
+auto literal_value(std::string_view value) -> bool {
+    if (value.empty() || value.size() > 128) {
+        return false;
+    }
+    for (const char ch : value) {
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+              ch == '_' || ch == '-' || ch == '.' || ch == ':' || ch == '/' || ch == ',')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto endpoint_variable(native_environment_source source, net::endpoint_provider provider)
+    -> std::string_view {
+    const bool openai = provider == net::endpoint_provider::openai;
+    if (source == native_environment_source::endpoint_base_url) {
+        return openai ? "OPENAI_BASE_URL" : "ANTHROPIC_BASE_URL";
+    }
+    return openai ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+}
+
+// Provider-independent shape check. Exact endpoint variable names are bound to
+// the provider by validate_native_startup_recipe once the provider is known.
+auto environment_binding_valid(const native_environment_binding& binding) -> bool {
+    switch (binding.source) {
+    case native_environment_source::private_location:
+        return environment_name(binding.name) && binding.literal.empty();
+    case native_environment_source::endpoint_base_url:
+        return (binding.name == "ANTHROPIC_BASE_URL" || binding.name == "OPENAI_BASE_URL") &&
+               binding.literal.empty();
+    case native_environment_source::endpoint_nonce:
+        return (binding.name == "ANTHROPIC_API_KEY" || binding.name == "OPENAI_API_KEY") &&
+               binding.literal.empty();
+    case native_environment_source::literal:
+        return environment_name(binding.name) && literal_value(binding.literal);
+    }
+    return false;
+}
+
 auto location_valid(native_private_location location) -> bool {
     switch (location) {
     case native_private_location::agent:
@@ -137,6 +181,16 @@ auto closed_arguments(const native_startup_input& input, const native_startup_re
                 }
             }
             break;
+        case native_argument_source::conversation_selector:
+            if (!accept(input.resume ? argument.resume_literal : argument.literal)) {
+                return false;
+            }
+            break;
+        case native_argument_source::conversation_id:
+            if (!accept(input.conversation_id)) {
+                return false;
+            }
+            break;
         }
     }
     return index == recipe.argv.size();
@@ -187,7 +241,7 @@ auto validate_native_startup_policy(const native_startup_policy& policy)
     }
     for (std::size_t index = 0; index < policy.environment.size(); ++index) {
         const auto& binding = policy.environment[index];
-        if (!environment_name(binding.name) || !location_valid(binding.location)) {
+        if (!environment_binding_valid(binding) || !location_valid(binding.location)) {
             return std::unexpected(std::string{"invalid native startup policy environment"});
         }
         for (std::size_t prior = 0; prior < index; ++prior) {
@@ -196,16 +250,45 @@ auto validate_native_startup_policy(const native_startup_policy& policy)
             }
         }
     }
-    std::array<bool, 4> slots{};
+    std::array<bool, 6> slots{};
     for (std::size_t index = 0; index < policy.arguments.size(); ++index) {
         const auto& binding = policy.arguments[index];
         std::size_t slot = 0;
+        if (binding.source != native_argument_source::conversation_selector &&
+            !binding.resume_literal.empty()) {
+            return std::unexpected(std::string{"native resume literal outside its selector slot"});
+        }
         switch (binding.source) {
         case native_argument_source::literal:
             if (binding.literal.size() > 128 || binding.literal.find('\0') != std::string::npos) {
                 return std::unexpected(std::string{"invalid native startup policy literal"});
             }
             continue;
+        case native_argument_source::conversation_selector:
+            // Both flags are closed literals; the core picks one by launch mode.
+            if (binding.literal.empty() || binding.literal.size() > 32 ||
+                binding.resume_literal.empty() || binding.resume_literal.size() > 32 ||
+                binding.literal.find('\0') != std::string::npos ||
+                binding.resume_literal.find('\0') != std::string::npos ||
+                !binding.literal.starts_with("--") || !binding.resume_literal.starts_with("--")) {
+                return std::unexpected(std::string{"invalid native conversation selector"});
+            }
+            if (slots[4]) {
+                return std::unexpected(std::string{"duplicate native conversation selector"});
+            }
+            slots[4] = true;
+            if (index + 1 >= policy.arguments.size() ||
+                policy.arguments[index + 1].source != native_argument_source::conversation_id) {
+                return std::unexpected(std::string{"conversation selector must precede its id"});
+            }
+            continue;
+        case native_argument_source::conversation_id:
+            slot = 5;
+            if (index == 0 || policy.arguments[index - 1].source !=
+                                  native_argument_source::conversation_selector) {
+                return std::unexpected(std::string{"conversation id requires its selector"});
+            }
+            break;
         case native_argument_source::provider_name:
             slot = 0;
             break;
@@ -304,12 +387,29 @@ auto validate_native_startup_recipe(
             return std::unexpected(std::string{"native configuration differs from host policy"});
         }
     }
+    const bool binds_conversation =
+        std::ranges::any_of(input.policy.arguments, [](const native_argument_binding& binding) {
+            return binding.source == native_argument_source::conversation_id;
+        });
+    if (binds_conversation != !input.conversation_id.empty() ||
+        (binds_conversation && !valid_conversation_id(input.conversation_id))) {
+        return std::unexpected(
+            std::string{"native conversation identity differs from host policy"}
+        );
+    }
+    if (!binds_conversation && input.resume) {
+        return std::unexpected(std::string{"native resume requires a conversation-binding policy"});
+    }
     for (std::size_t index = 0; index < recipe.environment.size(); ++index) {
         const auto& binding = recipe.environment[index];
-        if (!environment_name(binding.name) || !location_valid(binding.location) ||
-            binding.name != input.policy.environment[index].name ||
-            binding.location != input.policy.environment[index].location) {
+        if (!environment_binding_valid(binding) || !location_valid(binding.location) ||
+            binding != input.policy.environment[index]) {
             return std::unexpected(std::string{"invalid native private environment projection"});
+        }
+        if ((binding.source == native_environment_source::endpoint_base_url ||
+             binding.source == native_environment_source::endpoint_nonce) &&
+            binding.name != endpoint_variable(binding.source, input.provider)) {
+            return std::unexpected(std::string{"native endpoint variable differs from provider"});
         }
         for (std::size_t prior = 0; prior < index; ++prior) {
             if (binding.name == recipe.environment[prior].name) {
@@ -328,6 +428,72 @@ auto validate_native_startup_recipe(
         }
     }
     return {};
+}
+
+auto valid_conversation_id(std::string_view value) -> bool {
+    if (value.size() != 36) {
+        return false;
+    }
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        const char ch = value[index];
+        if (index == 8 || index == 13 || index == 18 || index == 23) {
+            if (ch != '-') {
+                return false;
+            }
+        } else if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto native_startup_policy_digest(
+    const native_startup_policy& policy, net::endpoint_provider provider, std::string_view model
+) -> std::expected<std::string, std::string> {
+    if (auto checked = validate_native_startup_policy(policy); !checked) {
+        return std::unexpected(checked.error());
+    }
+    if (model.empty() || model.size() > 128 || model.find('\0') != std::string_view::npos) {
+        return std::unexpected(std::string{"invalid native model for policy digest"});
+    }
+    // Length-prefixed canonical encoding: no field can alias another.
+    std::string canonical;
+    const auto put = [&](std::string_view field) {
+        canonical += std::to_string(field.size());
+        canonical += ':';
+        canonical += field;
+        canonical += ';';
+    };
+    put("glove.native-startup-policy.v1");
+    put(policy.runtime_id);
+    put(provider == net::endpoint_provider::openai ? "openai" : "anthropic");
+    put(model);
+    put(std::to_string(policy.configuration_names.size()));
+    for (const auto& name : policy.configuration_names) {
+        put(name);
+    }
+    put(std::to_string(policy.environment.size()));
+    for (const auto& binding : policy.environment) {
+        put(binding.name);
+        put(std::to_string(static_cast<int>(binding.source)));
+        put(std::to_string(static_cast<int>(binding.location)));
+        put(binding.literal);
+    }
+    put(std::to_string(policy.reserved_entries.size()));
+    for (const auto& entry : policy.reserved_entries) {
+        put(entry);
+    }
+    put(std::to_string(policy.arguments.size()));
+    for (const auto& argument : policy.arguments) {
+        put(std::to_string(static_cast<int>(argument.source)));
+        put(argument.literal);
+        put(argument.resume_literal);
+    }
+    return container::detail::sha256_hex(
+        std::span<const unsigned char>{
+            reinterpret_cast<const unsigned char*>(canonical.data()), canonical.size()
+        }
+    );
 }
 
 } // namespace glove::run::detail

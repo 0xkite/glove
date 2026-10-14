@@ -74,11 +74,26 @@ auto pi_harness_adapter::encode_startup(const detail::native_startup_input& inpu
         {.name = "auth.json", .bytes = "{}"}
     };
     recipe.environment = {
-        {.name = "PI_CODING_AGENT_DIR", .location = detail::native_private_location::agent},
-        {.name = "XDG_CONFIG_HOME", .location = detail::native_private_location::config},
-        {.name = "XDG_STATE_HOME", .location = detail::native_private_location::state},
-        {.name = "XDG_DATA_HOME", .location = detail::native_private_location::data},
-        {.name = "XDG_CACHE_HOME", .location = detail::native_private_location::cache}
+        {.name = "PI_CODING_AGENT_DIR",
+         .location = detail::native_private_location::agent,
+         .source = detail::native_environment_source::private_location,
+         .literal = {}},
+        {.name = "XDG_CONFIG_HOME",
+         .location = detail::native_private_location::config,
+         .source = detail::native_environment_source::private_location,
+         .literal = {}},
+        {.name = "XDG_STATE_HOME",
+         .location = detail::native_private_location::state,
+         .source = detail::native_environment_source::private_location,
+         .literal = {}},
+        {.name = "XDG_DATA_HOME",
+         .location = detail::native_private_location::data,
+         .source = detail::native_environment_source::private_location,
+         .literal = {}},
+        {.name = "XDG_CACHE_HOME",
+         .location = detail::native_private_location::cache,
+         .source = detail::native_environment_source::private_location,
+         .literal = {}}
     };
     recipe.reserved_entries = {".pi"};
     if (auto checked = detail::validate_native_startup_recipe(input, recipe); !checked) {

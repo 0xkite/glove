@@ -186,6 +186,15 @@ request/edit behavior, buffered-response compatibility, or live-provider access.
 Same-UID namespace mutation and detached descendants are not covered by an
 atomic snapshot or general process-tree death guarantee.
 
+## Native session continuity
+
+A host supervisor can own successive native generations of one logical
+conversation with host-side durable checkpoints, a protected host-only
+management transport and retained finalization before private-run cleanup.
+See [Native session continuity](native-session-continuity.md). Constructed
+for the Claude Code harness in an offline fixture composition; it adds no
+public CLI, no provider rail and no managed-session capability.
+
 ## Historical synthetic status milestone
 
 The former construction-only synthetic status stack and harness-shaped adapter were

@@ -13,6 +13,15 @@ add_library(glove_run STATIC
     native_library_environment.cpp
     native_audit.cpp
     native_harness_adapter.cpp
+    native_session_model.cpp
+    native_session_store.cpp
+    native_session_checkpoints.cpp
+    native_management_transport.cpp
+    native_management_client.cpp
+    native_session_supervisor.cpp
+    claude_native_policy.cpp
+    claude_history.cpp
+    ../adapters/claude/native_harness.cpp
     pi_native_policy.cpp
     ../adapters/pi/native_harness.cpp
     pi_audit.cpp

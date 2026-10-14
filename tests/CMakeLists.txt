@@ -8,6 +8,34 @@ if(APPLE)
     add_test(NAME run_native_launch COMMAND run_native_launch_test)
     set_tests_properties(run_native_launch PROPERTIES TIMEOUT 30)
 
+    add_executable(run_native_session_supervisor_test run/native_session_supervisor_test.cpp)
+    target_link_libraries(run_native_session_supervisor_test PRIVATE glove_run glove_host)
+    target_include_directories(run_native_session_supervisor_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_native_session_supervisor COMMAND run_native_session_supervisor_test)
+    set_tests_properties(run_native_session_supervisor PROPERTIES TIMEOUT 180)
+
+    add_library(glove_test_anthropic_fixture STATIC support/anthropic_fixture_responder.cpp)
+    target_link_libraries(glove_test_anthropic_fixture PUBLIC glove_net glove_options)
+    target_include_directories(glove_test_anthropic_fixture PUBLIC ${CMAKE_SOURCE_DIR}/tests/support)
+
+    # Opt-in actual-Claude lane: exits 77 (skipped) unless the exact executable,
+    # its digest, version label and a private root are supplied.
+    add_executable(run_native_claude_lane_test run/native_claude_lane_test.cpp)
+    target_link_libraries(run_native_claude_lane_test PRIVATE glove_run glove_host glove_test_anthropic_fixture)
+    target_include_directories(run_native_claude_lane_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run ${CMAKE_SOURCE_DIR}/src/container
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_native_claude_lane COMMAND run_native_claude_lane_test)
+    set_tests_properties(run_native_claude_lane PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+
+    add_executable(native_session_fixture run/native_session_fixture_main.cpp)
+    target_link_libraries(native_session_fixture PRIVATE glove_run glove_host glove_test_anthropic_fixture)
+    target_include_directories(native_session_fixture PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run ${CMAKE_SOURCE_DIR}/src/container
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+
     add_executable(run_pi_launch_test run/pi_launch_test.cpp)
     target_link_libraries(run_pi_launch_test PRIVATE glove_run glove_host)
     target_include_directories(run_pi_launch_test PRIVATE
@@ -78,6 +106,38 @@ target_link_libraries(run_pi_catalog_test PRIVATE glove_run)
 target_include_directories(run_pi_catalog_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
 add_test(NAME run_pi_catalog COMMAND run_pi_catalog_test)
 set_tests_properties(run_pi_catalog PROPERTIES TIMEOUT 20)
+
+add_executable(run_native_session_model_test run/native_session_model_test.cpp)
+target_link_libraries(run_native_session_model_test PRIVATE glove_run)
+target_include_directories(run_native_session_model_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_session_model COMMAND run_native_session_model_test)
+set_tests_properties(run_native_session_model PROPERTIES TIMEOUT 10)
+
+add_executable(run_native_session_store_test run/native_session_store_test.cpp)
+target_link_libraries(run_native_session_store_test PRIVATE glove_run)
+target_include_directories(run_native_session_store_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_session_store COMMAND run_native_session_store_test)
+set_tests_properties(run_native_session_store PROPERTIES TIMEOUT 60)
+
+add_executable(run_claude_native_harness_test run/claude_native_harness_test.cpp)
+target_link_libraries(run_claude_native_harness_test PRIVATE glove_run)
+target_include_directories(run_claude_native_harness_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/run
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME run_claude_native_harness COMMAND run_claude_native_harness_test)
+set_tests_properties(run_claude_native_harness PROPERTIES TIMEOUT 10)
+
+add_executable(run_claude_history_test run/claude_history_test.cpp)
+target_link_libraries(run_claude_history_test PRIVATE glove_run)
+target_include_directories(run_claude_history_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_claude_history COMMAND run_claude_history_test)
+set_tests_properties(run_claude_history PROPERTIES TIMEOUT 10)
+
+add_executable(run_native_management_transport_test run/native_management_transport_test.cpp)
+target_link_libraries(run_native_management_transport_test PRIVATE glove_run)
+target_include_directories(run_native_management_transport_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_management_transport COMMAND run_native_management_transport_test)
+set_tests_properties(run_native_management_transport PROPERTIES TIMEOUT 120)
 
 add_executable(run_native_private_state_test run/native_private_state_test.cpp)
 target_link_libraries(run_native_private_state_test PRIVATE glove_run)

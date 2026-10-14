@@ -46,7 +46,12 @@ public:
             recipe->argv.pop_back();
             break;
         case 1:
-            recipe->environment.push_back({"NODE_PATH", native_private_location::agent});
+            recipe->environment.push_back(
+                {.name = "NODE_PATH",
+                 .location = native_private_location::agent,
+                 .source = native_environment_source::private_location,
+                 .literal = {}}
+            );
             break;
         case 2:
             recipe->environment.clear();
@@ -171,7 +176,12 @@ auto unsupported_authority_cases(const fs::path& root) -> int {
             },
             .start_endpoint = f.context.start_endpoint,
             .execute_owned = f.context.execute_owned,
-            .audit = f.context.audit
+            .audit = f.context.audit,
+            .conversation_id = {},
+            .resume = false,
+            .materialize = {},
+            .on_launching = {},
+            .finalize = {}
         };
         const fault_projection adapter{0};
         const auto refused = launch_native_with_context(context, adapter);
@@ -327,7 +337,12 @@ auto revalidated_library_refusal(const fs::path& root) -> int {
         },
         .start_endpoint = f.context.start_endpoint,
         .execute_owned = f.context.execute_owned,
-        .audit = f.context.audit
+        .audit = f.context.audit,
+        .conversation_id = {},
+        .resume = false,
+        .materialize = {},
+        .on_launching = {},
+        .finalize = {}
     };
     const glove::run::adapters::pi_harness_adapter adapter;
     const auto refused = launch_native_with_context(context, adapter);
@@ -402,7 +417,12 @@ auto library_authority_refusal(const fs::path& root) -> int {
         },
         .start_endpoint = f.context.start_endpoint,
         .execute_owned = f.context.execute_owned,
-        .audit = f.context.audit
+        .audit = f.context.audit,
+        .conversation_id = {},
+        .resume = false,
+        .materialize = {},
+        .on_launching = {},
+        .finalize = {}
     };
     const glove::run::adapters::pi_harness_adapter adapter;
     for (const auto& entry : invalid) {

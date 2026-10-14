@@ -527,6 +527,15 @@ locator. Applied terminals resolve those objects only to retry baseline
 cleanup. The bounded startup reconciler reports redacted per-record issue
 codes. Ambiguous transactions are never retried or terminalized automatically.
 
+## Native session store
+
+Native logical sessions persist below `<state>/<runtime_id>/sessions/ns-*/`
+with an exclusive flock lease, strict append-only JSON journal and immutable
+checkpoint directories. Journal corruption, reordering, truncation or mode
+drift refuses recovery; the store never repairs an existing object. Bounds:
+metadata 1 MiB, 4096 journal events of at most 16 KiB (4 MiB total), 32
+checkpoints of at most 32 MiB each and 256 MiB aggregate per session.
+
 ## Remaining boundary
 
 Glove's native adapters expand only exact `skill` bundle entries into a
