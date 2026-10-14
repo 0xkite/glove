@@ -175,7 +175,10 @@ auto malformed_output_refusals() -> int {
             break;
         case 11:
             recipe.environment.push_back(
-                {.name = "NODE_PATH", .location = native_private_location::agent}
+                {.name = "NODE_PATH",
+                 .location = native_private_location::agent,
+                 .source = native_environment_source::private_location,
+                 .literal = {}}
             );
             break;
         case 12:

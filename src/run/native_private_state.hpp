@@ -66,6 +66,9 @@ public:
     [[nodiscard]] auto agent() const -> const std::filesystem::path&;
     [[nodiscard]] auto sessions() const -> const std::filesystem::path&;
     [[nodiscard]] auto configuration_paths() const -> const std::vector<std::filesystem::path>&;
+    // Borrowed descriptor of the fixed agent child for descriptor-relative
+    // generation-local materialization and finalization. Never a grant.
+    [[nodiscard]] auto agent_descriptor() const -> int;
 
     // Durable transition before execution. Failed/uncertain states remain held.
     [[nodiscard]] auto mark_launching() -> std::expected<void, std::string>;

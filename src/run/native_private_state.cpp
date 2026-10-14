@@ -718,4 +718,9 @@ auto native_private_state::configuration_paths() const
     return state_->configuration_paths;
 }
 
+auto native_private_state::agent_descriptor() const -> int {
+    // agent is the third fixed child created by create_impl.
+    return state_ && state_->children.size() > 2 ? state_->children[2].fd.get() : -1;
+}
+
 } // namespace glove::run::detail

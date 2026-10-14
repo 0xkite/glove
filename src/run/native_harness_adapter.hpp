@@ -23,9 +23,25 @@ struct native_private_paths {
 // cannot return an arbitrary environment value or point it at a host directory.
 enum class native_private_location { agent, config, state, data, cache };
 
+// Typed value sources. private_location materializes an owned private path;
+// endpoint_base_url/endpoint_nonce materialize the host-bound endpoint for the
+// selected provider under that provider's exact documented variable name;
+// literal carries a short closed token selected by host policy. No source can
+// name an arbitrary host path, credential, or operator-supplied value.
+enum class native_environment_source {
+    private_location,
+    endpoint_base_url,
+    endpoint_nonce,
+    literal
+};
+
 struct native_environment_binding {
     std::string name;
     native_private_location location = native_private_location::agent;
+    native_environment_source source = native_environment_source::private_location;
+    std::string literal;
+
+    auto operator==(const native_environment_binding&) const -> bool = default;
 };
 
 struct native_configuration_file {
@@ -37,17 +53,26 @@ struct native_configuration_file {
 validate_native_configuration_files(std::span<const native_configuration_file> configuration)
     -> std::expected<void, std::string>;
 
+// conversation_selector emits the harness's start-or-resume flag chosen by the
+// core from the launch mode; conversation_id emits the exact host-admitted
+// conversation identity. Neither accepts an operator path or ambient lookup.
 enum class native_argument_source {
     literal,
     provider_name,
     model,
     session_directory,
-    forwarded_arguments
+    forwarded_arguments,
+    conversation_selector,
+    conversation_id
 };
 
 struct native_argument_binding {
     native_argument_source source = native_argument_source::literal;
     std::string literal;
+    // conversation_selector only: the flag emitted for a resumed generation.
+    std::string resume_literal;
+
+    auto operator==(const native_argument_binding&) const -> bool = default;
 };
 
 // Selected independently by trusted host composition, never supplied by a guest
@@ -74,6 +99,10 @@ struct native_startup_input {
     std::uint16_t endpoint_port = 0;
     std::string_view nonce;
     native_private_paths paths;
+    // Host-admitted conversation identity and launch mode for harnesses whose
+    // policy binds conversation slots. Empty/false for Pi's closed projection.
+    std::string_view conversation_id{};
+    bool resume = false;
 };
 
 // All results own their bytes. Configuration names are leaves below the owned
@@ -96,6 +125,17 @@ public:
 
 [[nodiscard]] auto validate_native_startup_policy(const native_startup_policy& policy)
     -> std::expected<void, std::string>;
+
+// Semantic startup-policy identity: harness, provider, model, configuration
+// leaves, environment sources, reservations and ordered argument slots. It
+// excludes fresh nonce/port/private-path spellings and the launch mode, so a
+// checkpoint produced by a start generation binds its resume generation.
+[[nodiscard]] auto native_startup_policy_digest(
+    const native_startup_policy& policy, net::endpoint_provider provider, std::string_view model
+) -> std::expected<std::string, std::string>;
+
+[[nodiscard]] auto valid_conversation_id(std::string_view value)
+    -> bool; // lowercase RFC 4122 text form
 
 // Structural and closed-manifest admission, not executable/model authorization
 // or configuration-format interpretation. The compiled encoder remains the

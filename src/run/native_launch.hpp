@@ -15,6 +15,8 @@
 
 namespace glove::run::detail {
 
+class native_private_state;
+
 struct native_launch_binding {
     host::staged_runtime_harness runtime;
     net::endpoint_provider provider = net::endpoint_provider::openai;
@@ -60,6 +62,20 @@ struct native_launch_context {
     )>
         execute_owned;
     std::shared_ptr<audit::sink> audit;
+
+    // Host-admitted conversation identity for conversation-binding policies
+    // (empty for Pi). `resume` selects the policy's resume selector literal.
+    std::string conversation_id;
+    bool resume = false;
+    // Session-continuity hooks, all synchronous borrows of the owned private
+    // run. materialize runs after immutable configuration publication and
+    // before mark_launching (generation-local writable history copy).
+    // on_launching runs right after the durable launching marker succeeds.
+    // finalize runs after a KNOWN owned process outcome and endpoint
+    // revocation, BEFORE mark_quiescent; a failure retains the private run.
+    std::function<std::expected<void, std::string>(const native_private_state&)> materialize;
+    std::function<void()> on_launching;
+    std::function<std::expected<void, std::string>(const native_private_state&, int)> finalize;
 };
 
 [[nodiscard]] auto admit_native_operator_stdio() -> std::expected<void, std::string>;

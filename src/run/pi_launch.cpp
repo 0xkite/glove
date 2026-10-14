@@ -94,7 +94,12 @@ auto launch_pi_with_adapter(
         .credential = {},
         .start_endpoint = context.start_endpoint,
         .execute_owned = context.execute_owned,
-        .audit = context.audit
+        .audit = context.audit,
+        .conversation_id = {},
+        .resume = false,
+        .materialize = {},
+        .on_launching = {},
+        .finalize = {}
     };
     native.admit_runtime = [&]() -> result<native_launch_binding> {
         auto exclusions = pi_source_authorities(context.directories, context.protected_auth_roots);
