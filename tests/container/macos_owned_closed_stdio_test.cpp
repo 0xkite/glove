@@ -193,6 +193,14 @@ auto main(int argc, char** argv) -> int {
             return 2;
         }
         const int closed = mask[0] - '0';
+        // A sanitizer or loader runtime may open a descriptor into a masked
+        // slot before main (observed on macOS 15), so the closed state is
+        // re-established here rather than assumed from the spawn actions.
+        for (int fd = 0; fd < 3; ++fd) {
+            if ((closed & (1 << fd)) != 0 && ::close(fd) != 0 && errno != EBADF) {
+                return 3;
+            }
+        }
         for (int fd = 0; fd < 3; ++fd) {
             const int result = ::fcntl(fd, F_GETFD);
             if ((closed & (1 << fd)) != 0) {
