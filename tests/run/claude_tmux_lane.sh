@@ -103,25 +103,52 @@ log "stale control refused: $(cat "$ROOT/stale.out")"
 grep -E "^\[serve\]|^\[responder\]|^\[supervisor\]" "$ROOT/serve.err" | tee -a "$LOG"
 grep -q "refusals=0" "$ROOT/serve.err"
 
-# ---- interactive TUI smoke (separate, best-effort; not headless parity) -----
+# ---- interactive TUI lane (first turn, stop/publish, resume in the TUI) -----
+# The generation carries a host-generated .claude.json approving only its own
+# nonce; no operator state is imported. Request arrivals are observed through
+# the fixture's request witness file, TUI renders through capture-pane.
 T new-window -t lane -n tui \
   "$FIXTURE serve --root $ROOT/i --executable $EXECUTABLE --sha256 $SHA256 --version $VERSION \
-     --mode interactive --auto-start --announce $ROOT/announce-i 2>$ROOT/serve-i.err; echo \$? >$ROOT/serve-i.exit; $TMUX_EXE -S $SOCK wait-for -S served-i"
-if "$FIXTURE" wait --announce "$ROOT/announce-i" --state running --timeout-ms 60000 | tee -a "$LOG"; then
-  ISESSION=$(sed -n 1p "$ROOT/announce-i"); ICONTROL=$(sed -n 3p "$ROOT/announce-i")
-  sleep 6  # single bounded TUI render wait, not a polling loop
-  T capture-pane -p -t lane:tui | tee "$ROOT/tui-1.txt" | tail -25 | tee -a "$LOG"
-  T send-keys -t lane:tui "Reply with exactly the single word pong." Enter
-  sleep 6
-  T capture-pane -p -t lane:tui | tee "$ROOT/tui-2.txt" | tail -25 | tee -a "$LOG"
-  ISTOP=$("$FIXTURE" ctl --control "$ICONTROL" --session "$ISESSION" --op stop --generation 1); log "tui stop: $ISTOP"
-  "$FIXTURE" wait --control "$ICONTROL" --session "$ISESSION" --state stopped --timeout-ms 60000 | tee -a "$LOG" || true
-  "$FIXTURE" ctl --control "$ICONTROL" --session "$ISESSION" --op status --generation 1 | tee -a "$LOG" || true
-  "$FIXTURE" ctl --control "$ICONTROL" --session "$ISESSION" --op shutdown --generation 1 | tee -a "$LOG" || true
-  T wait-for served-i || true
-  log "interactive serve exit=$(cat "$ROOT/serve-i.exit" 2>/dev/null || echo unknown)"
-  grep -E "^\[serve\]|^\[responder\]|^\[supervisor\]" "$ROOT/serve-i.err" | tee -a "$LOG" || true
-else
-  log "interactive lane: supervisor did not reach running (see $ROOT/serve-i.err)"
-fi
+     --mode interactive --auto-start --announce $ROOT/announce-i --requests-file $ROOT/requests-i \
+     --reply pong --reply pong-again 2>$ROOT/serve-i.err; echo \$? >$ROOT/serve-i.exit; $TMUX_EXE -S $SOCK wait-for -S served-i"
+"$FIXTURE" wait --announce "$ROOT/announce-i" --state running --timeout-ms 60000 | tee -a "$LOG"
+ISESSION=$(sed -n 1p "$ROOT/announce-i"); ICONTROL=$(sed -n 3p "$ROOT/announce-i")
+ictl() { "$FIXTURE" ctl --control "$ICONTROL" --session "$ISESSION" "$@"; }
+sleep 8  # single bounded TUI render wait (startup), not a polling loop
+T capture-pane -p -t lane:tui | tee "$ROOT/tui-1.txt" | grep -v '^$' | tail -12 | tee -a "$LOG"
+if grep -q "Do you want to use this API key" "$ROOT/tui-1.txt"; then log "ERROR: key prompt still shown"; exit 1; fi
+if grep -q "Choose the text style" "$ROOT/tui-1.txt"; then log "ERROR: onboarding still shown"; exit 1; fi
+T send-keys -t lane:tui "Reply with exactly the single word pong." Enter
+"$FIXTURE" wait --requests-file "$ROOT/requests-i" --count 1 --timeout-ms 60000 | tee -a "$LOG"
+sleep 4  # bounded render wait for the reply
+T capture-pane -p -t lane:tui | tee "$ROOT/tui-2.txt" | grep -v '^$' | tail -12 | tee -a "$LOG"
+grep -q "pong" "$ROOT/tui-2.txt"
+ISTOP=$(ictl --op stop --generation 1); log "tui stop: $ISTOP"; echo "$ISTOP" | grep -q '"code":"accepted"'
+"$FIXTURE" wait --control "$ICONTROL" --session "$ISESSION" --state stopped --timeout-ms 60000 | tee -a "$LOG"
+ISTATUS=$(ictl --op status --generation 1); log "tui status after stop: $ISTATUS"
+ICHECK=$(echo "$ISTATUS" | sed -n 's/.*"checkpoint":"\([0-9a-f]\{64\}\)".*/\1/p')
+[ -n "$ICHECK" ] && echo "$ISTATUS" | grep -q '"history":"published"'
+log "interactive checkpoint=$ICHECK"
+IRESUME=$(ictl --op resume --generation 1 --checkpoint "$ICHECK"); log "tui resume: $IRESUME"
+echo "$IRESUME" | grep -q '"code":"accepted"'
+"$FIXTURE" wait --control "$ICONTROL" --session "$ISESSION" --state running --timeout-ms 60000 | tee -a "$LOG"
+sleep 8
+T capture-pane -p -t lane:tui | tee "$ROOT/tui-3.txt" | grep -v '^$' | tail -12 | tee -a "$LOG"
+grep -q "pong" "$ROOT/tui-3.txt"
+T send-keys -t lane:tui "Now reply with exactly pong-again." Enter
+"$FIXTURE" wait --requests-file "$ROOT/requests-i" --count 2 --timeout-ms 60000 | tee -a "$LOG"
+grep -q "messages=3" "$ROOT/requests-i"
+sleep 4
+T capture-pane -p -t lane:tui | tee "$ROOT/tui-4.txt" | grep -v '^$' | tail -12 | tee -a "$LOG"
+grep -q "pong-again" "$ROOT/tui-4.txt"
+ictl --op stop --generation 2 | tee -a "$LOG"
+"$FIXTURE" wait --control "$ICONTROL" --session "$ISESSION" --state stopped --timeout-ms 60000 | tee -a "$LOG"
+ISTATUS2=$(ictl --op status --generation 2); log "tui status after second stop: $ISTATUS2"
+ICHECK2=$(echo "$ISTATUS2" | sed -n 's/.*"checkpoint":"\([0-9a-f]\{64\}\)".*/\1/p')
+[ -n "$ICHECK2" ] && [ "$ICHECK2" != "$ICHECK" ]
+ictl --op shutdown --generation 2 | tee -a "$LOG"
+T wait-for served-i
+log "interactive serve exit=$(cat "$ROOT/serve-i.exit")"
+grep -E "^\[serve\]|^\[responder\]|^\[supervisor\]" "$ROOT/serve-i.err" | tee -a "$LOG"
+grep -q "refusals=0" "$ROOT/serve-i.err"
 log "lane complete"

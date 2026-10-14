@@ -66,8 +66,45 @@ auto claude_harness_adapter::encode_startup(const detail::native_startup_input& 
         {.name = "settings.json",
          .bytes =
              "{\"includeCoAuthoredBy\":false,\"permissions\":{\"disableBypassPermissionsMode\":"
-             "\"disable\"}}"}
+             "\"disable\"}}",
+         .writable = false}
     };
+    for (const auto& name : input.policy.configuration_names) {
+        if (name != detail::claude_global_config_leaf) {
+            continue;
+        }
+        // Onboarding completion, approval of this generation's own nonce
+        // (Claude keys approvals by the credential's last 20 characters) and
+        // trust for exactly the host-admitted workspace. Nothing else is
+        // imported; the leaf is writable because Claude rewrites it.
+        if (input.workspace.empty() || input.workspace.front() != '/' ||
+            input.workspace.size() > 4096) {
+            return std::unexpected(
+                std::string{"Claude interactive startup requires the workspace"}
+            );
+        }
+        std::string escaped_workspace;
+        for (const char ch : input.workspace) {
+            if (static_cast<unsigned char>(ch) < 0x20U) {
+                return std::unexpected(std::string{"Claude workspace spelling is not encodable"});
+            }
+            if (ch == '"' || ch == '\\') {
+                escaped_workspace.push_back('\\');
+            }
+            escaped_workspace.push_back(ch);
+        }
+        const auto tail =
+            input.nonce.size() > 20 ? input.nonce.substr(input.nonce.size() - 20) : input.nonce;
+        recipe.configuration.push_back(
+            {.name = std::string{detail::claude_global_config_leaf},
+             .bytes =
+                 "{\"hasCompletedOnboarding\":true,\"theme\":\"dark\",\"customApiKeyResponses\":{"
+                 "\"approved\":[\"" +
+                 std::string{tail} + "\"],\"rejected\":[]},\"projects\":{\"" + escaped_workspace +
+                 "\":{\"hasTrustDialogAccepted\":true,\"allowedTools\":[],\"mcpServers\":{}}}}",
+             .writable = true}
+        );
+    }
     recipe.environment = input.policy.environment;
     recipe.reserved_entries = input.policy.reserved_entries;
     if (auto checked = detail::validate_native_startup_recipe(input, recipe); !checked) {

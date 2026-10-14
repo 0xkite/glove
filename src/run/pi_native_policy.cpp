@@ -6,6 +6,7 @@ auto pi_native_startup_policy() -> native_startup_policy {
     return {
         .runtime_id = "pi",
         .configuration_names = {"models.json", "settings.json", "auth.json"},
+        .writable_configuration_names = {},
         .environment =
             {{.name = "PI_CODING_AGENT_DIR",
               .location = native_private_location::agent,
