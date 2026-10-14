@@ -1,0 +1,75 @@
+#include "pi_native_policy.hpp"
+
+namespace glove::run::detail {
+
+auto pi_native_startup_policy() -> native_startup_policy {
+    return {
+        .runtime_id = "pi",
+        .configuration_names = {"models.json", "settings.json", "auth.json"},
+        .environment =
+            {{.name = "PI_CODING_AGENT_DIR",
+              .location = native_private_location::agent,
+              .source = native_environment_source::private_location,
+              .literal = {}},
+             {.name = "XDG_CONFIG_HOME",
+              .location = native_private_location::config,
+              .source = native_environment_source::private_location,
+              .literal = {}},
+             {.name = "XDG_STATE_HOME",
+              .location = native_private_location::state,
+              .source = native_environment_source::private_location,
+              .literal = {}},
+             {.name = "XDG_DATA_HOME",
+              .location = native_private_location::data,
+              .source = native_environment_source::private_location,
+              .literal = {}},
+             {.name = "XDG_CACHE_HOME",
+              .location = native_private_location::cache,
+              .source = native_environment_source::private_location,
+              .literal = {}}},
+        .reserved_entries = {".pi"},
+        .arguments = {
+            {.source = native_argument_source::literal,
+             .literal = "--provider",
+             .resume_literal = {}},
+            {.source = native_argument_source::provider_name, .literal = {}, .resume_literal = {}},
+            {.source = native_argument_source::literal, .literal = "--model", .resume_literal = {}},
+            {.source = native_argument_source::model, .literal = {}, .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--offline",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--no-approve",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--no-extensions",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--no-mcp",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--no-skills",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--no-prompt-templates",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--no-themes",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--no-context-files",
+             .resume_literal = {}},
+            {.source = native_argument_source::literal,
+             .literal = "--session-dir",
+             .resume_literal = {}},
+            {.source = native_argument_source::session_directory,
+             .literal = {},
+             .resume_literal = {}},
+            {.source = native_argument_source::forwarded_arguments,
+             .literal = {},
+             .resume_literal = {}}
+        }
+    };
+}
+
+} // namespace glove::run::detail
