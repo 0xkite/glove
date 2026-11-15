@@ -99,7 +99,7 @@ void print_setup_usage() {
         "  glove setup [--config <absolute-file>] [--path-root <absolute-directory>] "
         "[--session-policy <absolute-file>] "
         "[--root-id <id>] [--runtime <template-id>]... [--persistent] "
-        "[--dry-run | --yes]\n"
+        "[--dry-run | --yes [--start]]\n"
     );
 }
 
@@ -147,7 +147,7 @@ void print_daemon_usage() {
     std::fprintf(
         stderr,
         "usage: glove daemon <install|start|stop|restart|status> "
-        "[--config <absolute-file>] [--gloved <absolute-file>]\n"
+        "[--config <absolute-file>] [--gloved <absolute-file>] [--json]\n"
     );
 }
 
@@ -166,7 +166,7 @@ void print_policy_usage() {
         "      [--argument <value>]... [--environment <NAME=VALUE>]...\n"
         "      [--read-only-path <absolute-path>]... [--path-alias <id>]...\n"
         "      [--projection-destination <id>]...\n"
-        "  glove policy validate --file <absolute-file>\n"
+        "  glove policy validate --file <absolute-file> [--json]\n"
         "  glove policy explain --file <absolute-file> [--json]\n"
     );
 }
@@ -784,6 +784,7 @@ auto setup_command(std::span<char* const> arguments) -> int {
     }
     setup_options options;
     bool yes = false;
+    bool start_daemon = false;
     bool runtime_overridden = false;
     for (std::size_t index = 0; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
@@ -792,6 +793,9 @@ auto setup_command(std::span<char* const> arguments) -> int {
             ++index;
         } else if (argument == "--yes") {
             yes = true;
+            ++index;
+        } else if (argument == "--start") {
+            start_daemon = true;
             ++index;
         } else if (argument == "--persistent") {
             options.persistent_service = true;
@@ -834,6 +838,13 @@ auto setup_command(std::span<char* const> arguments) -> int {
             "setup_conflicting_flags",
             "--dry-run and --yes cannot be combined.",
             "glove setup --help"
+        );
+    }
+    if (start_daemon && !yes) {
+        return print_error(
+            "setup_start_requires_yes",
+            "--start requires --yes and cannot be used with --dry-run.",
+            "glove setup --yes --start"
         );
     }
     if (options.session_policy) {
@@ -905,13 +916,29 @@ auto setup_command(std::span<char* const> arguments) -> int {
     if (auto executed = execute_setup(*plan); !executed) {
         return print_error("setup_failed", executed.error(), "glove doctor");
     }
-    std::printf(
-        "Glove machine setup completed.\nNext:\n"
-        "  glove daemon start --config %s\n"
-        "  glove doctor --config %s\n",
-        plan->config_path.c_str(),
-        plan->config_path.c_str()
-    );
+    if (start_daemon) {
+        daemon_options d_options;
+        d_options.config_path = plan->config_path;
+        auto d_plan = plan_daemon_service(d_options, current_environment());
+        if (!d_plan) {
+            return print_error("daemon_invalid", d_plan.error(), "glove doctor");
+        }
+        if (auto started = start_daemon_service(*d_plan); !started) {
+            return print_error("daemon_start_failed", started.error(), "glove doctor");
+        }
+        std::printf(
+            "Glove machine setup completed and daemon started (%s).\n", d_plan->service_name.c_str()
+        );
+        std::printf("Next:\n  glove doctor --config %s\n", plan->config_path.c_str());
+    } else {
+        std::printf(
+            "Glove machine setup completed.\nNext:\n"
+            "  glove daemon start --config %s\n"
+            "  glove doctor --config %s\n",
+            plan->config_path.c_str(),
+            plan->config_path.c_str()
+        );
+    }
     if (plan->service.session_policy) {
         std::printf("  glove policy validate --file %s\n", plan->service.session_policy->c_str());
     }
@@ -929,8 +956,14 @@ auto daemon_command(std::span<char* const> arguments) -> int {
     }
     const std::string_view action{arguments.front()};
     daemon_options options;
+    bool json = false;
     for (std::size_t index = 1; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
+        if (argument == "--json" && action == "status") {
+            json = true;
+            ++index;
+            continue;
+        }
         if (index + 1 >= arguments.size() || (argument != "--config" && argument != "--gloved")) {
             print_daemon_usage();
             return 2;
@@ -956,9 +989,21 @@ auto daemon_command(std::span<char* const> arguments) -> int {
         if (!active) {
             return print_error("daemon_status_failed", active.error(), "glove daemon start");
         }
-        std::printf(
-            "Glove daemon: %s (%s)\n", *active ? "running" : "stopped", plan->service_name.c_str()
-        );
+        if (json) {
+            std::printf(
+                "{\"schema_version\":1,\"service_name\":\"%s\",\"running\":%s,\"status\":\"%s\"}"
+                "\n",
+                plan->service_name.c_str(),
+                *active ? "true" : "false",
+                *active ? "running" : "stopped"
+            );
+        } else {
+            std::printf(
+                "Glove daemon: %s (%s)\n",
+                *active ? "running" : "stopped",
+                plan->service_name.c_str()
+            );
+        }
         return *active ? 0 : 3;
     }
     result<void> changed;
@@ -1664,7 +1709,7 @@ auto policy_command(std::span<char* const> arguments) -> int {
         bool json = false;
         for (std::size_t index = 1; index < arguments.size();) {
             const std::string_view argument{arguments[index]};
-            if (argument == "--json" && action == "explain") {
+            if (argument == "--json") {
                 json = true;
                 ++index;
             } else if (argument == "--file" && index + 1 < arguments.size()) {
@@ -1680,7 +1725,7 @@ auto policy_command(std::span<char* const> arguments) -> int {
             return 2;
         }
         auto valid = validate_session_policy_file(*policy_path);
-        if (action == "validate") {
+        if (action == "validate" && !json) {
             if (!valid) {
                 return print_error(
                     "policy_invalid",
