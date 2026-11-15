@@ -274,6 +274,9 @@ auto build_registry(const std::vector<upstream_spec>& upstreams)
             .program = upstream.argv.front(),
             .args = upstream.argv,
             .environment = {},
+#if defined(__linux__)
+            .sandbox = {.enabled = true, .allow_network = false},
+#endif
         };
         auto transport = glove::mcp::make_stdio_transport(child);
         if (!transport) {

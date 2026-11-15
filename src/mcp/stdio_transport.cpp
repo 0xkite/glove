@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #if defined(__linux__)
+#    include <sched.h>
 #    include <sys/prctl.h>
 #endif
 
@@ -272,6 +273,113 @@ auto make_stdio_transport(const stdio_child_options& opts)
         environment.push_back(entry.data());
     }
     environment.push_back(nullptr);
+
+    if (opts.sandbox.enabled) {
+#if defined(__linux__)
+        int err_pipe[2] = {-1, -1};
+        if (::pipe(err_pipe) != 0) {
+            close_pipe_pair(pipe_in);
+            close_pipe_pair(pipe_out);
+            return std::unexpected(std::string{"pipe(err): "} + std::strerror(errno));
+        }
+        if (!set_cloexec(err_pipe[0]) || !set_cloexec(err_pipe[1])) {
+            const int saved = errno;
+            close_pipe_pair(err_pipe);
+            close_pipe_pair(pipe_in);
+            close_pipe_pair(pipe_out);
+            return std::unexpected(std::string{"fcntl(FD_CLOEXEC): "} + std::strerror(saved));
+        }
+
+        const ::uid_t host_uid = ::geteuid();
+        const ::gid_t host_gid = ::getegid();
+        const int clone_flags = CLONE_NEWUSER | (opts.sandbox.allow_network ? 0 : CLONE_NEWNET);
+        const ::pid_t child_pid = ::fork();
+        if (child_pid < 0) {
+            const int saved = errno;
+            close_pipe_pair(err_pipe);
+            close_pipe_pair(pipe_in);
+            close_pipe_pair(pipe_out);
+            return std::unexpected(std::string{"fork: "} + std::strerror(saved));
+        }
+        if (child_pid == 0) {
+            ::close(err_pipe[0]);
+            auto fail_child = [&](std::string_view msg) -> void {
+                (void)::write(err_pipe[1], msg.data(), msg.size());
+                ::_exit(127);
+            };
+            auto write_proc_file = [&](const char* path, const std::string& content) -> bool {
+                const int fd = ::open(path, O_WRONLY | O_CLOEXEC);
+                if (fd < 0) {
+                    return false;
+                }
+                const ::ssize_t written = ::write(fd, content.data(), content.size());
+                const int saved = errno;
+                ::close(fd);
+                errno = saved;
+                return written == static_cast<::ssize_t>(content.size());
+            };
+            if (::setpgid(0, 0) != 0) {
+                fail_child("setpgid failed");
+            }
+            if (::dup2(pipe_in[0], STDIN_FILENO) < 0 || ::dup2(pipe_out[1], STDOUT_FILENO) < 0) {
+                fail_child("dup2 failed");
+            }
+            close_pipe_pair(pipe_in);
+            close_pipe_pair(pipe_out);
+            if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+                fail_child("prctl(PR_SET_PDEATHSIG) failed");
+            }
+            if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+                fail_child("prctl(PR_SET_NO_NEW_PRIVS) failed");
+            }
+            if (::unshare(clone_flags) != 0) {
+                fail_child(std::string{"unshare: "} + std::strerror(errno));
+            }
+            if (!write_proc_file("/proc/self/setgroups", "deny")) {
+                fail_child("write /proc/self/setgroups failed");
+            }
+            if (!write_proc_file("/proc/self/uid_map", "0 " + std::to_string(host_uid) + " 1\n")) {
+                fail_child("write /proc/self/uid_map failed");
+            }
+            if (!write_proc_file("/proc/self/gid_map", "0 " + std::to_string(host_gid) + " 1\n")) {
+                fail_child("write /proc/self/gid_map failed");
+            }
+            environ = environment.data();
+            ::execvp(opts.program.c_str(), argv_storage.data());
+            fail_child(std::string{"execvp: "} + std::strerror(errno));
+        }
+
+        ::close(err_pipe[1]);
+        std::string child_error;
+        std::array<char, 256> err_buf{};
+        while (true) {
+            const ::ssize_t n = ::read(err_pipe[0], err_buf.data(), err_buf.size());
+            if (n > 0) {
+                child_error.append(err_buf.data(), static_cast<std::size_t>(n));
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        ::close(err_pipe[0]);
+        if (!child_error.empty()) {
+            int status = 0;
+            while (::waitpid(child_pid, &status, 0) < 0 && errno == EINTR) {}
+            close_pipe_pair(pipe_in);
+            close_pipe_pair(pipe_out);
+            return std::unexpected(std::string{"sandboxed spawn: "} + child_error);
+        }
+        ::close(pipe_in[0]);
+        ::close(pipe_out[1]);
+        return std::make_unique<stdio_transport>(pipe_in[1], pipe_out[0], child_pid);
+#else
+        close_pipe_pair(pipe_in);
+        close_pipe_pair(pipe_out);
+        return std::unexpected(std::string{"stdio_transport sandbox is only supported on Linux"});
+#endif
+    }
 
     ::pid_t pid = -1;
     int rc = ::posix_spawnp(

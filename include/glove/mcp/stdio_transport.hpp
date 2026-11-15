@@ -9,6 +9,11 @@
 
 namespace glove::mcp {
 
+struct stdio_sandbox_options {
+    bool enabled = false;
+    bool allow_network = false;
+};
+
 // Options for spawning an MCP server (or any line-framed peer) as a child
 // process. The child's stdin/stdout become the wire; its stderr is inherited
 // by the caller for log surfacing.
@@ -21,6 +26,8 @@ struct stdio_child_options {
     // Complete child environment as NAME=VALUE. Empty selects a minimal PATH,
     // never the host process environment.
     std::vector<std::string> environment{};
+    // Optional Linux namespace + NoNewPrivs containment for upstream MCP tools.
+    stdio_sandbox_options sandbox{};
 };
 
 // Spawn `opts.program` and return a transport that talks to it via newline-
