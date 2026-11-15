@@ -990,19 +990,27 @@ auto daemon_command(std::span<char* const> arguments) -> int {
 auto doctor_command(std::span<char* const> arguments) -> int {
     std::optional<std::filesystem::path> config_path;
     bool json = false;
+    bool verbose = false;
     for (std::size_t index = 0; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
         if (argument == "--json") {
             json = true;
             ++index;
+        } else if (argument == "-v" || argument == "--verbose") {
+            verbose = true;
+            ++index;
         } else if (argument == "--config" && index + 1 < arguments.size()) {
             config_path = arguments[index + 1];
             index += 2;
         } else if (argument == "-h" || argument == "--help") {
-            std::fprintf(stderr, "usage: glove doctor [--config <absolute-file>] [--json]\n");
+            std::fprintf(
+                stderr, "usage: glove doctor [--config <absolute-file>] [-v | --verbose] [--json]\n"
+            );
             return 0;
         } else {
-            std::fprintf(stderr, "usage: glove doctor [--config <absolute-file>] [--json]\n");
+            std::fprintf(
+                stderr, "usage: glove doctor [--config <absolute-file>] [-v | --verbose] [--json]\n"
+            );
             return 2;
         }
     }
@@ -1026,21 +1034,113 @@ auto doctor_command(std::span<char* const> arguments) -> int {
         std::printf("%s\n", output->c_str());
     } else {
         std::printf("Glove doctor: %s\n", report.healthy() ? "ready" : "not ready");
+        std::size_t hidden_info = 0;
         for (const auto& check : report.checks) {
+            if (check.status == doctor_status::info && !verbose) {
+                ++hidden_info;
+                continue;
+            }
             const char marker = check.status == doctor_status::passed    ? '+'
+                                : check.status == doctor_status::info    ? '-'
                                 : check.status == doctor_status::warning ? '!'
                                                                          : 'x';
             std::printf("%c [%s] %s\n", marker, check.code.c_str(), check.message.c_str());
-            if (check.status != doctor_status::passed && !check.recovery.empty()) {
+            if (check.status != doctor_status::passed && check.status != doctor_status::info &&
+                !check.recovery.empty()) {
                 std::printf("    %s\n", check.recovery.c_str());
             }
+        }
+        if (hidden_info > 0U) {
+            std::printf(
+                "  (%zu optional info check(s) hidden; pass --verbose to show)\n", hidden_info
+            );
         }
     }
     return report.healthy() ? 0 : 1;
 }
 
+auto status_command(std::span<char* const> arguments) -> int {
+    std::optional<std::filesystem::path> config_path;
+    bool json = false;
+    for (std::size_t index = 0; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--json") {
+            json = true;
+            ++index;
+        } else if (argument == "--config" && index + 1 < arguments.size()) {
+            config_path = arguments[index + 1];
+            index += 2;
+        } else if (argument == "-h" || argument == "--help") {
+            std::fprintf(stderr, "usage: glove status [--config <absolute-file>] [--json]\n");
+            return 0;
+        } else {
+            std::fprintf(stderr, "usage: glove status [--config <absolute-file>] [--json]\n");
+            return 2;
+        }
+    }
+    if (!config_path) {
+        auto resolved = default_path();
+        if (!resolved) {
+            return print_error(
+                "status_environment_invalid", resolved.error(), "glove setup --dry-run"
+            );
+        }
+        config_path = std::move(*resolved);
+    }
+    const auto report = diagnose(*config_path);
+    std::size_t passed = 0;
+    std::size_t info = 0;
+    std::size_t warning = 0;
+    std::size_t failed = 0;
+    bool daemon_running = false;
+    for (const auto& check : report.checks) {
+        if (check.code == "control_service" && check.status == doctor_status::passed) {
+            daemon_running = true;
+        }
+        switch (check.status) {
+        case doctor_status::passed:
+            ++passed;
+            break;
+        case doctor_status::info:
+            ++info;
+            break;
+        case doctor_status::warning:
+            ++warning;
+            break;
+        case doctor_status::failed:
+            ++failed;
+            break;
+        }
+    }
+    if (json) {
+        std::printf(
+            "{\"schema_version\":1,\"ready\":%s,\"daemon\":\"%s\",\"config_path\":\"%s\","
+            "\"counts\":{\"passed\":%zu,\"info\":%zu,\"warning\":%zu,\"failed\":%zu}}\n",
+            report.healthy() ? "true" : "false",
+            daemon_running ? "running" : "stopped",
+            report.config_path.c_str(),
+            passed,
+            info,
+            warning,
+            failed
+        );
+    } else {
+        std::printf(
+            "Glove status: %s (daemon: %s, passed=%zu, warning=%zu, failed=%zu, info=%zu)\n",
+            report.healthy() ? "ready" : "not ready",
+            daemon_running ? "running" : "stopped",
+            passed,
+            warning,
+            failed,
+            info
+        );
+    }
+    return report.healthy() ? 0 : 1;
+}
+
 auto config_command(std::span<char* const> arguments) -> int {
-    if (arguments.empty() || std::string_view{arguments.front()} == "--help") {
+    if (arguments.empty() || std::string_view{arguments.front()} == "-h" ||
+        std::string_view{arguments.front()} == "--help") {
         std::fprintf(
             stderr,
             "usage:\n"

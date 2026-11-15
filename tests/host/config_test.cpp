@@ -169,6 +169,30 @@ auto run() -> int {
     const auto report = diagnose(plan->config_path);
     REQUIRE(report.healthy());
     REQUIRE(report.checks.size() >= 5U);
+    const auto find_check = [](const doctor_report& value, std::string_view code) {
+        return std::ranges::find_if(value.checks, [code](const auto& item) {
+            return item.code == code;
+        });
+    };
+    const auto session_check = find_check(report, "session_policy");
+    REQUIRE(session_check != report.checks.end());
+    REQUIRE(session_check->status == doctor_status::info);
+
+    std::filesystem::remove_all(plan->service.runtime_directory);
+    const auto missing_runtime_report = diagnose(plan->config_path);
+    REQUIRE(missing_runtime_report.healthy());
+    const auto missing_runtime_check = find_check(missing_runtime_report, "runtime_directory");
+    REQUIRE(missing_runtime_check != missing_runtime_report.checks.end());
+    REQUIRE(missing_runtime_check->status == doctor_status::warning);
+
+    REQUIRE(std::filesystem::create_directories(plan->service.runtime_directory));
+    REQUIRE(::chmod(plan->service.runtime_directory.c_str(), 0755) == 0);
+    const auto insecure_runtime_report = diagnose(plan->config_path);
+    REQUIRE(!insecure_runtime_report.healthy());
+    const auto insecure_runtime_check = find_check(insecure_runtime_report, "runtime_directory");
+    REQUIRE(insecure_runtime_check != insecure_runtime_report.checks.end());
+    REQUIRE(insecure_runtime_check->status == doctor_status::failed);
+    REQUIRE(::chmod(plan->service.runtime_directory.c_str(), 0700) == 0);
 
     const auto derived_path = temporary.root() / ".config/glove/derived.json";
     auto derived = *loaded;

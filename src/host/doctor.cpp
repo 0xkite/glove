@@ -146,11 +146,11 @@ auto linux_host_checks(bool required, bool persistent_service) -> std::vector<do
         root_owned_executable("/usr/sbin/mkfs.ext4") || root_owned_executable("/sbin/mkfs.ext4");
     checks.push_back({
         .code = "linux_retained_storage",
-        .status = loop && mkfs ? doctor_status::passed : doctor_status::warning,
+        .status = loop && mkfs ? doctor_status::passed : doctor_status::info,
         .message = loop && mkfs
                        ? "Loop-control and immutable root-owned mkfs.ext4 support retained images."
-                       : "Retained-image prerequisites are incomplete; ephemeral sessions remain "
-                         "available.",
+                       : "Retained-image prerequisites are incomplete (optional; ephemeral "
+                         "sessions available).",
         .recovery =
             "Provide controlled loop access and root-owned mkfs.ext4 only for retained writes.",
     });
@@ -249,15 +249,27 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         .message = "Trusted Glove configuration is valid.",
         .recovery = {},
     });
+    auto health = supervisor_health(*configured);
+    const bool runtime_dir_ok = owner_only_directory(configured->runtime_directory);
+    struct stat runtime_dir_stat{};
+    const bool runtime_dir_missing =
+        !runtime_dir_ok && ::lstat(configured->runtime_directory.c_str(), &runtime_dir_stat) != 0 &&
+        errno == ENOENT;
     report.checks.push_back({
         .code = "runtime_directory",
-        .status = owner_only_directory(configured->runtime_directory) ? doctor_status::passed
-                                                                      : doctor_status::failed,
-        .message = owner_only_directory(configured->runtime_directory)
-                       ? "Runtime directory is owner-only."
+        .status = runtime_dir_ok                   ? doctor_status::passed
+                  : runtime_dir_missing && !health ? doctor_status::warning
+                                                   : doctor_status::failed,
+        .message = runtime_dir_ok ? "Runtime directory is owner-only."
+                   : runtime_dir_missing && !health
+                       ? "Runtime directory is not yet created; `glove daemon start` will create "
+                         "it with mode 0700."
                        : "Runtime directory is missing or not owner-only mode 0700.",
         .recovery =
-            "Repair the configured runtime directory ownership and mode before starting gloved.",
+            runtime_dir_missing && !health
+                ? "Run `glove daemon start`, then rerun `glove doctor`."
+                : "Repair the configured runtime directory ownership and mode before starting "
+                  "gloved.",
     });
     report.checks.push_back({
         .code = "audit_key",
@@ -270,14 +282,19 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
             "Restore the configured audit key as a current-user mode-0600 single-link file.",
     });
     const auto ledger_path = setup_ledger_path(*configured);
+    const bool ledger_exists = std::filesystem::exists(ledger_path);
     auto ledger = load_setup_ledger(ledger_path);
     const bool ledger_matches = ledger && ledger->config_path == config_path.lexically_normal();
     report.checks.push_back({
         .code = "setup_ledger",
-        .status = ledger_matches ? doctor_status::passed : doctor_status::warning,
+        .status = ledger_matches   ? doctor_status::passed
+                  : !ledger_exists ? doctor_status::info
+                                   : doctor_status::warning,
         .message = ledger_matches
                        ? "The owner-only setup resource ledger matches this configuration."
-                       : "The setup resource ledger is absent, invalid, or belongs to another "
+                   : !ledger_exists
+                       ? "No setup ledger is present (optional; managed cleanup disabled)."
+                       : "The setup resource ledger is invalid or belongs to another "
                          "configuration; runtime operation is unaffected, but managed cleanup is "
                          "disabled.",
         .recovery = ledger_matches
@@ -303,12 +320,12 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         .status = configured->session_policy
                       ? (owner_only_file(*configured->session_policy) ? doctor_status::passed
                                                                       : doctor_status::failed)
-                      : doctor_status::warning,
+                      : doctor_status::info,
         .message = configured->session_policy && owner_only_file(*configured->session_policy)
                        ? "Session policy is configured."
                    : configured->session_policy
                        ? "Session policy is missing or fails owner-only file checks."
-                       : "Session planning is disabled because no session policy is configured.",
+                       : "Session planning is disabled (no session policy configured).",
         .recovery =
             "Configure an owner-reviewed session policy before enabling Sage execution hosting.",
     });
@@ -317,13 +334,13 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         .status = configured->path_exposure_policy
                       ? (owner_only_file(*configured->path_exposure_policy) ? doctor_status::passed
                                                                             : doctor_status::failed)
-                      : doctor_status::warning,
+                      : doctor_status::info,
         .message =
             configured->path_exposure_policy && owner_only_file(*configured->path_exposure_policy)
                 ? "Project exposure policy is configured."
             : configured->path_exposure_policy
                 ? "Project exposure policy is missing or fails owner-only file checks."
-                : "Project enrollment is disabled because no protected root is configured.",
+                : "Project enrollment is disabled (no protected root configured).",
         .recovery = "Re-run setup with `--path-root <absolute-directory>`.",
     });
     for (const auto& [code, path] : {
@@ -361,7 +378,6 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         std::make_move_iterator(host_checks.end())
     );
 #endif
-    auto health = supervisor_health(*configured);
     report.checks.push_back({
         .code = "control_service",
         .status = health ? doctor_status::passed : doctor_status::warning,

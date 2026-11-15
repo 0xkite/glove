@@ -406,11 +406,33 @@ auto run_subcommand(std::span<char* const> args) -> int {
     return *code;
 }
 
+void print_usage() {
+    print_banner();
+    std::fprintf(
+        stderr,
+        "\noptions:\n"
+        "  -h, --help      show this help message and exit\n"
+        "  -V, --version   print version and exit\n"
+        "\nsubcommands:\n"
+        "  setup           initialize machine-local config, keys, and optional policies\n"
+        "  daemon          install and manage the fixed gloved user service\n"
+        "  status          show concise daemon and readiness summary\n"
+        "  doctor          diagnose configuration, sandbox prerequisites, and service health\n"
+        "  config          inspect or derive trusted machine-local configuration\n"
+        "  policy          detect harnesses and generate or validate runtime policy\n"
+        "  workspace       discover, register, and list explicit workspace exposures\n"
+        "  init            enroll a project beneath a setup-approved protected root\n"
+        "  run             spawn an MCP-client agent inside the container\n"
+        "  exec            contain a real self-driving agent (e.g. pi); stdio + egress\n"
+        "  pi              launch native macOS Pi with protected runtime and host-only API keys\n"
+    );
+}
+
 } // namespace
 
 auto main(int argc, char** argv) -> int {
     if (argc < 2) {
-        print_banner();
+        print_usage();
         return 0;
     }
     std::string_view sub{argv[1]};
@@ -446,6 +468,11 @@ auto main(int argc, char** argv) -> int {
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }
+    if (sub == "status") {
+        return glove::host::status_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
     if (sub == "config") {
         return glove::host::config_command(
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
@@ -467,21 +494,7 @@ auto main(int argc, char** argv) -> int {
         );
     }
     if (sub == "-h" || sub == "--help") {
-        print_banner();
-        std::fprintf(
-            stderr,
-            "\nsubcommands:\n"
-            "  pi      launch native macOS Pi with protected runtime and host-only API keys\n"
-            "  run     spawn an MCP-client agent inside the container\n"
-            "  exec    contain a real self-driving agent (e.g. pi); stdio + egress\n"
-            "  setup   create trusted machine-local configuration and state\n"
-            "  daemon  install and manage the fixed gloved user service\n"
-            "  workspace discover, register, and list explicit workspace exposures\n"
-            "  doctor  verify configuration and local service readiness\n"
-            "  config  inspect trusted machine-local configuration\n"
-            "  policy  detect harnesses and generate or validate runtime policy\n"
-            "  init    enroll a project beneath a setup-approved protected root\n"
-        );
+        print_usage();
         return 0;
     }
     std::fprintf(

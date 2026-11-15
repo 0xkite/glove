@@ -7,6 +7,7 @@ namespace glove::host {
 auto setup_command(std::span<char* const> arguments) -> int;
 auto daemon_command(std::span<char* const> arguments) -> int;
 auto doctor_command(std::span<char* const> arguments) -> int;
+auto status_command(std::span<char* const> arguments) -> int;
 auto config_command(std::span<char* const> arguments) -> int;
 auto policy_command(std::span<char* const> arguments) -> int;
 auto workspace_command(std::span<char* const> arguments) -> int;
