@@ -180,4 +180,23 @@ detect_runtime_harnesses(const std::vector<std::filesystem::path>& executable_se
 // valid; it does not start or advertise the service.
 [[nodiscard]] auto validate_session_policy_file(const std::filesystem::path& path) -> result<void>;
 
+struct installed_policy_entry {
+    std::string name;
+    std::filesystem::path path;
+    bool valid = false;
+    std::string error;
+};
+
+[[nodiscard]] auto is_valid_policy_name(std::string_view name) -> bool;
+[[nodiscard]] auto
+resolve_policy_reference(std::string_view name_or_path, const directories& values)
+    -> result<std::filesystem::path>;
+[[nodiscard]] auto install_policy_file(
+    const std::filesystem::path& source, std::string_view name, const directories& values
+) -> result<std::filesystem::path>;
+[[nodiscard]] auto list_installed_policies(const directories& values)
+    -> result<std::vector<installed_policy_entry>>;
+[[nodiscard]] auto remove_installed_policy(std::string_view name, const directories& values)
+    -> result<void>;
+
 } // namespace glove::host

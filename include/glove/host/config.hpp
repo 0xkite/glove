@@ -128,6 +128,7 @@ struct config {
 [[nodiscard]] auto current_environment() -> environment;
 [[nodiscard]] auto resolve_directories(const environment& values) -> result<directories>;
 [[nodiscard]] auto default_config_path(const directories& values) -> std::filesystem::path;
+[[nodiscard]] auto default_policy_directory(const directories& values) -> std::filesystem::path;
 [[nodiscard]] auto validate(const remote_backend_config& value) -> result<void>;
 [[nodiscard]] auto validate(const config& value) -> result<void>;
 [[nodiscard]] auto load_config(const std::filesystem::path& path) -> result<config>;
