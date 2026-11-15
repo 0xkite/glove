@@ -1,3 +1,4 @@
+#include "tls_peer_identity.hpp"
 #include "tls_stream.hpp"
 
 #include <fcntl.h>
@@ -355,11 +356,10 @@ auto connect_tls(
     if (!ssl) {
         return std::unexpected("tls: " + openssl_error());
     }
-    // SNI plus hostname verification against the certificate; without
-    // SSL_set1_host OpenSSL checks the chain but not that it names this host.
+    // SNI plus DNS-name or IP-address verification against the certificate.
     SSL_set_hostflags(ssl.get(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
     if (SSL_set_tlsext_host_name(ssl.get(), host.c_str()) != 1 ||
-        SSL_set1_host(ssl.get(), host.c_str()) != 1 || SSL_set_fd(ssl.get(), fd->get()) != 1) {
+        detail::set_peer_identity(ssl.get(), host) != 1 || SSL_set_fd(ssl.get(), fd->get()) != 1) {
         return std::unexpected("tls: " + openssl_error());
     }
     static constexpr unsigned char alpn[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
