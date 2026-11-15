@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -687,7 +688,9 @@ auto journal_failure_recovery(const fs::path& root) -> int {
         REQUIRE(runner.join());
     }
     for (const auto* kind : {"history_classified", "finalized"}) {
-        supervisor_fixture f{root / (std::string{"finalization-"} + kind)};
+        supervisor_fixture f{
+            root / (std::string_view{kind} == "history_classified" ? "fin-hc" : "fin-f")
+        };
         REQUIRE(f.prepare());
         f.harness.script.history = history_mode::invalid;
         auto created = native_session_supervisor::create(f.options(), f.harness);
