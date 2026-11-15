@@ -9,6 +9,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace glove::run::detail {
 namespace claude_history_wire {
@@ -77,6 +78,10 @@ auto validate_claude_history(std::string_view bytes, const claude_history_bindin
         if (!entry.type || !bounded_type(*entry.type)) {
             return std::unexpected("Claude history line lacks a bounded type");
         }
+        const bool conversational = *entry.type == "user" || *entry.type == "assistant";
+        if (conversational && (!entry.sessionId || !entry.version)) {
+            return std::unexpected("Claude history conversational entry lacks qualified identity");
+        }
         if (entry.sessionId && *entry.sessionId != binding.conversation_id) {
             return std::unexpected("Claude history is bound to another conversation");
         }
@@ -102,22 +107,36 @@ auto validate_claude_history(std::string_view bytes, const claude_history_bindin
             assistant = true;
         }
     }
-    // Every parent chain must terminate at a root inside this file: unknown
-    // parents and cycles (aliased ancestry) refuse.
-    for (const auto& [child, parent] : parent_of) {
-        if (!seen.contains(parent)) {
-            return std::unexpected("Claude history entry references an unknown parent");
-        }
-        std::string_view cursor = child;
-        for (std::size_t hop = 0; hop <= parent_of.size(); ++hop) {
-            const auto next = parent_of.find(std::string{cursor});
-            if (next == parent_of.end()) {
+    // Resolve each node and parent edge once. Ordered maps keep the complete
+    // ancestry check bounded by O(n log n), including adversarial chains.
+    enum class ancestry_state { visiting, complete };
+    std::map<std::string, ancestry_state> ancestry;
+    std::vector<std::string> path;
+    path.reserve(parent_of.size());
+    for (const auto& link : parent_of) {
+        std::string cursor = link.first;
+        path.clear();
+        while (true) {
+            const auto resolved = ancestry.find(cursor);
+            if (resolved != ancestry.end()) {
+                if (resolved->second == ancestry_state::visiting) {
+                    return std::unexpected("Claude history parent chain does not terminate");
+                }
                 break;
             }
-            if (hop == parent_of.size()) {
-                return std::unexpected("Claude history parent chain does not terminate");
+            ancestry.emplace(cursor, ancestry_state::visiting);
+            path.push_back(cursor);
+            const auto parent = parent_of.find(cursor);
+            if (parent == parent_of.end()) {
+                break;
             }
-            cursor = next->second;
+            if (!seen.contains(parent->second)) {
+                return std::unexpected("Claude history entry references an unknown parent");
+            }
+            cursor = parent->second;
+        }
+        for (const auto& node : path) {
+            ancestry.find(node)->second = ancestry_state::complete;
         }
     }
     if (!user || !assistant) {
