@@ -980,7 +980,9 @@ auto restrict_inherited_socket_inspection(
 // premature minimisation breaks debuggers, sanitizers, and language
 // runtimes that grow new syscall use across releases.
 auto setup_seccomp(
-    bool proxy_enabled, std::span<const linux_detail::inherited_stream_descriptor> inherited_streams
+    bool proxy_enabled,
+    bool allow_loopback_listen,
+    std::span<const linux_detail::inherited_stream_descriptor> inherited_streams
 ) -> std::expected<void, std::string> {
     ::scmp_filter_ctx ctx = ::seccomp_init(SCMP_ACT_ALLOW);
     if (ctx == nullptr) {
@@ -991,24 +993,29 @@ auto setup_seccomp(
         return ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), syscall_nr, 0);
     };
 
-    // Network: deny all Internet-capable socket creation. A local AF_UNIX
-    // socketpair is safe inside the private IPC namespace and lets runtimes use
-    // their signal helpers; it cannot connect to a host or network endpoint.
-    // The kernel-mediated MCP pipe is already open (file descriptors survive
-    // seccomp_load), so the agent can still read/write its existing channel.
-    const int always_denied_net_syscalls[] = {
-        SCMP_SYS(bind),
-        SCMP_SYS(listen),
-        SCMP_SYS(accept),
-        SCMP_SYS(accept4),
-    };
-    for (int sc : always_denied_net_syscalls) {
-        if (int rc = deny(sc); rc != 0) {
-            ::seccomp_release(ctx);
-            return std::unexpected(std::string{"deny network syscall: "} + std::strerror(-rc));
+    // Network: deny bind/listen/accept unless private-loopback listening is
+    // explicitly enabled inside CLONE_NEWNET. Seccomp cannot inspect the
+    // sockaddr, so the capability is scoped by the namespace instead: a fresh
+    // network namespace contains only `lo`, so any bind (including
+    // INADDR_ANY) is reachable only from inside the sandbox. AF_INET6 and
+    // other families stay denied by the socket-domain rule below. A local
+    // AF_UNIX socketpair is safe inside the private IPC namespace and lets
+    // runtimes use their signal helpers.
+    if (!allow_loopback_listen) {
+        const int always_denied_net_syscalls[] = {
+            SCMP_SYS(bind),
+            SCMP_SYS(listen),
+            SCMP_SYS(accept),
+            SCMP_SYS(accept4),
+        };
+        for (int sc : always_denied_net_syscalls) {
+            if (int rc = deny(sc); rc != 0) {
+                ::seccomp_release(ctx);
+                return std::unexpected(std::string{"deny network syscall: "} + std::strerror(-rc));
+            }
         }
     }
-    if (!proxy_enabled) {
+    if (!proxy_enabled && !allow_loopback_listen) {
         const int offline_net_syscalls[] = {
             SCMP_SYS(socket),
             SCMP_SYS(connect),
@@ -1311,12 +1318,21 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         }
     } else {
         close_fd(egress_channel_fd);
+        if (prof.allow_loopback_listen) {
+            if (auto lo = linux_detail::bring_up_loopback(); !lo) {
+                std::fprintf(stderr, "glove child: loopback: %s\n", lo.error().c_str());
+                std::_Exit(125);
+            }
+        }
     }
 
     // Seccomp filter goes after the rootfs pivot (so we don't accidentally
     // deny syscalls our setup needs) but before the agent's exec, so the
     // agent inherits the filter as its starting policy.
-    if (auto r = setup_seccomp(bridged_loopback_port(prof).has_value(), inherited_streams); !r) {
+    if (auto r = setup_seccomp(
+            bridged_loopback_port(prof).has_value(), prof.allow_loopback_listen, inherited_streams
+        );
+        !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }
@@ -1454,9 +1470,18 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         }
     } else {
         close_fd(egress_channel_fd);
+        if (prof.allow_loopback_listen) {
+            if (auto lo = linux_detail::bring_up_loopback(); !lo) {
+                std::fprintf(stderr, "glove child: loopback: %s\n", lo.error().c_str());
+                std::_Exit(125);
+            }
+        }
     }
 
-    if (auto r = setup_seccomp(bridged_loopback_port(prof).has_value(), inherited_streams); !r) {
+    if (auto r = setup_seccomp(
+            bridged_loopback_port(prof).has_value(), prof.allow_loopback_listen, inherited_streams
+        );
+        !r) {
         std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
         std::_Exit(125);
     }
