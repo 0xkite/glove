@@ -26,7 +26,7 @@ struct fixture {
     std::size_t expire_after = 99;
     bool pause_ok = true;
 
-    auto run() {
+    auto run(bool prior_group_eperm = false) {
         return drain_owned_group(
             [&]() -> std::optional<int> {
                 ++signal_calls;
@@ -41,7 +41,8 @@ struct fixture {
             [&]() {
                 ++pause_calls;
                 return pause_ok;
-            }
+            },
+            prior_group_eperm
         );
     }
 };
@@ -100,6 +101,45 @@ auto run() -> int {
     auto retained_denial = denial_then_lost_owner.run();
     REQUIRE(!retained_denial && retained_denial.error().reason == group_cleanup_failure::ownership);
     REQUIRE(retained_denial.error().deferred_error == EPERM);
+    fixture earlier_denial_resolved{{0}, {false}};
+    REQUIRE(earlier_denial_resolved.run(true));
+    REQUIRE(
+        earlier_denial_resolved.signal_calls == 1 && earlier_denial_resolved.inspect_calls == 1
+    );
+    fixture earlier_denial_lost_owner{{std::nullopt}, {}};
+    auto earlier_lost_owner = earlier_denial_lost_owner.run(true);
+    REQUIRE(
+        !earlier_lost_owner && earlier_lost_owner.error().reason == group_cleanup_failure::ownership
+    );
+    REQUIRE(earlier_lost_owner.error().deferred_error == EPERM);
+    fixture earlier_denial_inspection{{0}, {std::nullopt}};
+    auto earlier_inspection = earlier_denial_inspection.run(true);
+    REQUIRE(
+        !earlier_inspection &&
+        earlier_inspection.error().reason == group_cleanup_failure::inspection
+    );
+    REQUIRE(earlier_inspection.error().deferred_error == EPERM);
+    fixture earlier_denial_deadline{{0}, {true}};
+    earlier_denial_deadline.expire_after = 1;
+    auto earlier_deadline = earlier_denial_deadline.run(true);
+    REQUIRE(
+        !earlier_deadline && earlier_deadline.error().reason == group_cleanup_failure::deadline
+    );
+    REQUIRE(earlier_deadline.error().deferred_error == EPERM);
+    fixture earlier_denial_pause{{0}, {true}};
+    earlier_denial_pause.pause_ok = false;
+    auto earlier_pause = earlier_denial_pause.run(true);
+    REQUIRE(!earlier_pause && earlier_pause.error().reason == group_cleanup_failure::pause);
+    REQUIRE(earlier_pause.error().deferred_error == EPERM);
+    fixture earlier_denial_then_error{{EINVAL}, {false}};
+    auto earlier_then_error = earlier_denial_then_error.run(true);
+    REQUIRE(
+        !earlier_then_error && earlier_then_error.error().reason == group_cleanup_failure::signal
+    );
+    REQUIRE(
+        earlier_then_error.error().deferred_error == EPERM &&
+        earlier_then_error.error().signal_error == EINVAL
+    );
     return 0;
 }
 } // namespace
