@@ -109,6 +109,12 @@ struct policy_install_report {
     std::string installed_path;
 };
 
+struct policy_remove_report {
+    std::uint8_t schema_version = 1;
+    std::string name;
+    bool removed = true;
+};
+
 [[nodiscard]] auto encode(const detection_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const stage_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const pi_adoption_report& report) -> result<std::string>;
@@ -117,5 +123,6 @@ struct policy_install_report {
 [[nodiscard]] auto encode(const onboarding_plan_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const policy_list_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const policy_install_report& report) -> result<std::string>;
+[[nodiscard]] auto encode(const policy_remove_report& report) -> result<std::string>;
 
 } // namespace glove::host::policy_wire
