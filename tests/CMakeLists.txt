@@ -474,12 +474,22 @@ if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     if(GLOVE_ENABLE_SAGE_INTEROP_TEST)
         find_program(GLOVE_CARGO_EXECUTABLE NAMES cargo REQUIRED)
-        set(GLOVE_SAGE_MANIFEST "${CMAKE_SOURCE_DIR}/../sage/Cargo.toml")
-        if(NOT EXISTS "${GLOVE_SAGE_MANIFEST}")
+        if(NOT DEFINED GLOVE_SAGE_MANIFEST)
+            set(GLOVE_SAGE_MANIFEST "${CMAKE_SOURCE_DIR}/../sage/Cargo.toml")
+        endif()
+        # Validate before FILEPATH cache conversion can normalize relative input.
+        if(NOT IS_ABSOLUTE "${GLOVE_SAGE_MANIFEST}"
+            OR NOT EXISTS "${GLOVE_SAGE_MANIFEST}"
+            OR IS_DIRECTORY "${GLOVE_SAGE_MANIFEST}"
+        )
             message(FATAL_ERROR
-                "GLOVE_ENABLE_SAGE_INTEROP_TEST requires ../sage/Cargo.toml"
+                "GLOVE_ENABLE_SAGE_INTEROP_TEST requires an existing absolute manifest file "
+                "GLOVE_SAGE_MANIFEST (got '${GLOVE_SAGE_MANIFEST}')"
             )
         endif()
+        set(GLOVE_SAGE_MANIFEST "${GLOVE_SAGE_MANIFEST}"
+            CACHE FILEPATH "Absolute path to the Sage Cargo manifest used by the interop test"
+        )
         add_test(
             NAME sage_receipt_audit_interop
             COMMAND
