@@ -2189,9 +2189,20 @@ auto session_command(std::span<char* const> arguments) -> int {
             "Check that --plan points to an existing readable JSON file."
         );
     }
-    std::string plan_json(
-        (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>()
-    );
+    constexpr std::size_t max_plan_bytes = 1024U * 1024U;
+    std::string plan_json;
+    char chunk[8192];
+    while (input.read(chunk, sizeof(chunk)) || input.gcount() > 0) {
+        const auto count = static_cast<std::size_t>(input.gcount());
+        if (plan_json.size() + count > max_plan_bytes) {
+            return print_error(
+                "session_plan_too_large",
+                "The session plan file exceeds the 1 MiB control frame limit.",
+                "Supply a canonical session plan JSON file no larger than 1048576 bytes."
+            );
+        }
+        plan_json.append(chunk, count);
+    }
     if (plan_json.empty()) {
         return print_error(
             "session_plan_empty",
@@ -2200,7 +2211,10 @@ auto session_command(std::span<char* const> arguments) -> int {
         );
     }
     if (idempotency_key.empty()) {
-        idempotency_key = "session-" + session_id;
+        constexpr std::size_t max_key_bytes = 128U;
+        constexpr std::string_view prefix = "session-";
+        idempotency_key =
+            std::string{prefix} + session_id.substr(0, max_key_bytes - prefix.size());
     }
     auto status = create_workspace_session(
         *configured,
