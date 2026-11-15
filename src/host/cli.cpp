@@ -2213,8 +2213,7 @@ auto session_command(std::span<char* const> arguments) -> int {
     if (idempotency_key.empty()) {
         constexpr std::size_t max_key_bytes = 128U;
         constexpr std::string_view prefix = "session-";
-        idempotency_key =
-            std::string{prefix} + session_id.substr(0, max_key_bytes - prefix.size());
+        idempotency_key = std::string{prefix} + session_id.substr(0, max_key_bytes - prefix.size());
     }
     auto status = create_workspace_session(
         *configured,
