@@ -52,6 +52,9 @@ struct options {
     // Preset agent profile (e.g. "claude-code", "codex", "pi") that selects a
     // credentialed reverse endpoint and generates the matching environment.
     std::optional<std::string> agent_preset;
+    // Permit private-loopback socket binding/listening inside the sandbox's
+    // isolated network namespace (required by runtimes like agy).
+    bool allow_loopback_listen = false;
 };
 
 // Run the contained agent end-to-end: build the profile, spawn the agent,

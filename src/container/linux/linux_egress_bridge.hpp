@@ -39,4 +39,9 @@ auto start_host_egress_bridge(int host_channel_fd, std::uint16_t proxy_port)
 auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::uint16_t proxy_port)
     -> std::expected<void, std::string>;
 
+// Brings up the private loopback interface (`lo`) inside CLONE_NEWNET without
+// starting an egress bridge. Used when `allow_loopback_listen` is enabled
+// without external egress.
+auto bring_up_loopback() -> std::expected<void, std::string>;
+
 } // namespace glove::container::linux_detail
