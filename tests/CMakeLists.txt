@@ -646,6 +646,14 @@ if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_dependencies(glove_exec_perimeter_test glove)
     add_test(NAME glove_exec_perimeter COMMAND glove_exec_perimeter_test)
     set_tests_properties(glove_exec_perimeter PROPERTIES TIMEOUT 30)
+
+    add_executable(glove_shell_loop_cli_test run/glove_shell_loop_cli_test.cpp)
+    target_link_libraries(glove_shell_loop_cli_test PRIVATE glove_kernel)
+    target_compile_definitions(glove_shell_loop_cli_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_shell_loop_cli_test glove)
+    add_test(NAME glove_shell_loop_cli COMMAND glove_shell_loop_cli_test)
+    set_tests_properties(glove_shell_loop_cli PROPERTIES TIMEOUT 30)
 endif()
 
 if(APPLE)
