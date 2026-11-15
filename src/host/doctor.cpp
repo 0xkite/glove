@@ -296,17 +296,18 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
             "Restore the configured audit key as a current-user mode-0600 single-link file.",
     });
     const auto ledger_path = setup_ledger_path(*configured);
-    const bool ledger_exists = std::filesystem::exists(ledger_path);
+    struct stat ledger_stat{};
+    const bool ledger_absent = ::lstat(ledger_path.c_str(), &ledger_stat) != 0 && errno == ENOENT;
     auto ledger = load_setup_ledger(ledger_path);
     const bool ledger_matches = ledger && ledger->config_path == config_path.lexically_normal();
     report.checks.push_back({
         .code = "setup_ledger",
-        .status = ledger_matches   ? doctor_status::passed
-                  : !ledger_exists ? doctor_status::info
-                                   : doctor_status::warning,
+        .status = ledger_matches  ? doctor_status::passed
+                  : ledger_absent ? doctor_status::info
+                                  : doctor_status::warning,
         .message = ledger_matches
                        ? "The owner-only setup resource ledger matches this configuration."
-                   : !ledger_exists
+                   : ledger_absent
                        ? "No setup ledger is present (optional; managed cleanup disabled)."
                        : "The setup resource ledger is invalid or belongs to another "
                          "configuration; runtime operation is unaffected, but managed cleanup is "
