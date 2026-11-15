@@ -43,4 +43,12 @@ auto encode(const onboarding_plan_report& report) -> result<std::string> {
     return encode_json(report);
 }
 
+auto encode(const policy_list_report& report) -> result<std::string> {
+    return encode_json(report);
+}
+
+auto encode(const policy_install_report& report) -> result<std::string> {
+    return encode_json(report);
+}
+
 } // namespace glove::host::policy_wire

@@ -108,23 +108,8 @@ void print_setup_usage() {
         "  glove setup adopt [--config <absolute-file>] [--dry-run | --yes]\n"
         "  glove setup cleanup [--config <absolute-file>]\n"
         "      [--dry-run | --yes --confirm-ledger <sha256>]\n"
-        "  glove setup plan --path-root <absolute-directory>\n"
-        "      --search-path <absolute-directory>... [--config <absolute-file>]\n"
-        "      [--runtime <adapter-id>]... [--backend <linux_production|apple_container>]\n"
-        "      [--hostile-content] [--pi-settings <absolute-file>\n"
-        "       --pi-package-store <absolute-directory> --pi-adoption-root <absolute-directory>]\n"
-        "      [--show-policy] [--json]\n"
-        "  glove setup policy --search-path <absolute-directory>...\n"
-        "      --harness-root <absolute-directory> --path-root <absolute-directory>\n"
-        "      --output <absolute-file> [--backend <linux_production|apple_container>]\n"
-        "      [--runtime <adapter-id>]... [--hostile-content]\n"
-        "      [--pi-settings <absolute-file> --pi-package-store <absolute-directory>\n"
-        "       --pi-adoption-root <absolute-directory>]\n"
-        "      [--egress <policy-id> <host> <port>]...\n"
-        "      [--secret <runtime-id> <handle> <absolute-source> <sandbox-target>]...\n"
-        "      [--dry-run | --yes] [--json]\n"
         "  glove setup [--config <absolute-file>] [--path-root <absolute-directory>] "
-        "[--session-policy <absolute-file>] "
+        "[--session-policy <name-or-absolute-file>] "
         "[--root-id <id>] [--runtime <template-id>]... [--persistent] "
         "[--dry-run | --yes [--start]]\n"
     );
@@ -182,6 +167,9 @@ void print_policy_usage() {
     std::fprintf(
         stderr,
         "usage:\n"
+        "  glove policy install --file <absolute-file> [--name <id>] [--json]\n"
+        "  glove policy list [--json]\n"
+        "  glove policy remove --name <id> [--json]\n"
         "  glove policy detect --search-path <absolute-directory>... [--json]\n"
         "  glove policy stage --runtime <id> --source <absolute-file>\n"
         "      --directory <absolute-directory> [--dry-run | --yes] [--json]\n"
@@ -193,8 +181,13 @@ void print_policy_usage() {
         "      [--argument <value>]... [--environment <NAME=VALUE>]...\n"
         "      [--read-only-path <absolute-path>]... [--path-alias <id>]...\n"
         "      [--projection-destination <id>]...\n"
-        "  glove policy validate --file <absolute-file> [--json]\n"
-        "  glove policy explain --file <absolute-file> [--json]\n"
+        "  glove policy plan --path-root <absolute-directory>\n"
+        "      --search-path <absolute-directory>... [options]\n"
+        "  glove policy session --search-path <absolute-directory>...\n"
+        "      --harness-root <absolute-directory> --path-root <absolute-directory>\n"
+        "      --output <absolute-file> [options]\n"
+        "  glove policy validate (--file <name-or-absolute-file> | --name <id>) [--json]\n"
+        "  glove policy explain (--file <name-or-absolute-file> | --name <id>) [--json]\n"
     );
 }
 
@@ -841,7 +834,17 @@ auto setup_command(std::span<char* const> arguments) -> int {
             } else if (argument == "--path-root") {
                 options.protected_root = value;
             } else if (argument == "--session-policy") {
-                options.session_policy = value;
+                if (const auto dirs = resolve_directories(current_environment())) {
+                    auto resolved = resolve_policy_reference(value, *dirs);
+                    if (!resolved) {
+                        return print_error(
+                            "setup_session_policy_invalid", resolved.error(), "glove policy list"
+                        );
+                    }
+                    options.session_policy = *resolved;
+                } else {
+                    options.session_policy = value;
+                }
             } else if (argument == "--root-id") {
                 options.root_id = value;
             } else {
@@ -1399,6 +1402,155 @@ auto policy_command(std::span<char* const> arguments) -> int {
         print_policy_usage();
         return 0;
     }
+    if (action == "plan") {
+        return setup_plan_command(arguments.subspan(1));
+    }
+    if (action == "session") {
+        return setup_policy_command(arguments.subspan(1));
+    }
+    if (action == "install") {
+        std::optional<std::filesystem::path> source_path;
+        std::optional<std::string> policy_name;
+        bool json = false;
+        for (std::size_t index = 1; index < arguments.size();) {
+            const std::string_view argument{arguments[index]};
+            if (argument == "--json") {
+                json = true;
+                ++index;
+            } else if (argument == "--file" && index + 1 < arguments.size()) {
+                source_path = arguments[index + 1];
+                index += 2;
+            } else if (argument == "--name" && index + 1 < arguments.size()) {
+                policy_name = arguments[index + 1];
+                index += 2;
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+        }
+        if (!source_path) {
+            print_policy_usage();
+            return 2;
+        }
+        const auto dirs = resolve_directories(current_environment());
+        if (!dirs) {
+            return print_error("policy_dirs_failed", dirs.error(), "glove doctor");
+        }
+        const std::string effective_name = policy_name.value_or(source_path->stem().string());
+        auto installed = install_policy_file(*source_path, effective_name, *dirs);
+        if (!installed) {
+            return print_error(
+                "policy_install_failed",
+                installed.error(),
+                "glove policy validate --file <absolute-file>"
+            );
+        }
+        if (json) {
+            policy_wire::policy_install_report report{
+                .name = effective_name,
+                .source_path = source_path->string(),
+                .installed_path = installed->string(),
+            };
+            auto encoded = policy_wire::encode(report);
+            if (!encoded) {
+                return print_error(
+                    "policy_encode_failed",
+                    "Could not encode policy install output.",
+                    "glove policy install --help"
+                );
+            }
+            std::printf("%s\n", encoded->c_str());
+        } else {
+            std::printf(
+                "Installed policy '%s' -> %s\n", effective_name.c_str(), installed->c_str()
+            );
+        }
+        return 0;
+    }
+    if (action == "list") {
+        bool json = false;
+        for (std::size_t index = 1; index < arguments.size(); ++index) {
+            if (std::string_view{arguments[index]} == "--json") {
+                json = true;
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+        }
+        const auto dirs = resolve_directories(current_environment());
+        if (!dirs) {
+            return print_error("policy_dirs_failed", dirs.error(), "glove doctor");
+        }
+        auto listed = list_installed_policies(*dirs);
+        if (!listed) {
+            return print_error("policy_list_failed", listed.error(), "glove doctor");
+        }
+        const auto policy_dir = default_policy_directory(*dirs);
+        if (json) {
+            policy_wire::policy_list_report report{
+                .directory = policy_dir.string(),
+                .policies = {},
+            };
+            for (const auto& entry : *listed) {
+                report.policies.push_back({
+                    .name = entry.name,
+                    .path = entry.path.string(),
+                    .valid = entry.valid,
+                    .error = entry.error,
+                });
+            }
+            auto encoded = policy_wire::encode(report);
+            if (!encoded) {
+                return print_error(
+                    "policy_encode_failed",
+                    "Could not encode policy list output.",
+                    "glove policy list --help"
+                );
+            }
+            std::printf("%s\n", encoded->c_str());
+        } else {
+            std::printf("Policy directory: %s\n", policy_dir.c_str());
+            if (listed->empty()) {
+                std::printf("  (none installed)\n");
+            } else {
+                for (const auto& entry : *listed) {
+                    std::printf(
+                        "  %c %-20s %s%s\n",
+                        entry.valid ? '+' : 'x',
+                        entry.name.c_str(),
+                        entry.path.c_str(),
+                        entry.valid ? "" : (" (" + entry.error + ")").c_str()
+                    );
+                }
+            }
+        }
+        return 0;
+    }
+    if (action == "remove") {
+        std::optional<std::string> policy_name;
+        for (std::size_t index = 1; index < arguments.size();) {
+            if (std::string_view{arguments[index]} == "--name" && index + 1 < arguments.size()) {
+                policy_name = arguments[index + 1];
+                index += 2;
+            } else {
+                print_policy_usage();
+                return 2;
+            }
+        }
+        if (!policy_name) {
+            print_policy_usage();
+            return 2;
+        }
+        const auto dirs = resolve_directories(current_environment());
+        if (!dirs) {
+            return print_error("policy_dirs_failed", dirs.error(), "glove doctor");
+        }
+        if (auto removed = remove_installed_policy(*policy_name, *dirs); !removed) {
+            return print_error("policy_remove_failed", removed.error(), "glove policy list");
+        }
+        std::printf("Removed policy '%s'\n", policy_name->c_str());
+        return 0;
+    }
     if (action == "detect") {
         std::vector<std::filesystem::path> search_paths;
         bool json = false;
@@ -1758,25 +1910,45 @@ auto policy_command(std::span<char* const> arguments) -> int {
         return 0;
     }
     if (action == "validate" || action == "explain") {
-        std::optional<std::filesystem::path> policy_path;
+        std::optional<std::string> policy_ref;
         bool json = false;
         for (std::size_t index = 1; index < arguments.size();) {
             const std::string_view argument{arguments[index]};
             if (argument == "--json") {
                 json = true;
                 ++index;
-            } else if (argument == "--file" && index + 1 < arguments.size()) {
-                policy_path = arguments[index + 1];
+            } else if (
+                (argument == "--file" || argument == "--name") && index + 1 < arguments.size()
+            ) {
+                policy_ref = arguments[index + 1];
                 index += 2;
             } else {
                 print_policy_usage();
                 return 2;
             }
         }
-        if (!policy_path) {
+        if (!policy_ref) {
             print_policy_usage();
             return 2;
         }
+        std::filesystem::path resolved_path{*policy_ref};
+        if (!resolved_path.is_absolute()) {
+            const auto dirs = resolve_directories(current_environment());
+            if (!dirs) {
+                return print_error("policy_dirs_failed", dirs.error(), "glove doctor");
+            }
+            auto resolved = resolve_policy_reference(*policy_ref, *dirs);
+            if (!resolved) {
+                return print_error(
+                    "policy_invalid",
+                    resolved.error(),
+                    "pass an absolute --file path or an installed policy name from `glove policy "
+                    "list`"
+                );
+            }
+            resolved_path = *resolved;
+        }
+        const std::optional<std::filesystem::path> policy_path = resolved_path;
         auto valid = validate_session_policy_file(*policy_path);
         if (action == "validate" && !json) {
             if (!valid) {
