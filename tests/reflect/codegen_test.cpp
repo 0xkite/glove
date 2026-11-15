@@ -42,19 +42,25 @@ int main() {
     if (!require(descriptor.name == "read_elf", "descriptor.name == read_elf")) {
         return 1;
     }
-    if (!require(descriptor.description == "Inspect ELF headers of a pinned binary",
-                 "descriptor.description")) {
+    if (!require(
+            descriptor.description == "Inspect ELF headers of a pinned binary",
+            "descriptor.description"
+        )) {
         return 1;
     }
 
     const std::string expected_schema =
         R"({"type":"object","properties":{"path":{"type":"string","description":"Read-only quarantined artifact path"},"sections":{"type":"boolean","description":"Include section table"},"max_symbols":{"type":"integer","description":"Maximum symbol entries"},"extra_flags":{"type":"array","items":{"type":"string"}}},"required":["path","extra_flags"]})";
-    if (!require(descriptor.input_schema_json == expected_schema,
-                 "descriptor.input_schema_json == expected_schema")) {
+    if (!require(
+            descriptor.input_schema_json == expected_schema,
+            "descriptor.input_schema_json == expected_schema"
+        )) {
         return 1;
     }
-    if (!require(glove::reflect::input_schema_of<read_elf_args>() == expected_schema,
-                 "input_schema_of == expected_schema")) {
+    if (!require(
+            glove::reflect::input_schema_of<read_elf_args>() == expected_schema,
+            "input_schema_of == expected_schema"
+        )) {
         return 1;
     }
 #else
