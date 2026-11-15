@@ -132,11 +132,14 @@ resumption. `--bare` makes Anthropic authentication strictly
 
 History is Claude's `projects/<encoded cwd>/<uuid>.jsonl`. Admission
 (`src/run/claude_history.cpp`) binds the observed 2.1.296 shape: one bounded
-JSON object per line, `sessionId` equal to the host conversation id on every
-identified entry, `version` equal to the admitted runtime version, unique
-UUIDs, parent links that resolve within the file and terminate, and at least
-one user and one assistant entry. A stopped initial turn is `invalid` and
-produces no checkpoint; no new conversation is substituted.
+JSON object per line, every user and assistant record carries `sessionId`
+equal to the host conversation id and `version` equal to the admitted runtime
+version, optional identity fields on other records are still checked when
+present, and UUIDs are unique. Parent links resolve against the whole file, so
+forward attachment links remain valid; an iterative memoized walk rejects
+unknown parents and cycles in O(n log n) time with ordered containers. At least
+one user and one assistant entry are required. A stopped initial turn is
+`invalid` and produces no checkpoint; no new conversation is substituted.
 
 ## Interactive and tool lanes
 
