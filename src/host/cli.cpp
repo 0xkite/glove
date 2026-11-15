@@ -1528,8 +1528,13 @@ auto policy_command(std::span<char* const> arguments) -> int {
     }
     if (action == "remove") {
         std::optional<std::string> policy_name;
+        bool json = false;
         for (std::size_t index = 1; index < arguments.size();) {
-            if (std::string_view{arguments[index]} == "--name" && index + 1 < arguments.size()) {
+            const std::string_view argument{arguments[index]};
+            if (argument == "--json") {
+                json = true;
+                ++index;
+            } else if (argument == "--name" && index + 1 < arguments.size()) {
                 policy_name = arguments[index + 1];
                 index += 2;
             } else {
@@ -1548,7 +1553,23 @@ auto policy_command(std::span<char* const> arguments) -> int {
         if (auto removed = remove_installed_policy(*policy_name, *dirs); !removed) {
             return print_error("policy_remove_failed", removed.error(), "glove policy list");
         }
-        std::printf("Removed policy '%s'\n", policy_name->c_str());
+        if (json) {
+            policy_wire::policy_remove_report report{
+                .name = *policy_name,
+                .removed = true,
+            };
+            auto encoded = policy_wire::encode(report);
+            if (!encoded) {
+                return print_error(
+                    "policy_encode_failed",
+                    "Could not encode policy remove output.",
+                    "glove policy remove --help"
+                );
+            }
+            std::printf("%s\n", encoded->c_str());
+        } else {
+            std::printf("Removed policy '%s'\n", policy_name->c_str());
+        }
         return 0;
     }
     if (action == "detect") {

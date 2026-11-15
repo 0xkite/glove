@@ -743,6 +743,29 @@ auto run() -> int {
     auto listed_after_remove = glove::host::list_installed_policies(xdg_dirs);
     REQUIRE(listed_after_remove.has_value());
     REQUIRE(listed_after_remove->empty());
+
+    // Reject relaxed permissions (0755) on the policy directory.
+    REQUIRE(::chmod((xdg_dirs.config / "policies").c_str(), 0755) == 0);
+    REQUIRE(!glove::host::list_installed_policies(xdg_dirs).has_value());
+    REQUIRE(!glove::host::resolve_policy_reference("hostile-re", xdg_dirs).has_value());
+    REQUIRE(!glove::host::install_policy_file(
+                 snapshotted_prepare_options.policy_path, "hostile-re", xdg_dirs
+    )
+                 .has_value());
+    REQUIRE(::chmod((xdg_dirs.config / "policies").c_str(), 0700) == 0);
+
+    // Reject symlinked policy directory across install, resolve, list, and remove.
+    std::filesystem::remove_all(xdg_dirs.config / "policies");
+    const auto outside_dir = xdg_root / "outside-policies";
+    std::filesystem::create_directories(outside_dir);
+    std::filesystem::create_directory_symlink(outside_dir, xdg_dirs.config / "policies");
+    REQUIRE(!glove::host::install_policy_file(
+                 snapshotted_prepare_options.policy_path, "hostile-re", xdg_dirs
+    )
+                 .has_value());
+    REQUIRE(!glove::host::resolve_policy_reference("hostile-re", xdg_dirs).has_value());
+    REQUIRE(!glove::host::list_installed_policies(xdg_dirs).has_value());
+    REQUIRE(!glove::host::remove_installed_policy("hostile-re", xdg_dirs).has_value());
     std::filesystem::remove_all(xdg_root);
 
     return 0;
