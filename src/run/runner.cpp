@@ -12,9 +12,10 @@
 #include "glove/mcp/stdio_transport.hpp"
 #include "glove/net/credentialed_endpoint.hpp"
 #include "glove/net/egress_proxy.hpp"
-#include "glove/net/tls_forwarder.hpp"
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
+
+#include "provider_endpoint.hpp"
 
 #include <spawn.h>
 #include <sys/random.h>
@@ -364,11 +365,9 @@ auto start_egress(
 struct preset_definition {
     glove::net::endpoint_provider provider;
     std::string_view label;
-    std::string_view path_prefix;
-    std::string_view upstream_host;
+    detail::provider_surface surface;
     std::string_view base_url_env;
     std::string_view api_key_env;
-    std::vector<std::string> allowed_paths;
 };
 
 auto preset_definition_for(std::string_view name) -> std::optional<preset_definition> {
@@ -376,33 +375,27 @@ auto preset_definition_for(std::string_view name) -> std::optional<preset_defini
         return preset_definition{
             .provider = glove::net::endpoint_provider::anthropic,
             .label = "claude-code",
-            .path_prefix = "/anthropic",
-            .upstream_host = "api.anthropic.com",
+            .surface = detail::provider_surface::legacy_anthropic,
             .base_url_env = "ANTHROPIC_BASE_URL",
             .api_key_env = "ANTHROPIC_API_KEY",
-            .allowed_paths = {"/v1/messages", "/v1/messages/count_tokens"},
         };
     }
     if (name == "codex" || name == "openai") {
         return preset_definition{
             .provider = glove::net::endpoint_provider::openai,
             .label = "codex",
-            .path_prefix = "/openai",
-            .upstream_host = "api.openai.com",
+            .surface = detail::provider_surface::legacy_openai,
             .base_url_env = "OPENAI_BASE_URL",
             .api_key_env = "OPENAI_API_KEY",
-            .allowed_paths = {"/v1/chat/completions", "/v1/responses", "/v1/models"},
         };
     }
     if (name == "pi") {
         return preset_definition{
             .provider = glove::net::endpoint_provider::anthropic,
             .label = "pi",
-            .path_prefix = "/anthropic",
-            .upstream_host = "api.anthropic.com",
+            .surface = detail::provider_surface::legacy_anthropic,
             .base_url_env = "ANTHROPIC_BASE_URL",
             .api_key_env = "ANTHROPIC_API_KEY",
-            .allowed_paths = {"/v1/messages", "/v1/messages/count_tokens"},
         };
     }
     return std::nullopt;
@@ -490,28 +483,12 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
         return std::unexpected(nonce.error());
     }
 
-    glove::net::credentialed_endpoint_options endpoint_options;
-    endpoint_options.endpoints.push_back({
-        .provider = definition->provider,
-        .path_prefix = std::string{definition->path_prefix},
-        .upstream_host = std::string{definition->upstream_host},
-        .upstream_port = 443,
-        .secret_token = std::string{secret},
-        .session_nonce = *nonce,
-        .allowed_methods = {"POST"},
-        .allowed_paths = definition->allowed_paths,
-    });
-    // The forwarder may dial exactly the preset's provider and nothing else,
-    // independently of the rule the endpoint matched.
-    endpoint_options.forward = glove::net::make_tls_forwarder({
-        .allowed_upstreams = {{std::string{definition->upstream_host}, 443}},
-    });
-    // The transport buffers the whole response, so its deadline must cover a
-    // complete generation, including a streamed one. Providers bound a single
-    // request at about ten minutes; a shorter deadline turns a long but healthy
-    // generation into a 502 after the provider has already billed it.
-    endpoint_options.upstream_deadline_ms = 10 * 60 * 1000;
-    endpoint_options.on_event =
+    auto endpoint_options =
+        detail::make_provider_endpoint_options(definition->surface, std::string{secret}, *nonce);
+    if (!endpoint_options) {
+        return std::unexpected(endpoint_options.error());
+    }
+    endpoint_options->on_event =
         [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
         const std::string subject = event.method + " " + event.path;
         const auto status = event.allowed ? glove::mcp::tool_call_status::ok
@@ -532,7 +509,7 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
         return {};
     };
 
-    auto endpoint = glove::net::start_credentialed_endpoint(std::move(endpoint_options));
+    auto endpoint = glove::net::start_credentialed_endpoint(std::move(*endpoint_options));
     if (!endpoint) {
         return std::unexpected(std::string{"credentialed endpoint: "} + endpoint.error());
     }

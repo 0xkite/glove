@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <expected>
 #include <filesystem>
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace glove::container {
@@ -36,6 +38,71 @@ auto canonical_path(std::string_view raw, std::string_view label)
         return std::unexpected(std::string{label} + " may not grant the filesystem root");
     }
     return normal.string();
+}
+
+auto protected_path(std::string_view raw, std::string_view label, bool directory)
+    -> std::expected<void, std::string> {
+    if (raw.empty() || raw.size() > 4096U || raw.find('\0') != std::string_view::npos) {
+        return std::unexpected(std::string{label} + " must be a bounded path without NUL");
+    }
+    const std::filesystem::path candidate{raw};
+    if (!candidate.is_absolute() || candidate == candidate.root_path()) {
+        return std::unexpected(std::string{label} + " must be a non-root absolute path");
+    }
+    std::error_code ec;
+    const auto canonical = std::filesystem::canonical(candidate, ec);
+    if (ec || canonical.string() != raw) {
+        return std::unexpected(std::string{label} + " must already be canonical and exist");
+    }
+    if (directory && (!std::filesystem::is_directory(candidate, ec) || ec)) {
+        return std::unexpected(std::string{label} + " must be a directory");
+    }
+    return {};
+}
+
+auto reserved_name(std::string_view name) -> bool {
+    return !name.empty() && name.size() <= 64U && name != "." && name != ".." &&
+           std::ranges::all_of(name, [](char c) {
+               return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                      c == '-' || c == '_' || c == '.';
+           });
+}
+
+auto folded_name(std::string name) -> std::string {
+    for (auto& c : name) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return name;
+}
+
+auto constraint_bounds(const profile& p) -> std::expected<void, std::string> {
+    if (p.immutable_files.size() > 16U || p.reserved_entries.size() > 4U) {
+        return std::unexpected(
+            std::string{"launch constraints exceed file or reserved count bound"}
+        );
+    }
+    std::size_t file_bytes = 0;
+    for (const auto& file : p.immutable_files) {
+        if (file.size() > 4096U || file.size() > 8192U - file_bytes) {
+            return std::unexpected(std::string{"immutable files exceed path byte bounds"});
+        }
+        file_bytes += file.size();
+    }
+    std::size_t reserved_bytes = 0;
+    for (const auto& entry : p.reserved_entries) {
+        if (entry.parent.size() > 4096U || !reserved_name(entry.name) ||
+            entry.parent.size() > 16384U - reserved_bytes) {
+            return std::unexpected(std::string{"reserved entries exceed path or name bounds"});
+        }
+        reserved_bytes += entry.parent.size();
+        if (entry.name.size() > 16384U - reserved_bytes) {
+            return std::unexpected(std::string{"reserved entries exceed aggregate byte bound"});
+        }
+        reserved_bytes += entry.name.size();
+    }
+    return {};
 }
 
 auto valid_environment_name(std::string_view name) -> bool {
@@ -155,6 +222,9 @@ auto resource_enforcement_capabilities::complete() const noexcept -> bool {
 }
 
 auto validate(const profile& p) -> std::expected<profile, std::string> {
+    if (auto bounded = constraint_bounds(p); !bounded) {
+        return std::unexpected(bounded.error());
+    }
     profile copy = p;
     std::set<std::string> paths;
     for (auto& rule : copy.filesystem) {
@@ -177,6 +247,42 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
                     "' and '" + inner->path + "'"
                 );
             }
+        }
+    }
+
+    // Exact roots plus the overlap rejection above keep the protected parent
+    // outside any writable ancestor grant that could replace the parent itself.
+    const auto exact_writable_root = [&](const std::string& parent) {
+        return std::ranges::any_of(copy.filesystem, [&](const auto& rule) {
+            return rule.writable && rule.path == parent;
+        });
+    };
+    std::set<std::string> immutable_paths;
+    for (const auto& file : copy.immutable_files) {
+        if (auto canonical = protected_path(file, "immutable file", false); !canonical) {
+            return std::unexpected(canonical.error());
+        }
+        if (!immutable_paths.insert(file).second) {
+            return std::unexpected(std::string{"duplicate immutable file"});
+        }
+        if (!exact_writable_root(std::filesystem::path{file}.parent_path().string())) {
+            return std::unexpected(
+                std::string{"immutable file parent must exactly match a writable filesystem rule"}
+            );
+        }
+    }
+    std::set<std::pair<std::string, std::string>> reserved_paths;
+    for (const auto& entry : copy.reserved_entries) {
+        if (auto canonical = protected_path(entry.parent, "reserved parent", true); !canonical) {
+            return std::unexpected(canonical.error());
+        }
+        if (!exact_writable_root(entry.parent)) {
+            return std::unexpected(
+                std::string{"reserved parent must exactly match a writable filesystem rule"}
+            );
+        }
+        if (!reserved_paths.emplace(entry.parent, folded_name(entry.name)).second) {
+            return std::unexpected(std::string{"duplicate reserved entry (ASCII case alias)"});
         }
     }
 

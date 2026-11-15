@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,9 @@ struct runtime_harness_stage_options {
     std::filesystem::path source_executable;
     std::filesystem::path protected_directory;
     bool dry_run = false;
+    // Borrowed only during synchronous Pi staging. Additional host-policy
+    // exclusions remove source authority; they never replace fixed exclusions.
+    std::span<const std::filesystem::path> source_exclusions{};
 };
 
 struct pi_adoption_manifest_options {
@@ -75,6 +79,10 @@ struct staged_runtime_harness {
     std::string runtime_id;
     std::string executable_name;
     std::filesystem::path source_executable;
+    // Discovery provenance only; never grants direct launch authority.
+    std::filesystem::path canonical_source_executable{};
+    std::filesystem::path source_launch_executable{};
+    std::vector<std::filesystem::path> source_read_only_paths{};
     std::filesystem::path protected_entry_point;
     // Canonical launch closure derived locally from the staged entry point.
     // Script harnesses launch their pinned interpreter with source_executable
@@ -140,6 +148,11 @@ detect_runtime_harnesses(const std::vector<std::filesystem::path>& executable_se
 // overwritten.
 [[nodiscard]] auto stage_runtime_harness(const runtime_harness_stage_options& options)
     -> result<staged_runtime_harness>;
+
+// Recheck an approved Pi source and its protected Node-script snapshot binding.
+// Read-only: never stages files, executes dependency tools, or searches PATH.
+[[nodiscard]] auto validate_pi_runtime_harness(const staged_runtime_harness& runtime)
+    -> result<void>;
 
 // Generate a closed Pi extension manifest from explicitly named host settings
 // and package-store inputs. The result commits only selected logical package

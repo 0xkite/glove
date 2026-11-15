@@ -43,6 +43,45 @@ Run the full local gate before review or release:
 ./scripts/preflight.sh
 ```
 
+`GLOVE_PREFLIGHT_BUILD_ROOT` selects an absolute build root for the gate.
+It defaults to this checkout's `build` directory; the gate creates separate
+`dev`, `asan`, `tsan`, and `fuzz` trees beneath it. Select a separate reviewed
+root to preserve an existing build configured with another compiler. Every
+stage uses the selected root, with the same presets and checks. Relative or
+empty overrides are rejected. Selecting an override requires CTest 3.30 or
+newer for preset directory overrides; the default root retains CMake 3.28
+compatibility. The gate does not install toolchains; a locally
+provisioned formatter can be selected with `GLOVE_CLANG_FORMAT`.
+
+### Sage consumer interoperability
+
+The Sage Rust consumer test is opt-in via `GLOVE_ENABLE_SAGE_INTEROP_TEST` and
+requires Cargo plus a local Sage checkout. `GLOVE_SAGE_MANIFEST` is a CMake
+`FILEPATH` cache variable: provide the reviewed checkout's existing absolute
+Cargo manifest path when configuring. The historical default is
+`${CMAKE_SOURCE_DIR}/../sage/Cargo.toml`; that checkout is not bundled with Glove.
+Relative paths, missing files, and directories are rejected.
+
+After configuring with interoperability enabled:
+
+```sh
+cmake --build --preset dev
+ctest --preset dev -R '^sage_receipt_audit_interop$' --output-on-failure
+```
+
+Enabling this test does not enable remote launch or change production
+capabilities. The existing characterization suite for later Sage refactors is:
+
+| Contract | CTest coverage |
+| --- | --- |
+| Configuration and Sage guest DTO round-trips | `host_config` |
+| Canonical plans and refinement plans | `supervisor_session_plan`, `supervisor_refinement_session_plan` |
+| Adapter IDs, schema IDs, runtime IDs, aliases, and transport selectors | `control_sage_guest_channel_adapter` |
+| Control capabilities, idempotency, and observation dispositions | `control_receipt_audit_protocol` |
+| Observation admission and recovery | `control_session_registry`, `control_observation_intent_unix_server` |
+| Receipt chain, paging, acknowledgement, and torn-tail behavior | `container_receipt_chain`, `container_receipt_journal` |
+| Real Sage Rust consumer interoperability | `sage_receipt_audit_interop` (opt-in) |
+
 ## Controlled-source builds
 
 Glaze is pinned in `cmake/Dependencies.cmake`. For an offline or controlled

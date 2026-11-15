@@ -1,3 +1,201 @@
+# Typed launch uses native macOS constraints; no Linux execution parity is claimed.
+if(APPLE)
+    add_executable(run_native_launch_test run/native_launch_test.cpp)
+    target_link_libraries(run_native_launch_test PRIVATE glove_run glove_host)
+    target_include_directories(run_native_launch_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_native_launch COMMAND run_native_launch_test)
+    set_tests_properties(run_native_launch PROPERTIES TIMEOUT 30)
+
+    add_executable(run_native_session_supervisor_test run/native_session_supervisor_test.cpp)
+    target_link_libraries(run_native_session_supervisor_test PRIVATE glove_run glove_host)
+    target_include_directories(run_native_session_supervisor_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_native_session_supervisor COMMAND run_native_session_supervisor_test)
+    set_tests_properties(run_native_session_supervisor PROPERTIES TIMEOUT 180)
+
+    add_library(glove_test_anthropic_fixture STATIC support/anthropic_fixture_responder.cpp)
+    target_link_libraries(glove_test_anthropic_fixture PUBLIC glove_net glove_options)
+    target_include_directories(glove_test_anthropic_fixture PUBLIC ${CMAKE_SOURCE_DIR}/tests/support)
+
+    # Opt-in actual-Claude lane: exits 77 (skipped) unless the exact executable,
+    # its digest, version label and a private root are supplied.
+    add_executable(run_native_claude_lane_test run/native_claude_lane_test.cpp)
+    target_link_libraries(run_native_claude_lane_test PRIVATE glove_run glove_host glove_test_anthropic_fixture)
+    target_include_directories(run_native_claude_lane_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run ${CMAKE_SOURCE_DIR}/src/container
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_native_claude_lane COMMAND run_native_claude_lane_test)
+    set_tests_properties(run_native_claude_lane PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+
+    add_executable(native_session_fixture run/native_session_fixture_main.cpp)
+    target_link_libraries(native_session_fixture PRIVATE glove_run glove_host glove_test_anthropic_fixture)
+    target_include_directories(native_session_fixture PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run ${CMAKE_SOURCE_DIR}/src/container
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+
+    add_executable(run_pi_launch_test run/pi_launch_test.cpp)
+    target_link_libraries(run_pi_launch_test PRIVATE glove_run glove_host)
+    target_include_directories(run_pi_launch_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_pi_launch COMMAND run_pi_launch_test)
+    set_tests_properties(run_pi_launch PROPERTIES TIMEOUT 30)
+
+    add_executable(run_pi_launch_audit_test run/pi_launch_audit_test.cpp)
+    target_link_libraries(run_pi_launch_audit_test PRIVATE glove_run glove_host)
+    target_include_directories(run_pi_launch_audit_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_pi_launch_audit COMMAND run_pi_launch_audit_test)
+    set_tests_properties(run_pi_launch_audit PROPERTIES TIMEOUT 30)
+
+    add_executable(run_pi_exit_audit_test run/pi_exit_audit_test.cpp)
+    target_link_libraries(run_pi_exit_audit_test PRIVATE glove_run glove_host)
+    target_include_directories(run_pi_exit_audit_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_pi_exit_audit COMMAND run_pi_exit_audit_test)
+    set_tests_properties(run_pi_exit_audit PROPERTIES TIMEOUT 30)
+
+    add_executable(run_pi_source_authority_test run/pi_source_authority_test.cpp)
+    target_link_libraries(run_pi_source_authority_test PRIVATE glove_run glove_host)
+    target_include_directories(run_pi_source_authority_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/run
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_test(NAME run_pi_source_authority COMMAND run_pi_source_authority_test)
+    set_tests_properties(run_pi_source_authority PROPERTIES TIMEOUT 30)
+
+    add_executable(run_pi_launch_admission_test run/pi_launch_admission_test.cpp)
+    target_link_libraries(run_pi_launch_admission_test PRIVATE glove_run glove_host)
+    target_include_directories(run_pi_launch_admission_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+    add_test(NAME run_pi_launch_admission COMMAND run_pi_launch_admission_test)
+    set_tests_properties(run_pi_launch_admission PROPERTIES TIMEOUT 60)
+endif()
+
+add_executable(run_native_harness_adapter_test run/native_harness_adapter_test.cpp)
+target_link_libraries(run_native_harness_adapter_test PRIVATE glove_run)
+target_include_directories(run_native_harness_adapter_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/run
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME run_native_harness_adapter COMMAND run_native_harness_adapter_test)
+set_tests_properties(run_native_harness_adapter PROPERTIES TIMEOUT 10)
+
+add_executable(run_pi_audit_test run/pi_audit_test.cpp)
+target_link_libraries(run_pi_audit_test PRIVATE glove_run)
+target_include_directories(run_pi_audit_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_pi_audit COMMAND run_pi_audit_test)
+set_tests_properties(run_pi_audit PROPERTIES TIMEOUT 10)
+
+add_executable(run_pi_audit_allocation_test run/pi_audit_allocation_test.cpp)
+target_link_libraries(run_pi_audit_allocation_test PRIVATE glove_run)
+target_include_directories(run_pi_audit_allocation_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_pi_audit_allocation COMMAND run_pi_audit_allocation_test)
+set_tests_properties(run_pi_audit_allocation PROPERTIES TIMEOUT 10)
+
+add_executable(run_pi_cli_test run/pi_cli_test.cpp)
+target_link_libraries(run_pi_cli_test PRIVATE glove_run glove_host)
+target_include_directories(run_pi_cli_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_pi_cli COMMAND run_pi_cli_test)
+set_tests_properties(run_pi_cli PROPERTIES TIMEOUT 30)
+
+add_executable(run_pi_catalog_test run/pi_catalog_test.cpp)
+target_link_libraries(run_pi_catalog_test PRIVATE glove_run)
+target_include_directories(run_pi_catalog_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_pi_catalog COMMAND run_pi_catalog_test)
+set_tests_properties(run_pi_catalog PROPERTIES TIMEOUT 20)
+
+add_executable(run_native_session_model_test run/native_session_model_test.cpp)
+target_link_libraries(run_native_session_model_test PRIVATE glove_run)
+target_include_directories(run_native_session_model_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_session_model COMMAND run_native_session_model_test)
+set_tests_properties(run_native_session_model PROPERTIES TIMEOUT 10)
+
+add_executable(run_native_session_store_test run/native_session_store_test.cpp)
+target_link_libraries(run_native_session_store_test PRIVATE glove_run)
+target_include_directories(run_native_session_store_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_session_store COMMAND run_native_session_store_test)
+set_tests_properties(run_native_session_store PROPERTIES TIMEOUT 60)
+
+add_executable(run_claude_native_harness_test run/claude_native_harness_test.cpp)
+target_link_libraries(run_claude_native_harness_test PRIVATE glove_run)
+target_include_directories(run_claude_native_harness_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/run
+    ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME run_claude_native_harness COMMAND run_claude_native_harness_test)
+set_tests_properties(run_claude_native_harness PROPERTIES TIMEOUT 10)
+
+add_executable(run_claude_history_test run/claude_history_test.cpp)
+target_link_libraries(run_claude_history_test PRIVATE glove_run)
+target_include_directories(run_claude_history_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_claude_history COMMAND run_claude_history_test)
+set_tests_properties(run_claude_history PROPERTIES TIMEOUT 10)
+
+add_executable(run_native_management_transport_test run/native_management_transport_test.cpp)
+target_link_libraries(run_native_management_transport_test PRIVATE glove_run)
+target_include_directories(run_native_management_transport_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_management_transport COMMAND run_native_management_transport_test)
+set_tests_properties(run_native_management_transport PROPERTIES TIMEOUT 120)
+
+add_executable(run_native_private_state_test run/native_private_state_test.cpp)
+target_link_libraries(run_native_private_state_test PRIVATE glove_run)
+target_include_directories(run_native_private_state_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_native_private_state COMMAND run_native_private_state_test)
+set_tests_properties(run_native_private_state PROPERTIES TIMEOUT 15)
+
+add_executable(run_pi_private_state_test run/pi_private_state_test.cpp)
+target_link_libraries(run_pi_private_state_test PRIVATE glove_run)
+target_include_directories(run_pi_private_state_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_pi_private_state COMMAND run_pi_private_state_test)
+set_tests_properties(run_pi_private_state PROPERTIES TIMEOUT 15)
+
+add_executable(run_pi_private_cleanup_preflight_test run/pi_private_cleanup_preflight_test.cpp)
+target_link_libraries(run_pi_private_cleanup_preflight_test PRIVATE glove_run)
+target_include_directories(run_pi_private_cleanup_preflight_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_pi_private_cleanup_preflight COMMAND run_pi_private_cleanup_preflight_test)
+set_tests_properties(run_pi_private_cleanup_preflight PROPERTIES TIMEOUT 15)
+
+add_executable(run_pi_guest_config_test run/pi_guest_config_test.cpp)
+target_link_libraries(run_pi_guest_config_test PRIVATE glove_run)
+target_include_directories(run_pi_guest_config_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_pi_guest_config COMMAND run_pi_guest_config_test)
+set_tests_properties(run_pi_guest_config PROPERTIES TIMEOUT 10)
+
+add_executable(run_provider_endpoint_test run/provider_endpoint_test.cpp)
+target_link_libraries(run_provider_endpoint_test PRIVATE glove_run)
+target_include_directories(run_provider_endpoint_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_provider_endpoint COMMAND run_provider_endpoint_test)
+set_tests_properties(run_provider_endpoint PROPERTIES TIMEOUT 5)
+
+add_executable(run_pi_selection_test run/pi_selection_test.cpp)
+target_link_libraries(run_pi_selection_test PRIVATE glove_run)
+add_test(NAME run_pi_selection COMMAND run_pi_selection_test)
+set_tests_properties(run_pi_selection PROPERTIES TIMEOUT 5)
+
+add_executable(run_pi_runtime_selection_test run/pi_runtime_selection_test.cpp)
+target_link_libraries(run_pi_runtime_selection_test PRIVATE glove_run glove_host)
+# Test-only relocation fixture: no build-tree fallback or installed artifact.
+add_library(pi_runtime_library SHARED run/pi_runtime_library.cpp)
+target_link_libraries(pi_runtime_library PRIVATE glove_options)
+set_target_properties(pi_runtime_library PROPERTIES CXX_VISIBILITY_PRESET hidden)
+if(APPLE)
+    set_target_properties(pi_runtime_library PROPERTIES
+        MACOSX_RPATH OFF
+        INSTALL_NAME_DIR "/glove-unavailable-pi-library"
+        BUILD_WITH_INSTALL_NAME_DIR TRUE
+    )
+endif()
+add_executable(pi_runtime_library_fixture run/pi_runtime_library_fixture.cpp)
+target_link_libraries(pi_runtime_library_fixture PRIVATE glove_options pi_runtime_library)
+set_target_properties(pi_runtime_library_fixture PROPERTIES SKIP_BUILD_RPATH TRUE)
+add_dependencies(run_pi_runtime_selection_test pi_runtime_library_fixture)
+add_test(NAME run_pi_runtime_selection COMMAND run_pi_runtime_selection_test
+    $<TARGET_FILE:pi_runtime_library_fixture> $<TARGET_FILE:pi_runtime_library>
+)
+set_tests_properties(run_pi_runtime_selection PROPERTIES TIMEOUT 15)
+
 add_executable(smoke_test smoke_test.cpp)
 target_link_libraries(smoke_test PRIVATE glove_kernel)
 add_test(NAME smoke COMMAND smoke_test)
@@ -17,6 +215,29 @@ add_test(NAME host_remote_backend COMMAND host_remote_backend_test)
 add_executable(host_runtime_policy_test host/runtime_policy_test.cpp)
 target_link_libraries(host_runtime_policy_test PRIVATE glove_host glove_supervisor)
 add_test(NAME host_runtime_policy COMMAND host_runtime_policy_test)
+
+add_executable(host_pi_runtime_test host/pi_runtime_test.cpp)
+target_link_libraries(host_pi_runtime_test PRIVATE glove_host)
+if(APPLE)
+    target_link_libraries(host_pi_runtime_test PRIVATE glove_container)
+endif()
+add_test(NAME host_pi_runtime COMMAND host_pi_runtime_test)
+set_tests_properties(host_pi_runtime PROPERTIES TIMEOUT 15)
+
+add_executable(host_runtime_snapshot_bounds_test host/runtime_snapshot_bounds_test.cpp)
+target_link_libraries(host_runtime_snapshot_bounds_test PRIVATE glove_host)
+add_test(NAME host_runtime_snapshot_bounds COMMAND host_runtime_snapshot_bounds_test)
+set_tests_properties(host_runtime_snapshot_bounds PROPERTIES TIMEOUT 15)
+
+add_executable(host_snapshot_cleanup_test host/snapshot_cleanup_test.cpp)
+target_link_libraries(host_snapshot_cleanup_test PRIVATE glove_host)
+add_test(NAME host_snapshot_cleanup COMMAND host_snapshot_cleanup_test)
+set_tests_properties(host_snapshot_cleanup PROPERTIES TIMEOUT 15)
+
+add_executable(host_dependency_command_test host/dependency_command_test.cpp)
+target_link_libraries(host_dependency_command_test PRIVATE glove_host)
+add_test(NAME host_dependency_command COMMAND host_dependency_command_test)
+set_tests_properties(host_dependency_command PROPERTIES TIMEOUT 15)
 
 add_executable(host_operator_experience_test host/operator_experience_test.cpp)
 target_link_libraries(host_operator_experience_test PRIVATE glove_host)
@@ -253,12 +474,22 @@ if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     if(GLOVE_ENABLE_SAGE_INTEROP_TEST)
         find_program(GLOVE_CARGO_EXECUTABLE NAMES cargo REQUIRED)
-        set(GLOVE_SAGE_MANIFEST "${CMAKE_SOURCE_DIR}/../sage/Cargo.toml")
-        if(NOT EXISTS "${GLOVE_SAGE_MANIFEST}")
+        if(NOT DEFINED GLOVE_SAGE_MANIFEST)
+            set(GLOVE_SAGE_MANIFEST "${CMAKE_SOURCE_DIR}/../sage/Cargo.toml")
+        endif()
+        # Validate before FILEPATH cache conversion can normalize relative input.
+        if(NOT IS_ABSOLUTE "${GLOVE_SAGE_MANIFEST}"
+            OR NOT EXISTS "${GLOVE_SAGE_MANIFEST}"
+            OR IS_DIRECTORY "${GLOVE_SAGE_MANIFEST}"
+        )
             message(FATAL_ERROR
-                "GLOVE_ENABLE_SAGE_INTEROP_TEST requires ../sage/Cargo.toml"
+                "GLOVE_ENABLE_SAGE_INTEROP_TEST requires an existing absolute manifest file "
+                "GLOVE_SAGE_MANIFEST (got '${GLOVE_SAGE_MANIFEST}')"
             )
         endif()
+        set(GLOVE_SAGE_MANIFEST "${GLOVE_SAGE_MANIFEST}"
+            CACHE FILEPATH "Absolute path to the Sage Cargo manifest used by the interop test"
+        )
         add_test(
             NAME sage_receipt_audit_interop
             COMMAND
@@ -666,6 +897,12 @@ add_executable(reflect_codegen_availability_test reflect/codegen_availability_te
 target_link_libraries(reflect_codegen_availability_test PRIVATE glove_kernel)
 add_test(NAME reflect_codegen_availability COMMAND reflect_codegen_availability_test)
 
+add_executable(container_owned_group_cleanup_test container/owned_group_cleanup_test.cpp)
+target_link_libraries(container_owned_group_cleanup_test PRIVATE glove_options)
+target_include_directories(container_owned_group_cleanup_test PRIVATE ${CMAKE_SOURCE_DIR}/src/container)
+add_test(NAME container_owned_group_cleanup COMMAND container_owned_group_cleanup_test)
+set_tests_properties(container_owned_group_cleanup PROPERTIES TIMEOUT 10)
+
 if(APPLE)
     add_executable(
         control_apple_container_session_runtime_test
@@ -718,6 +955,60 @@ if(APPLE)
     target_link_libraries(container_macos_exec_test PRIVATE glove_kernel)
     add_test(NAME container_macos_exec COMMAND container_macos_exec_test)
     set_tests_properties(container_macos_exec PROPERTIES TIMEOUT 30)
+
+    add_executable(container_signal_mailbox_test container/signal_mailbox_test.cpp)
+    target_link_libraries(container_signal_mailbox_test PRIVATE glove_options)
+    target_include_directories(container_signal_mailbox_test PRIVATE ${CMAKE_SOURCE_DIR}/src/container)
+    add_test(NAME container_signal_mailbox COMMAND container_signal_mailbox_test)
+    set_tests_properties(container_signal_mailbox PROPERTIES TIMEOUT 15)
+
+    add_executable(container_macos_owned_tty_test container/macos_owned_tty_test.cpp)
+    target_link_libraries(container_macos_owned_tty_test PRIVATE glove_kernel)
+    add_dependencies(container_macos_owned_tty_test container_macos_owned_lifecycle_probe)
+    add_test(NAME container_macos_owned_tty COMMAND container_macos_owned_tty_test
+        $<TARGET_FILE:container_macos_owned_lifecycle_probe>)
+    set_tests_properties(container_macos_owned_tty PROPERTIES TIMEOUT 15)
+
+    add_executable(container_macos_owned_lifecycle_probe container/macos_owned_lifecycle_probe.cpp)
+    target_link_libraries(container_macos_owned_lifecycle_probe PRIVATE glove_options)
+    add_executable(container_macos_owned_lifecycle_test container/macos_owned_lifecycle_test.cpp)
+    target_link_libraries(container_macos_owned_lifecycle_test PRIVATE glove_kernel)
+    add_dependencies(container_macos_owned_lifecycle_test container_macos_owned_lifecycle_probe)
+    add_test(NAME container_macos_owned_lifecycle COMMAND container_macos_owned_lifecycle_test
+        $<TARGET_FILE:container_macos_owned_lifecycle_probe>)
+    set_tests_properties(container_macos_owned_lifecycle PROPERTIES TIMEOUT 30)
+
+    add_executable(container_macos_owned_closed_stdio_test container/macos_owned_closed_stdio_test.cpp)
+    target_link_libraries(container_macos_owned_closed_stdio_test PRIVATE glove_kernel)
+    add_dependencies(container_macos_owned_closed_stdio_test container_macos_owned_probe)
+    add_test(NAME container_macos_owned_closed_stdio COMMAND container_macos_owned_closed_stdio_test
+        $<TARGET_FILE:container_macos_owned_probe>)
+    set_tests_properties(container_macos_owned_closed_stdio PROPERTIES TIMEOUT 45)
+
+    add_executable(container_macos_owned_probe container/macos_owned_probe.cpp)
+    target_link_libraries(container_macos_owned_probe PRIVATE glove_options)
+    add_executable(container_macos_owned_test container/macos_owned_test.cpp)
+    target_link_libraries(container_macos_owned_test PRIVATE glove_kernel)
+    add_dependencies(container_macos_owned_test container_macos_owned_probe)
+    add_test(NAME container_macos_owned COMMAND container_macos_owned_test
+        $<TARGET_FILE:container_macos_owned_probe>)
+    set_tests_properties(container_macos_owned PROPERTIES TIMEOUT 15)
+
+    add_executable(container_macos_endpoint_probe container/macos_endpoint_probe.cpp)
+    target_link_libraries(container_macos_endpoint_probe PRIVATE glove_options)
+    add_executable(container_macos_endpoint_test container/macos_endpoint_test.cpp)
+    target_link_libraries(container_macos_endpoint_test PRIVATE glove_kernel)
+    target_include_directories(container_macos_endpoint_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/container/macos)
+    add_dependencies(container_macos_endpoint_test container_macos_endpoint_probe)
+    add_test(NAME container_macos_endpoint COMMAND container_macos_endpoint_test
+        --endpoint $<TARGET_FILE:container_macos_endpoint_probe>)
+    add_test(NAME container_macos_runtime_filesystem COMMAND container_macos_endpoint_test
+        --filesystem $<TARGET_FILE:container_macos_endpoint_probe>)
+    add_test(NAME container_macos_configuration COMMAND container_macos_endpoint_test
+        --configuration $<TARGET_FILE:container_macos_endpoint_probe>)
+    set_tests_properties(container_macos_endpoint container_macos_runtime_filesystem
+        container_macos_configuration PROPERTIES TIMEOUT 30)
 
     # Policy-owned Codex discovery is tested against the locally installed
     # harness when present. This is SBPL-only and intentionally not a claim of

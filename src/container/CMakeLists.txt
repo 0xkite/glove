@@ -1,5 +1,6 @@
 add_library(glove_container STATIC
     output_pump.cpp
+    owned_passthrough.cpp
     profile.cpp
     receipt_chain.cpp
     receipt_journal.cpp
@@ -20,6 +21,7 @@ target_include_directories(glove_container
 if(APPLE)
     target_sources(glove_container PRIVATE
         macos/sandbox_spawner.cpp
+        macos/runtime_filesystem.cpp
         linux/pty_session_channel.cpp
     )
     target_include_directories(glove_container PRIVATE

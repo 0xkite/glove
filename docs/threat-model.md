@@ -45,6 +45,22 @@ host security boundary.
 Security-relevant append, policy, setup, and receipt failures terminate or reject
 the operation rather than silently reducing enforcement.
 
+## Native session continuity
+
+- Durable checkpoints live below the owner-private state directory, outside
+  every guest grant; a generation receives only a writable copy inside its
+  private run. Publication, admission and resume are descriptor-first with
+  repeated identity checks and refuse symlinks, hard links, mode drift,
+  unknown parents, foreign session ids and unqualified runtime versions.
+- The management socket is a host capability authenticated by peer UID plus a
+  per-epoch capability; it is not a confidentiality boundary against the
+  trusted same-UID account. A replaced socket object is refused, not adopted.
+- Missing sockets, PIDs or leases never prove descendant death. Uncertain
+  outcomes, failed publication and interrupted durable records enter
+  recovery_required, retain private state and block automatic resume.
+- The fixture responder used for offline qualification is test-only and never
+  dials; the production provider transport is unchanged.
+
 ## Residual risks
 
 | Risk                                   | Consequence                                                                                                                                           | Required mitigation                                                                                                                                                                   |

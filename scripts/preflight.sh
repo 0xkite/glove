@@ -51,6 +51,11 @@ bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 
+BUILD_ROOT="${GLOVE_PREFLIGHT_BUILD_ROOT-${ROOT}/build}"
+if [[ "${BUILD_ROOT}" != /* ]]; then
+    fail "GLOVE_PREFLIGHT_BUILD_ROOT must be an absolute directory"
+fi
+
 # True when $1 >= $2 for dotted numeric versions such as 23.1.1 vs 22.1.8.
 version_ge() {
     local have="$1" want="$2"
@@ -67,6 +72,23 @@ version_ge() {
         if ((10#${a} < 10#${b})); then return 1; fi
     done
     return 0
+}
+
+if [[ -n "${GLOVE_PREFLIGHT_BUILD_ROOT+x}" ]]; then
+    ctest_version="$(ctest --version | sed -n '1{s/.*version //;p;}')"
+    if ! version_ge "${ctest_version}" "3.30"; then
+        fail "GLOVE_PREFLIGHT_BUILD_ROOT requires CTest >= 3.30 for preset directory overrides"
+    fi
+fi
+
+test_preset() {
+    local preset="$1"
+    shift
+    if [[ -n "${GLOVE_PREFLIGHT_BUILD_ROOT+x}" ]]; then
+        "$@" ctest --preset "${preset}" --test-dir "${BUILD_ROOT}/${preset}"
+    else
+        "$@" ctest --preset "${preset}"
+    fi
 }
 
 # Resolve a tool from an explicit override, then PATH. Prints the path or
@@ -133,7 +155,8 @@ select_compiler() {
     local resolved
     resolved="$(command -v "${cxx_bin}")"
     local cache
-    for cache in build/dev/CMakeCache.txt build/asan/CMakeCache.txt build/tsan/CMakeCache.txt; do
+    for cache in "${BUILD_ROOT}/dev/CMakeCache.txt" "${BUILD_ROOT}/asan/CMakeCache.txt" \
+                 "${BUILD_ROOT}/tsan/CMakeCache.txt"; do
         [[ -f "${cache}" ]] || continue
         local cached
         cached="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "${cache}" | head -1)"
@@ -262,11 +285,12 @@ else
     else
         # Benchmarks are opt-in for ordinary builds, but their source remains
         # part of the style gate and must appear in the compilation database.
-        cmake --preset dev -DGLOVE_BUILD_BENCHMARKS=ON -DGLOVE_BUILD_FUZZERS=OFF >/dev/null
+        cmake --preset dev -B "${BUILD_ROOT}/dev" \
+            -DGLOVE_BUILD_BENCHMARKS=ON -DGLOVE_BUILD_FUZZERS=OFF >/dev/null
         # Ninja's C++ dependency scanner writes module-map response files that
         # appear in compile_commands.json. A fresh checkout must build once
         # before clang-tidy can consume those generated arguments.
-        cmake --build --preset dev
+        cmake --build "${BUILD_ROOT}/dev"
         # Apple clang's compile_commands omits -isysroot because the driver
         # implicitly knows the SDK; homebrew clang-tidy doesn't, so tell it.
         tidy_extra=()
@@ -282,13 +306,13 @@ else
         while IFS= read -r -d '' f; do
             tidy_files+=("${f}")
         done < <(
-            python3 - "${ROOT}" <<'PY'
+            python3 - "${ROOT}" "${BUILD_ROOT}" <<'PY'
 import json
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
-database = json.loads((root / "build/dev/compile_commands.json").read_text())
+database = json.loads((pathlib.Path(sys.argv[2]) / "dev/compile_commands.json").read_text())
 seen = set()
 for entry in database:
     source = pathlib.Path(entry["file"])
@@ -317,7 +341,7 @@ PY
         fi
         # Two workers keep memory bounded on hosted runners while reducing the
         # full Linux translation-unit pass from timeout-scale wall-clock time.
-        "${tidy_runner}" -j 2 -quiet -p build/dev -clang-tidy-binary "${tidy_bin}" \
+        "${tidy_runner}" -j 2 -quiet -p "${BUILD_ROOT}/dev" -clang-tidy-binary "${tidy_bin}" \
             "${tidy_extra[@]}" "${tidy_files[@]}"
         ok "tidy clean (${tidy_bin})"
     fi
@@ -358,20 +382,19 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
         fail "LeakSanitizer cannot run: yama ptrace_scope=${ptrace_scope} blocks ptrace. Set GLOVE_ALLOW_NO_LSAN=1 to run ASan/UBSan without leak detection, or fix the host sysctl."
     fi
 fi
-cmake --preset asan -DGLOVE_BUILD_FUZZERS=OFF
-cmake --build --preset asan
+cmake --preset asan -B "${BUILD_ROOT}/asan" -DGLOVE_BUILD_FUZZERS=OFF
+cmake --build "${BUILD_ROOT}/asan"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    ctest --preset asan
+    test_preset asan
 fuzzer_cxx="$(find_fuzzer_compiler)"
 fuzzer_symbolizer="$(dirname "${fuzzer_cxx}")/llvm-symbolizer"
 if [[ -x "${fuzzer_symbolizer}" ]]; then
     export ASAN_SYMBOLIZER_PATH="${fuzzer_symbolizer}"
 fi
-cmake --preset fuzz \
-    -DCMAKE_CXX_COMPILER="${fuzzer_cxx}" \
-    -DFETCHCONTENT_SOURCE_DIR_GLAZE="${ROOT}/build/dev/_deps/glaze-src"
-cmake --build --preset fuzz
+cmake --preset fuzz -B "${BUILD_ROOT}/fuzz" \
+    -DCMAKE_CXX_COMPILER="${fuzzer_cxx}"
+cmake --build "${BUILD_ROOT}/fuzz"
 fuzz_workspace="$(mktemp -d "${TMPDIR:-/tmp}/glove-fuzz-corpora.XXXXXX")"
 trap 'rm -rf -- "${fuzz_workspace}"' EXIT
 mcp_fuzz_corpus="${fuzz_workspace}/mcp_codec"
@@ -390,46 +413,46 @@ apple_stats_fuzz_corpus="${fuzz_workspace}/apple_container_stats"
 cp -R fuzz/corpus/apple_container_stats "${apple_stats_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    build/fuzz/fuzz/glove_mcp_codec_fuzzer \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_mcp_codec_fuzzer" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${mcp_fuzz_corpus}/" \
         "${mcp_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    build/fuzz/fuzz/glove_policy_jsonpath_fuzzer \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_policy_jsonpath_fuzzer" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${policy_fuzz_corpus}/" \
         "${policy_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    build/fuzz/fuzz/glove_change_manifest_fuzzer \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_change_manifest_fuzzer" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${manifest_fuzz_corpus}/" \
         "${manifest_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    build/fuzz/fuzz/glove_session_plan_fuzzer \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_session_plan_fuzzer" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${session_plan_fuzz_corpus}/" \
         "${session_plan_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    build/fuzz/fuzz/glove_change_apply_journal_fuzzer \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_change_apply_journal_fuzzer" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${journal_fuzz_corpus}/" \
         "${journal_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
 UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-    build/fuzz/fuzz/glove_library_bundle_fuzzer \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_library_bundle_fuzzer" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${bundle_fuzz_corpus}/" \
         "${bundle_fuzz_corpus}"
 # The Apple container-stats parser fuzzer is only built on platforms with that
 # runtime (macOS); run it when present so the target stops being built-but-idle.
-if [[ -x build/fuzz/fuzz/glove_apple_container_stats_fuzzer ]]; then
+if [[ -x "${BUILD_ROOT}/fuzz/fuzz/glove_apple_container_stats_fuzzer" ]]; then
     ASAN_OPTIONS="${asan_opts}" \
     UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
-        build/fuzz/fuzz/glove_apple_container_stats_fuzzer \
+        "${BUILD_ROOT}/fuzz/fuzz/glove_apple_container_stats_fuzzer" \
             -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
             -artifact_prefix="${apple_stats_fuzz_corpus}/" \
             "${apple_stats_fuzz_corpus}"
@@ -442,8 +465,8 @@ fi
 
 # 5. tsan -------------------------------------------------------------------
 bold "[5/5] tsan preset"
-cmake --preset tsan -DGLOVE_BUILD_FUZZERS=OFF
-cmake --build --preset tsan
+cmake --preset tsan -B "${BUILD_ROOT}/tsan" -DGLOVE_BUILD_FUZZERS=OFF
+cmake --build "${BUILD_ROOT}/tsan"
 # Some kernels ship vm.mmap_rnd_bits=32, which makes TSan abort at startup with
 # "unexpected memory mapping". Disabling ASLR for the test process keeps the
 # sanitizer usable without touching a host sysctl. This does not weaken the
@@ -453,10 +476,10 @@ cmake --build --preset tsan
 # the lane on a platform where setarch does not apply.
 if [[ "$(uname -s)" == "Linux" ]] && command -v setarch >/dev/null; then
     TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
-        setarch -R ctest --preset tsan
+        test_preset tsan setarch -R
 else
     TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1" \
-        ctest --preset tsan
+        test_preset tsan
 fi
 ok "tsan ok"
 

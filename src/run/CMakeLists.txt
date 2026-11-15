@@ -1,5 +1,32 @@
 add_library(glove_run STATIC
     runner.cpp
+    provider_endpoint.cpp
+    pi_selection.cpp
+    pi_guest_config.cpp
+    pi_catalog.cpp
+    pi_private_state.cpp
+    native_private_state.cpp
+    native_private_plan.cpp
+    pi_runtime.cpp
+    pi_launch.cpp
+    native_launch.cpp
+    native_library_environment.cpp
+    native_audit.cpp
+    native_harness_adapter.cpp
+    native_session_model.cpp
+    native_session_store.cpp
+    native_session_checkpoints.cpp
+    native_management_transport.cpp
+    native_management_client.cpp
+    native_session_supervisor.cpp
+    claude_native_policy.cpp
+    claude_history.cpp
+    ../adapters/claude/native_harness.cpp
+    pi_native_policy.cpp
+    ../adapters/pi/native_harness.cpp
+    pi_audit.cpp
+    pi_cli.cpp
+    pi_machine_authorities.cpp
 )
 add_library(glove::run ALIAS glove_run)
 
@@ -12,6 +39,9 @@ target_link_libraries(glove_run
         glove::policy
         glove::audit
         glove::net
+    PRIVATE
+        glaze::glaze
+        glove_host
 )
 target_include_directories(glove_run
     PUBLIC

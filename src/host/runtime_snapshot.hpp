@@ -1,7 +1,9 @@
 #pragma once
 
+#include "glove/detail/descriptor_acl.hpp"
 #include "glove/host/runtime_policy.hpp"
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -23,42 +25,107 @@ inline auto system_error(std::string_view operation, int error_number = errno) -
            std::error_code{error_number, std::generic_category()}.message();
 }
 
-inline auto ensure_protected_directory(const std::filesystem::path& path) -> result<void> {
-    if (!path.is_absolute() || path == path.root_path() || path.lexically_normal() != path) {
+inline auto
+ensure_protected_directory(const std::filesystem::path& path, bool private_final = false)
+    -> result<void> {
+    if (!path.is_absolute() || path == path.root_path() || path.lexically_normal() != path ||
+        path.native().size() > 4096U || path.native().contains('\0')) {
         return std::unexpected(
-            std::string{"protected harness directory must be a canonical absolute non-root path"}
+            std::string{
+                "protected harness directory must be a bounded canonical absolute non-root path"
+            }
         );
     }
-    std::filesystem::path current = path.root_path();
+
+    struct owned_fd {
+        int value;
+
+        explicit owned_fd(int fd) : value{fd} {}
+
+        owned_fd(const owned_fd&) = delete;
+        auto operator=(const owned_fd&) -> owned_fd& = delete;
+
+        ~owned_fd() {
+            if (value >= 0) {
+                (void)::close(value);
+            }
+        }
+    } parent{::open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)};
+
+    if (parent.value < 0) {
+        return std::unexpected(system_error("open protected harness root"));
+    }
+    if (auto acl =
+            glove::detail::check_descriptor_acl(parent.value, glove::detail::acl_scope::integrity);
+        !acl) {
+        return acl;
+    }
+    std::filesystem::path walked{"/"};
+    std::size_t depth = 0;
     for (const auto& component : path.relative_path()) {
-        current /= component;
-        struct stat metadata{};
-        if (::lstat(current.c_str(), &metadata) == 0) {
-            if (!S_ISDIR(metadata.st_mode)) {
-                return std::unexpected(
-                    "protected harness ancestor is not a directory: " + current.string()
-                );
-            }
-            const bool root_sticky = metadata.st_uid == 0 && (metadata.st_mode & S_ISVTX) != 0;
-            if (metadata.st_uid != 0 && metadata.st_uid != ::geteuid()) {
-                return std::unexpected(
-                    "protected harness ancestor is not owned by root or the service user: " +
-                    current.string()
-                );
-            }
-            if ((metadata.st_mode & (S_IWGRP | S_IWOTH)) != 0 && !root_sticky) {
-                return std::unexpected(
-                    "protected harness ancestor is writable by another principal: " +
-                    current.string()
-                );
-            }
-            continue;
+        if (++depth > 128U) {
+            return std::unexpected(std::string{"protected harness directory exceeds depth bound"});
         }
-        if (errno != ENOENT) {
-            return std::unexpected(system_error("inspect protected harness directory"));
+        walked /= component;
+        struct stat named{};
+        bool created = false;
+        if (::fstatat(parent.value, component.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT) {
+                return std::unexpected(system_error("inspect protected harness directory"));
+            }
+            if (::mkdirat(parent.value, component.c_str(), 0700) != 0) {
+                return std::unexpected(
+                    system_error("create exclusive protected harness directory")
+                );
+            }
+            created = true;
+            if (::fstatat(parent.value, component.c_str(), &named, AT_SYMLINK_NOFOLLOW) != 0) {
+                return std::unexpected(system_error("pin created protected harness directory"));
+            }
         }
-        if (::mkdir(current.c_str(), 0700) != 0) {
-            return std::unexpected(system_error("create protected harness directory"));
+        const bool root_sticky = named.st_uid == 0 && (named.st_mode & S_ISVTX) != 0;
+        if (!S_ISDIR(named.st_mode) || (named.st_uid != 0 && named.st_uid != ::geteuid()) ||
+            ((named.st_mode & (S_IWGRP | S_IWOTH)) != 0 && !root_sticky) ||
+            ((created || (private_final && walked == path)) &&
+             (named.st_uid != ::geteuid() || (named.st_mode & 07777U) != 0700U))) {
+            return std::unexpected(
+                std::string{"protected harness directory ownership or mode is unsafe"}
+            );
+        }
+        owned_fd next{::openat(
+            parent.value,
+            component.c_str(),
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        )};
+        struct stat opened{};
+        if (next.value < 0 || ::fstat(next.value, &opened) != 0 || opened.st_dev != named.st_dev ||
+            opened.st_ino != named.st_ino || opened.st_uid != named.st_uid ||
+            opened.st_gid != named.st_gid || opened.st_mode != named.st_mode) {
+            return std::unexpected(std::string{"protected harness directory changed on open"});
+        }
+        if (created) {
+            if (auto acl = glove::detail::clear_created_descriptor_acl(next.value); !acl) {
+                return acl;
+            }
+        }
+        const auto scope = created || (private_final && walked == path)
+                               ? glove::detail::acl_scope::owner_private
+                               : glove::detail::acl_scope::integrity;
+        if (auto acl = glove::detail::check_descriptor_acl(next.value, scope); !acl) {
+            return acl;
+        }
+        struct stat rebound{};
+        if (::fstatat(parent.value, component.c_str(), &rebound, AT_SYMLINK_NOFOLLOW) != 0 ||
+            rebound.st_dev != opened.st_dev || rebound.st_ino != opened.st_ino ||
+            rebound.st_uid != opened.st_uid || rebound.st_gid != opened.st_gid ||
+            rebound.st_mode != opened.st_mode) {
+            return std::unexpected(std::string{"protected harness directory binding changed"});
+        }
+        const int previous = parent.value;
+        parent.value = next.value;
+        next.value = -1;
+        if (::close(previous) != 0) {
+            return std::unexpected(system_error("close protected harness ancestor"));
         }
     }
     return {};
@@ -120,6 +187,27 @@ auto snapshot_tree_digest(
 
 auto package_root_for(const std::filesystem::path& source) -> std::filesystem::path;
 
+// A non-script returns nullopt. Script directives are bounded to 4096 bytes.
+auto read_runtime_shebang(const std::filesystem::path& source)
+    -> result<std::optional<std::vector<std::string>>>;
+
+// Exclusions only: the production caller obtains home from the effective account,
+// never from a launch request. Configured paths can remove authority, not grant it.
+auto validate_pi_source_exclusions(
+    std::span<const std::filesystem::path> roots,
+    const std::filesystem::path& account_home,
+    std::span<const std::filesystem::path> additional_exclusions = {}
+) -> result<void>;
+
+// Pi-only source admission shared by staging and read-only revalidation.
+auto validate_pi_source_closure(
+    const std::filesystem::path& source_entry,
+    const std::filesystem::path& source,
+    const runtime_dependency_closure& closure,
+    const std::filesystem::path& protected_directory,
+    std::span<const std::filesystem::path> additional_exclusions = {}
+) -> result<void>;
+
 auto derive_runtime_dependency_closure(
     const std::filesystem::path& source_entry,
     const std::filesystem::path& source,
@@ -154,8 +242,39 @@ auto plan_runtime_snapshot(
     const runtime_dependency_closure& closure
 ) -> result<planned_runtime_snapshot>;
 
+// Wrapper entries do not consume the unchanged 200000-content-entry budget.
+struct snapshot_tree_budget {
+    std::size_t content_remaining = 200'000U;
+    std::size_t wrappers_remaining = 64U + 1U;
+
+    constexpr auto admit(bool wrapper) noexcept -> bool {
+        auto& remaining = wrapper ? wrappers_remaining : content_remaining;
+        if (remaining == 0) {
+            return false;
+        }
+        --remaining;
+        return true;
+    }
+};
+
+// Read-only admission for a sealed, owner-owned root and its sole payload tree.
+auto validate_protected_snapshot_tree(
+    const std::filesystem::path& snapshot_root, std::size_t root_count
+) -> result<void>;
+
 auto protect_snapshot_tree(const std::filesystem::path& payload_root) -> result<void>;
 
 auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> result<bool>;
 
 } // namespace glove::host::snapshot
+
+namespace glove::host::detail {
+
+// Caller-owned deny-only policy. Public no-context validation stays strict;
+// native composition supplies its admitted machine authority before any hash.
+auto validate_pi_runtime_with_exclusions(
+    const staged_runtime_harness& runtime,
+    std::span<const std::filesystem::path> additional_exclusions
+) -> result<void>;
+
+} // namespace glove::host::detail

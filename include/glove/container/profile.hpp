@@ -18,6 +18,14 @@ struct fs_rule {
     bool writable = false;
 };
 
+// A missing direct child of an explicit writable directory, reserved by an
+// adapter before launch. Native enforcement blocks case aliases and creation;
+// an already present file, directory or symlink is rejected rather than imported.
+struct reserved_entry {
+    std::string parent;
+    std::string name;
+};
+
 struct proxy_settings {
     std::uint16_t port = 0;
     // Credential-bearing loopback URL injected into the standard proxy
@@ -25,9 +33,10 @@ struct proxy_settings {
     std::string url;
 };
 
-// A plain (non-CONNECT) host-loopback reverse endpoint forwarded into the
-// sandbox loopback by the egress bridge. Unlike `proxy_settings`, no proxy
-// environment variable is derived from it; callers name it explicitly.
+// A plain (non-CONNECT) IPv4 host-loopback TCP reverse endpoint. Linux forwards
+// it through the egress bridge; macOS permits the exact loopback port in SBPL.
+// Unlike `proxy_settings`, no proxy environment variable is derived from it;
+// callers name it explicitly.
 struct bridge_endpoint_settings {
     std::uint16_t port = 0;
 
@@ -184,6 +193,13 @@ struct profile {
     // grants and accepts this read-only surface separately.
     std::vector<fs_rule> runtime_filesystem;
 
+    // Existing canonical single-link files in exact writable private-directory
+    // grants. Reads and adjacent lock creation remain permitted; file mutation
+    // and replacement, and renaming/removing their grant roots, are denied.
+    // Backends without this construction reject these fields at launch.
+    std::vector<std::string> immutable_files;
+    std::vector<reserved_entry> reserved_entries;
+
     // Complete environment inherited by the agent, expressed as NAME=VALUE.
     // The host environment is never copied implicitly.
     std::vector<std::string> environment;
@@ -200,10 +216,10 @@ struct profile {
     std::optional<proxy_settings> proxy;
 
     // Set only by the runner after starting a plain host-loopback reverse
-    // endpoint (for example the mediated credential proxy). The egress bridge
-    // forwards this port into the sandbox loopback, but no proxy environment
-    // variables are injected: the agent reaches the endpoint through an
-    // explicit base-URL variable. Mutually exclusive with `proxy`, which
+    // endpoint (for example the mediated credential proxy). Linux bridges it
+    // into private loopback; macOS grants only 127.0.0.1 TCP at this port.
+    // No proxy environment variables are injected: the agent reaches the
+    // endpoint through an explicit base URL. Mutually exclusive with `proxy`, which
     // enforces the rule that a credentialed upstream is never also reachable
     // over a raw CONNECT tunnel.
     std::optional<bridge_endpoint_settings> bridge_endpoint;

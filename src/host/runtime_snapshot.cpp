@@ -1,10 +1,13 @@
 #include "runtime_snapshot.hpp"
 
 #include "glove/container/digest.hpp"
+#include "glove/detail/symlink_acl.hpp"
+
+#include "dependency_command.hpp"
+#include "snapshot_cleanup.hpp"
+#include "snapshot_copy.hpp"
 
 #include <fcntl.h>
-#include <spawn.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
@@ -14,104 +17,9 @@
 #include <fstream>
 #include <sstream>
 
-extern char** environ;
-
 namespace glove::host::snapshot {
 
 namespace {
-
-auto capture_command(
-    const std::filesystem::path& executable, const std::vector<std::string>& arguments
-) -> result<std::string> {
-    constexpr std::size_t max_output_bytes = 1024U * 1024U;
-    std::array<int, 2> output_pipe{-1, -1};
-    if (::pipe(output_pipe.data()) != 0) {
-        return std::unexpected(system_error("create dependency command pipe"));
-    }
-    if (::fcntl(output_pipe[0], F_SETFD, FD_CLOEXEC) < 0 ||
-        ::fcntl(output_pipe[1], F_SETFD, FD_CLOEXEC) < 0) {
-        const auto error = system_error("protect dependency command pipe");
-        (void)::close(output_pipe[0]);
-        (void)::close(output_pipe[1]);
-        return std::unexpected(error);
-    }
-
-    ::posix_spawn_file_actions_t actions{};
-    if (::posix_spawn_file_actions_init(&actions) != 0) {
-        (void)::close(output_pipe[0]);
-        (void)::close(output_pipe[1]);
-        return std::unexpected(std::string{"initialize dependency command"});
-    }
-    const std::array action_results = {
-        ::posix_spawn_file_actions_adddup2(&actions, output_pipe[1], STDOUT_FILENO),
-        ::posix_spawn_file_actions_addclose(&actions, output_pipe[0]),
-        ::posix_spawn_file_actions_addclose(&actions, output_pipe[1]),
-        ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0),
-    };
-    if (const auto failed =
-            std::ranges::find_if(action_results, [](int result) { return result != 0; });
-        failed != action_results.end()) {
-        (void)::posix_spawn_file_actions_destroy(&actions);
-        (void)::close(output_pipe[0]);
-        (void)::close(output_pipe[1]);
-        return std::unexpected(
-            std::string{"configure dependency command: "} +
-            std::error_code{*failed, std::generic_category()}.message()
-        );
-    }
-
-    std::vector<std::string> owned_argv;
-    owned_argv.reserve(arguments.size() + 1U);
-    owned_argv.push_back(executable.string());
-    owned_argv.insert(owned_argv.end(), arguments.begin(), arguments.end());
-    std::vector<char*> argv;
-    argv.reserve(owned_argv.size() + 1U);
-    for (auto& argument : owned_argv) {
-        argv.push_back(argument.data());
-    }
-    argv.push_back(nullptr);
-
-    ::pid_t child = -1;
-    const int spawned =
-        ::posix_spawn(&child, executable.c_str(), &actions, nullptr, argv.data(), environ);
-    (void)::posix_spawn_file_actions_destroy(&actions);
-    (void)::close(output_pipe[1]);
-    if (spawned != 0) {
-        (void)::close(output_pipe[0]);
-        return std::unexpected(
-            std::string{"launch dependency command: "} +
-            std::error_code{spawned, std::generic_category()}.message()
-        );
-    }
-
-    std::string output;
-    std::array<char, 4096> buffer{};
-    while (output.size() <= max_output_bytes) {
-        const auto count = ::read(output_pipe[0], buffer.data(), buffer.size());
-        if (count > 0) {
-            output.append(buffer.data(), static_cast<std::size_t>(count));
-            continue;
-        }
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        break;
-    }
-    (void)::close(output_pipe[0]);
-    int child_status = 0;
-    ::pid_t waited = -1;
-    do {
-        waited = ::waitpid(child, &child_status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited < 0) {
-        return std::unexpected(std::string{"wait for dependency command: "} + std::strerror(errno));
-    }
-    if (output.size() > max_output_bytes || !WIFEXITED(child_status) ||
-        WEXITSTATUS(child_status) != 0) {
-        return std::unexpected(std::string{"dependency command failed"});
-    }
-    return output;
-}
 
 auto valid_formula_name(std::string_view value) noexcept -> bool {
     return !value.empty() && value.size() <= 128U &&
@@ -165,8 +73,9 @@ auto append_homebrew_runtime_closure(
     if (error) {
         return std::unexpected("resolve Homebrew dependency tool: " + error.message());
     }
-    auto dependencies =
-        capture_command(canonical_brew, {"deps", "--installed", "--formula", interpreter.formula});
+    auto dependencies = detail::capture_dependency_command(
+        canonical_brew, {"deps", "--installed", "--formula", interpreter.formula}
+    );
     if (!dependencies) {
         return std::unexpected(dependencies.error());
     }
@@ -221,15 +130,21 @@ auto append_snapshot_file_digest(
     std::string& manifest,
     std::uint64_t& total_bytes
 ) -> result<void> {
-    const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    // Discovery trees can change between enumeration and open. A replacement
+    // FIFO must fail the descriptor type check instead of blocking setup.
+    const int descriptor = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
     if (descriptor < 0) {
         return std::unexpected(system_error("open harness snapshot file"));
     }
     struct stat metadata{};
-    if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) || metadata.st_size < 0) {
+    if (::fstat(descriptor, &metadata) != 0) {
         const auto error = system_error("inspect harness snapshot file");
         (void)::close(descriptor);
         return std::unexpected(error);
+    }
+    if (!S_ISREG(metadata.st_mode) || metadata.st_size < 0 || metadata.st_nlink != 1) {
+        (void)::close(descriptor);
+        return std::unexpected(std::string{"harness snapshot requires single-link regular files"});
     }
     const auto size = static_cast<std::uint64_t>(metadata.st_size);
     if (size > max_snapshot_bytes || total_bytes > max_snapshot_bytes - size) {
@@ -374,22 +289,101 @@ auto package_root_for(const std::filesystem::path& source) -> std::filesystem::p
     return source;
 }
 
-auto derive_runtime_dependency_closure(
-    const std::filesystem::path& source_entry,
-    const std::filesystem::path& source,
-    bool allow_dependency_commands
-) -> result<runtime_dependency_closure> {
-    std::ifstream input{source, std::ios::binary};
-    std::string first_line;
-    std::getline(input, first_line);
-    if (!first_line.starts_with("#!")) {
-        return runtime_dependency_closure{
-            .executable = source,
-            .arguments = {},
-            .read_only_paths = {source},
-        };
+auto read_runtime_shebang(const std::filesystem::path& source)
+    -> result<std::optional<std::vector<std::string>>> {
+    const int descriptor = ::open(source.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        return std::unexpected(system_error("open harness interpreter directive"));
     }
-    first_line.erase(0, 2);
+
+    struct close_descriptor {
+        explicit close_descriptor(int descriptor_value) : value{descriptor_value} {}
+
+        close_descriptor(const close_descriptor&) = delete;
+        auto operator=(const close_descriptor&) -> close_descriptor& = delete;
+
+        ~close_descriptor() { (void)::close(value); }
+
+        int value;
+    } owned{descriptor};
+    struct stat before{};
+    if (::fstat(descriptor, &before) != 0 || !S_ISREG(before.st_mode) || before.st_nlink != 1) {
+        return std::unexpected(
+            std::string{"harness directive source must be a single-link regular file"}
+        );
+    }
+    const auto unchanged = [&]() -> bool {
+        struct stat after{};
+        struct stat named{};
+        if (::fstat(descriptor, &after) != 0 || ::lstat(source.c_str(), &named) != 0) {
+            return false;
+        }
+        const auto same = [&](const struct stat& value) {
+            const bool identity = value.st_dev == before.st_dev && value.st_ino == before.st_ino &&
+                                  value.st_mode == before.st_mode &&
+                                  value.st_uid == before.st_uid && value.st_gid == before.st_gid &&
+                                  value.st_nlink == before.st_nlink &&
+                                  value.st_size == before.st_size;
+#if defined(__APPLE__)
+            return identity && value.st_mtimespec.tv_sec == before.st_mtimespec.tv_sec &&
+                   value.st_mtimespec.tv_nsec == before.st_mtimespec.tv_nsec &&
+                   value.st_ctimespec.tv_sec == before.st_ctimespec.tv_sec &&
+                   value.st_ctimespec.tv_nsec == before.st_ctimespec.tv_nsec;
+#else
+            return identity && value.st_mtim.tv_sec == before.st_mtim.tv_sec &&
+                   value.st_mtim.tv_nsec == before.st_mtim.tv_nsec &&
+                   value.st_ctim.tv_sec == before.st_ctim.tv_sec &&
+                   value.st_ctim.tv_nsec == before.st_ctim.tv_nsec;
+#endif
+        };
+        return same(after) && same(named);
+    };
+    // Read only the marker for native binaries. A script gets at most its
+    // bounded directive plus one newline; a FIFO replacement never blocks.
+    std::array<char, 4097U> bytes{};
+    std::size_t filled = 0;
+    const auto read_prefix = [&](std::size_t limit) -> result<void> {
+        while (filled < limit) {
+            const auto count = ::pread(
+                descriptor, bytes.data() + filled, limit - filled, static_cast<off_t>(filled)
+            );
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count < 0) {
+                return std::unexpected(system_error("read harness interpreter directive"));
+            }
+            if (count == 0) {
+                break;
+            }
+            filled += static_cast<std::size_t>(count);
+        }
+        return {};
+    };
+    if (auto read = read_prefix(2U); !read) {
+        return std::unexpected(read.error());
+    }
+    if (filled < 2U || bytes[0] != '#' || bytes[1] != '!') {
+        if (!unchanged()) {
+            return std::unexpected(std::string{"harness directive source changed"});
+        }
+        return std::nullopt;
+    }
+    if (auto read = read_prefix(bytes.size()); !read) {
+        return std::unexpected(read.error());
+    }
+    if (!unchanged()) {
+        return std::unexpected(std::string{"harness directive source changed"});
+    }
+    const std::string_view remainder{bytes.data() + 2, filled - 2U};
+    const auto newline = remainder.find('\n');
+    const auto directive = remainder.substr(0, newline);
+    if (directive.size() > 4094U || directive.find('\0') != std::string_view::npos) {
+        return std::unexpected(
+            std::string{"harness interpreter directive exceeds its bound or contains NUL"}
+        );
+    }
+    const std::string first_line{directive};
     std::istringstream shebang{first_line};
     std::vector<std::string> fields;
     for (std::string field; shebang >> field;) {
@@ -399,6 +393,26 @@ auto derive_runtime_dependency_closure(
         return std::unexpected(std::string{"unsupported harness interpreter directive"});
     }
 
+    return fields;
+}
+
+auto derive_runtime_dependency_closure(
+    const std::filesystem::path& source_entry,
+    const std::filesystem::path& source,
+    bool allow_dependency_commands
+) -> result<runtime_dependency_closure> {
+    auto directive = read_runtime_shebang(source);
+    if (!directive) {
+        return std::unexpected(directive.error());
+    }
+    if (!*directive) {
+        return runtime_dependency_closure{
+            .executable = source,
+            .arguments = {},
+            .read_only_paths = {source},
+        };
+    }
+    const auto& fields = **directive;
     std::filesystem::path interpreter;
     std::error_code error;
     if (fields.front() == "/usr/bin/env") {
@@ -623,37 +637,115 @@ auto protect_snapshot_tree(const std::filesystem::path& payload_root) -> result<
             if (error) {
                 return std::unexpected("enumerate staged harness snapshot: " + error.message());
             }
+            if (entries.size() >= 200'000U + 64U + 1U || iterator.depth() > 129 ||
+                iterator->path().native().size() > 4096U) {
+                return std::unexpected(std::string{"snapshot sealing enumeration exceeds bounds"});
+            }
             entries.push_back(iterator->path());
         }
     }
     std::ranges::reverse(entries);
-    for (const auto& entry : entries) {
-        const auto status = std::filesystem::symlink_status(entry, error);
-        if (error) {
-            return std::unexpected("inspect staged harness snapshot: " + error.message());
+    entries.push_back(payload_root);
+    // Inspect every entry before sealing any; never treat chmod as ACL revocation.
+    // Created objects were already cleared through their exclusive descriptors.
+    const auto inspect_and_seal = [](const std::filesystem::path& entry,
+                                     bool seal) -> result<void> {
+        struct stat named{};
+        if (::lstat(entry.c_str(), &named) != 0) {
+            return std::unexpected(system_error("inspect staged harness snapshot"));
         }
-        if (std::filesystem::is_symlink(status)) {
-            continue;
+        if (S_ISLNK(named.st_mode)) {
+            struct directory_guard {
+                int fd;
+                ~directory_guard() {
+                    if (fd >= 0) {
+                        (void)::close(fd);
+                    }
+                }
+            } parent{::open(
+                entry.parent_path().c_str(),
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+            )};
+            if (parent.fd < 0) {
+                return std::unexpected(system_error("open symlink sealing parent"));
+            }
+            if (auto checked = glove::detail::check_descriptor_acl(
+                    parent.fd, glove::detail::acl_scope::integrity
+                );
+                !checked) {
+                return checked;
+            }
+            return glove::detail::check_symlink_acl_at(parent.fd, entry.filename().native(), named);
+        }
+        if (named.st_uid != ::geteuid() ||
+            (!S_ISDIR(named.st_mode) && (!S_ISREG(named.st_mode) || named.st_nlink != 1)) ||
+            (named.st_mode & (S_ISUID | S_ISGID | S_ISVTX | S_IRWXG | S_IRWXO)) != 0) {
+            return std::unexpected(std::string{"unsafe staged snapshot entry before sealing"});
+        }
+        struct owned_fd {
+            int value;
+            explicit owned_fd(int fd) : value{fd} {}
+            owned_fd(const owned_fd&) = delete;
+            auto operator=(const owned_fd&) -> owned_fd& = delete;
+            ~owned_fd() {
+                if (value >= 0) {
+                    (void)::close(value);
+                }
+            }
+        } fd{::open(
+            entry.c_str(),
+            O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC |
+                (S_ISDIR(named.st_mode) ? O_DIRECTORY : 0)
+        )};
+        struct stat opened{};
+        if (fd.value < 0 || ::fstat(fd.value, &opened) != 0 || named.st_dev != opened.st_dev ||
+            named.st_ino != opened.st_ino || named.st_uid != opened.st_uid ||
+            named.st_mode != opened.st_mode || named.st_nlink != opened.st_nlink) {
+            return std::unexpected(std::string{"snapshot sealing entry changed on open"});
+        }
+        if (auto acl =
+                glove::detail::check_descriptor_acl(fd.value, glove::detail::acl_scope::integrity);
+            !acl) {
+            return acl;
         }
         const mode_t mode =
-            std::filesystem::is_directory(status)
-                ? 0500
-                : ((status.permissions() &
-                    (std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
-                     std::filesystem::perms::others_exec)) != std::filesystem::perms::none
-                       ? 0500
-                       : 0400);
-        if (::chmod(entry.c_str(), mode) != 0) {
-            return std::unexpected(system_error("protect staged harness snapshot"));
+            S_ISDIR(opened.st_mode) || (opened.st_mode & S_IXUSR) != 0 ? 0500 : 0400;
+        if (seal && ::fchmod(fd.value, mode) != 0) {
+            return std::unexpected(system_error("seal pinned snapshot entry"));
+        }
+        struct stat after{};
+        struct stat rebound{};
+        if (::fstat(fd.value, &after) != 0 || ::lstat(entry.c_str(), &rebound) != 0 ||
+            opened.st_dev != after.st_dev || opened.st_ino != after.st_ino ||
+            opened.st_uid != after.st_uid || after.st_dev != rebound.st_dev ||
+            after.st_ino != rebound.st_ino || after.st_uid != rebound.st_uid ||
+            after.st_mode != rebound.st_mode || after.st_nlink != rebound.st_nlink ||
+            (seal && (after.st_mode & 07777U) != mode)) {
+            return std::unexpected(std::string{"snapshot sealing entry binding changed"});
+        }
+        return glove::detail::check_descriptor_acl(fd.value, glove::detail::acl_scope::integrity);
+    };
+    for (const auto& entry : entries) {
+        if (auto checked = inspect_and_seal(entry, false); !checked) {
+            return checked;
         }
     }
-    if (::chmod(payload_root.c_str(), 0500) != 0) {
-        return std::unexpected(system_error("protect staged harness snapshot root"));
+    for (const auto& entry : entries) {
+        if (auto sealed = inspect_and_seal(entry, true); !sealed) {
+            return sealed;
+        }
     }
     return {};
 }
 
 auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> result<bool> {
+    const auto snapshots = plan.snapshot_root.parent_path();
+    if (auto prepared = ensure_protected_directory(snapshots.parent_path(), true); !prepared) {
+        return std::unexpected(prepared.error());
+    }
+    if (auto prepared = ensure_protected_directory(snapshots, true); !prepared) {
+        return std::unexpected(prepared.error());
+    }
     std::error_code error;
     if (std::filesystem::exists(plan.snapshot_root, error)) {
         struct stat metadata{};
@@ -663,6 +755,11 @@ auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> resul
             return std::unexpected(
                 std::string{"existing runtime snapshot root is not owner-protected"}
             );
+        }
+        if (auto acl_tree =
+                validate_protected_snapshot_tree(plan.snapshot_root, plan.source_roots.size());
+            !acl_tree) {
+            return std::unexpected(acl_tree.error());
         }
         auto existing_digest =
             materialized_snapshot_digest(plan.payload_root, plan.source_roots.size());
@@ -676,79 +773,138 @@ auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> resul
     if (error) {
         return std::unexpected("inspect runtime snapshot: " + error.message());
     }
-    const auto snapshots = plan.snapshot_root.parent_path();
-    if (auto prepared = ensure_protected_directory(snapshots); !prepared) {
-        return std::unexpected(prepared.error());
-    }
     const auto temporary =
         snapshots / (".staging-" + plan.digest + "-" + std::to_string(::getpid()));
     if (std::filesystem::exists(temporary, error) || error) {
         return std::unexpected(std::string{"runtime snapshot staging path already exists"});
     }
-    if (!std::filesystem::create_directory(temporary, error) || error) {
-        return std::unexpected("create runtime snapshot staging directory: " + error.message());
-    }
-    const auto temporary_payload = temporary / "payload";
-    const auto remove_temporary = [&] {
-        std::error_code ignored;
-        std::filesystem::permissions(
-            temporary,
-            std::filesystem::perms::owner_all,
-            std::filesystem::perm_options::add,
-            ignored
-        );
-        std::filesystem::remove_all(temporary, ignored);
-    };
-    if (!std::filesystem::create_directory(temporary_payload, error) || error) {
-        remove_temporary();
-        return std::unexpected("create runtime snapshot payload: " + error.message());
-    }
-    for (std::size_t index = 0; index < plan.source_roots.size() && !error; ++index) {
-        const auto& closure_root = plan.source_roots[index];
-        const auto destination = snapshot_payload_root(temporary_payload, index);
-        if (std::filesystem::is_directory(closure_root, error)) {
-            std::filesystem::copy(
-                closure_root,
-                destination,
-                std::filesystem::copy_options::recursive |
-                    std::filesystem::copy_options::copy_symlinks,
-                error
-            );
-        } else {
-            std::filesystem::create_directory(destination, error);
-            if (!error) {
-                std::filesystem::copy_file(
-                    closure_root,
-                    destination / closure_root.filename(),
-                    std::filesystem::copy_options::none,
-                    error
-                );
+
+    struct staging_handles {
+        staging_handles() = default;
+        staging_handles(const staging_handles&) = delete;
+        auto operator=(const staging_handles&) -> staging_handles& = delete;
+
+        ~staging_handles() {
+            if (payload >= 0) {
+                (void)::close(payload);
+            }
+            if (root >= 0) {
+                (void)::close(root);
+            }
+            if (parent >= 0) {
+                (void)::close(parent);
             }
         }
+
+        int parent{-1};
+        int root{-1};
+        int payload{-1};
+    } owned;
+
+    owned.parent = ::open(snapshots.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    struct stat parent_metadata{};
+    if (owned.parent < 0 || ::fstat(owned.parent, &parent_metadata) != 0 ||
+        !S_ISDIR(parent_metadata.st_mode) || parent_metadata.st_uid != ::geteuid() ||
+        (parent_metadata.st_mode & 07777U) != 0700U) {
+        return std::unexpected(std::string{"runtime snapshot parent is not owner-protected"});
     }
-    if (error) {
-        remove_temporary();
-        return std::unexpected("copy runtime snapshot: " + error.message());
+    if (auto acl = glove::detail::check_descriptor_acl(
+            owned.parent, glove::detail::acl_scope::owner_private
+        );
+        !acl) {
+        return std::unexpected(acl.error());
+    }
+    const auto temporary_name = temporary.filename().string();
+    if (::mkdirat(owned.parent, temporary_name.c_str(), 0700) != 0) {
+        return std::unexpected(system_error("create runtime snapshot staging directory"));
+    }
+    owned.root = ::openat(
+        owned.parent, temporary_name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    );
+    struct stat created{};
+    if (owned.root < 0 || ::fstat(owned.root, &created) != 0 || created.st_uid != ::geteuid() ||
+        !S_ISDIR(created.st_mode) || (created.st_mode & 07777U) != 0700U) {
+        return std::unexpected(
+            std::string{"cannot pin new runtime staging directory; cleanup ownership unknown"}
+        );
+    }
+    const auto temporary_payload = temporary / "payload";
+    const auto fail_with_cleanup = [&](std::string failure) -> std::unexpected<std::string> {
+        auto removed = remove_owned_staging_tree(owned.parent, temporary_name, owned.root);
+        if (!removed) {
+            failure += "; staging cleanup failed: " + removed.error();
+        }
+        return std::unexpected(std::move(failure));
+    };
+    struct stat root_named{};
+    if (::fstatat(owned.parent, temporary_name.c_str(), &root_named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        root_named.st_dev != created.st_dev || root_named.st_ino != created.st_ino ||
+        root_named.st_uid != created.st_uid || root_named.st_mode != created.st_mode) {
+        return fail_with_cleanup("new snapshot staging root binding changed");
+    }
+    if (auto acl = glove::detail::clear_created_descriptor_acl(owned.root); !acl) {
+        return fail_with_cleanup(acl.error());
+    }
+    if (::mkdirat(owned.root, "payload", 0700) != 0) {
+        return fail_with_cleanup(system_error("create runtime snapshot payload"));
+    }
+    owned.payload = ::openat(
+        owned.root, "payload", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+    );
+    struct stat payload_created{};
+    struct stat payload_named{};
+    if (owned.payload < 0 || ::fstat(owned.payload, &payload_created) != 0 ||
+        !S_ISDIR(payload_created.st_mode) || payload_created.st_uid != ::geteuid() ||
+        (payload_created.st_mode & 07777U) != 0700U ||
+        ::fstatat(owned.root, "payload", &payload_named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        payload_created.st_dev != payload_named.st_dev ||
+        payload_created.st_ino != payload_named.st_ino ||
+        payload_created.st_uid != payload_named.st_uid ||
+        payload_created.st_mode != payload_named.st_mode) {
+        return fail_with_cleanup("new snapshot payload binding is unsafe");
+    }
+    if (auto acl = glove::detail::clear_created_descriptor_acl(owned.payload); !acl) {
+        return fail_with_cleanup(acl.error());
+    }
+    if (auto copied = copy_runtime_closure(
+            plan.source_roots, temporary_payload, plan.logical_bytes, plan.entries
+        );
+        !copied) {
+        return fail_with_cleanup("copy runtime snapshot: " + copied.error());
     }
     auto copied_digest = materialized_snapshot_digest(temporary_payload, plan.source_roots.size());
     if (!copied_digest || *copied_digest != plan.digest) {
-        remove_temporary();
-        return std::unexpected(
+        return fail_with_cleanup(
             copied_digest ? std::string{"runtime source changed while it was being snapshotted"}
                           : copied_digest.error()
         );
     }
     if (auto protected_tree = protect_snapshot_tree(temporary_payload); !protected_tree) {
-        remove_temporary();
-        return std::unexpected(protected_tree.error());
+        return fail_with_cleanup(protected_tree.error());
     }
     // Publish under an owner-only parent before sealing the final root. Some
     // platforms reject renaming a non-writable directory; the verified 0700
     // parent prevents another principal from observing this transition.
-    if (::rename(temporary.c_str(), plan.snapshot_root.c_str()) != 0) {
+    if (::renameat(
+            owned.parent,
+            temporary_name.c_str(),
+            owned.parent,
+            plan.snapshot_root.filename().c_str()
+        ) != 0) {
         const int rename_error = errno;
-        remove_temporary();
+        auto removed = remove_owned_staging_tree(owned.parent, temporary_name, owned.root);
+        if (!removed) {
+            return std::unexpected(
+                system_error("publish runtime snapshot", rename_error) +
+                "; staging cleanup failed: " + removed.error()
+            );
+        }
         if (rename_error == EEXIST || rename_error == ENOTEMPTY) {
+            if (auto acl_tree =
+                    validate_protected_snapshot_tree(plan.snapshot_root, plan.source_roots.size());
+                !acl_tree) {
+                return std::unexpected(acl_tree.error());
+            }
             auto existing_digest =
                 materialized_snapshot_digest(plan.payload_root, plan.source_roots.size());
             if (existing_digest && *existing_digest == plan.digest) {
@@ -757,17 +913,16 @@ auto materialize_runtime_snapshot(const planned_runtime_snapshot& plan) -> resul
         }
         return std::unexpected(system_error("publish runtime snapshot", rename_error));
     }
-    if (::chmod(plan.snapshot_root.c_str(), 0500) != 0) {
+    if (::fchmod(owned.root, 0500) != 0) {
         const int protection_error = errno;
-        std::error_code ignored;
-        std::filesystem::permissions(
-            plan.snapshot_root,
-            std::filesystem::perms::owner_all,
-            std::filesystem::perm_options::add,
-            ignored
+        auto removed = remove_owned_staging_tree(
+            owned.parent, plan.snapshot_root.filename().string(), owned.root
         );
-        std::filesystem::remove_all(plan.snapshot_root, ignored);
-        return std::unexpected(system_error("protect runtime snapshot root", protection_error));
+        auto failure = system_error("protect runtime snapshot root", protection_error);
+        if (!removed) {
+            failure += "; published snapshot cleanup failed: " + removed.error();
+        }
+        return std::unexpected(std::move(failure));
     }
     return true;
 }
