@@ -79,6 +79,7 @@ The adapter fixes the private home and native skill location:
 | `pi` | `pi` | `/home/agent/.pi/agent/skills` | none |
 | `copilot` | `copilot` | `/home/agent/.copilot/skills` | `COPILOT_HOME=/home/agent/.copilot` |
 | `opencode` | `opencode` | `/home/agent/.config/opencode/skills` | `XDG_CONFIG_HOME=/home/agent/.config` |
+| `agy` | `agy` | `/home/agent/.gemini/skills` | none |
 
 Arguments, environment, and read-only dependencies are part of the local
 runtime digest. A Sage plan can select only the resulting template ID and
@@ -123,6 +124,7 @@ glove setup policy \
   --runtime pi \
   --runtime copilot \
   --runtime opencode \
+  --runtime agy \
   --pi-settings /absolute/reviewed/pi/settings.json \
   --pi-package-store /absolute/reviewed/pi/package-store \
   --pi-adoption-root "$HOME/.local/share/glove/pi-adoption" \
@@ -172,6 +174,7 @@ Repository-tested credential targets are deliberately narrow:
 | `pi` | none | Host Pi auth is explicitly excluded; a future model profile must separately approve an exact managed target |
 | `copilot` | none | Operator must verify the exact target for the pinned distribution before enabling a secret |
 | `opencode` | none | Operator must verify the exact target for the pinned distribution before enabling a secret |
+| `agy` | none | Operator must verify the exact target for the pinned distribution before enabling a secret |
 
 "None" is not permission to mount a directory. Until an exact target gains
 executable review evidence, that client remains credential-free.
@@ -206,7 +209,7 @@ Prepare one immutable test root with this reviewed shape:
 
 ```text
 <harness-root>/
-  node_modules/.bin/{codex,claude,pi,copilot,opencode}
+  node_modules/.bin/{codex,claude,pi,copilot,opencode,agy}
   node-runtime/bin/
 ```
 
