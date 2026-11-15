@@ -43,6 +43,16 @@ Run the full local gate before review or release:
 ./scripts/preflight.sh
 ```
 
+`GLOVE_PREFLIGHT_BUILD_ROOT` selects an absolute build root for the gate.
+It defaults to this checkout's `build` directory; the gate creates separate
+`dev`, `asan`, `tsan`, and `fuzz` trees beneath it. Select a separate reviewed
+root to preserve an existing build configured with another compiler. Every
+stage uses the selected root, with the same presets and checks. Relative or
+empty overrides are rejected. Selecting an override requires CTest 3.30 or
+newer for preset directory overrides; the default root retains CMake 3.28
+compatibility. The gate does not install toolchains; a locally
+provisioned formatter can be selected with `GLOVE_CLANG_FORMAT`.
+
 ### Sage consumer interoperability
 
 The Sage Rust consumer test is opt-in via `GLOVE_ENABLE_SAGE_INTEROP_TEST` and
