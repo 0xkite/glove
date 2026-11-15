@@ -2,6 +2,7 @@ add_library(glove_kernel_lib STATIC
     registry.cpp
     server.cpp
     mcp_extension.cpp
+    reflect_json_codec.cpp
 )
 add_library(glove::kernel ALIAS glove_kernel_lib)
 

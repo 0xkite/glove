@@ -2,6 +2,7 @@
 #include "glove/kernel/server.hpp"
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
+#include "glove/reflect/codegen.hpp"
 #include "glove/reflect/extension.hpp"
 
 #include "tests/kernel/mock_pair.hpp"
@@ -35,14 +36,17 @@ struct[[= glove::reflect::tool_meta{"read_elf", "Inspect ELF headers of a pinned
 int main() {
 #if defined(GLOVE_HAS_REFLECTION)
     auto ext = std::make_unique<glove::reflect::reflected_extension>("re");
-    ext->add_tool<read_elf_args>([](const read_elf_args& args) {
+    assert(ext->add_tool<read_elf_args>([](const read_elf_args& args) {
         return glove::mcp::tool_call_result{
             .status = glove::mcp::tool_call_status::ok,
             .content = args.path + (args.sections ? ":sections" : ":header"),
             .structured_json = {},
             .error_message = {},
         };
-    });
+    }).has_value());
+    assert(!ext->add_tool<read_elf_args>([](const read_elf_args&) {
+        return glove::mcp::tool_call_result{};
+    }).has_value());
 
     glove::kernel::registry reg;
     assert(reg.add(std::move(ext)).has_value());
@@ -105,6 +109,17 @@ int main() {
     auto bad_resp = agent.recv();
     assert(bad_resp.has_value());
     assert(bad_resp->find("isError") != std::string::npos);
+
+    assert(
+        agent
+            .send(
+                R"({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"re.read_elf","arguments":{}}})"
+            )
+            .has_value()
+    );
+    auto missing_resp = agent.recv();
+    assert(missing_resp.has_value());
+    assert(missing_resp->find("isError") != std::string::npos);
 
     pair.close_agent_to_kernel();
     server_thread.join();
