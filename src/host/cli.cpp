@@ -25,6 +25,32 @@
 #include <vector>
 
 namespace glove::host {
+namespace detail {
+
+struct daemon_status_payload {
+    int schema_version = 1;
+    std::string service_name{};
+    bool running = false;
+    std::string status{};
+};
+
+struct status_counts_payload {
+    std::size_t passed = 0;
+    std::size_t info = 0;
+    std::size_t warning = 0;
+    std::size_t failed = 0;
+};
+
+struct status_payload {
+    int schema_version = 1;
+    bool ready = false;
+    std::string daemon{};
+    std::string config_path{};
+    status_counts_payload counts{};
+};
+
+} // namespace detail
+
 namespace {
 
 auto print_error(std::string_view code, std::string_view message, std::string_view recovery)
@@ -990,13 +1016,22 @@ auto daemon_command(std::span<char* const> arguments) -> int {
             return print_error("daemon_status_failed", active.error(), "glove daemon start");
         }
         if (json) {
-            std::printf(
-                "{\"schema_version\":1,\"service_name\":\"%s\",\"running\":%s,\"status\":\"%s\"}"
-                "\n",
-                plan->service_name.c_str(),
-                *active ? "true" : "false",
-                *active ? "running" : "stopped"
+            std::string encoded;
+            const auto write_error = glz::write_json(
+                detail::daemon_status_payload{
+                    .schema_version = 1,
+                    .service_name = plan->service_name,
+                    .running = *active,
+                    .status = *active ? "running" : "stopped",
+                },
+                encoded
             );
+            if (write_error) {
+                return print_error(
+                    "daemon_encode_failed", "Could not encode daemon status.", "glove daemon status"
+                );
+            }
+            std::printf("%s\n", encoded.c_str());
         } else {
             std::printf(
                 "Glove daemon: %s (%s)\n",
@@ -1137,11 +1172,7 @@ auto status_command(std::span<char* const> arguments) -> int {
     std::size_t info = 0;
     std::size_t warning = 0;
     std::size_t failed = 0;
-    bool daemon_running = false;
     for (const auto& check : report.checks) {
-        if (check.code == "control_service" && check.status == doctor_status::passed) {
-            daemon_running = true;
-        }
         switch (check.status) {
         case doctor_status::passed:
             ++passed;
@@ -1157,23 +1188,44 @@ auto status_command(std::span<char* const> arguments) -> int {
             break;
         }
     }
+    std::string daemon_state = "unknown";
+    if (auto daemon_plan = plan_daemon_service(
+            daemon_options{.config_path = config_path, .gloved_path = std::nullopt},
+            current_environment()
+        )) {
+        if (auto active = daemon_service_is_active(*daemon_plan)) {
+            daemon_state = *active ? "running" : "stopped";
+        }
+    }
     if (json) {
-        std::printf(
-            "{\"schema_version\":1,\"ready\":%s,\"daemon\":\"%s\",\"config_path\":\"%s\","
-            "\"counts\":{\"passed\":%zu,\"info\":%zu,\"warning\":%zu,\"failed\":%zu}}\n",
-            report.healthy() ? "true" : "false",
-            daemon_running ? "running" : "stopped",
-            report.config_path.c_str(),
-            passed,
-            info,
-            warning,
-            failed
+        std::string encoded;
+        const auto write_error = glz::write_json(
+            detail::status_payload{
+                .schema_version = 1,
+                .ready = report.healthy(),
+                .daemon = daemon_state,
+                .config_path = report.config_path,
+                .counts =
+                    detail::status_counts_payload{
+                        .passed = passed,
+                        .info = info,
+                        .warning = warning,
+                        .failed = failed,
+                    },
+            },
+            encoded
         );
+        if (write_error) {
+            return print_error(
+                "status_encode_failed", "Could not encode status output.", "glove status"
+            );
+        }
+        std::printf("%s\n", encoded.c_str());
     } else {
         std::printf(
             "Glove status: %s (daemon: %s, passed=%zu, warning=%zu, failed=%zu, info=%zu)\n",
             report.healthy() ? "ready" : "not ready",
-            daemon_running ? "running" : "stopped",
+            daemon_state.c_str(),
             passed,
             warning,
             failed,

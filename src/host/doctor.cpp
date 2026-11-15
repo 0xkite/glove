@@ -1,6 +1,7 @@
 #include "glove/host/doctor.hpp"
 
 #include "glove/host/control_client.hpp"
+#include "glove/host/daemon.hpp"
 #include "glove/host/setup.hpp"
 
 #if defined(__linux__)
@@ -250,6 +251,19 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         .recovery = {},
     });
     auto health = supervisor_health(*configured);
+    bool daemon_active_for_config = false;
+    if (auto daemon_plan = plan_daemon_service(
+            daemon_options{.config_path = config_path, .gloved_path = std::nullopt},
+            current_environment()
+        )) {
+        const auto directories = resolve_directories(current_environment());
+        const bool is_default_config =
+            directories && default_config_path(*directories) == config_path;
+        if (auto active = daemon_service_is_active(*daemon_plan);
+            active && *active && is_default_config) {
+            daemon_active_for_config = true;
+        }
+    }
     const bool runtime_dir_ok = owner_only_directory(configured->runtime_directory);
     struct stat runtime_dir_stat{};
     const bool runtime_dir_missing =
@@ -257,16 +271,16 @@ auto diagnose(const std::filesystem::path& config_path) -> doctor_report {
         errno == ENOENT;
     report.checks.push_back({
         .code = "runtime_directory",
-        .status = runtime_dir_ok                   ? doctor_status::passed
-                  : runtime_dir_missing && !health ? doctor_status::warning
-                                                   : doctor_status::failed,
+        .status = runtime_dir_ok                                     ? doctor_status::passed
+                  : runtime_dir_missing && !daemon_active_for_config ? doctor_status::warning
+                                                                     : doctor_status::failed,
         .message = runtime_dir_ok ? "Runtime directory is owner-only."
-                   : runtime_dir_missing && !health
+                   : runtime_dir_missing && !daemon_active_for_config
                        ? "Runtime directory is not yet created; `glove daemon start` will create "
                          "it with mode 0700."
                        : "Runtime directory is missing or not owner-only mode 0700.",
         .recovery =
-            runtime_dir_missing && !health
+            runtime_dir_missing && !daemon_active_for_config
                 ? "Run `glove daemon start`, then rerun `glove doctor`."
                 : "Repair the configured runtime directory ownership and mode before starting "
                   "gloved.",
