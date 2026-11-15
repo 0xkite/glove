@@ -25,8 +25,8 @@ namespace glove::control::linux_detail {
 namespace {
 
 constexpr std::size_t max_idempotency_namespace_bytes = 112U;
-constexpr std::array<std::string_view, 5> managed_runtime_catalog{
-    "codex", "claude-code", "pi", "copilot", "opencode"
+constexpr std::array<std::string_view, 6> managed_runtime_catalog{
+    "codex", "claude-code", "pi", "copilot", "opencode", "agy"
 };
 
 auto valid_identifier(std::string_view value, std::size_t max_bytes = 128U) -> bool {

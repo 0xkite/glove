@@ -48,6 +48,7 @@ lifecycle.
 | `pi` | `pi` | `.pi/agent/skills` | None | Glove generates `settings.json` from the adopted package snapshot | Explicit package-closure adoption only; auth, sessions, host settings, model state, and package credentials are excluded |
 | `copilot` | `copilot` | `.copilot/skills` | `COPILOT_HOME=/home/agent/.copilot` | None | None; credentials require an explicit secret mount |
 | `opencode` | `opencode` | `.config/opencode/skills` | `XDG_CONFIG_HOME=/home/agent/.config` | None | None; credentials require an explicit secret mount |
+| `agy` | `agy` | `.gemini/skills` | None | None | None; credentials require an explicit secret mount |
 
 Pi is intentionally different. `glove policy adopt-pi` reads an explicitly named
 host settings file only to select package closure members from an explicitly

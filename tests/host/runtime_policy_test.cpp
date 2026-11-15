@@ -68,7 +68,7 @@ auto run() -> int {
     REQUIRE(write_owner_file(codex, "#!/bin/sh\nexit 0\n", 0700));
 
     const auto detected = detect_runtime_harnesses({harness_bin});
-    REQUIRE(detected.size() == 5U);
+    REQUIRE(detected.size() == 6U);
     const auto codex_detection = std::ranges::find_if(detected, [](const auto& candidate) {
         return candidate.runtime_id == "codex";
     });

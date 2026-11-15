@@ -1,7 +1,7 @@
 # Managed agent client setup
 
-This runbook turns an operator-installed Codex, Claude Code, Pi, Copilot, or
-OpenCode distribution into an explicit Glove runtime. It does not copy the
+This runbook turns an operator-installed Codex, Claude Code, Pi, Copilot,
+OpenCode, or Antigravity (`agy`) distribution into an explicit Glove runtime. It does not copy the
 operator's home or make a client usable merely because it runs in the service
 user's shell. Read the authority model and evidence status in
 [client-adoption-matrix.md](client-adoption-matrix.md) first.
@@ -52,7 +52,7 @@ into the protected root. Review the dry run before confirming it.
 
 ```sh
 glove policy stage \
-  --runtime <codex|claude-code|pi|copilot|opencode> \
+  --runtime <codex|claude-code|pi|copilot|opencode|agy> \
   --source /absolute/reviewed/client-bin/<executable> \
   --directory "$HOME/.local/share/glove/harnesses" \
   --dry-run --json

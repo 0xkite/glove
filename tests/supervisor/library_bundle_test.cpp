@@ -692,6 +692,7 @@ auto run() -> int {
              "pi",
              "copilot",
              "opencode",
+             "agy",
          }) {
         const auto adapter = glove::supervisor::native_skill_runtime_adapter_for(runtime_id);
         REQUIRE(adapter.has_value());

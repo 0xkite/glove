@@ -701,7 +701,7 @@ auto run() -> int {
     REQUIRE(capabilities.agent_runtime_adapter_schema_version == 1);
     REQUIRE(
         capabilities.managed_runtime_ids ==
-        std::vector<std::string>({"codex", "claude-code", "pi", "copilot", "opencode"})
+        std::vector<std::string>({"codex", "claude-code", "pi", "copilot", "opencode", "agy"})
     );
     REQUIRE(capabilities.path_exposure_admin_schema_version == 0);
     REQUIRE(capabilities.path_exposure_catalog_schema_version == 0);

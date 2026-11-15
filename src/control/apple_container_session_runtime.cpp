@@ -2303,7 +2303,7 @@ auto apple_container_session_runtime::managed_runtime_ids() const -> std::vector
     if (!lifecycle_operational() || !state_ || !state_->config.harness_closure_digest) {
         return {};
     }
-    std::vector<std::string> runtime_ids{"claude-code", "pi", "copilot", "opencode"};
+    std::vector<std::string> runtime_ids{"claude-code", "pi", "copilot", "opencode", "agy"};
     if (state_->config.sage_guest) {
         runtime_ids.emplace_back(supervisor::sage_guest_runtime_id);
     }

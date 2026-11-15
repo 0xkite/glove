@@ -254,7 +254,7 @@ auto run() -> int {
     const auto discovered_digest = runtime_launch_template_digest(discovered_codex);
     REQUIRE(discovered_digest.has_value());
     REQUIRE(*discovered_digest != launch_digest());
-    for (const std::string_view runtime_id : {"claude-code", "pi", "copilot", "opencode"}) {
+    for (const std::string_view runtime_id : {"claude-code", "pi", "copilot", "opencode", "agy"}) {
         auto native_discovery = discovered_codex;
         native_discovery.runtime_discovery = std::string{runtime_id};
         REQUIRE(runtime_launch_template_digest(native_discovery).has_value());

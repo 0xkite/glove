@@ -176,12 +176,24 @@ auto native_skill_runtime_adapter_for(std::string_view runtime_id)
             .managed_configuration = std::nullopt,
         };
     }
+    if (runtime_id == "agy") {
+        return native_skill_runtime_adapter{
+            .runtime_id = "agy",
+            .executable_name = "agy",
+            .home_mount_alias = "__runtime_home_agy",
+            .skill_root_components = {".gemini", "skills"},
+            .managed_environment = {},
+            .managed_arguments = {},
+            .adoption_manifest = std::nullopt,
+            .managed_configuration = std::nullopt,
+        };
+    }
     return std::nullopt;
 }
 
 auto native_skill_runtime_adapters() -> std::vector<native_skill_runtime_adapter> {
-    constexpr std::array<std::string_view, 5> runtime_ids = {
-        "codex", "claude-code", "pi", "copilot", "opencode"
+    constexpr std::array<std::string_view, 6> runtime_ids = {
+        "codex", "claude-code", "pi", "copilot", "opencode", "agy"
     };
     std::vector<native_skill_runtime_adapter> adapters;
     adapters.reserve(runtime_ids.size());
