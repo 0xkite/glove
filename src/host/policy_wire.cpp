@@ -51,4 +51,8 @@ auto encode(const policy_install_report& report) -> result<std::string> {
     return encode_json(report);
 }
 
+auto encode(const policy_remove_report& report) -> result<std::string> {
+    return encode_json(report);
+}
+
 } // namespace glove::host::policy_wire
