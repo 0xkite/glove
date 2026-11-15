@@ -18,6 +18,7 @@
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <span>
 #include <string>
@@ -2051,6 +2052,169 @@ auto workspace_command(std::span<char* const> arguments) -> int {
         );
     }
     return 0;
+}
+
+auto print_session_usage() -> void {
+    std::fprintf(
+        stderr,
+        "usage:\n"
+        "  glove session start --id <session-id> --plan <absolute-file> "
+        "--controller-digest <sha256> [--idempotency-key <key>] [--config <absolute-file>] "
+        "[--json]\n"
+        "  glove session status --id <session-id> [--config <absolute-file>] [--json]\n"
+    );
+}
+
+auto print_session_status(const workspace_session_status& status, bool json) -> int {
+    if (json) {
+        auto encoded = glz::write_json(status);
+        if (!encoded) {
+            return print_error(
+                "session_encode_failed",
+                "Could not encode workspace session status.",
+                "glove session status --id " + status.session_id
+            );
+        }
+        std::printf("%s\n", encoded->c_str());
+        return 0;
+    }
+    std::printf(
+        "%s state=%s controller_plan_digest=%s plan_content_digest=%s expires_at_ms=%llu\n",
+        status.session_id.c_str(),
+        status.state.c_str(),
+        status.controller_plan_digest.c_str(),
+        status.plan_content_digest.c_str(),
+        static_cast<unsigned long long>(status.expires_at_ms)
+    );
+    return 0;
+}
+
+auto session_command(std::span<char* const> arguments) -> int {
+    if (arguments.empty() || std::string_view{arguments.front()} == "-h" ||
+        std::string_view{arguments.front()} == "--help") {
+        print_session_usage();
+        return arguments.empty() ? 2 : 0;
+    }
+    const std::string_view action{arguments.front()};
+    if (action != "start" && action != "status") {
+        print_session_usage();
+        return 2;
+    }
+
+    std::string session_id;
+    std::string controller_digest;
+    std::string idempotency_key;
+    std::optional<std::filesystem::path> plan_path;
+    std::optional<std::filesystem::path> config_path;
+    bool json = false;
+
+    for (std::size_t index = 1; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--json") {
+            json = true;
+            ++index;
+            continue;
+        }
+        if (argument == "-h" || argument == "--help") {
+            print_session_usage();
+            return 0;
+        }
+        if (index + 1U >= arguments.size()) {
+            print_session_usage();
+            return 2;
+        }
+        const std::string_view value{arguments[index + 1U]};
+        if (argument == "--id") {
+            session_id = value;
+        } else if (argument == "--config") {
+            config_path = value;
+        } else if (action == "start" && argument == "--plan") {
+            plan_path = value;
+        } else if (action == "start" && argument == "--controller-digest") {
+            controller_digest = value;
+        } else if (action == "start" && argument == "--idempotency-key") {
+            idempotency_key = value;
+        } else {
+            print_session_usage();
+            return 2;
+        }
+        index += 2U;
+    }
+
+    if (session_id.empty()) {
+        return print_error(
+            "session_id_missing",
+            "A workspace session identifier is required.",
+            action == "start" ? "glove session start --id <session-id> --plan <absolute-file> "
+                                "--controller-digest <sha256>"
+                              : "glove session status --id <session-id>"
+        );
+    }
+
+    if (!config_path) {
+        auto resolved = default_path();
+        if (!resolved) {
+            return print_error(
+                "session_environment_invalid", resolved.error(), "glove setup --dry-run"
+            );
+        }
+        config_path = std::move(*resolved);
+    }
+    auto configured = load_config(*config_path);
+    if (!configured) {
+        return print_error("session_config_invalid", configured.error(), "glove doctor");
+    }
+
+    if (action == "status") {
+        auto status = workspace_session_status_for(*configured, session_id);
+        if (!status) {
+            return print_error("session_status_failed", status.error(), "glove daemon status");
+        }
+        return print_session_status(*status, json);
+    }
+
+    if (!plan_path || !plan_path->is_absolute() || controller_digest.empty()) {
+        return print_error(
+            "session_start_usage",
+            "Session start requires --id, an absolute --plan file, and --controller-digest.",
+            "glove session start --id <session-id> --plan <absolute-file> "
+            "--controller-digest <sha256>"
+        );
+    }
+    std::ifstream input(*plan_path, std::ios::binary);
+    if (!input) {
+        return print_error(
+            "session_plan_unreadable",
+            "Could not read the session plan file.",
+            "Check that --plan points to an existing readable JSON file."
+        );
+    }
+    std::string plan_json(
+        (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>()
+    );
+    if (plan_json.empty()) {
+        return print_error(
+            "session_plan_empty",
+            "The session plan file is empty.",
+            "Supply a non-empty canonical session plan JSON file."
+        );
+    }
+    if (idempotency_key.empty()) {
+        idempotency_key = "session-" + session_id;
+    }
+    auto status = create_workspace_session(
+        *configured,
+        workspace_session_create_request{
+            .session_id = std::move(session_id),
+            .controller_plan_digest = std::move(controller_digest),
+            .canonical_plan_json = std::move(plan_json),
+            .idempotency_key = std::move(idempotency_key),
+        }
+    );
+    if (!status) {
+        return print_error("session_start_failed", status.error(), "glove daemon status");
+    }
+    return print_session_status(*status, json);
 }
 
 auto init_command(std::span<char* const> arguments) -> int {

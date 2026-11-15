@@ -11,6 +11,7 @@ auto status_command(std::span<char* const> arguments) -> int;
 auto config_command(std::span<char* const> arguments) -> int;
 auto policy_command(std::span<char* const> arguments) -> int;
 auto workspace_command(std::span<char* const> arguments) -> int;
+auto session_command(std::span<char* const> arguments) -> int;
 auto init_command(std::span<char* const> arguments) -> int;
 
 } // namespace glove::host

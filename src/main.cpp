@@ -421,6 +421,7 @@ void print_usage() {
         "  config          inspect or derive trusted machine-local configuration\n"
         "  policy          detect harnesses and generate or validate runtime policy\n"
         "  workspace       discover, register, and list explicit workspace exposures\n"
+        "  session         create or inspect gloved-managed workspace sessions\n"
         "  init            enroll a project beneath a setup-approved protected root\n"
         "  run             spawn an MCP-client agent inside the container\n"
         "  exec            contain a real self-driving agent (e.g. pi); stdio + egress\n"
@@ -485,6 +486,11 @@ auto main(int argc, char** argv) -> int {
     }
     if (sub == "workspace") {
         return glove::host::workspace_command(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
+    if (sub == "session") {
+        return glove::host::session_command(
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }
