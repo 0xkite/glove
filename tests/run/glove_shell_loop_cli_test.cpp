@@ -62,10 +62,42 @@ auto run() -> int {
     std::filesystem::create_directories(workspace, ec);
     REQUIRE(!ec);
 
-    // 1. `glove shell` without `--workspace` uses an ephemeral private runtime dir.
+    // 1. `glove shell` without `--workspace` uses an ephemeral private runtime dir
+    //    for PWD/HOME/TMPDIR and removes that directory on exit.
+    const auto probe_dir = base / "probe";
+    std::filesystem::create_directories(probe_dir, ec);
+    REQUIRE(!ec);
+    const auto runtime_record = probe_dir / "runtime_paths.txt";
     REQUIRE(
-        run_glove({GLOVE_BIN, "shell", "--", "/bin/sh", "-c", "test \"$GLOVE_SANDBOXED\" = 1"}) == 0
+        run_glove({
+            GLOVE_BIN,
+            "shell",
+            "--write",
+            probe_dir.string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "test \"$GLOVE_SANDBOXED\" = 1 && test -d \"$PWD\" && test -d \"$HOME\" && "
+            "test -d \"$TMPDIR\" && printf '%s\\n%s\\n%s\\n' \"$PWD\" \"$HOME\" \"$TMPDIR\" > " +
+                runtime_record.string(),
+        }) == 0
     );
+    {
+        std::ifstream in(runtime_record);
+        REQUIRE(in.good());
+        std::string pwd_path;
+        std::string home_path;
+        std::string tmp_path;
+        REQUIRE(static_cast<bool>(std::getline(in, pwd_path)));
+        REQUIRE(static_cast<bool>(std::getline(in, home_path)));
+        REQUIRE(static_cast<bool>(std::getline(in, tmp_path)));
+        REQUIRE(!pwd_path.empty());
+        REQUIRE(home_path == pwd_path + "/home");
+        REQUIRE(tmp_path == pwd_path + "/tmp");
+        REQUIRE(!std::filesystem::exists(pwd_path, ec));
+        REQUIRE(!std::filesystem::exists(home_path, ec));
+        REQUIRE(!std::filesystem::exists(tmp_path, ec));
+    }
 
     // 2. Explicit missing `--workspace` must fail closed (never auto-create).
     const auto missing_ws = base / "does-not-exist";
@@ -86,6 +118,7 @@ auto run() -> int {
         out << "#!/bin/sh\n"
                "set -e\n"
                "prompt=\"$1\"\n"
+               "echo turn >> turns.txt\n"
                "printf '%s\\n' \"$prompt\" > last_prompt.txt\n"
                "case \"$prompt\" in\n"
                "  *\"Previous verification failed\"*)\n"
@@ -125,7 +158,8 @@ auto run() -> int {
         REQUIRE(last_prompt.find("Initial RE prompt") != std::string::npos);
     }
 
-    // 4. Exhausting `--max-iterations` returns non-zero.
+    // 4. Exhausting `--max-iterations` runs exactly 2 turns before returning 1.
+    std::filesystem::remove(workspace / "turns.txt", ec);
     REQUIRE(
         run_glove({
             GLOVE_BIN,
@@ -144,6 +178,18 @@ auto run() -> int {
             "2",
         }) == 1
     );
+    {
+        std::ifstream turns_in(workspace / "turns.txt");
+        REQUIRE(turns_in.good());
+        int turns = 0;
+        std::string line;
+        while (std::getline(turns_in, line)) {
+            if (line == "turn") {
+                ++turns;
+            }
+        }
+        REQUIRE(turns == 2);
+    }
 
     std::filesystem::remove_all(base, ec);
     return 0;

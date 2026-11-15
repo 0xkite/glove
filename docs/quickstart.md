@@ -52,8 +52,8 @@ private `127.0.0.1:0` socket inside the isolated network namespace.
 ./build/dev/src/glove loop \
   --workspace /tmp/glove-work \
   --agent pi \
-  --prompt "Fix the parser bug and add a test" \
-  --verify "ctest --test-dir build --output-on-failure" \
+  --prompt "Write a findings summary to report.md" \
+  --verify "test -s report.md" \
   --max-iterations 5
 ```
 
