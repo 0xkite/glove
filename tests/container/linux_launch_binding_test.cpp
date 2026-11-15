@@ -323,6 +323,15 @@ auto run() -> int {
     REQUIRE(workspace_binding.has_value());
     REQUIRE(workspace_binding->profile_digest != first->profile_digest);
 
+    auto loopback_profile = first_profile;
+    loopback_profile.allow_loopback_listen = true;
+    auto loopback_binding = make_binding(loopback_profile, argv, first_mounts);
+    REQUIRE(loopback_binding.has_value());
+    REQUIRE(loopback_binding->profile_digest != first->profile_digest);
+    auto loopback_again = make_binding(loopback_profile, argv, first_mounts);
+    REQUIRE(loopback_again.has_value());
+    REQUIRE(loopback_again->profile_digest == loopback_binding->profile_digest);
+
     auto invalid_work_dir = first_profile;
     invalid_work_dir.work_dir = "/tmp";
     REQUIRE(!make_binding(invalid_work_dir, argv, first_mounts).has_value());

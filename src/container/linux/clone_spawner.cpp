@@ -994,9 +994,13 @@ auto setup_seccomp(
     };
 
     // Network: deny bind/listen/accept unless private-loopback listening is
-    // explicitly enabled inside CLONE_NEWNET. A local AF_UNIX socketpair is
-    // safe inside the private IPC namespace and lets runtimes use their signal
-    // helpers; it cannot connect to a host or network endpoint.
+    // explicitly enabled inside CLONE_NEWNET. Seccomp cannot inspect the
+    // sockaddr, so the capability is scoped by the namespace instead: a fresh
+    // network namespace contains only `lo`, so any bind (including
+    // INADDR_ANY) is reachable only from inside the sandbox. AF_INET6 and
+    // other families stay denied by the socket-domain rule below. A local
+    // AF_UNIX socketpair is safe inside the private IPC namespace and lets
+    // runtimes use their signal helpers.
     if (!allow_loopback_listen) {
         const int always_denied_net_syscalls[] = {
             SCMP_SYS(bind),

@@ -6,9 +6,16 @@
 #include "host/cli.hpp"
 #include "run/pi_cli.hpp"
 
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
@@ -218,7 +225,8 @@ void print_loop_usage() {
         "  --agent <name>          agent driver: pi (default), claude, codex, or agy\n"
         "  --cmd <path>            override agent executable path\n"
         "  --verify <cmd>          sandboxed shell command to verify each iteration\n"
-        "  --max-iterations <N>    maximum loop iterations (default: 5)\n"
+        "  --verify-timeout <sec>  kill the verifier after this many seconds (default: 600)\n"
+        "  --max-iterations <N>    maximum loop iterations, 1-1000 (default: 5)\n"
         "  --workspace <path>      read-write workspace for the agent\n"
         "  --read <path>           expose one additional path read-only\n"
         "  --write <path>          expose one additional path read-write\n"
@@ -439,10 +447,36 @@ auto load_prompt_spec(std::string_view spec) -> std::expected<std::string, std::
     return std::string{spec};
 }
 
-auto run_sandbox_verify(const glove::run::options& base_opts, const std::string& verify_cmd)
-    -> std::expected<std::pair<int, std::string>, std::string> {
+// Parse a complete positive decimal integer in [1, max]. Rejects prefixes such
+// as "3garbage", signs, empty input, and out-of-range values.
+auto parse_positive_int(std::string_view text, int max) -> std::optional<int> {
+    int value = 0;
+    const auto* first = text.data();
+    const auto* last = text.data() + text.size();
+    const auto [ptr, ec] = std::from_chars(first, last, value);
+    if (text.empty() || ec != std::errc{} || ptr != last || value < 1 || value > max) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+constexpr std::size_t kVerifyFeedbackTailBytes = 4000;
+
+struct verify_outcome {
+    int exit_code = 0;
+    bool timed_out = false;
+    std::string tail;
+};
+
+// Run `verify_cmd` offline inside the sandbox. Output is echoed to stderr and
+// only a bounded tail is retained. A monotonic deadline bounds the whole
+// verifier: on expiry its process group is killed (the contained child dies
+// with it through PR_SET_PDEATHSIG and its PID namespace), then it is reaped.
+auto run_sandbox_verify(
+    const glove::run::options& base_opts, const std::string& verify_cmd, int timeout_seconds
+) -> std::expected<verify_outcome, std::string> {
     int pipe_fd[2] = {-1, -1};
-    if (::pipe(pipe_fd) != 0) {
+    if (::pipe2(pipe_fd, O_CLOEXEC) != 0) {
         return std::unexpected(std::string{"pipe failed for --verify"});
     }
     const ::pid_t child = ::fork();
@@ -452,10 +486,13 @@ auto run_sandbox_verify(const glove::run::options& base_opts, const std::string&
         return std::unexpected(std::string{"fork failed for --verify"});
     }
     if (child == 0) {
-        ::close(pipe_fd[0]);
+        ::setpgid(0, 0);
+        const int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDIN_FILENO);
+        }
         ::dup2(pipe_fd[1], STDOUT_FILENO);
         ::dup2(pipe_fd[1], STDERR_FILENO);
-        ::close(pipe_fd[1]);
         glove::run::options verify_opts = base_opts;
         verify_opts.egress.clear();
         verify_opts.agent_preset.reset();
@@ -469,22 +506,57 @@ auto run_sandbox_verify(const glove::run::options& base_opts, const std::string&
         }
         std::_Exit(*rc);
     }
+    ::setpgid(child, child);
     ::close(pipe_fd[1]);
-    std::string captured;
-    char buf[4096];
+
+    verify_outcome outcome;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{timeout_seconds};
+    std::array<char, 4096> buf{};
     for (;;) {
-        const ssize_t n = ::read(pipe_fd[0], buf, sizeof(buf));
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()
+        );
+        if (remaining.count() <= 0) {
+            outcome.timed_out = true;
+            break;
+        }
+        ::pollfd pfd{.fd = pipe_fd[0], .events = POLLIN, .revents = 0};
+        const int ready = ::poll(&pfd, 1, static_cast<int>(remaining.count()));
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (ready == 0) {
+            continue;
+        }
+        const ssize_t n = ::read(pipe_fd[0], buf.data(), buf.size());
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
         if (n <= 0) {
             break;
         }
-        captured.append(buf, static_cast<std::size_t>(n));
-        std::fwrite(buf, 1, static_cast<std::size_t>(n), stderr);
+        const auto count = static_cast<std::size_t>(n);
+        std::fwrite(buf.data(), 1, count, stderr);
+        outcome.tail.append(buf.data(), count);
+        if (outcome.tail.size() > kVerifyFeedbackTailBytes) {
+            outcome.tail.erase(0, outcome.tail.size() - kVerifyFeedbackTailBytes);
+        }
+    }
+    if (outcome.timed_out) {
+        ::kill(-child, SIGKILL);
     }
     ::close(pipe_fd[0]);
     int status = 0;
     while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
-    return std::pair<int, std::string>{exit_code, std::move(captured)};
+    if (outcome.timed_out) {
+        outcome.exit_code = 124;
+    } else {
+        outcome.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+    }
+    return outcome;
 }
 
 auto loop_subcommand(std::span<char* const> args) -> int {
@@ -493,6 +565,7 @@ auto loop_subcommand(std::span<char* const> args) -> int {
     std::optional<std::string> verify_cmd;
     std::optional<std::string> cmd_override;
     int max_iterations = 5;
+    int verify_timeout_seconds = 600;
 
     std::size_t i = 0;
     while (i < args.size()) {
@@ -507,7 +580,8 @@ auto loop_subcommand(std::span<char* const> args) -> int {
             }
             continue;
         }
-        if (a == "--prompt" || a == "--verify" || a == "--cmd" || a == "--max-iterations") {
+        if (a == "--prompt" || a == "--verify" || a == "--cmd" || a == "--max-iterations" ||
+            a == "--verify-timeout") {
             if (i + 1 >= args.size()) {
                 std::fprintf(
                     stderr,
@@ -523,12 +597,26 @@ auto loop_subcommand(std::span<char* const> args) -> int {
                 verify_cmd = std::string{args[i + 1]};
             } else if (a == "--cmd") {
                 cmd_override = std::string{args[i + 1]};
-            } else {
-                max_iterations = std::atoi(args[i + 1]);
-                if (max_iterations <= 0) {
-                    std::fprintf(stderr, "glove loop: --max-iterations must be >= 1\n");
+            } else if (a == "--max-iterations") {
+                const auto parsed = parse_positive_int(args[i + 1], 1000);
+                if (!parsed) {
+                    std::fprintf(
+                        stderr, "glove loop: --max-iterations must be an integer in [1, 1000]\n"
+                    );
                     return 2;
                 }
+                max_iterations = *parsed;
+            } else {
+                const auto parsed = parse_positive_int(args[i + 1], 86400);
+                if (!parsed) {
+                    std::fprintf(
+                        stderr,
+                        "glove loop: --verify-timeout must be an integer number of seconds in "
+                        "[1, 86400]\n"
+                    );
+                    return 2;
+                }
+                verify_timeout_seconds = *parsed;
             }
             i += 2;
             continue;
@@ -598,12 +686,12 @@ auto loop_subcommand(std::span<char* const> args) -> int {
         if (!verify_cmd) {
             return *code;
         }
-        auto verify_result = run_sandbox_verify(opts, *verify_cmd);
+        auto verify_result = run_sandbox_verify(opts, *verify_cmd, verify_timeout_seconds);
         if (!verify_result) {
             std::fprintf(stderr, "glove loop: %s\n", verify_result.error().c_str());
             return 1;
         }
-        if (verify_result->first == 0) {
+        if (verify_result->exit_code == 0) {
             std::fprintf(
                 stderr, "[glove loop] iteration %d/%d: verification passed\n", iter, total_turns
             );
@@ -611,19 +699,16 @@ auto loop_subcommand(std::span<char* const> args) -> int {
         }
         std::fprintf(
             stderr,
-            "[glove loop] iteration %d/%d: verification failed (exit %d)\n",
+            "[glove loop] iteration %d/%d: verification %s (exit %d)\n",
             iter,
             total_turns,
-            verify_result->first
+            verify_result->timed_out ? "timed out" : "failed",
+            verify_result->exit_code
         );
-        constexpr std::size_t kMaxTail = 4000;
-        std::string_view out{verify_result->second};
-        if (out.size() > kMaxTail) {
-            out = out.substr(out.size() - kMaxTail);
-        }
-        current_prompt = "Previous verification failed (exit " +
-                         std::to_string(verify_result->first) + "):\n```\n" + std::string{out} +
-                         "\n```\n\nOriginal task:\n" + *base_prompt;
+        current_prompt = std::string{"Previous verification "} +
+                         (verify_result->timed_out ? "timed out" : "failed") + " (exit " +
+                         std::to_string(verify_result->exit_code) + "):\n```\n" +
+                         verify_result->tail + "\n```\n\nOriginal task:\n" + *base_prompt;
     }
     std::fprintf(
         stderr,

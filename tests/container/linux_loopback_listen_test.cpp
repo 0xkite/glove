@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,7 +40,43 @@ auto child_check_denied() -> int {
     return 0;
 }
 
+// The capability is scoped by the private network namespace, not by the
+// sockaddr (seccomp cannot inspect it). Prove the namespace exposes only `lo`,
+// so even an INADDR_ANY bind is reachable only from inside the sandbox.
+auto child_check_namespace_only_loopback() -> int {
+    std::ifstream dev("/proc/net/dev");
+    REQUIRE(dev.good());
+    std::string line;
+    int interfaces = 0;
+    int line_number = 0;
+    while (std::getline(dev, line)) {
+        if (++line_number <= 2) {
+            continue;
+        }
+        const auto colon = line.find(':');
+        REQUIRE(colon != std::string::npos);
+        auto name = line.substr(0, colon);
+        name.erase(0, name.find_first_not_of(' '));
+        REQUIRE(name == "lo");
+        ++interfaces;
+    }
+    REQUIRE(interfaces == 1);
+
+    const int any_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(any_fd >= 0);
+    ::sockaddr_in any{};
+    any.sin_family = AF_INET;
+    any.sin_port = htons(0);
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    REQUIRE(::bind(any_fd, reinterpret_cast<const ::sockaddr*>(&any), sizeof(any)) == 0);
+    ::close(any_fd);
+    return 0;
+}
+
 auto child_check_allowed() -> int {
+    if (child_check_namespace_only_loopback() != 0) {
+        return 1;
+    }
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     REQUIRE(fd >= 0);
 
