@@ -86,6 +86,12 @@ inline void append_json_escaped(std::string& out, std::string_view text) {
         case '\\':
             out += "\\\\";
             break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
         case '\n':
             out += "\\n";
             break;
@@ -95,9 +101,18 @@ inline void append_json_escaped(std::string& out, std::string_view text) {
         case '\t':
             out += "\\t";
             break;
-        default:
-            out.push_back(ch);
+        default: {
+            const auto byte = static_cast<unsigned char>(ch);
+            if (byte < 0x20U) {
+                static constexpr char kHex[] = "0123456789abcdef";
+                out += "\\u00";
+                out.push_back(kHex[(byte >> 4U) & 0x0FU]);
+                out.push_back(kHex[byte & 0x0FU]);
+            } else {
+                out.push_back(ch);
+            }
             break;
+        }
         }
     }
     out.push_back('"');

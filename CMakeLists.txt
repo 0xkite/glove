@@ -96,7 +96,7 @@ if(_glove_reflection_mode STREQUAL "AUTO" OR _glove_reflection_mode STREQUAL "ON
             set(_glove_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
             string(APPEND CMAKE_REQUIRED_FLAGS " ${_glove_refl_flag}")
             check_cxx_source_compiles(
-                "#if __has_include(<meta>)\n#include <meta>\n#else\n#include <experimental/meta>\n#endif\nint main() { return std::meta::is_type(^^int) ? 0 : 1; }"
+                "#if __has_include(<meta>)\n#include <meta>\n#else\n#include <experimental/meta>\n#endif\ntemplate<int N> struct probe_ann { int v = N; };\nstruct [[= probe_ann<1>{}]] probe_s { int x; };\nconsteval bool probe_ok() {\n  constexpr auto ms = std::define_static_array(std::meta::nonstatic_data_members_of(^^probe_s, std::meta::access_context::current()));\n  constexpr auto as = std::define_static_array(std::meta::annotations_of(^^probe_s));\n  if (ms.size() != 1 || as.size() != 1) return false;\n  return (std::meta::type_of(ms[0]) == ^^int) && std::meta::has_template_arguments(std::meta::type_of(as[0])) && (std::meta::template_of(std::meta::type_of(as[0])) == ^^probe_ann) && std::meta::extract<probe_ann<1>>(as[0]).v == 1;\n}\nint main() { return probe_ok() ? 0 : 1; }"
                 "GLOVE_HAS_META_${_glove_refl_id}"
             )
             set(CMAKE_REQUIRED_FLAGS "${_glove_saved_required_flags}")

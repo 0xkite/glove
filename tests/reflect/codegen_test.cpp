@@ -1,6 +1,6 @@
 #include "glove/reflect/codegen.hpp"
 
-#include <cassert>
+#include <iostream>
 
 #if defined(GLOVE_HAS_REFLECTION)
 #    include <cstdint>
@@ -28,19 +28,38 @@ struct[[= glove::reflect::tool_meta{"read_elf", "Inspect ELF headers of a pinned
 #endif
 
 int main() {
+    auto require = [](bool cond, const char* expr) {
+        if (!cond) {
+            std::cerr << "reflect_codegen_test failed: " << expr << '\n';
+            return false;
+        }
+        return true;
+    };
 #if defined(GLOVE_HAS_REFLECTION)
     static_assert(glove::reflect::reflection_available);
 
     const auto descriptor = glove::reflect::descriptor_of<read_elf_args>();
-    assert(descriptor.name == "read_elf");
-    assert(descriptor.description == "Inspect ELF headers of a pinned binary");
+    if (!require(descriptor.name == "read_elf", "descriptor.name == read_elf")) {
+        return 1;
+    }
+    if (!require(descriptor.description == "Inspect ELF headers of a pinned binary",
+                 "descriptor.description")) {
+        return 1;
+    }
 
     const std::string expected_schema =
         R"({"type":"object","properties":{"path":{"type":"string","description":"Read-only quarantined artifact path"},"sections":{"type":"boolean","description":"Include section table"},"max_symbols":{"type":"integer","description":"Maximum symbol entries"},"extra_flags":{"type":"array","items":{"type":"string"}}},"required":["path","extra_flags"]})";
-    assert(descriptor.input_schema_json == expected_schema);
-    assert(glove::reflect::input_schema_of<read_elf_args>() == expected_schema);
+    if (!require(descriptor.input_schema_json == expected_schema,
+                 "descriptor.input_schema_json == expected_schema")) {
+        return 1;
+    }
+    if (!require(glove::reflect::input_schema_of<read_elf_args>() == expected_schema,
+                 "input_schema_of == expected_schema")) {
+        return 1;
+    }
 #else
     static_assert(!glove::reflect::reflection_available);
+    (void)require;
 #endif
     return 0;
 }

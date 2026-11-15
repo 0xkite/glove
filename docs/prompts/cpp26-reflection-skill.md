@@ -6,12 +6,12 @@ description: Author, build, and verify C++26 P2996/P3394 reflection-driven MCP t
 # C++26 P2996/P3394 Reflection in Glove
 
 Use this skill whenever adding or modifying reflection-driven MCP tool descriptors,
-annotations, or CMake reflection detection in `tools/glove`.
+annotations, or CMake reflection detection in this repository.
 
 ## Offline Reference
-- Canonical repo doc: `tools/glove/docs/cpp26-reflection.md`
-- Header: `tools/glove/include/glove/reflect/codegen.hpp`
-- Test: `tools/glove/tests/reflect/codegen_test.cpp` (`reflect_codegen`)
+- Canonical repo doc: `docs/cpp26-reflection.md`
+- Header: `include/glove/reflect/codegen.hpp`
+- Test: `tests/reflect/codegen_test.cpp` (`reflect_codegen`)
 
 ## Rules (Verified on GCC 16.2.1 + Clang 23.1.5)
 1. **Tri-state CMake option**: Keep `GLOVE_REFLECTION` as `AUTO|ON|OFF` (default `AUTO`).

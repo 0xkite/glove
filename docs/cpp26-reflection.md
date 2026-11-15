@@ -75,7 +75,7 @@ Supported C++ field types in `input_schema_of<T>()`:
 ## Local Verification (Offline)
 
 ```sh
-cmake -S tools/glove -B build/refl-dev -G Ninja \
+cmake -S . -B build/refl-dev -G Ninja \
   -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
   -DGLOVE_REFLECTION=ON
 cmake --build build/refl-dev --target reflect_codegen_test
