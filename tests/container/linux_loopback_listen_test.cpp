@@ -91,7 +91,33 @@ auto child_check_allowed() -> int {
     ::socklen_t len = sizeof(bound);
     REQUIRE(::getsockname(fd, reinterpret_cast<::sockaddr*>(&bound), &len) == 0);
     REQUIRE(ntohs(bound.sin_port) != 0);
+
+    // Verify private loopback connect + accept succeeds inside CLONE_NEWNET.
+    const int client_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(client_fd >= 0);
+    ::sockaddr_in peer{};
+    peer.sin_family = AF_INET;
+    peer.sin_port = bound.sin_port;
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::connect(client_fd, reinterpret_cast<const ::sockaddr*>(&peer), sizeof(peer)) == 0);
+    const int accepted_fd = ::accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
+    REQUIRE(accepted_fd >= 0);
+    ::close(accepted_fd);
+    ::close(client_fd);
     ::close(fd);
+
+    // Invariant: allow_loopback_listen must NOT grant external IPv4 reachability.
+    const int ext_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(ext_fd >= 0);
+    ::sockaddr_in ext{};
+    ext.sin_family = AF_INET;
+    ext.sin_port = htons(443);
+    REQUIRE(::inet_pton(AF_INET, "192.0.2.1", &ext.sin_addr) == 1);
+    const int ext_rc = ::connect(ext_fd, reinterpret_cast<const ::sockaddr*>(&ext), sizeof(ext));
+    const int ext_err = errno;
+    ::close(ext_fd);
+    REQUIRE(ext_rc < 0);
+    REQUIRE(ext_err == ENETUNREACH || ext_err == EPERM || ext_err == EACCES);
 
     const int inet6_fd = ::socket(AF_INET6, SOCK_STREAM, 0);
     if (inet6_fd >= 0) {
