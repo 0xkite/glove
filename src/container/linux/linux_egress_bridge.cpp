@@ -283,7 +283,7 @@ private:
     std::vector<worker_record> workers_;
 };
 
-auto bring_up_loopback() -> std::expected<void, std::string> {
+auto bring_up_loopback_impl() -> std::expected<void, std::string> {
     const int descriptor = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (descriptor < 0) {
         return std::unexpected(error_text("open loopback control socket"));
@@ -395,7 +395,7 @@ auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::uint16_t proxy_p
         close_descriptor(sandbox_channel_fd);
         return std::unexpected(std::string{"invalid sandbox egress bridge configuration"});
     }
-    if (auto loopback = bring_up_loopback(); !loopback) {
+    if (auto loopback = bring_up_loopback_impl(); !loopback) {
         close_descriptor(sandbox_channel_fd);
         return loopback;
     }
@@ -417,6 +417,10 @@ auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::uint16_t proxy_p
     close_descriptor(*listener);
     close_descriptor(sandbox_channel_fd);
     return {};
+}
+
+auto bring_up_loopback() -> std::expected<void, std::string> {
+    return bring_up_loopback_impl();
 }
 
 } // namespace glove::container::linux_detail

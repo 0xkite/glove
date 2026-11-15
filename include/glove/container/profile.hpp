@@ -227,6 +227,11 @@ struct profile {
     // When present, launch is rejected unless the selected spawner reports
     // complete enforcement and observable receipts for every limit.
     std::optional<resource_limits> required_limits;
+
+    // Permit private-loopback socket binding/listening/accepting inside the
+    // isolated network namespace (e.g. for agent runtimes like agy that bind
+    // 127.0.0.1:0). Does not grant external network egress.
+    bool allow_loopback_listen = false;
 };
 
 // Validate and canonicalise a profile. Invalid, overlapping, contradictory,

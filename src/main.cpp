@@ -6,11 +6,17 @@
 #include "host/cli.hpp"
 #include "run/pi_cli.hpp"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
+#include <fstream>
+#include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -159,6 +165,8 @@ void print_exec_usage() {
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
         "                          the agent has no network.\n"
+        "  --allow-loopback-listen allow private-loopback bind/listen inside the\n"
+        "                          sandbox network namespace (e.g. for agy)\n"
         "  --herdr                 report lifecycle (working/done) to host Herdr when\n"
         "                          running inside a Herdr pane\n"
         "  --agent <preset>        mediate provider credentials for a built-in client\n"
@@ -169,6 +177,159 @@ void print_exec_usage() {
         "                          session nonce.\n"
         "  -h, --help              show this help and exit\n"
     );
+}
+
+void print_shell_usage() {
+    std::fprintf(
+        stderr,
+        "usage: glove shell [options] [-- <command argv>...]\n"
+        "\n"
+        "Drop into an interactive sandboxed workspace shell (defaults to /bin/bash\n"
+        "or /bin/sh when no command is given).\n"
+        "\n"
+        "options:\n"
+        "  --workspace <path>      read-write workspace for the shell\n"
+        "  --read <path>           expose one additional path read-only\n"
+        "  --write <path>          expose one additional path read-write\n"
+        "  --env <name>            copy one named host environment variable\n"
+        "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
+        "  --egress-allow <host>[:port]\n"
+        "                          permit outbound HTTPS through the egress proxy\n"
+        "  --allow-loopback-listen allow private-loopback bind/listen inside the\n"
+        "                          sandbox network namespace\n"
+        "  --herdr                 report lifecycle to host Herdr\n"
+        "  --agent <preset>        mediate provider credentials (claude-code, codex, pi)\n"
+        "  -h, --help              show this help and exit\n"
+    );
+}
+
+void print_loop_usage() {
+    std::fprintf(
+        stderr,
+        "usage: glove loop --prompt <text|@file> [options]\n"
+        "\n"
+        "Run a seeded agent feedback loop inside the sandbox. After each agent turn,\n"
+        "if --verify is set, runs the verification command inside the sandbox (offline)\n"
+        "and feeds failure output back into the next turn until it passes or\n"
+        "--max-iterations is reached.\n"
+        "\n"
+        "options:\n"
+        "  --prompt <text|@file>   initial task prompt or @path to prompt file (required)\n"
+        "  --agent <name>          agent driver: pi (default), claude, codex, or agy\n"
+        "  --cmd <path>            override agent executable path\n"
+        "  --verify <cmd>          sandboxed shell command to verify each iteration\n"
+        "  --max-iterations <N>    maximum loop iterations (default: 5)\n"
+        "  --workspace <path>      read-write workspace for the agent\n"
+        "  --read <path>           expose one additional path read-only\n"
+        "  --write <path>          expose one additional path read-write\n"
+        "  --env <name>            copy one named host environment variable\n"
+        "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
+        "  --egress-allow <host>[:port]\n"
+        "                          permit outbound HTTPS through the egress proxy\n"
+        "  --allow-loopback-listen allow private-loopback bind/listen inside the sandbox\n"
+        "  --herdr                 report lifecycle to host Herdr\n"
+        "  -h, --help              show this help and exit\n"
+    );
+}
+
+// Parse flags shared across `exec`, `shell`, and `loop`.
+// Returns std::nullopt if args[i] is not a shared sandbox flag, 0 if consumed,
+// or 2 on parse error.
+auto parse_sandbox_flag(
+    std::span<char* const> args,
+    std::size_t& i,
+    glove::run::options& opts,
+    std::string_view cmd_name
+) -> std::optional<int> {
+    std::string_view a{args[i]};
+    if (a == "--workspace") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --workspace needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        opts.workspace = std::filesystem::path{args[i + 1]};
+        i += 2;
+        return 0;
+    }
+    if (a == "--herdr") {
+        opts.herdr = true;
+        ++i;
+        return 0;
+    }
+    if (a == "--allow-loopback-listen") {
+        opts.allow_loopback_listen = true;
+        ++i;
+        return 0;
+    }
+    if (a == "--agent") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --agent needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        opts.agent_preset = std::string{args[i + 1]};
+        i += 2;
+        return 0;
+    }
+    if (a == "--read" || a == "--write" || a == "--env" || a == "--audit-log") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: %.*s needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data(),
+                static_cast<int>(a.size()),
+                a.data()
+            );
+            return 2;
+        }
+        if (a == "--read") {
+            opts.readable.emplace_back(args[i + 1]);
+        } else if (a == "--write") {
+            opts.writable.emplace_back(args[i + 1]);
+        } else if (a == "--env") {
+            opts.environment_names.emplace_back(args[i + 1]);
+        } else {
+            opts.audit_log = std::filesystem::path{args[i + 1]};
+        }
+        i += 2;
+        return 0;
+    }
+    if (a == "--egress-allow") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --egress-allow needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        auto rule = parse_egress(args[i + 1]);
+        if (!rule) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: %s\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data(),
+                rule.error().c_str()
+            );
+            return 2;
+        }
+        opts.egress.push_back(std::move(*rule));
+        i += 2;
+        return 0;
+    }
+    return std::nullopt;
 }
 
 auto exec_subcommand(std::span<char* const> args) -> int {
@@ -186,63 +347,10 @@ auto exec_subcommand(std::span<char* const> args) -> int {
             print_exec_usage();
             return 0;
         }
-        if (a == "--workspace") {
-            if (i + 1 >= args.size()) {
-                std::fprintf(stderr, "glove exec: --workspace needs an argument\n");
-                return 2;
+        if (const auto handled = parse_sandbox_flag(args, i, opts, "exec")) {
+            if (*handled != 0) {
+                return *handled;
             }
-            opts.workspace = std::filesystem::path{args[i + 1]};
-            i += 2;
-            continue;
-        }
-        if (a == "--herdr") {
-            opts.herdr = true;
-            ++i;
-            continue;
-        }
-        if (a == "--agent") {
-            if (i + 1 >= args.size()) {
-                std::fprintf(stderr, "glove exec: --agent needs an argument\n");
-                return 2;
-            }
-            opts.agent_preset = std::string{args[i + 1]};
-            i += 2;
-            continue;
-        }
-        if (a == "--read" || a == "--write" || a == "--env" || a == "--audit-log") {
-            if (i + 1 >= args.size()) {
-                std::fprintf(
-                    stderr,
-                    "glove exec: %.*s needs an argument\n",
-                    static_cast<int>(a.size()),
-                    a.data()
-                );
-                return 2;
-            }
-            if (a == "--read") {
-                opts.readable.emplace_back(args[i + 1]);
-            } else if (a == "--write") {
-                opts.writable.emplace_back(args[i + 1]);
-            } else if (a == "--env") {
-                opts.environment_names.emplace_back(args[i + 1]);
-            } else {
-                opts.audit_log = std::filesystem::path{args[i + 1]};
-            }
-            i += 2;
-            continue;
-        }
-        if (a == "--egress-allow") {
-            if (i + 1 >= args.size()) {
-                std::fprintf(stderr, "glove exec: --egress-allow needs an argument\n");
-                return 2;
-            }
-            auto rule = parse_egress(args[i + 1]);
-            if (!rule) {
-                std::fprintf(stderr, "glove exec: %s\n", rule.error().c_str());
-                return 2;
-            }
-            opts.egress.push_back(std::move(*rule));
-            i += 2;
             continue;
         }
         std::fprintf(
@@ -271,6 +379,258 @@ auto exec_subcommand(std::span<char* const> args) -> int {
         return 1;
     }
     return *code;
+}
+
+auto shell_subcommand(std::span<char* const> args) -> int {
+    glove::run::options opts;
+    std::size_t i = 0;
+    while (i < args.size()) {
+        std::string_view a{args[i]};
+        if (a == "--") {
+            ++i;
+            break;
+        }
+        if (a == "-h" || a == "--help") {
+            print_shell_usage();
+            return 0;
+        }
+        if (const auto handled = parse_sandbox_flag(args, i, opts, "shell")) {
+            if (*handled != 0) {
+                return *handled;
+            }
+            continue;
+        }
+        std::fprintf(
+            stderr, "glove shell: unknown flag '%.*s'\n", static_cast<int>(a.size()), a.data()
+        );
+        print_shell_usage();
+        return 2;
+    }
+    while (i < args.size()) {
+        opts.agent_argv.emplace_back(args[i]);
+        ++i;
+    }
+    if (opts.agent_argv.empty()) {
+        if (std::filesystem::exists("/bin/bash")) {
+            opts.agent_argv.emplace_back("/bin/bash");
+        } else {
+            opts.agent_argv.emplace_back("/bin/sh");
+        }
+    }
+    auto code = glove::run::exec(opts);
+    if (!code) {
+        std::fprintf(stderr, "glove shell: %s\n", code.error().c_str());
+        return 1;
+    }
+    return *code;
+}
+
+auto load_prompt_spec(std::string_view spec) -> std::expected<std::string, std::string> {
+    if (spec.starts_with('@')) {
+        const std::filesystem::path path{spec.substr(1)};
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            return std::unexpected(std::string{"cannot open prompt file '"} + path.string() + "'");
+        }
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
+    return std::string{spec};
+}
+
+auto run_sandbox_verify(const glove::run::options& base_opts, const std::string& verify_cmd)
+    -> std::expected<std::pair<int, std::string>, std::string> {
+    int pipe_fd[2] = {-1, -1};
+    if (::pipe(pipe_fd) != 0) {
+        return std::unexpected(std::string{"pipe failed for --verify"});
+    }
+    const ::pid_t child = ::fork();
+    if (child < 0) {
+        ::close(pipe_fd[0]);
+        ::close(pipe_fd[1]);
+        return std::unexpected(std::string{"fork failed for --verify"});
+    }
+    if (child == 0) {
+        ::close(pipe_fd[0]);
+        ::dup2(pipe_fd[1], STDOUT_FILENO);
+        ::dup2(pipe_fd[1], STDERR_FILENO);
+        ::close(pipe_fd[1]);
+        glove::run::options verify_opts = base_opts;
+        verify_opts.egress.clear();
+        verify_opts.agent_preset.reset();
+        verify_opts.allow_loopback_listen = false;
+        verify_opts.herdr = false;
+        verify_opts.agent_argv = {"/bin/sh", "-c", verify_cmd};
+        auto rc = glove::run::exec(verify_opts);
+        if (!rc) {
+            std::fprintf(stderr, "glove loop verify: %s\n", rc.error().c_str());
+            std::_Exit(125);
+        }
+        std::_Exit(*rc);
+    }
+    ::close(pipe_fd[1]);
+    std::string captured;
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = ::read(pipe_fd[0], buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        captured.append(buf, static_cast<std::size_t>(n));
+        std::fwrite(buf, 1, static_cast<std::size_t>(n), stderr);
+    }
+    ::close(pipe_fd[0]);
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+    return std::pair<int, std::string>{exit_code, std::move(captured)};
+}
+
+auto loop_subcommand(std::span<char* const> args) -> int {
+    glove::run::options opts;
+    std::optional<std::string> prompt_spec;
+    std::optional<std::string> verify_cmd;
+    std::optional<std::string> cmd_override;
+    int max_iterations = 5;
+
+    std::size_t i = 0;
+    while (i < args.size()) {
+        std::string_view a{args[i]};
+        if (a == "-h" || a == "--help") {
+            print_loop_usage();
+            return 0;
+        }
+        if (const auto handled = parse_sandbox_flag(args, i, opts, "loop")) {
+            if (*handled != 0) {
+                return *handled;
+            }
+            continue;
+        }
+        if (a == "--prompt" || a == "--verify" || a == "--cmd" || a == "--max-iterations") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(
+                    stderr,
+                    "glove loop: %.*s needs an argument\n",
+                    static_cast<int>(a.size()),
+                    a.data()
+                );
+                return 2;
+            }
+            if (a == "--prompt") {
+                prompt_spec = std::string{args[i + 1]};
+            } else if (a == "--verify") {
+                verify_cmd = std::string{args[i + 1]};
+            } else if (a == "--cmd") {
+                cmd_override = std::string{args[i + 1]};
+            } else {
+                max_iterations = std::atoi(args[i + 1]);
+                if (max_iterations <= 0) {
+                    std::fprintf(stderr, "glove loop: --max-iterations must be >= 1\n");
+                    return 2;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        std::fprintf(
+            stderr, "glove loop: unknown flag '%.*s'\n", static_cast<int>(a.size()), a.data()
+        );
+        print_loop_usage();
+        return 2;
+    }
+
+    if (!prompt_spec) {
+        std::fprintf(stderr, "glove loop: --prompt <text|@file> is required\n");
+        print_loop_usage();
+        return 2;
+    }
+    auto base_prompt = load_prompt_spec(*prompt_spec);
+    if (!base_prompt) {
+        std::fprintf(stderr, "glove loop: %s\n", base_prompt.error().c_str());
+        return 2;
+    }
+
+    const std::string driver = opts.agent_preset.value_or("pi");
+    if (driver != "pi" && driver != "claude" && driver != "claude-code" && driver != "codex" &&
+        driver != "agy") {
+        std::fprintf(
+            stderr,
+            "glove loop: unsupported --agent '%s' (expected pi, claude, claude-code, codex, or "
+            "agy)\n",
+            driver.c_str()
+        );
+        return 2;
+    }
+    if (driver == "agy") {
+        opts.allow_loopback_listen = true;
+        opts.agent_preset.reset();
+    } else if (!opts.egress.empty()) {
+        // Explicit --egress-allow uses the CONNECT proxy rather than the
+        // credentialed reverse endpoint.
+        opts.agent_preset.reset();
+    } else {
+        opts.agent_preset = driver;
+    }
+
+    const std::string bin =
+        cmd_override.value_or(driver == "claude-code" ? std::string{"claude"} : driver);
+
+    std::string current_prompt = *base_prompt;
+    const int total_turns = verify_cmd ? max_iterations : 1;
+    for (int iter = 1; iter <= total_turns; ++iter) {
+        std::fprintf(
+            stderr, "[glove loop] iteration %d/%d (%s)\n", iter, total_turns, driver.c_str()
+        );
+        glove::run::options turn_opts = opts;
+        if (driver == "agy") {
+            turn_opts.agent_argv = {bin, current_prompt};
+        } else if (driver == "codex") {
+            turn_opts.agent_argv = {bin, "exec", current_prompt};
+        } else {
+            turn_opts.agent_argv = {bin, "-p", current_prompt};
+        }
+        auto code = glove::run::exec(turn_opts);
+        if (!code) {
+            std::fprintf(stderr, "glove loop: %s\n", code.error().c_str());
+            return 1;
+        }
+        if (!verify_cmd) {
+            return *code;
+        }
+        auto verify_result = run_sandbox_verify(opts, *verify_cmd);
+        if (!verify_result) {
+            std::fprintf(stderr, "glove loop: %s\n", verify_result.error().c_str());
+            return 1;
+        }
+        if (verify_result->first == 0) {
+            std::fprintf(
+                stderr, "[glove loop] iteration %d/%d: verification passed\n", iter, total_turns
+            );
+            return 0;
+        }
+        std::fprintf(
+            stderr,
+            "[glove loop] iteration %d/%d: verification failed (exit %d)\n",
+            iter,
+            total_turns,
+            verify_result->first
+        );
+        constexpr std::size_t kMaxTail = 4000;
+        std::string_view out{verify_result->second};
+        if (out.size() > kMaxTail) {
+            out = out.substr(out.size() - kMaxTail);
+        }
+        current_prompt = "Previous verification failed (exit " +
+                         std::to_string(verify_result->first) + "):\n```\n" + std::string{out} +
+                         "\n```\n\nOriginal task:\n" + *base_prompt;
+    }
+    std::fprintf(
+        stderr,
+        "[glove loop] reached max iterations (%d) without passing verification\n",
+        total_turns
+    );
+    return 1;
 }
 
 auto run_subcommand(std::span<char* const> args) -> int {
@@ -413,19 +773,20 @@ void print_usage() {
         "\noptions:\n"
         "  -h, --help      show this help message and exit\n"
         "  -V, --version   print version and exit\n"
-        "\nsubcommands:\n"
+        "\nworkspace & agent execution:\n"
+        "  shell           drop into an interactive sandboxed workspace shell\n"
+        "  loop            run a seeded agent feedback loop (--prompt, --verify)\n"
+        "  exec            contain a self-driving agent (-- <argv>...)\n"
+        "  run             spawn an MCP-client agent inside the container\n"
+        "\nsetup, policy & sessions:\n"
         "  setup           initialize machine-local config, keys, and optional policies\n"
+        "  policy          detect harnesses and generate or validate runtime policy\n"
+        "  workspace       register and list explicit workspace exposures\n"
+        "  session         create or inspect gloved-managed workspace sessions\n"
         "  daemon          install and manage the fixed gloved user service\n"
         "  status          show concise daemon and readiness summary\n"
         "  doctor          diagnose configuration, sandbox prerequisites, and service health\n"
         "  config          inspect or derive trusted machine-local configuration\n"
-        "  policy          detect harnesses and generate or validate runtime policy\n"
-        "  workspace       discover, register, and list explicit workspace exposures\n"
-        "  session         create or inspect gloved-managed workspace sessions\n"
-        "  init            enroll a project beneath a setup-approved protected root\n"
-        "  run             spawn an MCP-client agent inside the container\n"
-        "  exec            contain a real self-driving agent (e.g. pi); stdio + egress\n"
-        "  pi              launch native macOS Pi with protected runtime and host-only API keys\n"
     );
 }
 
@@ -451,6 +812,16 @@ auto main(int argc, char** argv) -> int {
     }
     if (sub == "exec") {
         return exec_subcommand(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
+    if (sub == "shell") {
+        return shell_subcommand(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
+    if (sub == "loop") {
+        return loop_subcommand(
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }
