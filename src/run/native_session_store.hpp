@@ -92,7 +92,11 @@ enum class store_fault : std::uint8_t {
     record_fsync,
     publish_rename,
     parent_sync,
-    journal_append
+    journal_append,
+    journal_partial_write,
+    journal_sync,
+    journal_rollback,
+    journal_rollback_sync
 };
 
 struct admitted_checkpoint {

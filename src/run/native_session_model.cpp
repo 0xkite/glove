@@ -393,6 +393,28 @@ auto native_session_model::prepare_cancelled()
     return settle(result_code::ok);
 }
 
+auto native_session_model::preparation_persistence_failed()
+    -> std::expected<std::optional<settled>, std::string> {
+    if (launched_ || (projection_.phase != session_phase::preparing &&
+                      projection_.phase != session_phase::stopping)) {
+        return std::unexpected("preparation persistence failure outside preparation");
+    }
+    projection_.phase = session_phase::recovery_required;
+    projection_.history = history_status::failed;
+    projection_.effects = effects_status::incomplete;
+    return settle(result_code::checkpoint_failed);
+}
+
+auto native_session_model::intent_persistence_failed() -> std::expected<void, std::string> {
+    if (projection_.phase != session_phase::fresh && projection_.phase != session_phase::stopped &&
+        projection_.phase != session_phase::recovery_required) {
+        return std::unexpected("intent persistence failure while generation is active");
+    }
+    projection_.phase = session_phase::recovery_required;
+    projection_.effects = effects_status::incomplete;
+    return {};
+}
+
 auto native_session_model::prepare_failed() -> std::expected<std::optional<settled>, std::string> {
     if (launched_ || (projection_.phase != session_phase::preparing &&
                       projection_.phase != session_phase::stopping)) {

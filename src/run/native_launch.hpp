@@ -74,7 +74,7 @@ struct native_launch_context {
     // finalize runs after a KNOWN owned process outcome and endpoint
     // revocation, BEFORE mark_quiescent; a failure retains the private run.
     std::function<std::expected<void, std::string>(const native_private_state&)> materialize;
-    std::function<void()> on_launching;
+    std::function<std::expected<void, std::string>()> on_launching;
     std::function<std::expected<void, std::string>(const native_private_state&, int)> finalize;
 };
 

@@ -125,6 +125,9 @@ struct native_session_supervisor::implementation {
     std::uint64_t launches = 0;
     std::optional<std::string> last_error;
     store_fault injected = store_fault::none;
+    std::optional<std::string> journal_fault_kind;
+    bool cancellation_persistence_failed = false;
+    bool admission_closed = false;
 
     void log(std::string_view line) const {
         if (options.log) {
@@ -133,11 +136,26 @@ struct native_session_supervisor::implementation {
     }
 
     auto journal(journal_event item) -> result<void> {
-        auto appended = store->append(std::move(item));
+        auto fault = store_fault::none;
+        if (journal_fault_kind && *journal_fault_kind == item.kind) {
+            journal_fault_kind.reset();
+            fault = store_fault::journal_append;
+        }
+        auto appended = store->append(std::move(item), fault);
         if (!appended) {
             log("journal failure: " + appended.error());
         }
         return appended;
+    }
+
+    void record_preparation_result(
+        std::expected<std::optional<native_session_model::settled>, std::string> outcome
+    ) {
+        if (!outcome) {
+            const auto message = "model preparation transition failed: " + outcome.error();
+            last_error = last_error ? *last_error + "; " + message : message;
+            log(message);
+        }
     }
 
     auto snapshot_locked() const -> supervisor_snapshot {
@@ -164,9 +182,15 @@ struct native_session_supervisor::implementation {
             .checkpoint = request.checkpoint,
             .body_digest = request.body_digest
         };
+        native_session_model preview = *model;
+        const auto previewed = preview.submit(admitted);
+        const bool new_record = preview.operation_records() > model->operation_records();
         if (shutdown && request.op != session_operation::status) {
-            // An admitted shutdown closes mutation admission: nothing can be
-            // reserved that no loop will ever run.
+            if (!new_record && (previewed.code == result_code::request_conflict ||
+                                (request.op == session_operation::shutdown &&
+                                 previewed.code == result_code::ok))) {
+                return previewed;
+            }
             return {
                 .op = request.op,
                 .code = result_code::invalid_state,
@@ -183,11 +207,20 @@ struct native_session_supervisor::implementation {
                 .snapshot = model->projection()
             };
         }
-        native_session_model preview = *model;
-        const auto previewed = preview.submit(admitted);
-        const bool new_record = preview.operation_records() > model->operation_records();
         if (!new_record) {
             return previewed;
+        }
+        if (admission_closed && request.op != session_operation::shutdown) {
+            if (request.op == session_operation::stop && previewed.code == result_code::accepted &&
+                stop_source) {
+                stop_source->request_stop();
+            }
+            return {
+                .op = request.op,
+                .code = result_code::outcome_uncertain,
+                .final = true,
+                .snapshot = model->projection()
+            };
         }
         auto intent = event("intent", epoch, previewed.snapshot.generation);
         intent.request = request.request;
@@ -197,9 +230,24 @@ struct native_session_supervisor::implementation {
             intent.checkpoint = *request.checkpoint;
         }
         if (auto journaled = journal(std::move(intent)); !journaled) {
+            last_error = "request intent persistence failed: " + journaled.error();
+            admission_closed = true;
+            if (!pending) {
+                if (auto recovered = model->intent_persistence_failed(); !recovered) {
+                    *last_error += "; model recovery failed: " + recovered.error();
+                    log(*last_error);
+                }
+            }
+            if (request.op == session_operation::stop && previewed.code == result_code::accepted &&
+                stop_source) {
+                cancellation_persistence_failed = true;
+                stop_source->request_stop();
+            }
+            changed.notify_all();
             return {
                 .op = request.op,
-                .code = result_code::capacity,
+                .code = request.op == session_operation::stop ? result_code::outcome_uncertain
+                                                              : result_code::capacity,
                 .final = true,
                 .snapshot = model->projection()
             };
@@ -279,6 +327,9 @@ struct native_session_supervisor::implementation {
             return known;
         }
         changed.notify_all();
+        if (cancellation_persistence_failed) {
+            return std::unexpected("stop intent persistence failed; generation requires recovery");
+        }
         const std::span<const std::string> directories{
             history_location.data(), history_location.size() - 1
         };
@@ -319,7 +370,9 @@ struct native_session_supervisor::implementation {
                 !classified) {
                 return classified;
             }
-            (void)finish();
+            if (auto finished = finish(); !finished) {
+                return finished;
+            }
             return std::unexpected("history location unresolved: " + directory.error());
         }
         checkpoint_record record{
@@ -403,9 +456,16 @@ struct native_session_supervisor::implementation {
                 std::scoped_lock lock{mutex};
                 auto failed = event("prepare_failed", epoch, intent.generation);
                 failed.detail = admitted.error().substr(0, 512);
-                note(options.log, "journal prepare_failed", journal(std::move(failed)));
-                last_error = admitted.error();
-                note(options.log, "model prepare_failed", model->prepare_failed());
+                if (!cancellation_persistence_failed) {
+                    note(options.log, "journal prepare_failed", journal(std::move(failed)));
+                    last_error = admitted.error();
+                } else {
+                    last_error = *last_error + "; preparation failed: " + admitted.error();
+                }
+                record_preparation_result(
+                    cancellation_persistence_failed ? model->preparation_persistence_failed()
+                                                    : model->prepare_failed()
+                );
                 pending.reset();
                 stop_source.reset();
                 changed.notify_all();
@@ -438,9 +498,16 @@ struct native_session_supervisor::implementation {
             std::scoped_lock lock{mutex};
             auto failed = event("prepare_failed", epoch, intent.generation);
             failed.detail = composed.error().substr(0, 512);
-            note(options.log, "journal prepare_failed", journal(std::move(failed)));
-            last_error = composed.error();
-            note(options.log, "model prepare_failed", model->prepare_failed());
+            if (!cancellation_persistence_failed) {
+                note(options.log, "journal prepare_failed", journal(std::move(failed)));
+                last_error = composed.error();
+            } else {
+                last_error = *last_error + "; preparation failed: " + composed.error();
+            }
+            record_preparation_result(
+                cancellation_persistence_failed ? model->preparation_persistence_failed()
+                                                : model->prepare_failed()
+            );
             pending.reset();
             stop_source.reset();
             changed.notify_all();
@@ -451,17 +518,28 @@ struct native_session_supervisor::implementation {
                 return materialize(state, history);
             };
         }
-        context.on_launching = [&] {
+        context.on_launching = [&]() -> result<void> {
             std::scoped_lock lock{mutex};
+            if (cancellation_persistence_failed) {
+                return std::unexpected("request intent persistence failed before launch");
+            }
+            if (auto recorded = journal(event("launched", epoch, intent.generation)); !recorded) {
+                cancellation_persistence_failed = true;
+                admission_closed = true;
+                last_error = "launch journal persistence failed: " + recorded.error();
+                return std::unexpected(*last_error);
+            }
+            if (auto recorded = model->launched(); !recorded) {
+                cancellation_persistence_failed = true;
+                admission_closed = true;
+                last_error = "launch model transition failed: " + recorded.error();
+                log(*last_error);
+                return std::unexpected(*last_error);
+            }
             launched = true;
             ++launches;
-            note(
-                options.log,
-                "journal launched",
-                journal(event("launched", epoch, intent.generation))
-            );
-            note(options.log, "model launched", model->launched());
             changed.notify_all();
+            return {};
         };
         context.finalize = [&](const native_private_state& state, int) -> result<void> {
             return finalize(state, intent.generation);
@@ -469,7 +547,11 @@ struct native_session_supervisor::implementation {
         auto exited = launch_native_with_context(context, harness->adapter(), stop);
         std::scoped_lock lock{mutex};
         if (!exited) {
-            last_error = exited.error();
+            if (cancellation_persistence_failed && last_error) {
+                last_error = *last_error + "; generation ended: " + exited.error();
+            } else {
+                last_error = exited.error();
+            }
             log("generation ended with error: " + exited.error());
         }
         const auto phase = model->projection().phase;
@@ -480,11 +562,13 @@ struct native_session_supervisor::implementation {
             if (!exited) {
                 item.detail = exited.error().substr(0, 512);
             }
-            note(options.log, "journal preparation end", journal(std::move(item)));
-            note(
-                options.log,
-                "model preparation end",
-                cancelled ? model->prepare_cancelled() : model->prepare_failed()
+            if (!cancellation_persistence_failed) {
+                note(options.log, "journal preparation end", journal(std::move(item)));
+            }
+            record_preparation_result(
+                cancellation_persistence_failed ? model->preparation_persistence_failed()
+                : cancelled                     ? model->prepare_cancelled()
+                                                : model->prepare_failed()
             );
         } else if (
             phase == session_phase::running || phase == session_phase::stopping ||
@@ -497,6 +581,12 @@ struct native_session_supervisor::implementation {
             }
             note(options.log, "journal outcome_uncertain", journal(std::move(item)));
             note(options.log, "model outcome_uncertain", model->process_outcome_uncertain());
+        } else if (phase == session_phase::finalizing && !exited) {
+            auto recovered = model->checkpoint_failed();
+            if (!recovered) {
+                last_error = *last_error + "; model recovery failed: " + recovered.error();
+                log(*last_error);
+            }
         }
         pending.reset();
         stop_source.reset();
@@ -678,6 +768,16 @@ auto native_session_supervisor::management() const -> const native_management_se
 void native_session_supervisor::inject_store_fault(store_fault fault) {
     std::scoped_lock lock{state_->mutex};
     state_->injected = fault;
+}
+
+void native_session_supervisor::inject_journal_fault(std::string kind) {
+    std::scoped_lock lock{state_->mutex};
+    state_->journal_fault_kind = std::move(kind);
+}
+
+auto native_session_supervisor::cancellation_requested_for_test() const -> bool {
+    std::scoped_lock lock{state_->mutex};
+    return state_->stop_source && state_->stop_source->stop_requested();
 }
 
 } // namespace glove::run::detail

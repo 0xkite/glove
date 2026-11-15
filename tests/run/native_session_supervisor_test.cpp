@@ -578,6 +578,243 @@ auto history_classification(const fs::path& root) -> int {
     return 0;
 }
 
+auto journal_failure_recovery(const fs::path& root) -> int {
+    {
+        supervisor_fixture f{root / "start-intent-failure"};
+        REQUIRE(f.prepare());
+        auto created = native_session_supervisor::create(f.options(), f.harness);
+        REQUIRE_CREATED(created);
+        auto& supervisor = **created;
+        supervisor.inject_journal_fault("intent");
+        const auto start = control(supervisor, session_operation::start, 0);
+        REQUIRE(start && start->code == result_code::capacity);
+        REQUIRE(supervisor.snapshot().projection.phase == session_phase::recovery_required);
+        REQUIRE(supervisor.snapshot().last_error);
+        REQUIRE(
+            control(supervisor, session_operation::start, 0)->code == result_code::invalid_state
+        );
+        REQUIRE(
+            control(supervisor, session_operation::stop, 0)->code == result_code::invalid_state
+        );
+        REQUIRE(!supervisor.cancellation_requested_for_test());
+        REQUIRE(control(supervisor, session_operation::shutdown, 0)->code == result_code::ok);
+    }
+    {
+        supervisor_fixture f{root / "launch-journal-failure"};
+        REQUIRE(f.prepare());
+        auto created = native_session_supervisor::create(f.options(), f.harness);
+        REQUIRE_CREATED(created);
+        auto& supervisor = **created;
+        supervisor.inject_journal_fault("launched");
+        running_supervisor runner{supervisor};
+        REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
+        REQUIRE(reached(supervisor, session_phase::recovery_required, 60s));
+        REQUIRE(f.harness.observed.births == 0 && supervisor.snapshot().launches == 0);
+        REQUIRE(supervisor.snapshot().last_error && f.run_count() == 1);
+        REQUIRE(
+            control(supervisor, session_operation::start, 1)->code == result_code::invalid_state
+        );
+        REQUIRE(control(supervisor, session_operation::shutdown, 1)->code == result_code::ok);
+        REQUIRE(runner.join());
+    }
+    {
+        supervisor_fixture f{root / "preparing-intent-failure"};
+        REQUIRE(f.prepare());
+        f.harness.script.block_admission = true;
+        auto created = native_session_supervisor::create(f.options(), f.harness);
+        REQUIRE_CREATED(created);
+        auto& supervisor = **created;
+        running_supervisor runner{supervisor};
+        const auto start_id = next_request();
+        REQUIRE(
+            control(supervisor, session_operation::start, 0, std::nullopt, start_id)->code ==
+            result_code::accepted
+        );
+        REQUIRE(f.harness.wait_admission_blocked(10s));
+        supervisor.inject_journal_fault("intent");
+        REQUIRE(
+            control(supervisor, session_operation::stop, 1)->code == result_code::outcome_uncertain
+        );
+        REQUIRE(
+            control(supervisor, session_operation::stop, 1)->code == result_code::outcome_uncertain
+        );
+        REQUIRE(
+            control(supervisor, session_operation::start, 1)->code == result_code::invalid_state
+        );
+        REQUIRE(supervisor.cancellation_requested_for_test());
+        f.harness.release();
+        REQUIRE(reached(supervisor, session_phase::recovery_required, 60s));
+        REQUIRE(
+            control(supervisor, session_operation::start, 0, std::nullopt, start_id)->code ==
+            result_code::checkpoint_failed
+        );
+        REQUIRE(f.harness.observed.births == 0);
+        REQUIRE(control(supervisor, session_operation::shutdown, 1)->code == result_code::ok);
+        REQUIRE(runner.join());
+    }
+    {
+        supervisor_fixture f{root / "stop-intent-failure"};
+        REQUIRE(f.prepare());
+        auto created = native_session_supervisor::create(f.options(), f.harness);
+        REQUIRE_CREATED(created);
+        auto& supervisor = **created;
+        running_supervisor runner{supervisor};
+        const auto start_id = next_request();
+        REQUIRE(
+            control(supervisor, session_operation::start, 0, std::nullopt, start_id)->code ==
+            result_code::accepted
+        );
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
+        supervisor.inject_journal_fault("intent");
+        REQUIRE(
+            control(supervisor, session_operation::stop, 0)->code == result_code::stale_generation
+        );
+        REQUIRE(
+            control(supervisor, session_operation::stop, 1, std::nullopt, start_id)->code ==
+            result_code::request_conflict
+        );
+        REQUIRE(!supervisor.cancellation_requested_for_test());
+        const auto stop = control(supervisor, session_operation::stop, 1);
+        REQUIRE(stop && stop->code == result_code::outcome_uncertain && stop->final);
+        REQUIRE(reached(supervisor, session_phase::recovery_required, 60s));
+        REQUIRE(f.harness.observed.stop_seen);
+        REQUIRE(supervisor.snapshot().last_error);
+        REQUIRE(!supervisor.snapshot().projection.checkpoint);
+        REQUIRE(f.run_count() == 1);
+        const auto order = kinds(supervisor.journal());
+        REQUIRE(index_of(order, "intent:stop") == order.size());
+        REQUIRE(control(supervisor, session_operation::shutdown, 1)->code == result_code::ok);
+        REQUIRE(runner.join());
+    }
+    for (const auto* kind : {"history_classified", "finalized"}) {
+        supervisor_fixture f{root / (std::string{"finalization-"} + kind)};
+        REQUIRE(f.prepare());
+        f.harness.script.history = history_mode::invalid;
+        auto created = native_session_supervisor::create(f.options(), f.harness);
+        REQUIRE_CREATED(created);
+        auto& supervisor = **created;
+        running_supervisor runner{supervisor};
+        REQUIRE(control(supervisor, session_operation::start, 0)->code == result_code::accepted);
+        REQUIRE(reached(supervisor, session_phase::running, 60s));
+        supervisor.inject_journal_fault(kind);
+        const auto stop = control(supervisor, session_operation::stop, 1);
+        REQUIRE(stop && stop->code == result_code::accepted);
+        REQUIRE(reached(supervisor, session_phase::recovery_required, 60s));
+        const auto snapshot = supervisor.snapshot();
+        REQUIRE(snapshot.last_error && snapshot.projection.history == history_status::failed);
+        REQUIRE(snapshot.projection.effects == effects_status::incomplete);
+        REQUIRE(!snapshot.projection.checkpoint && f.run_count() == 1);
+        const auto retry =
+            control(supervisor, session_operation::stop, 1, std::nullopt, stop->request);
+        REQUIRE(retry && retry->code == result_code::checkpoint_failed && retry->final);
+        const auto order = kinds(supervisor.journal());
+        REQUIRE(index_of(order, "outcome_known") < order.size());
+        REQUIRE(index_of(order, kind) == order.size());
+        REQUIRE(control(supervisor, session_operation::shutdown, 1)->code == result_code::ok);
+        REQUIRE(runner.join());
+    }
+    return 0;
+}
+
+auto shutdown_replay(const fs::path& root) -> int {
+    supervisor_fixture f{root / "shutdown-replay"};
+    REQUIRE(f.prepare());
+    auto created = native_session_supervisor::create(f.options(), f.harness);
+    REQUIRE_CREATED(created);
+    auto& supervisor = **created;
+    const auto id = next_request();
+    management_request request{
+        .observed_generation = 0,
+        .request = id,
+        .op = session_operation::shutdown,
+        .checkpoint = std::nullopt,
+        .body_digest = std::string(64, '1')
+    };
+    const auto first = supervisor.submit(request);
+    REQUIRE(first.code == result_code::ok && first.final);
+    REQUIRE(supervisor.submit(request) == first);
+    request.body_digest = std::string(64, '2');
+    REQUIRE(supervisor.submit(request).code == result_code::request_conflict);
+    request.op = session_operation::interrupt;
+    REQUIRE(supervisor.submit(request).code == result_code::request_conflict);
+    request.op = session_operation::shutdown;
+    request.request = next_request();
+    REQUIRE(supervisor.submit(request).code == result_code::invalid_state);
+    request.op = session_operation::start;
+    REQUIRE(supervisor.submit(request).code == result_code::invalid_state);
+    return 0;
+}
+
+auto exhausted_journal_stop(const fs::path& root) -> int {
+    supervisor_fixture f{root / "stop-journal-exhausted"};
+    REQUIRE(f.prepare());
+    auto id = mint_session_id();
+    REQUIRE(id);
+    auto digest = native_startup_policy_digest(
+        f.harness.policy(), glove::net::endpoint_provider::anthropic, std::string{fixture_model}
+    );
+    REQUIRE(digest);
+    {
+        auto store = native_session_store::create(
+            f.root / "sessions",
+            {.session = *id,
+             .runtime_id = "claude",
+             .harness_id = "claude",
+             .runtime_digest = std::string(64, 'd'),
+             .history_format = std::string{claude_history_format},
+             .workspace = f.workspace().string(),
+             .policy_digest = *digest,
+             .conversation_id = std::string{fixture_conversation}}
+        );
+        REQUIRE(store);
+        journal_event note{
+            .seq = 0,
+            .kind = "note",
+            .epoch = {},
+            .generation = 0,
+            .request = {},
+            .body_digest = {},
+            .op = {},
+            .code = {},
+            .checkpoint = {},
+            .detail = {}
+        };
+        while (store->events().size() < max_journal_events - 2) {
+            REQUIRE(store->append(note));
+        }
+    }
+    auto created = native_session_supervisor::create(f.options(*id), f.harness);
+    REQUIRE_CREATED(created);
+    auto& supervisor = **created;
+    const auto start_id = next_request();
+    REQUIRE(
+        supervisor
+            .submit(
+                {.observed_generation = 0,
+                 .request = start_id,
+                 .op = session_operation::start,
+                 .checkpoint = std::nullopt,
+                 .body_digest = std::string(64, '1')}
+            )
+            .code == result_code::accepted
+    );
+    REQUIRE(supervisor.journal().size() == max_journal_events);
+    REQUIRE(
+        supervisor
+            .submit(
+                {.observed_generation = 1,
+                 .request = next_request(),
+                 .op = session_operation::stop,
+                 .checkpoint = std::nullopt,
+                 .body_digest = std::string(64, '2')}
+            )
+            .code == result_code::outcome_uncertain
+    );
+    REQUIRE(supervisor.cancellation_requested_for_test());
+    REQUIRE(supervisor.snapshot().last_error);
+    return 0;
+}
+
 auto corrupted_checkpoint_and_unknown_ownership(const fs::path& root) -> int {
     {
         supervisor_fixture f{root / "corrupt"};
@@ -760,6 +997,9 @@ auto main() -> int {
     REQUIRE(preparation_cancellation(root.path) == 0);
     REQUIRE(persistence_and_uncertainty(root.path) == 0);
     REQUIRE(history_classification(root.path) == 0);
+    REQUIRE(journal_failure_recovery(root.path) == 0);
+    REQUIRE(shutdown_replay(root.path) == 0);
+    REQUIRE(exhausted_journal_stop(root.path) == 0);
     REQUIRE(corrupted_checkpoint_and_unknown_ownership(root.path) == 0);
     REQUIRE(listener_recovery(root.path) == 0);
     return 0;

@@ -104,6 +104,9 @@ public:
 
     // Test-only persistence fault for the next publication; production never sets it.
     void inject_store_fault(store_fault fault);
+    // Test-only fault for the next matching supervisor journal event.
+    void inject_journal_fault(std::string kind);
+    [[nodiscard]] auto cancellation_requested_for_test() const -> bool;
 
 private:
     struct implementation;

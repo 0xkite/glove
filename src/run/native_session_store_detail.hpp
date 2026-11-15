@@ -356,8 +356,12 @@ struct native_session_store::implementation {
     std::size_t journal_bytes = 0;
     std::uint64_t checkpoint_aggregate = 0;
     std::size_t checkpoints = 0;
+    bool journal_poisoned = false;
 
     auto attached() const -> result<void> {
+        if (journal_poisoned) {
+            return std::unexpected("native session journal is poisoned; recovery required");
+        }
         if (auto checked = parent.check(); !checked) {
             return checked;
         }

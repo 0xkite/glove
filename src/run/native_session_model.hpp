@@ -131,6 +131,9 @@ public:
     [[nodiscard]] auto launched() -> std::expected<void, std::string>;
     [[nodiscard]] auto prepare_cancelled() -> std::expected<std::optional<settled>, std::string>;
     [[nodiscard]] auto prepare_failed() -> std::expected<std::optional<settled>, std::string>;
+    [[nodiscard]] auto preparation_persistence_failed()
+        -> std::expected<std::optional<settled>, std::string>;
+    [[nodiscard]] auto intent_persistence_failed() -> std::expected<void, std::string>;
     [[nodiscard]] auto interrupt_acknowledged()
         -> std::expected<std::optional<settled>, std::string>;
     [[nodiscard]] auto interrupt_timed_out() -> std::expected<std::optional<settled>, std::string>;

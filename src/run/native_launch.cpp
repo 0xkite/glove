@@ -617,7 +617,13 @@ auto launch_native_with_context(
         );
     }
     if (context.on_launching) {
-        context.on_launching();
+        if (auto admitted = context.on_launching(); !admitted) {
+            endpoint.reset();
+            return std::unexpected(
+                context.display_name +
+                " launch admission failed; private state retained: " + admitted.error()
+            );
+        }
     }
     auto exited = context.execute_owned
                       ? context.execute_owned(*checked_profile, recipe->argv, stop)

@@ -346,6 +346,23 @@ auto interrupt_paths() -> int {
     return 0;
 }
 
+auto preparation_persistence_recovery() -> int {
+    native_session_model model{epoch_a};
+    REQUIRE(!model.preparation_persistence_failed());
+    const auto start = make(session_operation::start, '1', 0);
+    REQUIRE(model.submit(start).code == result_code::accepted);
+    REQUIRE(model.preparation_persistence_failed());
+    REQUIRE(model.projection().phase == session_phase::recovery_required);
+    REQUIRE(model.projection().effects == effects_status::incomplete);
+    REQUIRE(model.submit(start).code == result_code::checkpoint_failed);
+    REQUIRE(!model.prepare_cancelled());
+    native_session_model idle{epoch_a};
+    REQUIRE(idle.intent_persistence_failed());
+    REQUIRE(idle.projection().phase == session_phase::recovery_required);
+    REQUIRE(idle.submit(make(session_operation::start, '2', 0)).code == result_code::invalid_state);
+    return 0;
+}
+
 auto epoch_and_capacity() -> int {
     {
         native_session_model model{epoch_a};
@@ -447,6 +464,7 @@ auto main() -> int {
     REQUIRE(preparation_cancellation_edges() == 0);
     REQUIRE(uncertainty_paths() == 0);
     REQUIRE(interrupt_paths() == 0);
+    REQUIRE(preparation_persistence_recovery() == 0);
     REQUIRE(epoch_and_capacity() == 0);
     return 0;
 }

@@ -47,8 +47,15 @@ an unknown mutation with a stale observed generation refuses, and 64 records
 are retained without eviction (capacity refuses further start/resume/
 interrupt; stop and shutdown stay admissible up to 8 further records so a
 running generation can always be cancelled). An admitted shutdown closes
-mutation admission. Status is read-only and never a historical lookup. Interrupt is advertised as
+mutation admission but exact shutdown retries retain their recorded result.
+Status is read-only and never a historical lookup. Interrupt is advertised as
 unsupported for Claude because no qualified turn-abort contract exists.
+
+If an intent cannot be journaled, normal live admission closes and the model
+enters recovery; a validated stop still requests cooperative cancellation,
+without claiming a durable stop. A persistence error is logged and retained
+in the supervisor's last error. Active preparation or finalization reaches
+recovery when its owning call returns, retaining private state when required.
 
 ## Durable store
 
@@ -77,12 +84,21 @@ modes, link counts and the validator all run again. Injected faults (copy,
 history fsync, record fsync, rename, parent sync, journal append) are covered
 by `tests/run/native_session_store_test.cpp`.
 
+After a partial journal write or sync failure, the store truncates to the
+previous byte count and syncs the rollback. If truncation, sync or verification
+fails, the live store is poisoned and refuses further writes and checkpoint
+admission. The poison is not itself durable: after reopening, the journal is
+validated strictly, but a syntactically valid journal cannot prove a failed
+rollback sync survived a crash. Persistence failure therefore requires
+operator recovery rather than an assumption that a clean reopen proves safety.
+
 ## Finalization before cleanup
 
 The launch core gained three synchronous hooks: `materialize` (after
 immutable configuration publication, before the launching marker) writes the
 admitted history copy into the generation's private agent directory;
-`on_launching` fires after the durable launching marker; `finalize` runs after
+`on_launching` fires after the durable launching marker and can refuse owned
+execution with an explicit error while retaining private state; `finalize` runs after
 a known owned process outcome and endpoint revocation and BEFORE
 `mark_quiescent`. A publication failure in `finalize` retains the private run
 and reports `checkpoint_failed`; the generation enters recovery_required and

@@ -249,6 +249,9 @@ auto native_session_store::checkpoint_count() const -> std::size_t {
 }
 
 auto native_session_store::append(journal_event event, store_fault fault) -> result<void> {
+    if (state_->journal_poisoned) {
+        return std::unexpected("native session journal is poisoned; recovery required");
+    }
     event.seq = state_->events.size() + 1;
     if (!valid_event(event)) {
         return std::unexpected("invalid native session journal event");
@@ -270,30 +273,63 @@ auto native_session_store::append(journal_event event, store_fault fault) -> res
     struct stat before{};
     if (::fstat(state_->journal_fd.get(), &before) != 0 ||
         static_cast<std::uint64_t>(before.st_size) != state_->journal_bytes) {
+        state_->journal_poisoned = true;
         return std::unexpected("native session journal changed externally");
     }
     if (fault == store_fault::journal_append) {
         errno = EIO;
         return failure("append native session journal (injected)");
     }
+    const auto rollback = [&](std::string original) -> result<void> {
+        bool restored =
+            fault != store_fault::journal_rollback &&
+            ::ftruncate(state_->journal_fd.get(), static_cast<off_t>(state_->journal_bytes)) == 0;
+        if (restored) {
+            restored = fault != store_fault::journal_rollback_sync &&
+                       ::fsync(state_->journal_fd.get()) == 0;
+        }
+        struct stat after{};
+        if (restored) {
+            restored = ::fstat(state_->journal_fd.get(), &after) == 0 &&
+                       static_cast<std::uint64_t>(after.st_size) == state_->journal_bytes;
+        }
+        if (!restored) {
+            state_->journal_poisoned = true;
+            return std::unexpected(
+                original + "; journal rollback or sync failed; recovery required"
+            );
+        }
+        return std::unexpected(original + "; journal rollback synced");
+    };
+    const bool partial_fault = fault == store_fault::journal_partial_write ||
+                               fault == store_fault::journal_rollback ||
+                               fault == store_fault::journal_rollback_sync;
     std::size_t offset = 0;
     while (offset < line.size()) {
+        const auto remaining =
+            partial_fault ? std::min(line.size() - offset, std::size_t{1}) : line.size() - offset;
         const auto count = ::pwrite(
             state_->journal_fd.get(),
             line.data() + offset,
-            line.size() - offset,
+            remaining,
             static_cast<off_t>(state_->journal_bytes + offset)
         );
         if (count < 0 && errno == EINTR) {
             continue;
         }
         if (count <= 0) {
-            return failure("append native session journal");
+            return rollback(failure("append native session journal").error());
         }
         offset += static_cast<std::size_t>(count);
+        if (partial_fault) {
+            return rollback("append native session journal: injected partial write");
+        }
+    }
+    if (fault == store_fault::journal_sync) {
+        return rollback("persist native session journal: injected sync failure");
     }
     if (::fsync(state_->journal_fd.get()) != 0) {
-        return failure("persist native session journal");
+        return rollback(failure("persist native session journal").error());
     }
     state_->journal_bytes += line.size();
     if (event.kind == "checkpoint_published") {

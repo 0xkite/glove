@@ -449,6 +449,50 @@ auto fault_injection(const fs::path& root) -> int {
     return 0;
 }
 
+auto journal_rollback_faults(const fs::path& root) -> int {
+    const auto sessions = root / "journal-rollback-sessions";
+    fs::create_directories(sessions);
+    REQUIRE(::chmod(sessions.c_str(), 0700) == 0);
+    source_directory source{root / "journal-rollback-history"};
+    REQUIRE(write_file(source.path() / "history.jsonl", "{\"type\":\"user\"}\n"));
+    for (const auto fault :
+         {store_fault::journal_partial_write,
+          store_fault::journal_sync,
+          store_fault::journal_rollback,
+          store_fault::journal_rollback_sync}) {
+        auto id = mint_session_id();
+        REQUIRE(id);
+        auto store = native_session_store::create(sessions, metadata_for(*id));
+        REQUIRE(store);
+        const auto path = store->root() / "journal.log";
+        const auto before = read_file(path);
+        const auto count = store->events().size();
+        const auto failed = store->append(journal_event_of("note"), fault);
+        REQUIRE(!failed && store->events().size() == count);
+        const bool poisoned =
+            fault == store_fault::journal_rollback || fault == store_fault::journal_rollback_sync;
+        if (poisoned) {
+            REQUIRE(failed.error().find("recovery required") != std::string::npos);
+            REQUIRE(!store->append(journal_event_of("note")));
+            const auto published = store->publish_checkpoint(
+                record_for(store->metadata(), 1), source.fd(), "history.jsonl", line_validator
+            );
+            REQUIRE(!published && published.error().kind == publish_failure_kind::failed);
+        } else {
+            REQUIRE(read_file(path) == before);
+            REQUIRE(store->append(journal_event_of("note")));
+        }
+        { native_session_store released{std::move(*store)}; }
+        auto reopened = native_session_store::open(sessions, *id, "claude");
+        if (fault == store_fault::journal_rollback) {
+            REQUIRE(!reopened);
+        } else {
+            REQUIRE(reopened);
+        }
+    }
+    return 0;
+}
+
 auto bounds(const fs::path& root) -> int {
     const auto sessions = root / "bound-sessions";
     fs::create_directories(sessions);
@@ -485,6 +529,7 @@ auto main() -> int {
     REQUIRE(journal_reconstruction(root.path) == 0);
     REQUIRE(publication_and_admission(root.path) == 0);
     REQUIRE(fault_injection(root.path) == 0);
+    REQUIRE(journal_rollback_faults(root.path) == 0);
     REQUIRE(bounds(root.path) == 0);
     return 0;
 }
