@@ -46,6 +46,11 @@ using clock_type = std::chrono::steady_clock;
 constexpr std::size_t aggregate_limit = 192U * 1024U;
 constexpr std::array broker_signals{SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGCHLD};
 
+auto is_bounded_termination_signal(int number) noexcept -> bool {
+    return number == SIGINT || number == SIGQUIT || number == SIGTERM || number == SIGHUP ||
+           number == SIGKILL;
+}
+
 // Handlers never hold a PID or touch per-invocation storage. Only the owning
 // thread sends signals, so handler teardown cannot race a reap into PID reuse.
 std::atomic_flag broker_exclusive = ATOMIC_FLAG_INIT;
@@ -316,6 +321,7 @@ public:
 
     ~owned_child() noexcept {
         if (pid_ <= 0) {
+            report_pending_group_eperm();
             return;
         }
         if (!observed_) {
@@ -324,6 +330,7 @@ public:
             // still-running child. Successful KILL/reap can still block in the
             // kernel; it is deliberately not advertised as a hard time bound.
             if (observe(!kill_accepted) != observation::exited) {
+                report_pending_group_eperm();
                 errors_.add("owned child exit/reap unresolved", EIO);
                 return;
             }
@@ -342,12 +349,14 @@ public:
             },
             [&]() noexcept { return group_has_live_members(pid_, errors_); },
             [&]() noexcept { return clock_type::now() >= deadline; },
-            [&]() noexcept { return pause_tick(errors_); }
+            [&]() noexcept { return pause_tick(errors_); },
+            pending_group_eperm_
         );
         if (!drained) {
             const auto& error = drained.error();
             if (error.deferred_error != 0) {
                 errors_.add("signal original owned process group", error.deferred_error);
+                pending_group_eperm_ = false;
             }
             if (error.signal_error != 0) {
                 errors_.add("signal original owned process group", error.signal_error);
@@ -361,6 +370,7 @@ public:
             }
         }
         if (pid_ <= 0) {
+            report_pending_group_eperm();
             return; // Never turn lost leader ownership into waitpid(-1).
         }
         int status = 0;
@@ -374,13 +384,17 @@ public:
             if ((!WIFEXITED(status) && !WIFSIGNALED(status)) ||
                 (WIFEXITED(status) && code_ != WEXITSTATUS(status)) ||
                 (WIFSIGNALED(status) && code_ != 128 + WTERMSIG(status))) {
+                report_pending_group_eperm();
                 errors_.add("waitpid disagrees with WNOWAIT exit observation", EIO);
+            } else {
+                pending_group_eperm_ = false;
             }
         } else {
             const int error = waited < 0 ? errno : EIO;
             if (error == ECHILD) {
                 pid_ = -1;
             }
+            report_pending_group_eperm();
             errors_.add("waitpid consume (owned child reap unresolved)", error);
         }
     }
@@ -448,11 +462,11 @@ public:
         return observation::exited;
     }
 
-    auto signal(int number) noexcept -> bool {
+    auto signal(int number, bool bounded_termination = false) noexcept -> bool {
         if (pid_ <= 0) {
             return false;
         }
-        signal_group(number);
+        signal_group(number, bounded_termination);
         const auto group = ::getpgid(pid_);
         if (group < 0 && errno != ESRCH) {
             errors_.add("getpgid owned leader", errno);
@@ -462,7 +476,11 @@ public:
             // directly for KILL as well: it can move after getpgid, and a
             // single escalation must not leave a drifting child alive.
             if (::kill(pid_, number) != 0 && errno != ESRCH) {
-                errors_.add("signal direct owned child", errno);
+                const int error = errno;
+                if (number == SIGKILL) {
+                    report_pending_group_eperm();
+                }
+                errors_.add("signal direct owned child", error);
                 return false;
             }
         }
@@ -474,14 +492,17 @@ public:
     [[nodiscard]] auto code() const noexcept -> int { return code_; }
 
 private:
-    void signal_group(int number) noexcept {
+    void signal_group(int number, bool bounded_termination) noexcept {
         if (pid_ > 0 && ::kill(-pid_, number) != 0 && errno != ESRCH) {
             const int error = errno;
-            // Darwin can return EPERM when the reserved group consists only
-            // of zombies. Suppress it only after proving no live member remains.
+            // Only bounded teardown signals may defer EPERM to the final drain.
             if (error == EPERM) {
                 const auto live = group_has_live_members(pid_, errors_);
                 if (live && !*live) {
+                    return;
+                }
+                if (bounded_termination && live) {
+                    pending_group_eperm_ = true;
                     return;
                 }
             }
@@ -489,9 +510,17 @@ private:
         }
     }
 
+    void report_pending_group_eperm() noexcept {
+        if (pending_group_eperm_) {
+            errors_.add("signal original owned process group", EPERM);
+            pending_group_eperm_ = false;
+        }
+    }
+
     failures& errors_;
     ::pid_t pid_ = -1;
     bool observed_ = false;
+    bool pending_group_eperm_ = false;
     int code_ = 0;
 };
 
@@ -621,16 +650,17 @@ auto execute(
         const auto pending = broker_events.take();
         for (std::size_t index = 0; index != 4; ++index) {
             if ((pending & (1U << index)) != 0) {
-                child.signal(broker_signals[index]);
+                const int number = broker_signals[index];
+                child.signal(number, is_bounded_termination_signal(number));
                 if (!deadline) {
-                    requested_signal = broker_signals[index];
+                    requested_signal = number;
                     deadline = clock_type::now() + grace;
                 }
             }
         }
         if (stop.stop_requested() && !deadline) {
             requested_signal = SIGTERM;
-            child.signal(SIGTERM);
+            child.signal(SIGTERM, true);
             deadline = clock_type::now() + grace;
         }
         const auto observed = child.observe(true);
@@ -642,7 +672,7 @@ auto execute(
             return 1;
         }
         if (deadline && !killed && clock_type::now() >= *deadline) {
-            child.signal(SIGKILL);
+            child.signal(SIGKILL, true);
             killed = true;
         }
         if (!errors.empty() || !pause_tick(errors)) {

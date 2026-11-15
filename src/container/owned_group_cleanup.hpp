@@ -21,9 +21,10 @@ struct group_cleanup_error {
 // Darwin may reject a KILL while an exiting member remains non-zombie. EPERM
 // stays pending until zero-live proof; every unresolved path retains it.
 template<typename Signal, typename Inspect, typename Expired, typename Pause>
-auto drain_owned_group(Signal signal, Inspect inspect, Expired expired, Pause pause) noexcept
-    -> std::expected<void, group_cleanup_error> {
-    int deferred = 0;
+auto drain_owned_group(
+    Signal signal, Inspect inspect, Expired expired, Pause pause, bool prior_group_eperm = false
+) noexcept -> std::expected<void, group_cleanup_error> {
+    int deferred = prior_group_eperm ? EPERM : 0;
     for (;;) {
         const std::optional<int> signalled = signal();
         if (!signalled) {
