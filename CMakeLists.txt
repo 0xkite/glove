@@ -76,7 +76,31 @@ glove_apply_sanitizers(glove_options)
 target_compile_features(glove_options INTERFACE cxx_std_23)
 
 if(GLOVE_REFLECTION)
+    set(CMAKE_CXX_STANDARD 26)
+    set(GLOVE_REFLECTION_COMPILE_OPTION "")
+    foreach(_glove_refl_flag IN ITEMS "-freflection" "-freflection-latest")
+        string(MAKE_C_IDENTIFIER "${_glove_refl_flag}" _glove_refl_id)
+        check_cxx_compiler_flag("${_glove_refl_flag}" "GLOVE_HAS_FLAG_${_glove_refl_id}")
+        if(GLOVE_HAS_FLAG_${_glove_refl_id})
+            set(_glove_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+            string(APPEND CMAKE_REQUIRED_FLAGS " ${_glove_refl_flag}")
+            check_cxx_source_compiles(
+                "#if __has_include(<meta>)\n#include <meta>\n#else\n#include <experimental/meta>\n#endif\nint main() { return std::meta::is_type(^^int) ? 0 : 1; }"
+                "GLOVE_HAS_META_${_glove_refl_id}"
+            )
+            set(CMAKE_REQUIRED_FLAGS "${_glove_saved_required_flags}")
+            if(GLOVE_HAS_META_${_glove_refl_id})
+                set(GLOVE_REFLECTION_COMPILE_OPTION "${_glove_refl_flag}")
+                break()
+            endif()
+        endif()
+    endforeach()
+    if(NOT GLOVE_REFLECTION_COMPILE_OPTION)
+        message(FATAL_ERROR
+            "GLOVE_REFLECTION=ON requires C++26 P2996 reflection (-freflection on GCC 16+ or -freflection-latest on clang-p2996) with <meta>")
+    endif()
     target_compile_features(glove_options INTERFACE cxx_std_26)
+    target_compile_options(glove_options INTERFACE "${GLOVE_REFLECTION_COMPILE_OPTION}")
     target_compile_definitions(glove_options INTERFACE GLOVE_HAS_REFLECTION=1)
 endif()
 

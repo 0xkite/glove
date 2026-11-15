@@ -1,6 +1,6 @@
 include_guard(GLOBAL)
 
-option(GLOVE_REFLECTION       "Enable C++26 P2996 reflection (requires P2996-capable clang)" OFF)
+option(GLOVE_REFLECTION       "Enable C++26 P2996 reflection (requires GCC 16+ -freflection or P2996 clang)" OFF)
 option(GLOVE_WITH_GHOSTTY     "Build the libghostty terminal frontend"                       OFF)
 option(GLOVE_WARNINGS_AS_ERRORS "Treat warnings as errors"                                   OFF)
 option(GLOVE_ENABLE_SAGE_INTEROP_TEST

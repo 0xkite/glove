@@ -1,79 +1,219 @@
 #pragma once
 
-// Reflection-driven codec sketch.
+// Reflection-driven MCP tool codec and schema generator (C++26 P2996 + P3394).
 //
-// This header is the design target for phase 1 of the project plan: replacing
-// the hand-written codec types in `src/mcp/{jsonrpc,mcp_messages}.hpp` and
-// the manual JSON-Schema synthesis with one that walks members of an
-// annotated struct via C++26 P2996 reflection.
-//
-// Today, mainline clang and Apple clang do not ship P2996. The gating option
-// is OFF by default; flip GLOVE_REFLECTION=ON only when building under a
-// P2996-capable compiler (e.g. the Bloomberg clang-p2996 fork). The
-// implementation below is intentionally compiled out — it documents intent in
-// a single place that future work will fill in.
-//
-// Why this lives in a header that compiles to nothing: the design value is in
-// freezing the *boundary* — what user code looks like, what the registry
-// emits — so the rest of the project (policy, audit, transport) can be built
-// against the eventual surface. When the compiler arrives, dropping this
-// header in flips the project from manual codec to reflection-driven, and
-// every other layer keeps working unchanged.
+// When GLOVE_REFLECTION=ON (GCC 16+ `-std=c++26 -freflection` or a P2996-capable
+// clang), `input_schema_of<T>()` and `descriptor_of<T>()` inspect structural
+// `[[=tool_meta{...}]]` / `[[=param_meta{...}]]` annotations and data members
+// of `T` via `<meta>` to synthesize MCP `tool_descriptor`s without manual
+// schema boilerplate.
 
 #if defined(GLOVE_HAS_REFLECTION)
 
-#    include <glove/mcp/messages.hpp>
+#    include "glove/mcp/messages.hpp"
 
-#    include <experimental/meta>
+#    include <algorithm>
+#    include <concepts>
+#    include <cstddef>
+#    if __has_include(<meta>)
+#        include <meta>
+#    else
+#        include <experimental/meta>
+#    endif
+#    include <optional>
 #    include <string>
 #    include <string_view>
+#    include <type_traits>
+#    include <vector>
 
 namespace glove::reflect {
 
-// Author-side annotation. Tool authors decorate fields and the struct itself
-// to drive codegen. The annotation values are consteval-readable via
-// `annotations_of`.
-struct tool_meta {
-    std::string_view name;
-    std::string_view description;
+inline constexpr bool reflection_available = true;
+
+// Structural fixed-length string so annotation structs satisfy C++26 P3394
+// structural-type requirements (std::string_view has private members in
+// libstdc++ and cannot appear in `[[=...]]` annotations).
+template<std::size_t N> struct fixed_string {
+    char data[N]{};
+
+    consteval fixed_string(const char (&str)[N]) { std::copy_n(str, N, data); }
+
+    constexpr auto view() const noexcept -> std::string_view { return {data, N > 0 ? N - 1U : 0U}; }
 };
 
-struct param_meta {
-    std::string_view label;
-    std::string_view description;
+template<std::size_t NameN, std::size_t DescN> struct tool_meta {
+    fixed_string<NameN> name;
+    fixed_string<DescN> description;
+};
+
+template<std::size_t NameN, std::size_t DescN>
+tool_meta(const char (&)[NameN], const char (&)[DescN]) -> tool_meta<NameN, DescN>;
+
+template<std::size_t LabelN, std::size_t DescN> struct param_meta {
+    fixed_string<LabelN> label;
+    fixed_string<DescN> description;
     bool required = true;
 };
 
-// Synthesize a JSON-Schema object describing the input shape of a tool struct
-// `T`. Walks members_of(^^T) at consteval, reads each member's `param_meta`
-// annotation, and recursively maps C++ types to JSON-Schema types.
-//
-// Sketch only; the body cannot be written until P2996 lands. The intended
-// shape:
-//
-//     template <class T>
-//     consteval auto input_schema_of() -> std::string {
-//         std::string out = R"({"type":"object","properties":{)";
-//         template for (constexpr auto m : nonstatic_data_members_of(^^T)) {
-//             constexpr auto p = annotations_of<param_meta>(m);
-//             out += '"';
-//             out += identifier_of(m);
-//             out += R"(":)";
-//             out += json_schema_of_type<typename_of(m)>();
-//             ...
-//         }
-//         out += "}}";
-//         return out;
-//     }
-//
-// Likewise, `marshal_request_of<T>(T const&)` and `unmarshal_request_of<T>`
-// would walk members and call glaze (or a P2996-driven equivalent) per
-// field, eliminating the hand-written `mcp_messages.hpp` shapes.
+template<std::size_t LabelN, std::size_t DescN>
+param_meta(const char (&)[LabelN], const char (&)[DescN], bool = true) -> param_meta<LabelN, DescN>;
 
-template<class T> consteval auto input_schema_of() -> std::string; // intentionally undefined
+namespace detail {
 
-template<class T>
-consteval auto descriptor_of() -> glove::mcp::tool_descriptor; // intentionally undefined
+template<class T> struct is_optional : std::false_type {};
+
+template<class T> struct is_optional<std::optional<T>> : std::true_type {};
+
+template<class T> struct is_vector : std::false_type {};
+
+template<class T, class Alloc> struct is_vector<std::vector<T, Alloc>> : std::true_type {};
+
+template<class T> struct unwrap_optional {
+    using type = T;
+};
+
+template<class T> struct unwrap_optional<std::optional<T>> {
+    using type = T;
+};
+
+inline void append_json_escaped(std::string& out, std::string_view text) {
+    out.push_back('"');
+    for (const char ch : text) {
+        switch (ch) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            out.push_back(ch);
+            break;
+        }
+    }
+    out.push_back('"');
+}
+
+template<class FieldT> inline void append_json_schema_for_type(std::string& out) {
+    using base_t = std::remove_cvref_t<typename unwrap_optional<FieldT>::type>;
+    if constexpr (std::same_as<base_t, bool>) {
+        out += R"({"type":"boolean"})";
+    } else if constexpr (std::integral<base_t>) {
+        out += R"({"type":"integer"})";
+    } else if constexpr (std::floating_point<base_t>) {
+        out += R"({"type":"number"})";
+    } else if constexpr (
+        std::same_as<base_t, std::string> || std::same_as<base_t, std::string_view>
+    ) {
+        out += R"({"type":"string"})";
+    } else if constexpr (is_vector<base_t>::value) {
+        out += R"({"type":"array","items":)";
+        append_json_schema_for_type<typename base_t::value_type>(out);
+        out.push_back('}');
+    } else {
+        out += R"({"type":"object"})";
+    }
+}
+
+template<std::meta::info Target, std::meta::info TemplateRef, class Fn>
+constexpr void visit_template_annotations(Fn&& fn) {
+    template for (constexpr auto ann :
+                  std::define_static_array(std::meta::annotations_of(Target))) {
+        constexpr auto ann_type = std::meta::type_of(ann);
+        if constexpr (
+            std::meta::has_template_arguments(ann_type) &&
+            std::meta::template_of(ann_type) == TemplateRef
+        ) {
+            fn(std::meta::extract<typename[:ann_type:]>(ann));
+        }
+    }
+}
+
+} // namespace detail
+
+template<class T> auto input_schema_of() -> std::string {
+    std::string out = R"({"type":"object","properties":{)";
+    std::vector<std::string> required_fields;
+    bool first_prop = true;
+
+    constexpr auto ctx = std::meta::access_context::current();
+    template for (constexpr auto member :
+                  std::define_static_array(std::meta::nonstatic_data_members_of(^^T, ctx))) {
+        using member_t = typename[:std::meta::type_of(member):];
+        std::string prop_name{std::meta::identifier_of(member)};
+        std::string description;
+        bool required = !detail::is_optional<std::remove_cvref_t<member_t>>::value;
+
+        detail::visit_template_annotations<member, ^^param_meta>([&](const auto& meta) {
+            if (!meta.label.view().empty()) {
+                prop_name.assign(meta.label.view());
+            }
+            description.assign(meta.description.view());
+            if (!meta.required) {
+                required = false;
+            }
+        });
+
+        if (!first_prop) {
+            out.push_back(',');
+        }
+        first_prop = false;
+
+        detail::append_json_escaped(out, prop_name);
+        out.push_back(':');
+
+        if (description.empty()) {
+            detail::append_json_schema_for_type<member_t>(out);
+        } else {
+            std::string type_schema;
+            detail::append_json_schema_for_type<member_t>(type_schema);
+            // Insert `"description":"..."` before the closing `}` of the property schema.
+            if (!type_schema.empty() && type_schema.back() == '}') {
+                type_schema.pop_back();
+                type_schema += R"(,"description":)";
+                detail::append_json_escaped(type_schema, description);
+                type_schema.push_back('}');
+            }
+            out += type_schema;
+        }
+
+        if (required) {
+            required_fields.push_back(prop_name);
+        }
+    }
+
+    out += R"(},"required":[)";
+    for (std::size_t i = 0; i < required_fields.size(); ++i) {
+        if (i > 0) {
+            out.push_back(',');
+        }
+        detail::append_json_escaped(out, required_fields[i]);
+    }
+    out += "]}";
+    return out;
+}
+
+template<class T> auto descriptor_of() -> glove::mcp::tool_descriptor {
+    glove::mcp::tool_descriptor desc{};
+    desc.name = std::string{std::meta::identifier_of(^^T)};
+    detail::visit_template_annotations<^^T, ^^tool_meta>([&](const auto& meta) {
+        if (!meta.name.view().empty()) {
+            desc.name.assign(meta.name.view());
+        }
+        desc.description.assign(meta.description.view());
+    });
+    desc.input_schema_json = input_schema_of<T>();
+    return desc;
+}
 
 } // namespace glove::reflect
 
@@ -81,9 +221,8 @@ consteval auto descriptor_of() -> glove::mcp::tool_descriptor; // intentionally 
 
 namespace glove::reflect {
 
-// When GLOVE_REFLECTION is off, the registry is unavailable. Including this
-// header on a non-reflection build is allowed (so consumers don't need to
-// scatter their own #ifdefs), but no callable surface is exposed.
+// When GLOVE_REFLECTION is off, including this header on a non-reflection
+// build is allowed so consumers can gate reflection via `reflection_available`.
 inline constexpr bool reflection_available = false;
 
 } // namespace glove::reflect
