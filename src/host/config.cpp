@@ -350,6 +350,10 @@ auto default_config_path(const directories& values) -> std::filesystem::path {
     return values.config / "config.json";
 }
 
+auto default_policy_directory(const directories& values) -> std::filesystem::path {
+    return values.config / "policies";
+}
+
 auto validate(const remote_backend_config& value) -> result<void> {
     const auto staging = value.staging_root.lexically_normal();
     const bool valid_staging = value.staging_root.is_absolute() &&

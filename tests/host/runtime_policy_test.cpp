@@ -710,6 +710,41 @@ auto run() -> int {
         ) != std::filesystem::canonical(managed_script)
     );
 
+    const auto xdg_root = std::filesystem::temp_directory_path() /
+                          ("glove-xdg-policy-test-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(xdg_root);
+    const glove::host::directories xdg_dirs{
+        .config = xdg_root / "config" / "glove",
+        .state = xdg_root / "state" / "glove",
+        .data = xdg_root / "data" / "glove",
+        .cache = xdg_root / "cache" / "glove",
+        .runtime = xdg_root / "runtime" / "glove",
+    };
+    REQUIRE(glove::host::default_policy_directory(xdg_dirs) == xdg_dirs.config / "policies");
+    auto resolved_named = glove::host::resolve_policy_reference("hostile-re", xdg_dirs);
+    REQUIRE(resolved_named.has_value());
+    REQUIRE(*resolved_named == xdg_dirs.config / "policies" / "hostile-re.json");
+    REQUIRE(!glove::host::resolve_policy_reference("../escape", xdg_dirs).has_value());
+    REQUIRE(!glove::host::resolve_policy_reference("relative/path.json", xdg_dirs).has_value());
+
+    auto installed_policy = glove::host::install_policy_file(
+        snapshotted_prepare_options.policy_path, "hostile-re", xdg_dirs
+    );
+    REQUIRE(installed_policy.has_value());
+    REQUIRE(*installed_policy == *resolved_named);
+
+    auto listed_policies = glove::host::list_installed_policies(xdg_dirs);
+    REQUIRE(listed_policies.has_value());
+    REQUIRE(listed_policies->size() == 1U);
+    REQUIRE((*listed_policies)[0].name == "hostile-re");
+    REQUIRE((*listed_policies)[0].valid);
+
+    REQUIRE(glove::host::remove_installed_policy("hostile-re", xdg_dirs).has_value());
+    auto listed_after_remove = glove::host::list_installed_policies(xdg_dirs);
+    REQUIRE(listed_after_remove.has_value());
+    REQUIRE(listed_after_remove->empty());
+    std::filesystem::remove_all(xdg_root);
+
     return 0;
 }
 
