@@ -733,6 +733,11 @@ auto bind_managed_launch_projection_from_fd(
         encoder.append_string("glove.managed-launch-bridge-endpoint");
         encoder.append_u32(checked->bridge_endpoint->port);
     }
+    // Private-loopback listening changes the enforced seccomp network policy,
+    // so commit to it. Appended only when enabled to preserve existing digests.
+    if (checked->allow_loopback_listen) {
+        encoder.append_string("glove.managed-launch-loopback-listen");
+    }
     if (!encoder.valid()) {
         return std::unexpected(
             std::string{"managed launch field exceeds canonical encoding limit"}
