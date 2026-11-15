@@ -440,8 +440,9 @@ auto validate_inherited_streams(
     const auto fd_environment = std::ranges::count_if(environment, [](const auto& entry) {
         return entry.starts_with("GLOVE_LOCAL_SERVICE_FDS_V1=");
     });
-    const auto path_environment =
-        std::ranges::count(environment, "GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local");
+    const auto path_environment = std::ranges::count(
+        environment, std::string_view{"GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local"}
+    );
     if (streams.empty()) {
         if (fd_environment != 0U) {
             return std::unexpected(std::string{"inherited stream environment lacks descriptors"});

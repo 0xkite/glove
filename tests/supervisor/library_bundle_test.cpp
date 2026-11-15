@@ -692,6 +692,7 @@ auto run() -> int {
              "pi",
              "copilot",
              "opencode",
+             "agy",
          }) {
         const auto adapter = glove::supervisor::native_skill_runtime_adapter_for(runtime_id);
         REQUIRE(adapter.has_value());
@@ -718,7 +719,8 @@ auto run() -> int {
                 );
                 REQUIRE(
                     std::ranges::find(
-                        adapter->adoption_manifest->excluded_host_state_ids, "host-auth"
+                        adapter->adoption_manifest->excluded_host_state_ids,
+                        std::string_view{"host-auth"}
                     ) != adapter->adoption_manifest->excluded_host_state_ids.end()
                 );
                 auto manifest_digest =

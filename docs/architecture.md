@@ -156,8 +156,7 @@ queue behind a long generation.
   secret digests;
 - structural JSON schema validation and token-budget enforcement derived from
   provider response metadata;
-- **contained MCP upstreams** (`contained_launcher`). Upstream servers are still
-  started as unsandboxed host processes by `src/mcp/stdio_transport.cpp`.
+- **partially isolated MCP upstreams** (`contained_launcher` is not yet constructed). On Linux, `glove run` launches stdio upstreams under `CLONE_NEWUSER | CLONE_NEWNET`, `PR_SET_NO_NEW_PRIVS`, and `PR_SET_PDEATHSIG` (`src/mcp/stdio_transport.cpp`), while full mount/PID/cgroup containment remains unbuilt.
 
 ## Native macOS Pi
 

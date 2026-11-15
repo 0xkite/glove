@@ -162,6 +162,7 @@ executable path. Supported values and their Glove-owned private locations are:
 | `pi`          | `pi`       | `/home/agent/.pi/agent/skills`        | —                                     |
 | `copilot`     | `copilot`  | `/home/agent/.copilot/skills`         | `COPILOT_HOME=/home/agent/.copilot`   |
 | `opencode`    | `opencode` | `/home/agent/.config/opencode/skills` | `XDG_CONFIG_HOME=/home/agent/.config` |
+| `agy`         | `agy`      | `/home/agent/.gemini/skills`          | —                                     |
 
 Discovery requires a non-empty ordered `executable_search_paths` list. Each
 directory is an explicit, digest-bound local policy value; Glove rejects any

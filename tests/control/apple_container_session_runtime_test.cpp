@@ -441,7 +441,7 @@ auto run() -> int {
     REQUIRE(shared_runtime->resource_capabilities().complete());
     if (managed_closure) {
         const std::vector<std::string> expected_runtime_ids{
-            "claude-code", "pi", "copilot", "opencode"
+            "claude-code", "pi", "copilot", "opencode", "agy"
         };
         REQUIRE(shared_runtime->managed_runtime_ids() == expected_runtime_ids);
     } else {

@@ -1320,9 +1320,10 @@ auto prepare_session_policy(const session_policy_prepare_options& options)
         if (!adoption) {
             return std::unexpected("generate Pi adoption manifest: " + adoption.error());
         }
-        const auto pi_template = std::ranges::find(templates, "pi", [](const auto& template_) {
-            return template_.runtime_id;
-        });
+        const auto pi_template =
+            std::ranges::find(templates, std::string_view{"pi"}, [](const auto& template_) {
+                return template_.runtime_id;
+            });
         if (pi_template == templates.end()) {
             return std::unexpected(std::string{"Pi runtime template is missing"});
         }

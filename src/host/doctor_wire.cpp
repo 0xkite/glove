@@ -14,6 +14,8 @@ auto status_name(doctor_status value) -> std::string_view {
     switch (value) {
     case doctor_status::passed:
         return "passed";
+    case doctor_status::info:
+        return "info";
     case doctor_status::warning:
         return "warning";
     case doctor_status::failed:

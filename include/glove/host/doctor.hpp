@@ -10,6 +10,7 @@ namespace glove::host {
 
 enum class doctor_status : unsigned char {
     passed,
+    info,
     warning,
     failed,
 };

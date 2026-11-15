@@ -684,6 +684,7 @@ auto codex_runtime_context_test(
              native_runtime_case{
                  "opencode", ".config/opencode/skills", "XDG_CONFIG_HOME=/home/agent/.config"
              },
+             native_runtime_case{"agy", ".gemini/skills", ""},
          }) {
         auto native_projections = store->resolve_projections({{
             .projection =
@@ -750,12 +751,13 @@ struct native_harness_case {
     std::string_view executable;
 };
 
-constexpr std::array<native_harness_case, 5> native_harnesses{{
+constexpr std::array<native_harness_case, 6> native_harnesses{{
     {"codex", "codex"},
     {"claude-code", "claude"},
     {"pi", "pi"},
     {"copilot", "copilot"},
     {"opencode", "opencode"},
+    {"agy", "agy"},
 }};
 
 // A test-only image supplies pinned, operator-like harness installations under

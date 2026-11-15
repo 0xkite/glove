@@ -18,6 +18,7 @@
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <span>
 #include <string>
@@ -25,6 +26,32 @@
 #include <vector>
 
 namespace glove::host {
+namespace detail {
+
+struct daemon_status_payload {
+    int schema_version = 1;
+    std::string service_name{};
+    bool running = false;
+    std::string status{};
+};
+
+struct status_counts_payload {
+    std::size_t passed = 0;
+    std::size_t info = 0;
+    std::size_t warning = 0;
+    std::size_t failed = 0;
+};
+
+struct status_payload {
+    int schema_version = 1;
+    bool ready = false;
+    std::string daemon{};
+    std::string config_path{};
+    status_counts_payload counts{};
+};
+
+} // namespace detail
+
 namespace {
 
 auto print_error(std::string_view code, std::string_view message, std::string_view recovery)
@@ -99,7 +126,7 @@ void print_setup_usage() {
         "  glove setup [--config <absolute-file>] [--path-root <absolute-directory>] "
         "[--session-policy <absolute-file>] "
         "[--root-id <id>] [--runtime <template-id>]... [--persistent] "
-        "[--dry-run | --yes]\n"
+        "[--dry-run | --yes [--start]]\n"
     );
 }
 
@@ -147,7 +174,7 @@ void print_daemon_usage() {
     std::fprintf(
         stderr,
         "usage: glove daemon <install|start|stop|restart|status> "
-        "[--config <absolute-file>] [--gloved <absolute-file>]\n"
+        "[--config <absolute-file>] [--gloved <absolute-file>] [--json]\n"
     );
 }
 
@@ -166,7 +193,7 @@ void print_policy_usage() {
         "      [--argument <value>]... [--environment <NAME=VALUE>]...\n"
         "      [--read-only-path <absolute-path>]... [--path-alias <id>]...\n"
         "      [--projection-destination <id>]...\n"
-        "  glove policy validate --file <absolute-file>\n"
+        "  glove policy validate --file <absolute-file> [--json]\n"
         "  glove policy explain --file <absolute-file> [--json]\n"
     );
 }
@@ -784,6 +811,7 @@ auto setup_command(std::span<char* const> arguments) -> int {
     }
     setup_options options;
     bool yes = false;
+    bool start_daemon = false;
     bool runtime_overridden = false;
     for (std::size_t index = 0; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
@@ -792,6 +820,9 @@ auto setup_command(std::span<char* const> arguments) -> int {
             ++index;
         } else if (argument == "--yes") {
             yes = true;
+            ++index;
+        } else if (argument == "--start") {
+            start_daemon = true;
             ++index;
         } else if (argument == "--persistent") {
             options.persistent_service = true;
@@ -834,6 +865,13 @@ auto setup_command(std::span<char* const> arguments) -> int {
             "setup_conflicting_flags",
             "--dry-run and --yes cannot be combined.",
             "glove setup --help"
+        );
+    }
+    if (start_daemon && !yes) {
+        return print_error(
+            "setup_start_requires_yes",
+            "--start requires --yes and cannot be used with --dry-run.",
+            "glove setup --yes --start"
         );
     }
     if (options.session_policy) {
@@ -905,13 +943,29 @@ auto setup_command(std::span<char* const> arguments) -> int {
     if (auto executed = execute_setup(*plan); !executed) {
         return print_error("setup_failed", executed.error(), "glove doctor");
     }
-    std::printf(
-        "Glove machine setup completed.\nNext:\n"
-        "  glove daemon start --config %s\n"
-        "  glove doctor --config %s\n",
-        plan->config_path.c_str(),
-        plan->config_path.c_str()
-    );
+    if (start_daemon) {
+        daemon_options d_options;
+        d_options.config_path = plan->config_path;
+        auto d_plan = plan_daemon_service(d_options, current_environment());
+        if (!d_plan) {
+            return print_error("daemon_invalid", d_plan.error(), "glove doctor");
+        }
+        if (auto started = start_daemon_service(*d_plan); !started) {
+            return print_error("daemon_start_failed", started.error(), "glove doctor");
+        }
+        std::printf(
+            "Glove machine setup completed and daemon started (%s).\n", d_plan->service_name.c_str()
+        );
+        std::printf("Next:\n  glove doctor --config %s\n", plan->config_path.c_str());
+    } else {
+        std::printf(
+            "Glove machine setup completed.\nNext:\n"
+            "  glove daemon start --config %s\n"
+            "  glove doctor --config %s\n",
+            plan->config_path.c_str(),
+            plan->config_path.c_str()
+        );
+    }
     if (plan->service.session_policy) {
         std::printf("  glove policy validate --file %s\n", plan->service.session_policy->c_str());
     }
@@ -929,8 +983,14 @@ auto daemon_command(std::span<char* const> arguments) -> int {
     }
     const std::string_view action{arguments.front()};
     daemon_options options;
+    bool json = false;
     for (std::size_t index = 1; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
+        if (argument == "--json" && action == "status") {
+            json = true;
+            ++index;
+            continue;
+        }
         if (index + 1 >= arguments.size() || (argument != "--config" && argument != "--gloved")) {
             print_daemon_usage();
             return 2;
@@ -956,9 +1016,30 @@ auto daemon_command(std::span<char* const> arguments) -> int {
         if (!active) {
             return print_error("daemon_status_failed", active.error(), "glove daemon start");
         }
-        std::printf(
-            "Glove daemon: %s (%s)\n", *active ? "running" : "stopped", plan->service_name.c_str()
-        );
+        if (json) {
+            std::string encoded;
+            const auto write_error = glz::write_json(
+                detail::daemon_status_payload{
+                    .schema_version = 1,
+                    .service_name = plan->service_name,
+                    .running = *active,
+                    .status = *active ? "running" : "stopped",
+                },
+                encoded
+            );
+            if (write_error) {
+                return print_error(
+                    "daemon_encode_failed", "Could not encode daemon status.", "glove daemon status"
+                );
+            }
+            std::printf("%s\n", encoded.c_str());
+        } else {
+            std::printf(
+                "Glove daemon: %s (%s)\n",
+                *active ? "running" : "stopped",
+                plan->service_name.c_str()
+            );
+        }
         return *active ? 0 : 3;
     }
     result<void> changed;
@@ -990,19 +1071,27 @@ auto daemon_command(std::span<char* const> arguments) -> int {
 auto doctor_command(std::span<char* const> arguments) -> int {
     std::optional<std::filesystem::path> config_path;
     bool json = false;
+    bool verbose = false;
     for (std::size_t index = 0; index < arguments.size();) {
         const std::string_view argument{arguments[index]};
         if (argument == "--json") {
             json = true;
             ++index;
+        } else if (argument == "-v" || argument == "--verbose") {
+            verbose = true;
+            ++index;
         } else if (argument == "--config" && index + 1 < arguments.size()) {
             config_path = arguments[index + 1];
             index += 2;
         } else if (argument == "-h" || argument == "--help") {
-            std::fprintf(stderr, "usage: glove doctor [--config <absolute-file>] [--json]\n");
+            std::fprintf(
+                stderr, "usage: glove doctor [--config <absolute-file>] [-v | --verbose] [--json]\n"
+            );
             return 0;
         } else {
-            std::fprintf(stderr, "usage: glove doctor [--config <absolute-file>] [--json]\n");
+            std::fprintf(
+                stderr, "usage: glove doctor [--config <absolute-file>] [-v | --verbose] [--json]\n"
+            );
             return 2;
         }
     }
@@ -1026,21 +1115,130 @@ auto doctor_command(std::span<char* const> arguments) -> int {
         std::printf("%s\n", output->c_str());
     } else {
         std::printf("Glove doctor: %s\n", report.healthy() ? "ready" : "not ready");
+        std::size_t hidden_info = 0;
         for (const auto& check : report.checks) {
+            if (check.status == doctor_status::info && !verbose) {
+                ++hidden_info;
+                continue;
+            }
             const char marker = check.status == doctor_status::passed    ? '+'
+                                : check.status == doctor_status::info    ? '-'
                                 : check.status == doctor_status::warning ? '!'
                                                                          : 'x';
             std::printf("%c [%s] %s\n", marker, check.code.c_str(), check.message.c_str());
-            if (check.status != doctor_status::passed && !check.recovery.empty()) {
+            if (check.status != doctor_status::passed && check.status != doctor_status::info &&
+                !check.recovery.empty()) {
                 std::printf("    %s\n", check.recovery.c_str());
             }
+        }
+        if (hidden_info > 0U) {
+            std::printf(
+                "  (%zu optional info check(s) hidden; pass --verbose to show)\n", hidden_info
+            );
         }
     }
     return report.healthy() ? 0 : 1;
 }
 
+auto status_command(std::span<char* const> arguments) -> int {
+    std::optional<std::filesystem::path> config_path;
+    bool json = false;
+    for (std::size_t index = 0; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--json") {
+            json = true;
+            ++index;
+        } else if (argument == "--config" && index + 1 < arguments.size()) {
+            config_path = arguments[index + 1];
+            index += 2;
+        } else if (argument == "-h" || argument == "--help") {
+            std::fprintf(stderr, "usage: glove status [--config <absolute-file>] [--json]\n");
+            return 0;
+        } else {
+            std::fprintf(stderr, "usage: glove status [--config <absolute-file>] [--json]\n");
+            return 2;
+        }
+    }
+    if (!config_path) {
+        auto resolved = default_path();
+        if (!resolved) {
+            return print_error(
+                "status_environment_invalid", resolved.error(), "glove setup --dry-run"
+            );
+        }
+        config_path = std::move(*resolved);
+    }
+    const auto report = diagnose(*config_path);
+    std::size_t passed = 0;
+    std::size_t info = 0;
+    std::size_t warning = 0;
+    std::size_t failed = 0;
+    for (const auto& check : report.checks) {
+        switch (check.status) {
+        case doctor_status::passed:
+            ++passed;
+            break;
+        case doctor_status::info:
+            ++info;
+            break;
+        case doctor_status::warning:
+            ++warning;
+            break;
+        case doctor_status::failed:
+            ++failed;
+            break;
+        }
+    }
+    std::string daemon_state = "unknown";
+    if (auto daemon_plan = plan_daemon_service(
+            daemon_options{.config_path = config_path, .gloved_path = std::nullopt},
+            current_environment()
+        )) {
+        if (auto active = daemon_service_is_active(*daemon_plan)) {
+            daemon_state = *active ? "running" : "stopped";
+        }
+    }
+    if (json) {
+        std::string encoded;
+        const auto write_error = glz::write_json(
+            detail::status_payload{
+                .schema_version = 1,
+                .ready = report.healthy(),
+                .daemon = daemon_state,
+                .config_path = report.config_path,
+                .counts =
+                    detail::status_counts_payload{
+                        .passed = passed,
+                        .info = info,
+                        .warning = warning,
+                        .failed = failed,
+                    },
+            },
+            encoded
+        );
+        if (write_error) {
+            return print_error(
+                "status_encode_failed", "Could not encode status output.", "glove status"
+            );
+        }
+        std::printf("%s\n", encoded.c_str());
+    } else {
+        std::printf(
+            "Glove status: %s (daemon: %s, passed=%zu, warning=%zu, failed=%zu, info=%zu)\n",
+            report.healthy() ? "ready" : "not ready",
+            daemon_state.c_str(),
+            passed,
+            warning,
+            failed,
+            info
+        );
+    }
+    return report.healthy() ? 0 : 1;
+}
+
 auto config_command(std::span<char* const> arguments) -> int {
-    if (arguments.empty() || std::string_view{arguments.front()} == "--help") {
+    if (arguments.empty() || std::string_view{arguments.front()} == "-h" ||
+        std::string_view{arguments.front()} == "--help") {
         std::fprintf(
             stderr,
             "usage:\n"
@@ -1564,7 +1762,7 @@ auto policy_command(std::span<char* const> arguments) -> int {
         bool json = false;
         for (std::size_t index = 1; index < arguments.size();) {
             const std::string_view argument{arguments[index]};
-            if (argument == "--json" && action == "explain") {
+            if (argument == "--json") {
                 json = true;
                 ++index;
             } else if (argument == "--file" && index + 1 < arguments.size()) {
@@ -1580,7 +1778,7 @@ auto policy_command(std::span<char* const> arguments) -> int {
             return 2;
         }
         auto valid = validate_session_policy_file(*policy_path);
-        if (action == "validate") {
+        if (action == "validate" && !json) {
             if (!valid) {
                 return print_error(
                     "policy_invalid",
@@ -1854,6 +2052,182 @@ auto workspace_command(std::span<char* const> arguments) -> int {
         );
     }
     return 0;
+}
+
+auto print_session_usage() -> void {
+    std::fprintf(
+        stderr,
+        "usage:\n"
+        "  glove session start --id <session-id> --plan <absolute-file> "
+        "--controller-digest <sha256> [--idempotency-key <key>] [--config <absolute-file>] "
+        "[--json]\n"
+        "  glove session status --id <session-id> [--config <absolute-file>] [--json]\n"
+    );
+}
+
+auto print_session_status(const workspace_session_status& status, bool json) -> int {
+    if (json) {
+        auto encoded = glz::write_json(status);
+        if (!encoded) {
+            return print_error(
+                "session_encode_failed",
+                "Could not encode workspace session status.",
+                "glove session status --id " + status.session_id
+            );
+        }
+        std::printf("%s\n", encoded->c_str());
+        return 0;
+    }
+    std::printf(
+        "%s state=%s controller_plan_digest=%s plan_content_digest=%s expires_at_ms=%llu\n",
+        status.session_id.c_str(),
+        status.state.c_str(),
+        status.controller_plan_digest.c_str(),
+        status.plan_content_digest.c_str(),
+        static_cast<unsigned long long>(status.expires_at_ms)
+    );
+    return 0;
+}
+
+auto session_command(std::span<char* const> arguments) -> int {
+    if (arguments.empty() || std::string_view{arguments.front()} == "-h" ||
+        std::string_view{arguments.front()} == "--help") {
+        print_session_usage();
+        return arguments.empty() ? 2 : 0;
+    }
+    const std::string_view action{arguments.front()};
+    if (action != "start" && action != "status") {
+        print_session_usage();
+        return 2;
+    }
+
+    std::string session_id;
+    std::string controller_digest;
+    std::string idempotency_key;
+    std::optional<std::filesystem::path> plan_path;
+    std::optional<std::filesystem::path> config_path;
+    bool json = false;
+
+    for (std::size_t index = 1; index < arguments.size();) {
+        const std::string_view argument{arguments[index]};
+        if (argument == "--json") {
+            json = true;
+            ++index;
+            continue;
+        }
+        if (argument == "-h" || argument == "--help") {
+            print_session_usage();
+            return 0;
+        }
+        if (index + 1U >= arguments.size()) {
+            print_session_usage();
+            return 2;
+        }
+        const std::string_view value{arguments[index + 1U]};
+        if (argument == "--id") {
+            session_id = value;
+        } else if (argument == "--config") {
+            config_path = value;
+        } else if (action == "start" && argument == "--plan") {
+            plan_path = value;
+        } else if (action == "start" && argument == "--controller-digest") {
+            controller_digest = value;
+        } else if (action == "start" && argument == "--idempotency-key") {
+            idempotency_key = value;
+        } else {
+            print_session_usage();
+            return 2;
+        }
+        index += 2U;
+    }
+
+    if (session_id.empty()) {
+        return print_error(
+            "session_id_missing",
+            "A workspace session identifier is required.",
+            action == "start" ? "glove session start --id <session-id> --plan <absolute-file> "
+                                "--controller-digest <sha256>"
+                              : "glove session status --id <session-id>"
+        );
+    }
+
+    if (!config_path) {
+        auto resolved = default_path();
+        if (!resolved) {
+            return print_error(
+                "session_environment_invalid", resolved.error(), "glove setup --dry-run"
+            );
+        }
+        config_path = std::move(*resolved);
+    }
+    auto configured = load_config(*config_path);
+    if (!configured) {
+        return print_error("session_config_invalid", configured.error(), "glove doctor");
+    }
+
+    if (action == "status") {
+        auto status = workspace_session_status_for(*configured, session_id);
+        if (!status) {
+            return print_error("session_status_failed", status.error(), "glove daemon status");
+        }
+        return print_session_status(*status, json);
+    }
+
+    if (!plan_path || !plan_path->is_absolute() || controller_digest.empty()) {
+        return print_error(
+            "session_start_usage",
+            "Session start requires --id, an absolute --plan file, and --controller-digest.",
+            "glove session start --id <session-id> --plan <absolute-file> "
+            "--controller-digest <sha256>"
+        );
+    }
+    std::ifstream input(*plan_path, std::ios::binary);
+    if (!input) {
+        return print_error(
+            "session_plan_unreadable",
+            "Could not read the session plan file.",
+            "Check that --plan points to an existing readable JSON file."
+        );
+    }
+    constexpr std::size_t max_plan_bytes = 1024U * 1024U;
+    std::string plan_json;
+    char chunk[8192];
+    while (input.read(chunk, sizeof(chunk)) || input.gcount() > 0) {
+        const auto count = static_cast<std::size_t>(input.gcount());
+        if (plan_json.size() + count > max_plan_bytes) {
+            return print_error(
+                "session_plan_too_large",
+                "The session plan file exceeds the 1 MiB control frame limit.",
+                "Supply a canonical session plan JSON file no larger than 1048576 bytes."
+            );
+        }
+        plan_json.append(chunk, count);
+    }
+    if (plan_json.empty()) {
+        return print_error(
+            "session_plan_empty",
+            "The session plan file is empty.",
+            "Supply a non-empty canonical session plan JSON file."
+        );
+    }
+    if (idempotency_key.empty()) {
+        constexpr std::size_t max_key_bytes = 128U;
+        constexpr std::string_view prefix = "session-";
+        idempotency_key = std::string{prefix} + session_id.substr(0, max_key_bytes - prefix.size());
+    }
+    auto status = create_workspace_session(
+        *configured,
+        workspace_session_create_request{
+            .session_id = std::move(session_id),
+            .controller_plan_digest = std::move(controller_digest),
+            .canonical_plan_json = std::move(plan_json),
+            .idempotency_key = std::move(idempotency_key),
+        }
+    );
+    if (!status) {
+        return print_error("session_start_failed", status.error(), "glove daemon status");
+    }
+    return print_session_status(*status, json);
 }
 
 auto init_command(std::span<char* const> arguments) -> int {

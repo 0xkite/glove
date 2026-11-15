@@ -19,7 +19,7 @@ host security boundary.
 | Glove control, policy, and sandbox code                         | Trusted                                                                                        |
 | Local policy, launch templates, and approval records            | Trusted operator input                                                                         |
 | Project files, repository configuration, and agent instructions | Untrusted; never machine-setup authority                                                       |
-| MCP upstream servers                                            | Started as unsandboxed host processes today (`src/mcp/stdio_transport.cpp`); containment is planned, not constructed |
+| MCP upstream servers                                            | On Linux, `glove run` isolates stdio upstreams with `CLONE_NEWUSER \| CLONE_NEWNET`, `PR_SET_NO_NEW_PRIVS`, and `PR_SET_PDEATHSIG` (`src/mcp/stdio_transport.cpp`); full mount/PID/cgroup containment (`contained_launcher`) is planned, not constructed |
 | Sage controller                                                 | Authenticated peer, but not authority for raw paths, exposure administration, or host mutation |
 | Operating-system kernel and platform sandbox                    | Trusted and patched                                                                            |
 | Other processes under the same host user                        | Outside the strong integrity boundary; trusted as configured local-endpoint authority           |
