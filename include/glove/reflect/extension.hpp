@@ -31,11 +31,9 @@ namespace glove::reflect {
 namespace detail {
 
 template<class TargetT>
-[[nodiscard]] inline auto assign_json_value(
-    TargetT& target,
-    const json_value& value,
-    std::string_view field_name
-) -> std::expected<void, std::string> {
+[[nodiscard]] inline auto
+assign_json_value(TargetT& target, const json_value& value, std::string_view field_name)
+    -> std::expected<void, std::string> {
     using base_t = std::remove_cvref_t<typename unwrap_optional<TargetT>::type>;
     if constexpr (is_optional<std::remove_cvref_t<TargetT>>::value) {
         if (std::holds_alternative<std::monostate>(value)) {
@@ -65,9 +63,8 @@ template<class TargetT>
                 }
                 target = static_cast<base_t>(*n);
             } else {
-                if (*n < 0 ||
-                    static_cast<std::uint64_t>(*n) >
-                        static_cast<std::uint64_t>(std::numeric_limits<base_t>::max())) {
+                if (*n < 0 || static_cast<std::uint64_t>(*n) >
+                                  static_cast<std::uint64_t>(std::numeric_limits<base_t>::max())) {
                     return std::unexpected(
                         "integer out of range for field '" + std::string{field_name} + "'"
                     );
@@ -98,9 +95,7 @@ template<class TargetT>
             target = *arr;
             return {};
         }
-        return std::unexpected(
-            "expected string array for field '" + std::string{field_name} + "'"
-        );
+        return std::unexpected("expected string array for field '" + std::string{field_name} + "'");
     } else {
         return std::unexpected(
             "unsupported reflected argument type for field '" + std::string{field_name} + "'"
@@ -140,8 +135,10 @@ template<class ArgsT>
                 if (is_required) {
                     decode_error = "missing required argument: " + field_name;
                 }
-            } else if (auto assigned = assign_json_value(parsed.[:member:], it->second, field_name);
-                       !assigned) {
+            } else if (
+                auto assigned = assign_json_value(parsed.[:member:], it->second, field_name);
+                !assigned
+            ) {
                 decode_error = assigned.error();
             }
         }

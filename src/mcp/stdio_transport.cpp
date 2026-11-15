@@ -267,10 +267,8 @@ auto make_stdio_transport(const stdio_child_options& opts)
 
         char uid_map_buf[64]{};
         char gid_map_buf[64]{};
-        const int uid_len =
-            std::snprintf(uid_map_buf, sizeof(uid_map_buf), "0 %u 1\n", host_uid);
-        const int gid_len =
-            std::snprintf(gid_map_buf, sizeof(gid_map_buf), "0 %u 1\n", host_gid);
+        const int uid_len = std::snprintf(uid_map_buf, sizeof(uid_map_buf), "0 %u 1\n", host_uid);
+        const int gid_len = std::snprintf(gid_map_buf, sizeof(gid_map_buf), "0 %u 1\n", host_gid);
         if (uid_len <= 0 || static_cast<std::size_t>(uid_len) >= sizeof(uid_map_buf) ||
             gid_len <= 0 || static_cast<std::size_t>(gid_len) >= sizeof(gid_map_buf)) {
             close_pipe_pair(err_pipe);
@@ -296,7 +294,8 @@ auto make_stdio_transport(const stdio_child_options& opts)
                 (void)::write(err_pipe[1], msg, len);
                 ::_exit(127);
             };
-            auto write_proc_file = [&](const char* path, const char* data, std::size_t len) -> bool {
+            auto write_proc_file =
+                [&](const char* path, const char* data, std::size_t len) -> bool {
                 const int fd = ::open(path, O_WRONLY | O_CLOEXEC);
                 if (fd < 0) {
                     return false;

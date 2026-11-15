@@ -36,17 +36,19 @@ struct[[= glove::reflect::tool_meta{"read_elf", "Inspect ELF headers of a pinned
 int main() {
 #if defined(GLOVE_HAS_REFLECTION)
     auto ext = std::make_unique<glove::reflect::reflected_extension>("re");
-    assert(ext->add_tool<read_elf_args>([](const read_elf_args& args) {
-        return glove::mcp::tool_call_result{
-            .status = glove::mcp::tool_call_status::ok,
-            .content = args.path + (args.sections ? ":sections" : ":header"),
-            .structured_json = {},
-            .error_message = {},
-        };
-    }).has_value());
-    assert(!ext->add_tool<read_elf_args>([](const read_elf_args&) {
-        return glove::mcp::tool_call_result{};
-    }).has_value());
+    assert(ext->add_tool<read_elf_args>(
+                  [](const read_elf_args& args) {
+                      return glove::mcp::tool_call_result{
+                          .status = glove::mcp::tool_call_status::ok,
+                          .content = args.path + (args.sections ? ":sections" : ":header"),
+                          .structured_json = {},
+                          .error_message = {},
+                      };
+                  }
+    ).has_value());
+    assert(!ext->add_tool<read_elf_args>(
+                   [](const read_elf_args&) { return glove::mcp::tool_call_result{}; }
+    ).has_value());
 
     glove::kernel::registry reg;
     assert(reg.add(std::move(ext)).has_value());

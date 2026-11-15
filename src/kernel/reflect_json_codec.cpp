@@ -47,9 +47,7 @@ auto parse_json_object(std::string_view json) -> std::expected<json_object, std:
             items.reserve(arr.size());
             for (const auto& item : arr) {
                 if (!item.is_string()) {
-                    return std::unexpected(
-                        "expected string element in array field '" + key + "'"
-                    );
+                    return std::unexpected("expected string element in array field '" + key + "'");
                 }
                 items.push_back(item.get_string());
             }
