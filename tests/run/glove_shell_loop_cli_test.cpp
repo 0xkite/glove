@@ -103,7 +103,9 @@ auto run() -> int {
     const auto auto_ws = base / "auto-created-workspace";
     REQUIRE(!std::filesystem::exists(auto_ws, ec));
     REQUIRE(
-        run_glove({GLOVE_BIN, "shell", "--workspace", auto_ws.string(), "--", "/bin/true"}) == 0
+        run_glove(
+            {GLOVE_BIN, "shell", "--workspace", auto_ws.string(), "--", "/bin/sh", "-c", "true"}
+        ) == 0
     );
     REQUIRE(std::filesystem::is_directory(auto_ws, ec));
 
