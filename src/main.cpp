@@ -686,8 +686,14 @@ auto attach_agent_harness_closure(
         const std::filesystem::path home_dir{home};
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "bin");
         add_unique_path_dir(opts, home_dir / ".local" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "opt");
+        add_unique_path_dir(opts, home_dir / ".local" / "opt" / "clice" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "uv");
         add_non_overlapping_read_dir(opts, home_dir / ".cargo" / "bin");
         add_unique_path_dir(opts, home_dir / ".cargo" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".rustup");
+        add_non_overlapping_read_dir(opts, home_dir / "go" / "bin");
+        add_unique_path_dir(opts, home_dir / "go" / "bin");
         add_unique_path_dir(opts, std::filesystem::path{"/usr/local/bin"});
         const auto pi_agent_dir = home_dir / ".pi" / "agent";
         for (const char* sub :
@@ -695,6 +701,10 @@ auto attach_agent_harness_closure(
             add_non_overlapping_read_dir(opts, pi_agent_dir / sub);
         }
         add_unique_path_dir(opts, pi_agent_dir / "bin");
+        add_non_overlapping_read_dir(
+            opts,
+            home_dir / "Documents" / "depend" / "dotfiles" / "pi" / ".pi" / "agent" / "packages"
+        );
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");
