@@ -898,10 +898,10 @@ auto install_environment(const profile& prof) -> std::expected<void, std::string
                 return std::unexpected(std::string{"setenv "} + name + ": " + std::strerror(errno));
             }
         }
-        // Node.js 22.18+ / 24+ / 26+ built-in `fetch` (undici) ignores
-        // HTTPS_PROXY unless NODE_USE_ENV_PROXY=1 / --use-env-proxy is set.
-        if (::setenv("NODE_USE_ENV_PROXY", "1", 1) != 0 ||
-            ::setenv("NODE_OPTIONS", "--use-env-proxy", 1) != 0) {
+        // Node.js 22.18+ / 24+ / 26+ built-in `fetch` (undici) honors
+        // HTTPS_PROXY when NODE_USE_ENV_PROXY=1 is set. This is safely
+        // ignored by non-Node programs and older runtimes.
+        if (::setenv("NODE_USE_ENV_PROXY", "1", 1) != 0) {
             return std::unexpected(
                 std::string{"setenv NODE_USE_ENV_PROXY: "} + std::strerror(errno)
             );
