@@ -232,6 +232,17 @@ struct profile {
     // isolated network namespace (e.g. for agent runtimes like agy that bind
     // 127.0.0.1:0). Does not grant external network egress.
     bool allow_loopback_listen = false;
+
+    // How the Linux seccomp escape-surface tripwire responds to explicit
+    // escape/kernel-mutation syscalls (bpf, unshare, setns, mount API,
+    // open_by_handle_at, pidfd_getfd, kexec, TIOCSTI, ...). Default
+    // (`terminate_container`) traps via SECCOMP_RET_USER_NOTIF, logs the
+    // syscall, and immediately shuts down the container.
+    enum class seccomp_escape_policy : std::uint8_t {
+        terminate_container,
+        deny_errno,
+    };
+    seccomp_escape_policy escape_policy = seccomp_escape_policy::terminate_container;
 };
 
 // Validate and canonicalise a profile. Invalid, overlapping, contradictory,

@@ -687,4 +687,10 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     return exec_passthrough(prof, argv);
 }
 
+auto exec_contained(
+    const profile& prof, const std::vector<std::string>& argv, escape_event_observer /*on_escape*/
+) -> std::expected<int, std::string> {
+    return exec_contained(prof, argv);
+}
+
 } // namespace glove::container

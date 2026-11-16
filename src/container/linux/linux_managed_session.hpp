@@ -2,6 +2,7 @@
 
 #include "glove/container/profile.hpp"
 #include "glove/container/receipt_producer.hpp"
+#include "glove/container/spawner.hpp"
 
 #include "inherited_stream_descriptor.hpp"
 #include "linux_resource_lifecycle.hpp"
@@ -87,7 +88,8 @@ private:
         const managed_launch_binding& expected_binding,
         std::unique_ptr<linux_resource_lifecycle> lifecycle,
         managed_pty_session_options options,
-        const managed_session_start_gate& before_child_release
+        const managed_session_start_gate& before_child_release,
+        escape_event_observer on_escape
     ) -> std::expected<std::unique_ptr<managed_pty_session>, std::string>;
 
     std::unique_ptr<implementation> state_;
@@ -147,7 +149,8 @@ private:
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
     managed_pty_session_options options,
-    const managed_session_start_gate& before_child_release
+    const managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape = {}
 ) -> std::expected<std::unique_ptr<managed_pty_session>, std::string>;
 
 // The gate runs after clone, UID mapping, cgroup attachment, and output-pump
@@ -158,7 +161,8 @@ private:
     const std::vector<std::string>& argv,
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
-    const managed_session_start_gate& before_child_release
+    const managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape = {}
 ) -> std::expected<resource_enforcement_receipt, std::string>;
 
 // Lifecycle-complete authenticated seam. The producer reserves worst-case
@@ -170,7 +174,8 @@ private:
     std::string_view session_id,
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
-    receipt_audit_producer& audit_producer
+    receipt_audit_producer& audit_producer,
+    escape_event_observer on_escape = {}
 ) -> std::expected<authenticated_resource_enforcement_receipt, std::string>;
 
 } // namespace glove::container::linux_detail

@@ -937,6 +937,9 @@ cgroup_v2_root::create_session(std::string_view session_id, const resource_limit
     if (auto pids = write_at(session_fd.get(), "pids.max", std::to_string(limits.pids)); !pids) {
         return fail(pids.error());
     }
+    if (auto cpu_max = write_at(session_fd.get(), "cpu.max", "100000 100000", true); !cpu_max) {
+        return fail(cpu_max.error());
+    }
     auto parent_copy = duplicate_fd(directory_fd_);
     if (!parent_copy) {
         return fail(parent_copy.error());

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <map>
 #include <memory>
@@ -827,7 +828,8 @@ auto start_linux_pty_session(
     linux_session_preparer& preparer,
     container::receipt_audit_producer& receipt_producer,
     const linux_session_execution_request& request,
-    container::linux_detail::managed_pty_session_options options
+    container::linux_detail::managed_pty_session_options options,
+    container::escape_event_observer on_escape
 ) -> std::expected<std::unique_ptr<linux_pty_session>, std::string> {
     if (!valid_identifier(request.session_id) || !valid_identifier(request.authorization_id) ||
         !valid_identifier(request.idempotency_namespace, max_idempotency_namespace_bytes)) {
@@ -937,7 +939,22 @@ auto start_linux_pty_session(
             options.refinement_evaluator = prepared->refinement_evaluator;
             return options;
         }(),
-        before_child_release
+        before_child_release,
+        [session_id = prepared->session_id,
+         caller_escape =
+             std::move(on_escape)](const container::containment_escape_event& escape_event) {
+            static_cast<void>(std::fprintf(
+                stderr,
+                "glove security: terminated managed PTY session '%s' after escape syscall '%s' "
+                "(pid %d)\n",
+                session_id.c_str(),
+                escape_event.detail.c_str(),
+                static_cast<int>(escape_event.pid)
+            ));
+            if (caller_escape) {
+                caller_escape(escape_event);
+            }
+        }
     );
     if (!managed) {
         auto failure = failure_commitment;
@@ -964,7 +981,8 @@ auto execute_linux_session(
     session_registry& registry,
     linux_session_preparer& preparer,
     container::receipt_audit_producer& receipt_producer,
-    const linux_session_execution_request& request
+    const linux_session_execution_request& request,
+    container::escape_event_observer on_escape
 ) -> std::expected<session_exited_record, std::string> {
     if (!valid_identifier(request.session_id) || !valid_identifier(request.authorization_id) ||
         !valid_identifier(request.idempotency_namespace, max_idempotency_namespace_bytes)) {
@@ -1055,7 +1073,22 @@ auto execute_linux_session(
         prepared->argv,
         prepared->binding,
         std::move(prepared->lifecycle),
-        before_child_release
+        before_child_release,
+        [session_id = prepared->session_id,
+         on_escape =
+             std::move(on_escape)](const container::containment_escape_event& escape_event) {
+            static_cast<void>(std::fprintf(
+                stderr,
+                "glove security: terminated managed session '%s' after escape syscall '%s' "
+                "(pid %d)\n",
+                session_id.c_str(),
+                escape_event.detail.c_str(),
+                static_cast<int>(escape_event.pid)
+            ));
+            if (on_escape) {
+                on_escape(escape_event);
+            }
+        }
     );
     if (!receipt) {
         const auto code = running_committed ? session_failure_code::supervisor_error

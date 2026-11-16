@@ -20,6 +20,9 @@ auto canonical_path(std::string_view raw, std::string_view label)
     if (raw.empty()) {
         return std::unexpected(std::string{label} + " has empty path");
     }
+    if (raw.find('\0') != std::string_view::npos) {
+        return std::unexpected(std::string{label} + " contains NUL byte");
+    }
     std::filesystem::path candidate{raw};
     if (!candidate.is_absolute()) {
         return std::unexpected(
@@ -237,14 +240,18 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
             return std::unexpected(std::string{"duplicate filesystem rule: '"} + rule.path + "'");
         }
     }
-    for (auto outer = copy.filesystem.begin(); outer != copy.filesystem.end(); ++outer) {
-        for (auto inner = std::next(outer); inner != copy.filesystem.end(); ++inner) {
-            const std::filesystem::path first{outer->path};
-            const std::filesystem::path second{inner->path};
-            if (path_within(first, second) || path_within(second, first)) {
+    std::vector<std::filesystem::path> fs_paths;
+    fs_paths.reserve(copy.filesystem.size());
+    for (const auto& rule : copy.filesystem) {
+        fs_paths.emplace_back(rule.path);
+    }
+    for (std::size_t outer = 0; outer < fs_paths.size(); ++outer) {
+        for (std::size_t inner = outer + 1; inner < fs_paths.size(); ++inner) {
+            if (path_within(fs_paths[outer], fs_paths[inner]) ||
+                path_within(fs_paths[inner], fs_paths[outer])) {
                 return std::unexpected(
-                    std::string{"overlapping filesystem rules are ambiguous: '"} + outer->path +
-                    "' and '" + inner->path + "'"
+                    std::string{"overlapping filesystem rules are ambiguous: '"} +
+                    copy.filesystem[outer].path + "' and '" + copy.filesystem[inner].path + "'"
                 );
             }
         }
@@ -302,8 +309,7 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
             );
         }
         const std::filesystem::path runtime_path{rule.path};
-        if (std::ranges::any_of(copy.filesystem, [&](const auto& filesystem_rule) {
-                const std::filesystem::path filesystem_path{filesystem_rule.path};
+        if (std::ranges::any_of(fs_paths, [&](const auto& filesystem_path) {
                 return path_within(runtime_path, filesystem_path) ||
                        path_within(filesystem_path, runtime_path);
             })) {
@@ -312,15 +318,19 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
             );
         }
     }
-    for (auto outer = copy.runtime_filesystem.begin(); outer != copy.runtime_filesystem.end();
-         ++outer) {
-        for (auto inner = std::next(outer); inner != copy.runtime_filesystem.end(); ++inner) {
-            const std::filesystem::path first{outer->path};
-            const std::filesystem::path second{inner->path};
-            if (path_within(first, second) || path_within(second, first)) {
+    std::vector<std::filesystem::path> runtime_fs_paths;
+    runtime_fs_paths.reserve(copy.runtime_filesystem.size());
+    for (const auto& rule : copy.runtime_filesystem) {
+        runtime_fs_paths.emplace_back(rule.path);
+    }
+    for (std::size_t outer = 0; outer < runtime_fs_paths.size(); ++outer) {
+        for (std::size_t inner = outer + 1; inner < runtime_fs_paths.size(); ++inner) {
+            if (path_within(runtime_fs_paths[outer], runtime_fs_paths[inner]) ||
+                path_within(runtime_fs_paths[inner], runtime_fs_paths[outer])) {
                 return std::unexpected(
                     std::string{"overlapping runtime filesystem rules are ambiguous: '"} +
-                    outer->path + "' and '" + inner->path + "'"
+                    copy.runtime_filesystem[outer].path + "' and '" +
+                    copy.runtime_filesystem[inner].path + "'"
                 );
             }
         }

@@ -3,7 +3,9 @@
 #include "glove/container/profile.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -75,7 +77,19 @@ auto make_default_spawner() -> std::unique_ptr<spawner>;
 // self-driving agent (its terminal + LLM are its own) gets glove's OS perimeter
 // and egress, but is not driven as an MCP client. Returns an error on platforms
 // without a passthrough implementation yet.
+struct containment_escape_event {
+    std::string mechanism;
+    std::string detail;
+    std::int32_t pid = -1;
+};
+
+using escape_event_observer = std::function<void(const containment_escape_event&)>;
+
 auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     -> std::expected<int, std::string>;
+
+auto exec_contained(
+    const profile& prof, const std::vector<std::string>& argv, escape_event_observer on_escape
+) -> std::expected<int, std::string>;
 
 } // namespace glove::container

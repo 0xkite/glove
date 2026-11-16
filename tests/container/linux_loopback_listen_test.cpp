@@ -19,6 +19,17 @@
 #include <string_view>
 #include <vector>
 
+// LeakSanitizer cannot trace the nested exec into an isolated PID namespace;
+// keep ASan/UBSan active in the child while disabling only child leak tracing.
+#if defined(__has_feature)
+#    if __has_feature(address_sanitizer)
+#        define GLOVE_TEST_ADDRESS_SANITIZER 1
+#    endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) && !defined(GLOVE_TEST_ADDRESS_SANITIZER)
+#    define GLOVE_TEST_ADDRESS_SANITIZER 1
+#endif
+
 namespace {
 
 #define REQUIRE(cond)                                                                              \
@@ -145,6 +156,10 @@ auto run_contained_mode(const std::string& self_exe, const char* mode, bool allo
     prof.home_dir = (temp_base / "home").string();
     prof.temp_dir = (temp_base / "tmp").string();
     prof.work_dir = temp_base.string();
+    prof.environment = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin"};
+#if defined(GLOVE_TEST_ADDRESS_SANITIZER)
+    prof.environment.emplace_back("ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0");
+#endif
     prof.allow_loopback_listen = allow_loopback;
 
     auto validated = glove::container::validate(prof);

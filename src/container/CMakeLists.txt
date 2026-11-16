@@ -65,6 +65,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         linux/linux_resource_lifecycle.cpp
         linux/managed_launch_binding.cpp
         linux/pty_session_channel.cpp
+        linux/seccomp_monitor.cpp
     )
     target_link_libraries(glove_container PRIVATE glove_supervisor)
     find_package(PkgConfig REQUIRED)

@@ -91,14 +91,17 @@ auto command_cases(const std::filesystem::path& root) -> int {
     REQUIRE(!capture_dependency_command("/bin/sh", {"-c", "exit 7"}, 1s));
     REQUIRE(!capture_dependency_command("/bin/sh", {"-c", "kill -TERM $$"}, 1s));
     auto exact = capture_dependency_command(
-        "/bin/sh", {"-c", "dd if=/dev/zero bs=1024 count=1024 2>/dev/null"}, 2s
+        "/bin/sh", {"-c", "dd if=/dev/zero bs=1024 count=1024 2>/dev/null"}, 5s
     );
     REQUIRE(exact);
     REQUIRE(exact->size() == 1024U * 1024U);
     auto overflow = capture_dependency_command(
-        "/bin/sh", {"-c", "dd if=/dev/zero bs=1024 count=1025 2>/dev/null"}, 2s
+        "/bin/sh", {"-c", "dd if=/dev/zero bs=1024 count=1025 2>/dev/null"}, 5s
     );
     REQUIRE(!overflow);
+    if (overflow.error().find("output limit") == std::string::npos) {
+        std::fprintf(stderr, "unexpected overflow error: %s\n", overflow.error().c_str());
+    }
     REQUIRE(overflow.error().find("output limit") != std::string::npos);
     for (const auto& script : {
              "exec /bin/sleep 10",

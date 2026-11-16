@@ -55,7 +55,8 @@ private:
         linux_session_preparer& preparer,
         container::receipt_audit_producer& receipt_producer,
         const linux_session_execution_request& request,
-        container::linux_detail::managed_pty_session_options options
+        container::linux_detail::managed_pty_session_options options,
+        container::escape_event_observer on_escape
     ) -> std::expected<std::unique_ptr<linux_pty_session>, std::string>;
 
     std::unique_ptr<implementation> state_;
@@ -217,7 +218,8 @@ private:
     linux_session_preparer& preparer,
     container::receipt_audit_producer& receipt_producer,
     const linux_session_execution_request& request,
-    container::linux_detail::managed_pty_session_options options
+    container::linux_detail::managed_pty_session_options options,
+    container::escape_event_observer on_escape = {}
 ) -> std::expected<std::unique_ptr<linux_pty_session>, std::string>;
 
 // Private synchronous composition seam. It is intentionally absent from the
@@ -229,7 +231,8 @@ private:
     session_registry& registry,
     linux_session_preparer& preparer,
     container::receipt_audit_producer& receipt_producer,
-    const linux_session_execution_request& request
+    const linux_session_execution_request& request,
+    container::escape_event_observer on_escape = {}
 ) -> std::expected<session_exited_record, std::string>;
 
 } // namespace glove::control::linux_detail

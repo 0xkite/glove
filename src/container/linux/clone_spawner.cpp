@@ -22,8 +22,14 @@
 #include "linux_egress_bridge.hpp"
 #include "linux_managed_session.hpp"
 #include "output_pump.hpp"
+#include "seccomp_monitor.hpp"
 
 #include <fcntl.h>
+#include <linux/capability.h>
+#if __has_include(<linux/landlock.h>)
+#    include <linux/landlock.h>
+#    define GLOVE_HAS_LANDLOCK_UAPI 1
+#endif
 #include <linux/mount.h>
 #include <sched.h>
 #include <seccomp.h>
@@ -123,12 +129,14 @@ struct launched_sandbox_child {
     ::pid_t pid = -1;
     std::unique_ptr<detail::output_pump> output;
     std::unique_ptr<linux_detail::host_egress_bridge> egress;
+    std::unique_ptr<linux_detail::seccomp_escape_monitor> seccomp_monitor;
 };
 
 struct launched_pty_child {
     ::pid_t pid = -1;
     std::unique_ptr<linux_detail::pty_session_channel> terminal;
     std::unique_ptr<linux_detail::host_egress_bridge> egress;
+    std::unique_ptr<linux_detail::seccomp_escape_monitor> seccomp_monitor;
 };
 
 class owned_fd {
@@ -282,9 +290,13 @@ public:
     linux_agent_handle(
         ::pid_t pid,
         std::unique_ptr<pipe_transport> t,
-        std::unique_ptr<linux_detail::host_egress_bridge> egress
+        std::unique_ptr<linux_detail::host_egress_bridge> egress,
+        std::unique_ptr<linux_detail::seccomp_escape_monitor> seccomp_monitor
     )
-        : pid_{pid}, transport_{std::move(t)}, egress_{std::move(egress)} {}
+        : pid_{pid},
+          transport_{std::move(t)},
+          egress_{std::move(egress)},
+          seccomp_monitor_{std::move(seccomp_monitor)} {}
 
     ~linux_agent_handle() override {
         transport_.reset();
@@ -349,6 +361,7 @@ private:
     ::pid_t pid_;
     std::unique_ptr<pipe_transport> transport_;
     std::unique_ptr<linux_detail::host_egress_bridge> egress_;
+    std::unique_ptr<linux_detail::seccomp_escape_monitor> seccomp_monitor_;
     bool waited_ = false;
     int cached_code_ = -1;
 };
@@ -571,35 +584,123 @@ auto make_mount_target(const std::string& target, const struct ::stat& source_st
     return {};
 }
 
-auto bind_path(const std::string& new_root, std::string_view source, bool writable)
-    -> std::expected<void, std::string> {
+constexpr std::array<const char*, 6> allowed_sandbox_device_nodes{
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+};
+
+auto is_allowed_sandbox_device_node(std::string_view path) noexcept -> bool {
+    return std::ranges::any_of(allowed_sandbox_device_nodes, [path](const char* allowed) {
+        return path == allowed;
+    });
+}
+
+auto open_bind_source_fd(const std::string& source, bool allow_symlinks) -> owned_fd {
+    if (allow_symlinks) {
+        return owned_fd{::open(source.c_str(), O_PATH | O_CLOEXEC)}; // NOLINT
+    }
+    if (source.empty() || source.front() != '/') {
+        errno = EINVAL;
+        return owned_fd{-1};
+    }
+    owned_fd current{::open("/", O_PATH | O_CLOEXEC | O_DIRECTORY)}; // NOLINT
+    if (current.get() < 0) {
+        return current;
+    }
+    std::string_view remaining{source};
+    while (!remaining.empty()) {
+        while (!remaining.empty() && remaining.front() == '/') {
+            remaining.remove_prefix(1);
+        }
+        if (remaining.empty()) {
+            break;
+        }
+        const auto slash = remaining.find('/');
+        const std::string segment{remaining.substr(0, slash)};
+        if (segment == "." || segment == "..") {
+            errno = EINVAL;
+            return owned_fd{-1};
+        }
+        const int next =
+            ::openat(current.get(), segment.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW); // NOLINT
+        if (next < 0) {
+            return owned_fd{-1};
+        }
+        current = owned_fd{next};
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        remaining.remove_prefix(slash + 1);
+    }
+    return current;
+}
+
+auto bind_path_impl(
+    const std::string& new_root, std::string_view source, bool writable, bool ignore_missing
+) -> std::expected<void, std::string> {
     struct ::stat source_stat{};
 
     const std::string source_string{source};
-    if (::stat(source_string.c_str(), &source_stat) < 0) {
+    // Built-in static runtime paths (e.g. /bin, /lib) may be merged-/usr symlinks;
+    // user profile grants and resolved executables are canonicalized and must not
+    // traverse any symlink after validation.
+    const owned_fd source_fd = open_bind_source_fd(source_string, ignore_missing);
+    if (source_fd.get() < 0) {
+        if (ignore_missing && errno == ENOENT) {
+            return {};
+        }
+        return std::unexpected(
+            std::string{"open bind source '"} + source_string + "': " + std::strerror(errno)
+        );
+    }
+    if (::fstat(source_fd.get(), &source_stat) < 0) {
         return std::unexpected(
             std::string{"stat bind source '"} + source_string + "': " + std::strerror(errno)
+        );
+    }
+    if (S_ISLNK(source_stat.st_mode)) {
+        return std::unexpected(std::string{"refusing symlink bind source '"} + source_string + "'");
+    }
+    const bool safe_char_device =
+        S_ISCHR(source_stat.st_mode) && is_allowed_sandbox_device_node(source_string);
+    if ((S_ISCHR(source_stat.st_mode) || S_ISBLK(source_stat.st_mode)) && !safe_char_device) {
+        return std::unexpected(
+            std::string{"device node grant not permitted for '"} + source_string + "'"
         );
     }
     const std::string target = new_root + source_string;
     if (auto made = make_mount_target(target, source_stat); !made) {
         return made;
     }
+    const std::string proc_fd_source = "/proc/self/fd/" + std::to_string(source_fd.get());
     const unsigned long flags = MS_BIND | (S_ISDIR(source_stat.st_mode) ? MS_REC : 0UL);
-    if (::mount(source_string.c_str(), target.c_str(), nullptr, flags, nullptr) < 0) {
+    if (::mount(proc_fd_source.c_str(), target.c_str(), nullptr, flags, nullptr) < 0) {
         return std::unexpected(
             std::string{"bind '"} + source_string + "': " + std::strerror(errno)
         );
     }
+    struct ::stat target_stat{};
+    if (::stat(target.c_str(), &target_stat) < 0 || target_stat.st_dev != source_stat.st_dev ||
+        target_stat.st_ino != source_stat.st_ino) {
+        return std::unexpected(std::string{"bind identity mismatch for '"} + source_string + "'");
+    }
+    mount_attr_v attributes{};
+    attributes.attr_set = glove_mount_attr_nosuid;
     if (!writable) {
-        mount_attr_v attributes{};
-        attributes.attr_set = glove_mount_attr_rdonly;
-        const unsigned int attribute_flags = S_ISDIR(source_stat.st_mode) ? AT_RECURSIVE : 0U;
-        if (sys_mount_setattr(target.c_str(), attribute_flags, &attributes) < 0) {
-            return std::unexpected(
-                std::string{"make read-only '"} + source_string + "': " + std::strerror(errno)
-            );
-        }
+        attributes.attr_set |= glove_mount_attr_rdonly;
+    }
+    if (!safe_char_device) {
+        attributes.attr_set |= glove_mount_attr_nodev;
+    }
+    const unsigned int attribute_flags = S_ISDIR(source_stat.st_mode) ? AT_RECURSIVE : 0U;
+    if (sys_mount_setattr(target.c_str(), attribute_flags, &attributes) < 0) {
+        return std::unexpected(
+            std::string{"harden bind mount '"} + source_string + "': " + std::strerror(errno)
+        );
     }
     return {};
 }
@@ -706,20 +807,14 @@ auto bind_session_mount(
     return {};
 }
 
+auto bind_path(const std::string& new_root, std::string_view source, bool writable)
+    -> std::expected<void, std::string> {
+    return bind_path_impl(new_root, source, writable, false);
+}
+
 auto bind_if_present(const std::string& new_root, std::string_view source)
     -> std::expected<void, std::string> {
-    struct ::stat source_stat{};
-
-    const std::string source_string{source};
-    if (::stat(source_string.c_str(), &source_stat) < 0) {
-        if (errno == ENOENT) {
-            return {};
-        }
-        return std::unexpected(
-            std::string{"stat runtime path '"} + source_string + "': " + std::strerror(errno)
-        );
-    }
-    return bind_path(new_root, source, false);
+    return bind_path_impl(new_root, source, false, true);
 }
 
 // Construct an empty root and add only immutable runtime paths, the selected
@@ -990,15 +1085,27 @@ auto restrict_inherited_socket_inspection(
 auto setup_seccomp(
     bool proxy_enabled,
     bool allow_loopback_listen,
-    std::span<const linux_detail::inherited_stream_descriptor> inherited_streams
+    std::span<const linux_detail::inherited_stream_descriptor> inherited_streams,
+    profile::seccomp_escape_policy escape_policy,
+    int* out_notify_fd
 ) -> std::expected<void, std::string> {
+    if (out_notify_fd != nullptr) {
+        *out_notify_fd = -1;
+    }
     ::scmp_filter_ctx ctx = ::seccomp_init(SCMP_ACT_ALLOW);
     if (ctx == nullptr) {
         return std::unexpected(std::string{"seccomp_init failed"});
     }
 
+    const std::uint32_t escape_action =
+        escape_policy == profile::seccomp_escape_policy::terminate_container
+            ? SCMP_ACT_NOTIFY
+            : SCMP_ACT_ERRNO(EPERM);
     auto deny = [&](int syscall_nr) -> int {
         return ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), syscall_nr, 0);
+    };
+    auto trap_escape = [&](int syscall_nr) -> int {
+        return ::seccomp_rule_add(ctx, escape_action, syscall_nr, 0);
     };
 
     // Network: deny bind/listen/accept unless private-loopback listening is
@@ -1104,26 +1211,21 @@ auto setup_seccomp(
         SCMP_SYS(chroot),
     };
     for (int sc : ns_syscalls) {
-        if (int rc = deny(sc); rc != 0) {
+        if (int rc = trap_escape(sc); rc != 0) {
             ::seccomp_release(ctx);
-            return std::unexpected(std::string{"deny ns syscall: "} + std::strerror(-rc));
+            return std::unexpected(std::string{"trap ns syscall: "} + std::strerror(-rc));
         }
     }
 
-    // Kernel-surface mutation: bpf, kexec, modules, ptrace, audit, keyring.
-    // None of these are reachable by an unprivileged process inside a user
-    // namespace anyway, but we belt-and-brace the policy so the agent's own
-    // misbehaviour cannot probe the surface.
-    const int kernel_syscalls[] = {
+    // Kernel-surface mutation: bpf, kexec, modules, audit, keyring.
+    // Caught by seccomp_user_notif in default mode to kill the sandbox immediately.
+    const int kernel_escape_syscalls[] = {
         SCMP_SYS(bpf),
         SCMP_SYS(kexec_load),
         SCMP_SYS(kexec_file_load),
         SCMP_SYS(init_module),
         SCMP_SYS(finit_module),
         SCMP_SYS(delete_module),
-        SCMP_SYS(ptrace),
-        SCMP_SYS(process_vm_readv),
-        SCMP_SYS(process_vm_writev),
         SCMP_SYS(keyctl),
         SCMP_SYS(add_key),
         SCMP_SYS(request_key),
@@ -1131,44 +1233,37 @@ auto setup_seccomp(
         SCMP_SYS(swapon),
         SCMP_SYS(swapoff),
     };
-    for (int sc : kernel_syscalls) {
-        if (int rc = deny(sc); rc != 0) {
+    for (int sc : kernel_escape_syscalls) {
+        if (int rc = trap_escape(sc); rc != 0) {
             ::seccomp_release(ctx);
-            return std::unexpected(std::string{"deny kernel syscall: "} + std::strerror(-rc));
+            return std::unexpected(std::string{"trap kernel syscall: "} + std::strerror(-rc));
         }
     }
 
-    // Escape-relevant surface the classic deny list above misses. Verified
-    // reachable inside a live sandbox (Debian 13, kernel 6.12): the filter
-    // denies mount(2)/pivot_root/chroot but NOT the successor mount API
-    // (fsopen/fsconfig/fsmount/fspick/move_mount/open_tree), so the stated
-    // intent "an already-contained agent has no legitimate need to mount
-    // things" was not enforced against the modern equivalents. io_uring is a
-    // large asynchronous-syscall surface with a long LPE history and no
-    // legitimate need inside the sandbox; open_by_handle_at bypasses
-    // path-based mediation via file handles; pidfd_getfd steals descriptors
-    // from other processes; userfaultfd and fanotify_init are privileged
-    // kernel surfaces. None of these are needed by a contained agent.
-    //
-    // NOTE (compatibility): a few language runtimes use io_uring for async
-    // I/O. Blocking it is the conservative sandbox default (matches common
-    // container hardening), but if a specific agent runtime requires it, drop
-    // the three io_uring entries here rather than weakening the whole filter.
+    // Cross-process memory/ptrace stay soft-denied (EPERM) so sanitizer/debug
+    // probes in test harnesses never trigger false shutdowns, while blocking
+    // ptrace/vm_readv/vm_writev unconditionally.
+    const int soft_denied_process_syscalls[] = {
+        SCMP_SYS(ptrace),
+        SCMP_SYS(process_vm_readv),
+        SCMP_SYS(process_vm_writev),
+    };
+    for (int sc : soft_denied_process_syscalls) {
+        if (int rc = deny(sc); rc != 0) {
+            ::seccomp_release(ctx);
+            return std::unexpected(std::string{"deny process syscall: "} + std::strerror(-rc));
+        }
+    }
+
+    // Escape-relevant surface: modern mount API, handle bypass, pidfd_getfd,
+    // userfaultfd, fanotify_init.
     const int escape_surface_syscalls[] = {
-        SCMP_SYS(io_uring_setup),
-        SCMP_SYS(io_uring_enter),
-        SCMP_SYS(io_uring_register),
         SCMP_SYS(fsopen),
         SCMP_SYS(fsconfig),
         SCMP_SYS(fsmount),
         SCMP_SYS(fspick),
         SCMP_SYS(move_mount),
         SCMP_SYS(open_tree),
-        // mount_setattr(2) is the successor to remount and can mutate mount
-        // flags (e.g. clear nosuid/nodev/read-only) inside the agent's mount
-        // namespace, so it belongs with the rest of the mount API. Glove's own
-        // read-only binds run in the child before this filter loads, so denying
-        // it post-exec does not affect setup.
         SCMP_SYS(mount_setattr),
         SCMP_SYS(open_by_handle_at),
         SCMP_SYS(pidfd_getfd),
@@ -1176,30 +1271,39 @@ auto setup_seccomp(
         SCMP_SYS(fanotify_init),
     };
     for (int sc : escape_surface_syscalls) {
-        if (int rc = deny(sc); rc != 0) {
+        if (int rc = trap_escape(sc); rc != 0) {
             ::seccomp_release(ctx);
             return std::unexpected(
-                std::string{"deny escape-surface syscall "} + std::to_string(sc) + ": " +
+                std::string{"trap escape-surface syscall "} + std::to_string(sc) + ": " +
                 std::strerror(-rc)
             );
         }
     }
 
-    // Terminal input injection: deny TIOCSTI and TIOCLINUX ioctl requests.
-    // In passthrough/direct exec mode, the child shares the host terminal.
-    // Masking the low 32 bits prevents the 64-bit sign/extension bypass
-    // (CVE-2019-10063) where syscall(SYS_ioctl, fd, TIOCSTI | (1UL << 32), &c)
-    // is treated as TIOCSTI by the kernel.
+    // io_uring is blocked (EPERM) to eliminate its large LPE surface while
+    // allowing runtimes that benignly probe io_uring_setup to fall back to epoll.
+    const int io_uring_syscalls[] = {
+        SCMP_SYS(io_uring_setup),
+        SCMP_SYS(io_uring_enter),
+        SCMP_SYS(io_uring_register),
+    };
+    for (int sc : io_uring_syscalls) {
+        if (int rc = deny(sc); rc != 0) {
+            ::seccomp_release(ctx);
+            return std::unexpected(std::string{"deny io_uring syscall: "} + std::strerror(-rc));
+        }
+    }
+
+    // Terminal input injection: deny/trap TIOCSTI and TIOCLINUX ioctl requests.
     const scmp_arg_cmp tiocsti_cmp{
         .arg = 1,
         .op = SCMP_CMP_MASKED_EQ,
         .datum_a = 0xFFFFFFFFULL,
         .datum_b = static_cast<scmp_datum_t>(TIOCSTI),
     };
-    if (int rc = ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ioctl), 1, tiocsti_cmp);
-        rc != 0) {
+    if (int rc = ::seccomp_rule_add(ctx, escape_action, SCMP_SYS(ioctl), 1, tiocsti_cmp); rc != 0) {
         ::seccomp_release(ctx);
-        return std::unexpected(std::string{"deny ioctl TIOCSTI: "} + std::strerror(-rc));
+        return std::unexpected(std::string{"trap ioctl TIOCSTI: "} + std::strerror(-rc));
     }
 #if defined(TIOCLINUX)
     const scmp_arg_cmp tioclinux_cmp{
@@ -1208,16 +1312,31 @@ auto setup_seccomp(
         .datum_a = 0xFFFFFFFFULL,
         .datum_b = static_cast<scmp_datum_t>(TIOCLINUX),
     };
-    if (int rc = ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ioctl), 1, tioclinux_cmp);
+    if (int rc = ::seccomp_rule_add(ctx, escape_action, SCMP_SYS(ioctl), 1, tioclinux_cmp);
         rc != 0) {
         ::seccomp_release(ctx);
-        return std::unexpected(std::string{"deny ioctl TIOCLINUX: "} + std::strerror(-rc));
+        return std::unexpected(std::string{"trap ioctl TIOCLINUX: "} + std::strerror(-rc));
     }
 #endif
 
     if (int rc = ::seccomp_load(ctx); rc != 0) {
         ::seccomp_release(ctx);
         return std::unexpected(std::string{"seccomp_load: "} + std::strerror(-rc));
+    }
+    if (escape_policy == profile::seccomp_escape_policy::terminate_container &&
+        out_notify_fd != nullptr) {
+        const int raw_fd = ::seccomp_notify_fd(ctx);
+        if (raw_fd < 0) {
+            ::seccomp_release(ctx);
+            return std::unexpected(std::string{"seccomp_notify_fd unavailable"});
+        }
+        const int dup_fd = ::fcntl(raw_fd, F_DUPFD_CLOEXEC, 3);
+        if (dup_fd < 0) {
+            const int saved = errno;
+            ::seccomp_release(ctx);
+            return std::unexpected(std::string{"dup seccomp notify fd: "} + std::strerror(saved));
+        }
+        *out_notify_fd = dup_fd;
     }
     ::seccomp_release(ctx);
     return {};
@@ -1243,11 +1362,248 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
     return {};
 }
 
+auto drop_all_capabilities_and_no_new_privs() -> std::expected<void, std::string> {
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        return std::unexpected(std::string{"prctl(PR_SET_NO_NEW_PRIVS): "} + std::strerror(errno));
+    }
+#ifdef PR_CAP_AMBIENT_CLEAR_ALL
+    if (::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 && errno != EINVAL) {
+        return std::unexpected(
+            std::string{"prctl(PR_CAP_AMBIENT_CLEAR_ALL): "} + std::strerror(errno)
+        );
+    }
+#endif
+    for (unsigned long cap = 0; cap < 64UL; ++cap) {
+        if (::prctl(PR_CAPBSET_READ, cap, 0, 0, 0) < 0) {
+            if (errno == EINVAL) {
+                break;
+            }
+            return std::unexpected(std::string{"prctl(PR_CAPBSET_READ): "} + std::strerror(errno));
+        }
+        if (::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && errno != EINVAL) {
+            return std::unexpected(std::string{"prctl(PR_CAPBSET_DROP): "} + std::strerror(errno));
+        }
+    }
+    ::__user_cap_header_struct cap_header{};
+    cap_header.version = _LINUX_CAPABILITY_VERSION_3;
+    cap_header.pid = 0;
+    std::array<::__user_cap_data_struct, 2> cap_data{};
+    if (::syscall(SYS_capset, &cap_header, cap_data.data()) != 0) {
+        return std::unexpected(std::string{"capset(0): "} + std::strerror(errno));
+    }
+    return {};
+}
+
+auto setup_landlock(
+    const profile& prof, std::span<const supervisor::linux_detail::session_mount> session_mounts
+) -> std::expected<void, std::string> {
+#if defined(GLOVE_HAS_LANDLOCK_UAPI) && defined(SYS_landlock_create_ruleset)
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        return std::unexpected(std::string{"prctl(PR_SET_NO_NEW_PRIVS): "} + std::strerror(errno));
+    }
+    const long abi =
+        ::syscall(SYS_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi < 0) {
+        if (errno == ENOSYS || errno == EOPNOTSUPP) {
+            return {};
+        }
+        return std::unexpected(std::string{"landlock probe: "} + std::strerror(errno));
+    }
+
+    std::uint64_t handled_fs =
+        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE |
+        LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR |
+        LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_CHAR |
+        LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_SOCK |
+        LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK | LANDLOCK_ACCESS_FS_MAKE_SYM;
+#    ifdef LANDLOCK_ACCESS_FS_REFER
+    if (abi >= 2) {
+        handled_fs |= LANDLOCK_ACCESS_FS_REFER;
+    }
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    if (abi >= 3) {
+        handled_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+    if (abi >= 5) {
+        handled_fs |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+#    endif
+
+    std::uint64_t file_only_mask =
+        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE;
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    file_only_mask |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+    file_only_mask |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+#    endif
+
+    struct ::landlock_ruleset_attr ruleset_attr{};
+    ruleset_attr.handled_access_fs = handled_fs;
+    const owned_fd ruleset_fd{static_cast<int>(
+        ::syscall(SYS_landlock_create_ruleset, &ruleset_attr, sizeof(ruleset_attr), 0)
+    )};
+    if (ruleset_fd.get() < 0) {
+        if (errno == ENOSYS || errno == EOPNOTSUPP) {
+            return {};
+        }
+        return std::unexpected(std::string{"landlock_create_ruleset: "} + std::strerror(errno));
+    }
+
+    auto add_rule = [&](const char* path,
+                        std::uint64_t access) -> std::expected<void, std::string> {
+        const owned_fd target_fd{::open(path, O_PATH | O_CLOEXEC)}; // NOLINT
+        if (target_fd.get() < 0) {
+            if (errno == ENOENT) {
+                return {};
+            }
+            return std::unexpected(
+                std::string{"landlock open '"} + path + "': " + std::strerror(errno)
+            );
+        }
+        struct ::stat st{};
+        if (::fstat(target_fd.get(), &st) != 0) {
+            return std::unexpected(
+                std::string{"landlock fstat '"} + path + "': " + std::strerror(errno)
+            );
+        }
+        std::uint64_t effective = access & handled_fs;
+        if (!S_ISDIR(st.st_mode)) {
+            effective &= file_only_mask;
+        }
+        if (effective == 0) {
+            return {};
+        }
+        struct ::landlock_path_beneath_attr path_attr{};
+        path_attr.allowed_access = effective;
+        path_attr.parent_fd = target_fd.get();
+        if (::syscall(
+                SYS_landlock_add_rule, ruleset_fd.get(), LANDLOCK_RULE_PATH_BENEATH, &path_attr, 0
+            ) != 0) {
+            return std::unexpected(
+                std::string{"landlock_add_rule '"} + path + "': " + std::strerror(errno)
+            );
+        }
+        return {};
+    };
+
+    // Inside the pivoted minimal rootfs, `/` contains only allowlisted system
+    // runtime binaries/libraries and explicit grants; cap `/` globally to
+    // read + execute.
+    constexpr std::uint64_t kReadExecAccess =
+        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+    if (auto r = add_rule("/", kReadExecAccess); !r) {
+        return r;
+    }
+
+    std::uint64_t writable_fs = handled_fs;
+#    ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+    writable_fs &= ~static_cast<std::uint64_t>(LANDLOCK_ACCESS_FS_IOCTL_DEV);
+#    endif
+    if (session_mounts.empty()) {
+        for (const auto* scratch : {"/tmp", "/var/tmp"}) {
+            if (auto r = add_rule(scratch, writable_fs); !r) {
+                return r;
+            }
+        }
+    }
+    for (const auto& rule : prof.filesystem) {
+        if (rule.writable) {
+            if (auto r = add_rule(rule.path.c_str(), writable_fs); !r) {
+                return r;
+            }
+        }
+    }
+    if (prof.home_dir) {
+        if (auto r = add_rule(prof.home_dir->c_str(), writable_fs); !r) {
+            return r;
+        }
+    }
+    if (prof.temp_dir) {
+        if (auto r = add_rule(prof.temp_dir->c_str(), writable_fs); !r) {
+            return r;
+        }
+    }
+    for (const auto& mount : session_mounts) {
+        if (mount.writable) {
+            if (auto r = add_rule(mount.target_path.c_str(), writable_fs); !r) {
+                return r;
+            }
+        }
+    }
+
+    std::uint64_t dev_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    dev_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+    dev_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+#    endif
+    for (const auto* dev : allowed_sandbox_device_nodes) {
+        if (auto r = add_rule(dev, dev_access); !r) {
+            return r;
+        }
+    }
+
+    if (::syscall(SYS_landlock_restrict_self, ruleset_fd.get(), 0) != 0) {
+        return std::unexpected(std::string{"landlock_restrict_self: "} + std::strerror(errno));
+    }
+#else
+    (void)prof;
+    (void)session_mounts;
+#endif
+    return {};
+}
+
+auto install_child_containment_and_notify(
+    const profile& prof,
+    std::span<const linux_detail::inherited_stream_descriptor> inherited_streams,
+    std::span<const supervisor::linux_detail::session_mount> session_mounts,
+    int notify_channel_fd
+) -> std::expected<void, std::string> {
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+        return std::unexpected(std::string{"prctl(PR_SET_NO_NEW_PRIVS): "} + std::strerror(errno));
+    }
+    int seccomp_notif_fd = -1;
+    if (auto r = setup_seccomp(
+            bridged_loopback_port(prof).has_value(),
+            prof.allow_loopback_listen,
+            inherited_streams,
+            prof.escape_policy,
+            notify_channel_fd >= 0 ? &seccomp_notif_fd : nullptr
+        );
+        !r) {
+        return r;
+    }
+    if (notify_channel_fd >= 0) {
+        if (auto sent = linux_detail::send_seccomp_notify_fd_and_wait_ack(
+                notify_channel_fd, seccomp_notif_fd
+            );
+            !sent) {
+            close_fd(seccomp_notif_fd);
+            return sent;
+        }
+        close_fd(seccomp_notif_fd);
+        (void)::close(notify_channel_fd);
+    }
+    if (auto r = setup_landlock(prof, session_mounts); !r) {
+        return r;
+    }
+    if (auto r = drop_all_capabilities_and_no_new_privs(); !r) {
+        return r;
+    }
+    return {};
+}
+
 // Run inside the contained child between clone3 and exec. The signal pipe is
 // the parent's mechanism for telling us the uid_map/gid_map are written —
 // without that, all setuid/setgid calls in the child fail with EPERM.
 [[noreturn]] void child_setup_and_exec(
     int sync_read_fd,
+    int notify_channel_fd,
     int pipe_in_read,
     int pipe_in_write_close,
     int pipe_out_read_close,
@@ -1334,14 +1690,13 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         }
     }
 
-    // Seccomp filter goes after the rootfs pivot (so we don't accidentally
-    // deny syscalls our setup needs) but before the agent's exec, so the
-    // agent inherits the filter as its starting policy.
-    if (auto r = setup_seccomp(
-            bridged_loopback_port(prof).has_value(), prof.allow_loopback_listen, inherited_streams
+    // Seccomp, Landlock, and capability drop go after the rootfs pivot (so we
+    // don't deny syscalls our setup needs) but before the agent's exec.
+    if (auto r = install_child_containment_and_notify(
+            prof, inherited_streams, session_mounts, notify_channel_fd
         );
         !r) {
-        std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
+        std::fprintf(stderr, "glove child: containment: %s\n", r.error().c_str());
         std::_Exit(125);
     }
 
@@ -1399,6 +1754,7 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
 // contained but not driven as an MCP client.
 [[noreturn]] void child_setup_and_exec_passthrough(
     int sync_read_fd,
+    int notify_channel_fd,
     const profile& prof,
     std::vector<std::string> argv,
     std::span<const supervisor::linux_detail::session_mount> session_mounts,
@@ -1486,11 +1842,11 @@ auto pivot_into(const std::string& new_root) -> std::expected<void, std::string>
         }
     }
 
-    if (auto r = setup_seccomp(
-            bridged_loopback_port(prof).has_value(), prof.allow_loopback_listen, inherited_streams
+    if (auto r = install_child_containment_and_notify(
+            prof, inherited_streams, session_mounts, notify_channel_fd
         );
         !r) {
-        std::fprintf(stderr, "glove child: seccomp: %s\n", r.error().c_str());
+        std::fprintf(stderr, "glove child: containment: %s\n", r.error().c_str());
         std::_Exit(125);
     }
 
@@ -1534,6 +1890,51 @@ auto linux_resource_capabilities() noexcept -> resource_enforcement_capabilities
     return {};
 }
 
+auto start_parent_seccomp_monitor(
+    int notify_channel_fd,
+    ::pid_t child,
+    escape_event_observer on_escape,
+    linux_detail::seccomp_kill_callback kill_container
+) -> std::expected<std::unique_ptr<linux_detail::seccomp_escape_monitor>, std::string> {
+    if (notify_channel_fd < 0) {
+        return std::unique_ptr<linux_detail::seccomp_escape_monitor>{};
+    }
+    auto notif_fd = linux_detail::receive_seccomp_notify_fd(notify_channel_fd);
+    if (!notif_fd) {
+        return std::unexpected(notif_fd.error());
+    }
+    auto monitor = linux_detail::seccomp_escape_monitor::start(
+        *notif_fd,
+        child,
+        [observer = std::move(on_escape)](const linux_detail::seccomp_escape_info& info) {
+            if (observer) {
+                observer(
+                    containment_escape_event{
+                        .mechanism = "seccomp_user_notif",
+                        .detail = info.syscall_name,
+                        .pid = static_cast<std::int32_t>(info.pid),
+                    }
+                );
+            } else {
+                std::fprintf(
+                    stderr,
+                    "glove security: terminated sandbox on escape syscall '%s' (pid %d)\n",
+                    info.syscall_name.c_str(),
+                    static_cast<int>(info.pid)
+                );
+            }
+        },
+        std::move(kill_container)
+    );
+    if (!monitor) {
+        return std::unexpected(monitor.error());
+    }
+    if (auto acked = linux_detail::send_seccomp_notify_ack(notify_channel_fd); !acked) {
+        return std::unexpected(acked.error());
+    }
+    return monitor;
+}
+
 class linux_spawner final : public spawner {
 public:
     [[nodiscard]] auto resource_capabilities() const noexcept
@@ -1570,6 +1971,7 @@ public:
         int pipe_out[2] = {-1, -1};   // child stdout -> parent reads pipe_out[0]
         int pipe_error[2] = {-1, -1}; // child stderr -> parent drain worker
         int sync_pipe[2] = {-1, -1};  // parent → child uid-map ack
+        int notify_sock[2] = {-1, -1};
         int egress_host_fd = -1;
         int egress_sandbox_fd = -1;
 
@@ -1594,6 +1996,15 @@ public:
             close_pipe_pair(pipe_error);
             return std::unexpected(std::string{"pipe2(sync): "} + std::strerror(saved));
         }
+        if (checked->escape_policy == profile::seccomp_escape_policy::terminate_container) {
+            if (auto created = linux_detail::create_seccomp_notify_channel(notify_sock); !created) {
+                close_pipe_pair(pipe_in);
+                close_pipe_pair(pipe_out);
+                close_pipe_pair(pipe_error);
+                close_pipe_pair(sync_pipe);
+                return std::unexpected(created.error());
+            }
+        }
         if (bridged_loopback_port(*checked)) {
             auto channel = linux_detail::create_egress_channel();
             if (!channel) {
@@ -1601,6 +2012,7 @@ public:
                 close_pipe_pair(pipe_out);
                 close_pipe_pair(pipe_error);
                 close_pipe_pair(sync_pipe);
+                close_pipe_pair(notify_sock);
                 return std::unexpected(channel.error());
             }
             egress_host_fd = channel->host_fd;
@@ -1619,6 +2031,7 @@ public:
             close_pipe_pair(pipe_out);
             close_pipe_pair(pipe_error);
             close_pipe_pair(sync_pipe);
+            close_pipe_pair(notify_sock);
             close_fd(egress_host_fd);
             close_fd(egress_sandbox_fd);
             return std::unexpected(std::string{"clone3: "} + std::strerror(saved));
@@ -1629,12 +2042,14 @@ public:
             // rest. fcntl(F_SETFD) on inherited fds was set to CLOEXEC by
             // pipe2; clear that on the ones we keep.
             ::close(sync_pipe[1]);
+            close_fd(notify_sock[0]);
             ::fcntl(pipe_in[0], F_SETFD, 0);
             ::fcntl(pipe_out[1], F_SETFD, 0);
             ::fcntl(pipe_error[1], F_SETFD, 0);
             close_fd(egress_host_fd);
             child_setup_and_exec(
                 sync_pipe[0],
+                notify_sock[1],
                 pipe_in[0],
                 pipe_in[1],
                 pipe_out[0],
@@ -1655,6 +2070,7 @@ public:
         ::close(pipe_out[1]);
         ::close(pipe_error[1]);
         ::close(sync_pipe[0]);
+        close_fd(notify_sock[1]);
         close_fd(egress_sandbox_fd);
 
         if (auto uid_ok = setup_uid_map(child); !uid_ok) {
@@ -1662,6 +2078,7 @@ public:
             ::close(pipe_out[0]);
             ::close(pipe_error[0]);
             ::close(sync_pipe[1]);
+            close_fd(notify_sock[0]);
             close_fd(egress_host_fd);
             ::kill(child, SIGKILL);
             int status = 0;
@@ -1678,6 +2095,7 @@ public:
                 ::close(pipe_out[0]);
                 ::close(pipe_error[0]);
                 ::close(sync_pipe[1]);
+                close_fd(notify_sock[0]);
                 ::kill(child, SIGKILL);
                 int status = 0;
                 ::waitpid(child, &status, 0);
@@ -1686,7 +2104,7 @@ public:
             egress = std::move(*started);
         }
 
-        // Tell the child it can proceed with exec.
+        // Tell the child it can proceed with setup and seccomp load.
         const char go = '1';
         if (::write(sync_pipe[1], &go, 1) != 1) {
             const int saved = errno;
@@ -1694,6 +2112,7 @@ public:
             ::close(pipe_out[0]);
             ::close(pipe_error[0]);
             ::close(sync_pipe[1]);
+            close_fd(notify_sock[0]);
             egress.reset();
             ::kill(child, SIGKILL);
             int status = 0;
@@ -1701,6 +2120,19 @@ public:
             return std::unexpected(std::string{"sync write: "} + std::strerror(saved));
         }
         ::close(sync_pipe[1]);
+
+        auto seccomp_monitor = start_parent_seccomp_monitor(notify_sock[0], child, {}, {});
+        close_fd(notify_sock[0]);
+        if (!seccomp_monitor) {
+            ::close(pipe_in[1]);
+            ::close(pipe_out[0]);
+            ::close(pipe_error[0]);
+            egress.reset();
+            ::kill(child, SIGKILL);
+            int status = 0;
+            ::waitpid(child, &status, 0);
+            return std::unexpected(seccomp_monitor.error());
+        }
 
         detail::output_pump_options output_options;
         output_options.stdout_fd = pipe_out[0];
@@ -1713,6 +2145,7 @@ public:
             ::close(pipe_in[1]);
             ::close(pipe_out[0]);
             ::close(pipe_error[0]);
+            seccomp_monitor->reset();
             egress.reset();
             ::kill(child, SIGKILL);
             int status = 0;
@@ -1720,7 +2153,9 @@ public:
             return std::unexpected(output.error());
         }
         auto t = std::make_unique<pipe_transport>(pipe_in[1], std::move(*output));
-        return std::make_unique<linux_agent_handle>(child, std::move(t), std::move(egress));
+        return std::make_unique<linux_agent_handle>(
+            child, std::move(t), std::move(egress), std::move(*seccomp_monitor)
+        );
     }
 };
 
@@ -1875,7 +2310,8 @@ auto launch_passthrough_child(
     linux_detail::linux_resource_lifecycle* lifecycle,
     int agent_program_fd,
     bool capture_output,
-    const linux_detail::managed_session_start_gate* before_child_release
+    const linux_detail::managed_session_start_gate* before_child_release,
+    escape_event_observer on_escape = {}
 ) -> std::expected<launched_sandbox_child, std::string> {
     if (capture_output && lifecycle == nullptr) {
         return std::unexpected(std::string{"captured output requires a resource lifecycle"});
@@ -1892,6 +2328,13 @@ auto launch_passthrough_child(
     if (::pipe2(sync_pipe, O_CLOEXEC) != 0) {
         return std::unexpected(std::string{"pipe2(sync): "} + errno_message(errno));
     }
+    int notify_sock[2] = {-1, -1};
+    if (prof.escape_policy == profile::seccomp_escape_policy::terminate_container) {
+        if (auto created = linux_detail::create_seccomp_notify_channel(notify_sock); !created) {
+            close_pipe_pair(sync_pipe);
+            return std::unexpected(created.error());
+        }
+    }
     int pipe_out[2] = {-1, -1};
     int pipe_error[2] = {-1, -1};
     int egress_host_fd = -1;
@@ -1899,11 +2342,13 @@ auto launch_passthrough_child(
     if (capture_output && ::pipe2(pipe_out, O_CLOEXEC) != 0) {
         const int saved = errno;
         close_pipe_pair(sync_pipe);
+        close_pipe_pair(notify_sock);
         return std::unexpected(std::string{"pipe2(managed stdout): "} + errno_message(saved));
     }
     if (capture_output && ::pipe2(pipe_error, O_CLOEXEC) != 0) {
         const int saved = errno;
         close_pipe_pair(sync_pipe);
+        close_pipe_pair(notify_sock);
         close_pipe_pair(pipe_out);
         return std::unexpected(std::string{"pipe2(managed stderr): "} + errno_message(saved));
     }
@@ -1911,6 +2356,7 @@ auto launch_passthrough_child(
         auto channel = linux_detail::create_egress_channel();
         if (!channel) {
             close_pipe_pair(sync_pipe);
+            close_pipe_pair(notify_sock);
             close_pipe_pair(pipe_out);
             close_pipe_pair(pipe_error);
             return std::unexpected(channel.error());
@@ -1926,6 +2372,7 @@ auto launch_passthrough_child(
     if (lifecycle != nullptr) {
         if (lifecycle->cgroup_fd() < 0) {
             close_pipe_pair(sync_pipe);
+            close_pipe_pair(notify_sock);
             close_pipe_pair(pipe_out);
             close_pipe_pair(pipe_error);
             return std::unexpected(std::string{"managed session cgroup is closed"});
@@ -1940,6 +2387,7 @@ auto launch_passthrough_child(
     if (pid < 0) {
         const int saved = errno;
         close_pipe_pair(sync_pipe);
+        close_pipe_pair(notify_sock);
         close_pipe_pair(pipe_out);
         close_pipe_pair(pipe_error);
         close_fd(egress_host_fd);
@@ -1948,9 +2396,11 @@ auto launch_passthrough_child(
     }
     if (pid == 0) {
         ::close(sync_pipe[1]);
+        close_fd(notify_sock[0]);
         close_fd(egress_host_fd);
         child_setup_and_exec_passthrough(
             sync_pipe[0],
+            notify_sock[1],
             prof,
             launch_argv,
             mounts,
@@ -1972,17 +2422,21 @@ auto launch_passthrough_child(
     }
     const ::pid_t child = static_cast<::pid_t>(pid);
     ::close(sync_pipe[0]);
+    close_fd(notify_sock[1]);
     ::close(pipe_out[1]);
     pipe_out[1] = -1;
     ::close(pipe_error[1]);
     pipe_error[1] = -1;
     close_fd(egress_sandbox_fd);
     std::unique_ptr<linux_detail::host_egress_bridge> egress;
+    std::unique_ptr<linux_detail::seccomp_escape_monitor> seccomp_monitor;
     auto fail = [&](std::string message) -> std::expected<launched_sandbox_child, std::string> {
         ::close(sync_pipe[1]);
+        close_fd(notify_sock[0]);
         close_pipe_pair(pipe_out);
         close_pipe_pair(pipe_error);
         close_fd(egress_host_fd);
+        seccomp_monitor.reset();
         egress.reset();
         static_cast<void>(::kill(child, SIGKILL));
         int status = 0;
@@ -2036,8 +2490,30 @@ auto launch_passthrough_child(
         return fail(std::string{"sync write: "} + errno_message(errno));
     }
     ::close(sync_pipe[1]);
+    sync_pipe[1] = -1;
+    linux_detail::seccomp_kill_callback kill_cb;
+    if (lifecycle != nullptr) {
+        kill_cb = [monitor = lifecycle->monitor()] {
+            if (monitor != nullptr) {
+                static_cast<void>(
+                    monitor->request_termination(resource_termination_cause::supervisor_error)
+                );
+            }
+        };
+    }
+    auto started_monitor = start_parent_seccomp_monitor(
+        notify_sock[0], child, std::move(on_escape), std::move(kill_cb)
+    );
+    close_fd(notify_sock[0]);
+    if (!started_monitor) {
+        return fail(started_monitor.error());
+    }
+    seccomp_monitor = std::move(*started_monitor);
     return launched_sandbox_child{
-        .pid = child, .output = std::move(output), .egress = std::move(egress)
+        .pid = child,
+        .output = std::move(output),
+        .egress = std::move(egress),
+        .seccomp_monitor = std::move(seccomp_monitor),
     };
 }
 
@@ -2048,7 +2524,8 @@ auto launch_pty_child(
     linux_detail::linux_resource_lifecycle& lifecycle,
     int agent_program_fd,
     const linux_detail::managed_pty_session_options& options,
-    const linux_detail::managed_session_start_gate& before_child_release
+    const linux_detail::managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape = {}
 ) -> std::expected<launched_pty_child, std::string> {
     if (lifecycle.cgroup_fd() < 0) {
         return std::unexpected(std::string{"managed PTY session cgroup is closed"});
@@ -2065,12 +2542,20 @@ auto launch_pty_child(
     if (::pipe2(sync_pipe, O_CLOEXEC) != 0) {
         return std::unexpected(std::string{"pipe2(PTY sync): "} + errno_message(errno));
     }
+    int notify_sock[2] = {-1, -1};
+    if (prof.escape_policy == profile::seccomp_escape_policy::terminate_container) {
+        if (auto created = linux_detail::create_seccomp_notify_channel(notify_sock); !created) {
+            close_pipe_pair(sync_pipe);
+            return std::unexpected(created.error());
+        }
+    }
     int egress_host_fd = -1;
     int egress_sandbox_fd = -1;
     if (bridged_loopback_port(prof)) {
         auto channel = linux_detail::create_egress_channel();
         if (!channel) {
             close_pipe_pair(sync_pipe);
+            close_pipe_pair(notify_sock);
             return std::unexpected(channel.error());
         }
         egress_host_fd = channel->host_fd;
@@ -2089,15 +2574,18 @@ auto launch_pty_child(
     if (pid < 0) {
         const int saved = errno;
         close_pipe_pair(sync_pipe);
+        close_pipe_pair(notify_sock);
         close_fd(egress_host_fd);
         close_fd(egress_sandbox_fd);
         return std::unexpected(std::string{"clone3 PTY child: "} + errno_message(saved));
     }
     if (pid == 0) {
         ::close(sync_pipe[1]);
+        close_fd(notify_sock[0]);
         close_fd(egress_host_fd);
         child_setup_and_exec_passthrough(
             sync_pipe[0],
+            notify_sock[1],
             prof,
             launch_argv,
             mounts,
@@ -2115,13 +2603,17 @@ auto launch_pty_child(
     const ::pid_t child = static_cast<::pid_t>(pid);
     ::close(sync_pipe[0]);
     sync_pipe[0] = -1;
+    close_fd(notify_sock[1]);
     terminal_pair->close_slave();
     close_fd(egress_sandbox_fd);
     std::unique_ptr<linux_detail::host_egress_bridge> egress;
     std::unique_ptr<linux_detail::pty_session_channel> terminal;
+    std::unique_ptr<linux_detail::seccomp_escape_monitor> seccomp_monitor;
     auto fail = [&](std::string message) -> std::expected<launched_pty_child, std::string> {
         close_pipe_pair(sync_pipe);
+        close_fd(notify_sock[0]);
         close_fd(egress_host_fd);
+        seccomp_monitor.reset();
         egress.reset();
         terminal.reset();
         static_cast<void>(::kill(child, SIGKILL));
@@ -2176,8 +2668,25 @@ auto launch_pty_child(
     }
     ::close(sync_pipe[1]);
     sync_pipe[1] = -1;
+    auto started_monitor = start_parent_seccomp_monitor(
+        notify_sock[0], child, std::move(on_escape), [monitor = lifecycle.monitor()] {
+            if (monitor != nullptr) {
+                static_cast<void>(
+                    monitor->request_termination(resource_termination_cause::supervisor_error)
+                );
+            }
+        }
+    );
+    close_fd(notify_sock[0]);
+    if (!started_monitor) {
+        return fail(started_monitor.error());
+    }
+    seccomp_monitor = std::move(*started_monitor);
     return launched_pty_child{
-        .pid = child, .terminal = std::move(terminal), .egress = std::move(egress)
+        .pid = child,
+        .terminal = std::move(terminal),
+        .egress = std::move(egress),
+        .seccomp_monitor = std::move(seccomp_monitor),
     };
 }
 
@@ -2355,6 +2864,7 @@ struct linux_detail::managed_pty_session::implementation {
     std::unique_ptr<pty_session_channel> terminal;
     std::shared_ptr<refinement_transcript_evaluator> refinement_evaluator;
     std::unique_ptr<host_egress_bridge> egress;
+    std::unique_ptr<linux_detail::seccomp_escape_monitor> seccomp_monitor;
     std::mutex state_mutex;
     std::condition_variable state_changed;
     bool finished = false;
@@ -2487,7 +2997,8 @@ auto linux_detail::start_managed_pty_session(
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
     managed_pty_session_options options,
-    const managed_session_start_gate& before_child_release
+    const managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape
 ) -> std::expected<std::unique_ptr<managed_pty_session>, std::string> {
     if (!lifecycle || !before_child_release) {
         return std::unexpected(
@@ -2524,7 +3035,8 @@ auto linux_detail::start_managed_pty_session(
         *session->state_->lifecycle,
         prepared->executable_mount.get(),
         options,
-        before_child_release
+        before_child_release,
+        std::move(on_escape)
     );
     if (!child) {
         session->state_->publish_error(child.error());
@@ -2533,6 +3045,7 @@ auto linux_detail::start_managed_pty_session(
     session->state_->child = child->pid;
     session->state_->terminal = std::move(child->terminal);
     session->state_->egress = std::move(child->egress);
+    session->state_->seccomp_monitor = std::move(child->seccomp_monitor);
     session->state_->refinement_evaluator = std::move(options.refinement_evaluator);
     auto started = session->state_->start_waiter();
     if (!started) {
@@ -2550,6 +3063,12 @@ auto linux_detail::start_managed_pty_session(
 
 auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     -> std::expected<int, std::string> {
+    return exec_contained(prof, argv, {});
+}
+
+auto exec_contained(
+    const profile& prof, const std::vector<std::string>& argv, escape_event_observer on_escape
+) -> std::expected<int, std::string> {
     if (argv.empty()) {
         return std::unexpected(std::string{"spawner: empty argv"});
     }
@@ -2572,7 +3091,9 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
         return std::unexpected(program.error());
     }
     launch_argv.front() = std::move(*program);
-    auto child = launch_passthrough_child(*checked, launch_argv, {}, nullptr, -1, false, nullptr);
+    auto child = launch_passthrough_child(
+        *checked, launch_argv, {}, nullptr, -1, false, nullptr, std::move(on_escape)
+    );
     if (!child) {
         return std::unexpected(child.error());
     }
@@ -2603,7 +3124,7 @@ auto linux_detail::exec_managed_session(
     std::unique_ptr<linux_resource_lifecycle> lifecycle
 ) -> std::expected<resource_enforcement_receipt, std::string> {
     return exec_managed_session(
-        prof, argv, expected_binding, std::move(lifecycle), managed_session_start_gate{}
+        prof, argv, expected_binding, std::move(lifecycle), managed_session_start_gate{}, {}
     );
 }
 
@@ -2612,7 +3133,8 @@ auto linux_detail::exec_managed_session(
     const std::vector<std::string>& argv,
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
-    const managed_session_start_gate& before_child_release
+    const managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape
 ) -> std::expected<resource_enforcement_receipt, std::string> {
     if (!lifecycle) {
         return std::unexpected(std::string{"managed session lifecycle is required"});
@@ -2633,7 +3155,8 @@ auto linux_detail::exec_managed_session(
         lifecycle.get(),
         prepared->executable_mount.get(),
         true,
-        &before_child_release
+        &before_child_release,
+        std::move(on_escape)
     );
     if (!child) {
         return std::unexpected(child.error());
@@ -2660,13 +3183,21 @@ auto linux_detail::exec_managed_session_authenticated(
     std::string_view session_id,
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
-    receipt_audit_producer& audit_producer
+    receipt_audit_producer& audit_producer,
+    escape_event_observer on_escape
 ) -> std::expected<authenticated_resource_enforcement_receipt, std::string> {
     auto reservation = audit_producer.reserve_terminal();
     if (!reservation) {
         return std::unexpected(reservation.error());
     }
-    auto receipt = exec_managed_session(prof, argv, expected_binding, std::move(lifecycle));
+    auto receipt = exec_managed_session(
+        prof,
+        argv,
+        expected_binding,
+        std::move(lifecycle),
+        managed_session_start_gate{},
+        std::move(on_escape)
+    );
     if (!receipt) {
         return std::unexpected(receipt.error());
     }

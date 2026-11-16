@@ -8,8 +8,10 @@
 #include <unistd.h>
 
 #if defined(__linux__)
+#    include <linux/capability.h>
 #    include <sched.h>
 #    include <sys/prctl.h>
+#    include <sys/syscall.h>
 #endif
 
 #include <array>
@@ -29,7 +31,7 @@ namespace glove::mcp {
 
 namespace {
 
-constexpr std::size_t recv_chunk_bytes = 4096;
+constexpr std::size_t recv_chunk_bytes = 65536;
 
 // Hard ceiling on a single newline-framed frame. A peer that streams bytes
 // without ever sending a newline would otherwise grow this buffer without
@@ -126,14 +128,15 @@ public:
     }
 
     auto recv() -> std::expected<std::string, std::string> override {
+        std::size_t scan_pos = 0;
         for (;;) {
-            auto nl = buffer_.find('\n');
+            const auto nl = buffer_.find('\n', scan_pos);
             if (nl != std::string::npos) {
                 std::string out = buffer_.substr(0, nl);
                 buffer_.erase(0, nl + 1);
                 return out;
             }
-            std::array<char, recv_chunk_bytes> chunk{};
+            std::array<char, recv_chunk_bytes> chunk;
             const ::ssize_t got = ::read(read_fd_, chunk.data(), chunk.size());
             if (got < 0) {
                 if (errno == EINTR) {
@@ -147,6 +150,7 @@ public:
             if (buffer_.size() + static_cast<std::size_t>(got) > max_frame_bytes) {
                 return std::unexpected(std::string{"frame exceeds max_frame_bytes"});
             }
+            scan_pos = buffer_.size();
             buffer_.append(chunk.data(), static_cast<std::size_t>(got));
         }
     }
@@ -279,14 +283,20 @@ auto make_stdio_transport(const stdio_child_options& opts)
 
         const ::pid_t parent_pid = ::getpid();
         const char* const program_cstr = opts.program.c_str();
-        const int clone_flags = CLONE_NEWUSER | (opts.sandbox.allow_network ? 0 : CLONE_NEWNET);
-        const ::pid_t child_pid = ::fork();
+        const unsigned long clone_flags =
+            static_cast<unsigned long>(CLONE_NEWUSER) |
+            (opts.sandbox.allow_network ? 0UL : static_cast<unsigned long>(CLONE_NEWNET)) |
+            static_cast<unsigned long>(SIGCHLD);
+        const ::pid_t child_pid =
+            static_cast<::pid_t>(::syscall(SYS_clone, clone_flags, 0, nullptr, nullptr, 0));
         if (child_pid < 0) {
             const int saved = errno;
             close_pipe_pair(err_pipe);
             close_pipe_pair(pipe_in);
             close_pipe_pair(pipe_out);
-            return std::unexpected(std::string{"fork: "} + std::strerror(saved));
+            return std::unexpected(
+                std::string{"unshare: clone namespace setup failed: "} + std::strerror(saved)
+            );
         }
         if (child_pid == 0) {
             ::close(err_pipe[0]);
@@ -328,10 +338,6 @@ auto make_stdio_transport(const stdio_child_options& opts)
             }
             close_pipe_pair(pipe_in);
             close_pipe_pair(pipe_out);
-            if (::unshare(clone_flags) != 0) {
-                static constexpr char kErr[] = "unshare: namespace setup failed";
-                fail_child(kErr, sizeof(kErr) - 1U);
-            }
             static constexpr char kDeny[] = "deny";
             if (!write_proc_file("/proc/self/setgroups", kDeny, sizeof(kDeny) - 1U)) {
                 static constexpr char kErr[] = "write /proc/self/setgroups failed";
@@ -347,6 +353,34 @@ auto make_stdio_transport(const stdio_child_options& opts)
                     "/proc/self/gid_map", gid_map_buf, static_cast<std::size_t>(gid_len)
                 )) {
                 static constexpr char kErr[] = "write /proc/self/gid_map failed";
+                fail_child(kErr, sizeof(kErr) - 1U);
+            }
+#    ifdef PR_CAP_AMBIENT_CLEAR_ALL
+            if (::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 &&
+                errno != EINVAL) {
+                static constexpr char kErr[] = "prctl(PR_CAP_AMBIENT_CLEAR_ALL) failed";
+                fail_child(kErr, sizeof(kErr) - 1U);
+            }
+#    endif
+            for (unsigned long cap = 0; cap < 64UL; ++cap) {
+                if (::prctl(PR_CAPBSET_READ, cap, 0, 0, 0) < 0) {
+                    if (errno == EINVAL) {
+                        break;
+                    }
+                    static constexpr char kErr[] = "prctl(PR_CAPBSET_READ) failed";
+                    fail_child(kErr, sizeof(kErr) - 1U);
+                }
+                if (::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && errno != EINVAL) {
+                    static constexpr char kErr[] = "prctl(PR_CAPBSET_DROP) failed";
+                    fail_child(kErr, sizeof(kErr) - 1U);
+                }
+            }
+            ::__user_cap_header_struct cap_hdr{};
+            cap_hdr.version = _LINUX_CAPABILITY_VERSION_3;
+            cap_hdr.pid = 0;
+            std::array<::__user_cap_data_struct, 2> cap_data{};
+            if (::syscall(SYS_capset, &cap_hdr, cap_data.data()) != 0) {
+                static constexpr char kErr[] = "capset failed";
                 fail_child(kErr, sizeof(kErr) - 1U);
             }
             environ = environment.data();

@@ -551,6 +551,11 @@ auto bind_managed_launch_projection_from_fd(
             std::string{"managed launch does not support bridge_endpoint; use glove exec"}
         );
     }
+    if (checked->escape_policy != profile::seccomp_escape_policy::terminate_container) {
+        return std::unexpected(
+            std::string{"managed launch requires seccomp escape_policy=terminate_container"}
+        );
+    }
     if (!checked->filesystem.empty() || checked->home_dir || checked->temp_dir ||
         std::ranges::any_of(checked->runtime_filesystem, [](const auto& rule) {
             return rule.writable;
