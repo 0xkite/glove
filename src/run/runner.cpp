@@ -304,11 +304,36 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
             std::filesystem::perm_options::replace,
             ec
         );
-        for (const char* name :
-             {"settings.json", "models.json", "models-store.json", "auth.json"}) {
+        for (const char* name : {
+                 "settings.json",
+                 "models.json",
+                 "models-store.json",
+                 "auth.json",
+                 "mcp-onboarding.json",
+                 "mcp-last-seen-version.json",
+                 "trust.json",
+                 "pi-recurse.json",
+             }) {
             copy_regular_file_0600(host_pi_dir / name, guest_pi_dir / name);
         }
+        // Symlink read-only installed package/skill directories into the guest
+        // PI_CODING_AGENT_DIR so Pi finds `lsp-pi` and installed extensions
+        // locally without invoking `npm install` against registry.npmjs.org.
+        for (const char* dir_name :
+             {"npm", "skills", "pi-subagents", "pi-web-access", "missions"}) {
+            const auto src_dir = host_pi_dir / dir_name;
+            const auto dst_link = guest_pi_dir / dir_name;
+            if (std::filesystem::is_directory(src_dir, ec) && !ec &&
+                !std::filesystem::exists(dst_link, ec)) {
+                std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
+            }
+        }
         profile.environment.push_back("PI_CODING_AGENT_DIR=" + guest_pi_dir.string());
+        if (opts.egress.empty()) {
+            profile.environment.push_back("PI_OFFLINE=1");
+            profile.environment.push_back("NPM_CONFIG_OFFLINE=true");
+            profile.environment.push_back("NPM_CONFIG_UPDATE_NOTIFIER=false");
+        }
     }
 
     const auto host_agy_dir = host_home / ".gemini" / "antigravity-cli";
@@ -1197,11 +1222,14 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
             return std::unexpected(built_reg.error());
         }
         mcp_registry = std::move(*built_reg);
+        const auto default_mcp_decision = (opts.allow.empty() && !opts.upstreams.empty())
+                                              ? glove::policy::decision::allow
+                                              : glove::policy::decision::deny;
         std::shared_ptr<glove::policy::engine> policy = glove::policy::make_jsonpath_engine(
             {.allow = opts.allow,
              .deny = {},
              .prefix_rules = opts.prefix_rules,
-             .default_decision = glove::policy::decision::deny}
+             .default_decision = default_mcp_decision}
         );
         const auto sock_path = runtime->root() / "tmp" / "glove-mcp.sock";
         auto started_bridge =
