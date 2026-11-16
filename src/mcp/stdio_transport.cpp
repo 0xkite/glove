@@ -364,7 +364,11 @@ auto make_stdio_transport(const stdio_child_options& opts)
 #    endif
             for (unsigned long cap = 0; cap < 64UL; ++cap) {
                 if (::prctl(PR_CAPBSET_READ, cap, 0, 0, 0) < 0) {
-                    break;
+                    if (errno == EINVAL) {
+                        break;
+                    }
+                    static constexpr char kErr[] = "prctl(PR_CAPBSET_READ) failed";
+                    fail_child(kErr, sizeof(kErr) - 1U);
                 }
                 if (::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && errno != EINVAL) {
                     static constexpr char kErr[] = "prctl(PR_CAPBSET_DROP) failed";

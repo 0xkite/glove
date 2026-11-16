@@ -42,6 +42,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1765,19 +1766,29 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
     }
+    std::mutex escape_audit_mutex;
+    std::optional<std::string> escape_audit_error;
     auto exit_code = glove::container::exec_contained(
         *profile,
         opts.agent_argv,
-        [sink = *sink](const glove::container::containment_escape_event& escape_event) {
+        [sink = *sink,
+         &escape_audit_mutex,
+         &escape_audit_error](const glove::container::containment_escape_event& escape_event) {
             const std::string detail = escape_event.mechanism + ":" + escape_event.detail +
                                        " (pid=" + std::to_string(escape_event.pid) + ")";
-            static_cast<void>(record(
-                sink,
-                glove::audit::action::control,
-                "seccomp_escape_detected",
-                glove::mcp::tool_call_status::execution_error,
-                detail
-            ));
+            if (auto audited = record(
+                    sink,
+                    glove::audit::action::control,
+                    "seccomp_escape_detected",
+                    glove::mcp::tool_call_status::execution_error,
+                    detail
+                );
+                !audited) {
+                const std::scoped_lock lock{escape_audit_mutex};
+                if (!escape_audit_error) {
+                    escape_audit_error = audited.error();
+                }
+            }
             static_cast<void>(std::fprintf(
                 stderr,
                 "glove security: terminated sandbox after escape syscall '%s' (pid %d)\n",
@@ -1786,6 +1797,9 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
             ));
         }
     );
+    if (escape_audit_error) {
+        return std::unexpected(std::string{"audit seccomp escape: "} + *escape_audit_error);
+    }
     if (!exit_code) {
         return std::unexpected(exit_code.error());
     }

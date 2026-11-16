@@ -584,15 +584,61 @@ auto make_mount_target(const std::string& target, const struct ::stat& source_st
     return {};
 }
 
+auto is_allowed_sandbox_device_node(std::string_view path) noexcept -> bool {
+    return path == "/dev/null" || path == "/dev/zero" || path == "/dev/full" ||
+           path == "/dev/random" || path == "/dev/urandom" || path == "/dev/tty";
+}
+
+auto open_bind_source_fd(const std::string& source, bool allow_symlinks) -> owned_fd {
+    if (allow_symlinks) {
+        return owned_fd{::open(source.c_str(), O_PATH | O_CLOEXEC)}; // NOLINT
+    }
+    if (source.empty() || source.front() != '/') {
+        errno = EINVAL;
+        return owned_fd{-1};
+    }
+    owned_fd current{::open("/", O_PATH | O_CLOEXEC | O_DIRECTORY)}; // NOLINT
+    if (current.get() < 0) {
+        return current;
+    }
+    std::string_view remaining{source};
+    while (!remaining.empty()) {
+        while (!remaining.empty() && remaining.front() == '/') {
+            remaining.remove_prefix(1);
+        }
+        if (remaining.empty()) {
+            break;
+        }
+        const auto slash = remaining.find('/');
+        const std::string segment{remaining.substr(0, slash)};
+        if (segment == "." || segment == "..") {
+            errno = EINVAL;
+            return owned_fd{-1};
+        }
+        const int next =
+            ::openat(current.get(), segment.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW); // NOLINT
+        if (next < 0) {
+            return owned_fd{-1};
+        }
+        current = owned_fd{next};
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        remaining.remove_prefix(slash + 1);
+    }
+    return current;
+}
+
 auto bind_path_impl(
     const std::string& new_root, std::string_view source, bool writable, bool ignore_missing
 ) -> std::expected<void, std::string> {
     struct ::stat source_stat{};
 
     const std::string source_string{source};
-    const owned_fd source_fd{
-        ::open(source_string.c_str(), O_PATH | O_CLOEXEC) // NOLINT
-    };
+    // Built-in static runtime paths (e.g. /bin, /lib) may be merged-/usr symlinks;
+    // user profile grants and resolved executables are canonicalized and must not
+    // traverse any symlink after validation.
+    const owned_fd source_fd = open_bind_source_fd(source_string, ignore_missing);
     if (source_fd.get() < 0) {
         if (ignore_missing && errno == ENOENT) {
             return {};
@@ -604,6 +650,16 @@ auto bind_path_impl(
     if (::fstat(source_fd.get(), &source_stat) < 0) {
         return std::unexpected(
             std::string{"stat bind source '"} + source_string + "': " + std::strerror(errno)
+        );
+    }
+    if (S_ISLNK(source_stat.st_mode)) {
+        return std::unexpected(std::string{"refusing symlink bind source '"} + source_string + "'");
+    }
+    const bool safe_char_device =
+        S_ISCHR(source_stat.st_mode) && is_allowed_sandbox_device_node(source_string);
+    if ((S_ISCHR(source_stat.st_mode) || S_ISBLK(source_stat.st_mode)) && !safe_char_device) {
+        return std::unexpected(
+            std::string{"device node grant not permitted for '"} + source_string + "'"
         );
     }
     const std::string target = new_root + source_string;
@@ -622,20 +678,19 @@ auto bind_path_impl(
         target_stat.st_ino != source_stat.st_ino) {
         return std::unexpected(std::string{"bind identity mismatch for '"} + source_string + "'");
     }
-    if (!writable || !source_string.starts_with("/dev/")) {
-        mount_attr_v attributes{};
-        if (!writable) {
-            attributes.attr_set |= glove_mount_attr_rdonly;
-        }
-        if (!source_string.starts_with("/dev/")) {
-            attributes.attr_set |= glove_mount_attr_nosuid | glove_mount_attr_nodev;
-        }
-        const unsigned int attribute_flags = S_ISDIR(source_stat.st_mode) ? AT_RECURSIVE : 0U;
-        if (sys_mount_setattr(target.c_str(), attribute_flags, &attributes) < 0) {
-            return std::unexpected(
-                std::string{"harden bind mount '"} + source_string + "': " + std::strerror(errno)
-            );
-        }
+    mount_attr_v attributes{};
+    attributes.attr_set = glove_mount_attr_nosuid;
+    if (!writable) {
+        attributes.attr_set |= glove_mount_attr_rdonly;
+    }
+    if (!safe_char_device) {
+        attributes.attr_set |= glove_mount_attr_nodev;
+    }
+    const unsigned int attribute_flags = S_ISDIR(source_stat.st_mode) ? AT_RECURSIVE : 0U;
+    if (sys_mount_setattr(target.c_str(), attribute_flags, &attributes) < 0) {
+        return std::unexpected(
+            std::string{"harden bind mount '"} + source_string + "': " + std::strerror(errno)
+        );
     }
     return {};
 }
@@ -1310,7 +1365,10 @@ auto drop_all_capabilities_and_no_new_privs() -> std::expected<void, std::string
 #endif
     for (unsigned long cap = 0; cap < 64UL; ++cap) {
         if (::prctl(PR_CAPBSET_READ, cap, 0, 0, 0) < 0) {
-            break;
+            if (errno == EINVAL) {
+                break;
+            }
+            return std::unexpected(std::string{"prctl(PR_CAPBSET_READ): "} + std::strerror(errno));
         }
         if (::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && errno != EINVAL) {
             return std::unexpected(std::string{"prctl(PR_CAPBSET_DROP): "} + std::strerror(errno));
@@ -2456,7 +2514,8 @@ auto launch_pty_child(
     linux_detail::linux_resource_lifecycle& lifecycle,
     int agent_program_fd,
     const linux_detail::managed_pty_session_options& options,
-    const linux_detail::managed_session_start_gate& before_child_release
+    const linux_detail::managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape = {}
 ) -> std::expected<launched_pty_child, std::string> {
     if (lifecycle.cgroup_fd() < 0) {
         return std::unexpected(std::string{"managed PTY session cgroup is closed"});
@@ -2599,14 +2658,15 @@ auto launch_pty_child(
     }
     ::close(sync_pipe[1]);
     sync_pipe[1] = -1;
-    auto started_monitor =
-        start_parent_seccomp_monitor(notify_sock[0], child, {}, [monitor = lifecycle.monitor()] {
+    auto started_monitor = start_parent_seccomp_monitor(
+        notify_sock[0], child, std::move(on_escape), [monitor = lifecycle.monitor()] {
             if (monitor != nullptr) {
                 static_cast<void>(
                     monitor->request_termination(resource_termination_cause::supervisor_error)
                 );
             }
-        });
+        }
+    );
     close_fd(notify_sock[0]);
     if (!started_monitor) {
         return fail(started_monitor.error());
@@ -2927,7 +2987,8 @@ auto linux_detail::start_managed_pty_session(
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
     managed_pty_session_options options,
-    const managed_session_start_gate& before_child_release
+    const managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape
 ) -> std::expected<std::unique_ptr<managed_pty_session>, std::string> {
     if (!lifecycle || !before_child_release) {
         return std::unexpected(
@@ -2964,7 +3025,8 @@ auto linux_detail::start_managed_pty_session(
         *session->state_->lifecycle,
         prepared->executable_mount.get(),
         options,
-        before_child_release
+        before_child_release,
+        std::move(on_escape)
     );
     if (!child) {
         session->state_->publish_error(child.error());
@@ -3052,7 +3114,7 @@ auto linux_detail::exec_managed_session(
     std::unique_ptr<linux_resource_lifecycle> lifecycle
 ) -> std::expected<resource_enforcement_receipt, std::string> {
     return exec_managed_session(
-        prof, argv, expected_binding, std::move(lifecycle), managed_session_start_gate{}
+        prof, argv, expected_binding, std::move(lifecycle), managed_session_start_gate{}, {}
     );
 }
 
@@ -3061,7 +3123,8 @@ auto linux_detail::exec_managed_session(
     const std::vector<std::string>& argv,
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
-    const managed_session_start_gate& before_child_release
+    const managed_session_start_gate& before_child_release,
+    escape_event_observer on_escape
 ) -> std::expected<resource_enforcement_receipt, std::string> {
     if (!lifecycle) {
         return std::unexpected(std::string{"managed session lifecycle is required"});
@@ -3082,7 +3145,8 @@ auto linux_detail::exec_managed_session(
         lifecycle.get(),
         prepared->executable_mount.get(),
         true,
-        &before_child_release
+        &before_child_release,
+        std::move(on_escape)
     );
     if (!child) {
         return std::unexpected(child.error());
@@ -3109,13 +3173,21 @@ auto linux_detail::exec_managed_session_authenticated(
     std::string_view session_id,
     const managed_launch_binding& expected_binding,
     std::unique_ptr<linux_resource_lifecycle> lifecycle,
-    receipt_audit_producer& audit_producer
+    receipt_audit_producer& audit_producer,
+    escape_event_observer on_escape
 ) -> std::expected<authenticated_resource_enforcement_receipt, std::string> {
     auto reservation = audit_producer.reserve_terminal();
     if (!reservation) {
         return std::unexpected(reservation.error());
     }
-    auto receipt = exec_managed_session(prof, argv, expected_binding, std::move(lifecycle));
+    auto receipt = exec_managed_session(
+        prof,
+        argv,
+        expected_binding,
+        std::move(lifecycle),
+        managed_session_start_gate{},
+        std::move(on_escape)
+    );
     if (!receipt) {
         return std::unexpected(receipt.error());
     }

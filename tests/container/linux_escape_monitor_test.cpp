@@ -326,6 +326,18 @@ auto run(const std::filesystem::path& self) -> int {
     REQUIRE(journal.find("seccomp_escape_detected") != std::string::npos);
     REQUIRE(journal.find("seccomp_user_notif:setns") != std::string::npos);
 
+    // 4. Reject non-allowlisted device-node profile grants (e.g. /dev/ptmx).
+    if (std::filesystem::exists("/dev/ptmx", ec)) {
+        std::filesystem::remove(ws / "posture.txt", ec);
+        glove::container::profile dev_prof = prof;
+        dev_prof.filesystem.push_back({.path = "/dev/ptmx", .writable = true});
+        auto dev_rc = glove::container::exec_contained(
+            dev_prof, {self.string(), "--child-posture", ws.string(), ro_dir.string()}
+        );
+        REQUIRE(!dev_rc.has_value());
+        REQUIRE(!std::filesystem::exists(ws / "posture.txt", ec));
+    }
+
     return 0;
 }
 
