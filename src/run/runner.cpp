@@ -233,6 +233,14 @@ auto provision(const glove::container::profile& profile) -> std::expected<void, 
     return {};
 }
 
+auto path_within(const std::filesystem::path& candidate, const std::filesystem::path& root)
+    -> bool {
+    const auto nc = candidate.lexically_normal();
+    const auto nr = root.lexically_normal();
+    const auto mismatch = std::mismatch(nr.begin(), nr.end(), nc.begin(), nc.end());
+    return mismatch.first == nr.end();
+}
+
 void copy_regular_file_0600(
     const std::filesystem::path& src,
     const std::filesystem::path& dst,
@@ -242,8 +250,55 @@ void copy_regular_file_0600(
     if (::lstat(src.c_str(), &link_st) != 0 || link_st.st_uid != ::geteuid()) {
         return;
     }
-    if (S_ISLNK(link_st.st_mode) && !allow_owner_symlink) {
-        return;
+    if (S_ISLNK(link_st.st_mode)) {
+        if (!allow_owner_symlink) {
+            return;
+        }
+        std::error_code ec;
+        const auto target = std::filesystem::canonical(src, ec);
+        if (ec || target.empty()) {
+            return;
+        }
+        // Validate target constraints:
+        // 1. Target filename must match src filename (prevent settings.json -> id_rsa/auth.json)
+        if (target.filename() != src.filename()) {
+            return;
+        }
+        // 2. Target must be a regular file owned by the user
+        struct ::stat target_st{};
+        if (::stat(target.c_str(), &target_st) != 0 || target_st.st_uid != ::geteuid() ||
+            !S_ISREG(target_st.st_mode)) {
+            return;
+        }
+        // 3. Target must not contain sensitive path components
+        const std::string target_str = target.string();
+        for (std::string_view sensitive :
+             {".ssh",
+              ".gnupg",
+              ".aws",
+              ".azure",
+              ".kube",
+              "auth.json",
+              "id_rsa",
+              "id_ed25519",
+              "token"}) {
+            if (target_str.find(sensitive) != std::string::npos) {
+                return;
+            }
+        }
+        // 4. Target must be within approved trees
+        const char* home = std::getenv("HOME");
+        if (home != nullptr && *home != '\0') {
+            const std::filesystem::path home_path{home};
+            const bool in_approved =
+                path_within(target, home_path / ".pi") ||
+                path_within(target, home_path / "Documents" / "depend" / "dotfiles") ||
+                path_within(target, home_path / ".dotfiles") ||
+                path_within(target, src.parent_path());
+            if (!in_approved) {
+                return;
+            }
+        }
     }
     const int open_flags = O_RDONLY | O_CLOEXEC | (allow_owner_symlink ? 0 : O_NOFOLLOW);
     const int in_fd = ::open(src.c_str(), open_flags);
@@ -333,8 +388,10 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
     if (!opts.seed_guest_agent_home || !profile.home_dir) {
         return;
     }
-    profile.environment.push_back("PI_OFFLINE=1");
-    profile.environment.push_back("NPM_CONFIG_OFFLINE=true");
+    if (opts.egress.empty()) {
+        profile.environment.push_back("PI_OFFLINE=1");
+        profile.environment.push_back("NPM_CONFIG_OFFLINE=true");
+    }
     profile.environment.push_back("NPM_CONFIG_UPDATE_NOTIFIER=false");
 
     const char* host_home_env = std::getenv("HOME");
@@ -381,7 +438,24 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
                 std::string settings_text((std::istreambuf_iterator<char>(settings_in)), {});
                 settings_in.close();
                 const std::string needle = "\"../../";
-                const std::string replacement = "\"" + host_home.string() + "/";
+                std::string escaped_home;
+                for (const char ch : host_home.string()) {
+                    if (ch == '"') {
+                        escaped_home += "\\\"";
+                    } else if (ch == '\\') {
+                        escaped_home += "\\\\";
+                    } else if (static_cast<unsigned char>(ch) < 0x20U) {
+                        static constexpr char kHex[] = "0123456789abcdef";
+                        escaped_home += "\\u00";
+                        escaped_home.push_back(
+                            kHex[(static_cast<unsigned char>(ch) >> 4U) & 0x0FU]
+                        );
+                        escaped_home.push_back(kHex[static_cast<unsigned char>(ch) & 0x0FU]);
+                    } else {
+                        escaped_home.push_back(ch);
+                    }
+                }
+                const std::string replacement = "\"" + escaped_home + "/";
                 std::size_t pos = 0;
                 bool modified = false;
                 while ((pos = settings_text.find(needle, pos)) != std::string::npos) {
@@ -390,33 +464,50 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
                     modified = true;
                 }
                 if (modified) {
+                    const auto tmp_settings =
+                        guest_settings.string() + ".tmp." + std::to_string(::getpid());
                     const int sfd = ::open(
-                        guest_settings.c_str(), O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600
+                        tmp_settings.c_str(),
+                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                        0600
                     );
                     if (sfd >= 0) {
-                        (void)::write(sfd, settings_text.data(), settings_text.size());
+                        std::size_t written = 0;
+                        bool write_ok = true;
+                        while (written < settings_text.size()) {
+                            const ::ssize_t n = ::write(
+                                sfd, settings_text.data() + written, settings_text.size() - written
+                            );
+                            if (n < 0 && errno == EINTR) {
+                                continue;
+                            }
+                            if (n <= 0) {
+                                write_ok = false;
+                                break;
+                            }
+                            written += static_cast<std::size_t>(n);
+                        }
                         (void)::fchmod(sfd, 0600);
                         (void)::close(sfd);
+                        if (write_ok) {
+                            if (::rename(tmp_settings.c_str(), guest_settings.c_str()) != 0) {
+                                (void)::unlink(tmp_settings.c_str());
+                            }
+                        } else {
+                            (void)::unlink(tmp_settings.c_str());
+                        }
                     }
                 }
             }
         }
+        // Strictly preserve credential boundary: guest auth.json is ALWAYS empty `{}`.
         const auto guest_auth = guest_pi_dir / "auth.json";
-        if (!opts.agent_preset.has_value() && !opts.egress.empty()) {
-            // When direct provider egress is explicitly enabled without a
-            // host-mediated `--agent` preset (e.g. interactive `glove shell`
-            // talking to non-Anthropic/OpenAI providers like DeepSeek through
-            // the audited egress proxy), stage an owner-verified 0600 copy.
-            copy_regular_file_0600(host_pi_dir / "auth.json", guest_auth, false);
-        } else {
-            const int auth_fd = ::open(
-                guest_auth.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600
-            );
-            if (auth_fd >= 0) {
-                (void)::write(auth_fd, "{}\n", 3);
-                (void)::fchmod(auth_fd, 0600);
-                (void)::close(auth_fd);
-            }
+        const int auth_fd =
+            ::open(guest_auth.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (auth_fd >= 0) {
+            (void)::write(auth_fd, "{}\n", 3);
+            (void)::fchmod(auth_fd, 0600);
+            (void)::close(auth_fd);
         }
         // Symlink read-only installed package/skill directories into the guest
         // PI_CODING_AGENT_DIR so Pi finds `lsp-pi` and installed extensions
@@ -425,9 +516,40 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
              {"npm", "skills", "pi-subagents", "pi-web-access", "missions"}) {
             const auto src_dir = host_pi_dir / dir_name;
             const auto dst_link = guest_pi_dir / dir_name;
-            if (std::filesystem::is_directory(src_dir, ec) && !ec &&
-                !std::filesystem::exists(dst_link, ec)) {
-                std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
+            struct ::stat st{};
+            if (::lstat(src_dir.c_str(), &st) != 0 || st.st_uid != ::geteuid()) {
+                continue;
+            }
+            if (S_ISLNK(st.st_mode)) {
+                std::error_code canon_ec;
+                const auto canon = std::filesystem::canonical(src_dir, canon_ec);
+                if (canon_ec || canon.empty()) {
+                    continue;
+                }
+                struct ::stat cst{};
+                if (::stat(canon.c_str(), &cst) != 0 || !S_ISDIR(cst.st_mode) ||
+                    cst.st_uid != ::geteuid()) {
+                    continue;
+                }
+                const std::string canon_str = canon.string();
+                if (canon_str.find(".ssh") != std::string::npos ||
+                    canon_str.find("auth.json") != std::string::npos) {
+                    continue;
+                }
+                const bool in_approved =
+                    path_within(canon, host_pi_dir) ||
+                    path_within(canon, host_home / "Documents" / "depend" / "dotfiles") ||
+                    path_within(canon, host_home / ".dotfiles");
+                if (!in_approved) {
+                    continue;
+                }
+                if (!std::filesystem::exists(dst_link, ec)) {
+                    std::filesystem::create_directory_symlink(canon, dst_link, ec);
+                }
+            } else if (S_ISDIR(st.st_mode)) {
+                if (!std::filesystem::exists(dst_link, ec)) {
+                    std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
+                }
             }
         }
         profile.environment.push_back("PI_CODING_AGENT_DIR=" + guest_pi_dir.string());
@@ -442,10 +564,42 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
          }) {
         const auto src_dir = host_home / rel;
         const auto dst_link = guest_home / rel;
-        if (std::filesystem::is_directory(src_dir, ec) && !ec &&
-            !std::filesystem::exists(dst_link, ec)) {
-            std::filesystem::create_directories(dst_link.parent_path(), ec);
-            std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
+        struct ::stat st{};
+        if (::lstat(src_dir.c_str(), &st) != 0 || st.st_uid != ::geteuid()) {
+            continue;
+        }
+        if (S_ISLNK(st.st_mode)) {
+            std::error_code canon_ec;
+            const auto canon = std::filesystem::canonical(src_dir, canon_ec);
+            if (canon_ec || canon.empty()) {
+                continue;
+            }
+            struct ::stat cst{};
+            if (::stat(canon.c_str(), &cst) != 0 || !S_ISDIR(cst.st_mode) ||
+                cst.st_uid != ::geteuid()) {
+                continue;
+            }
+            const std::string canon_str = canon.string();
+            if (canon_str.find(".ssh") != std::string::npos ||
+                canon_str.find(".gnupg") != std::string::npos) {
+                continue;
+            }
+            const bool in_approved =
+                path_within(canon, host_home / rel) ||
+                path_within(canon, host_home / "Documents" / "depend" / "dotfiles") ||
+                path_within(canon, host_home / ".dotfiles");
+            if (!in_approved) {
+                continue;
+            }
+            if (!std::filesystem::exists(dst_link, ec)) {
+                std::filesystem::create_directories(dst_link.parent_path(), ec);
+                std::filesystem::create_directory_symlink(canon, dst_link, ec);
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            if (!std::filesystem::exists(dst_link, ec)) {
+                std::filesystem::create_directories(dst_link.parent_path(), ec);
+                std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
+            }
         }
     }
     if (const auto rustup_dir = host_home / ".rustup";
@@ -486,37 +640,121 @@ auto prepare_profile(const options& opts, const std::filesystem::path& runtime_r
     return revalidated;
 }
 
-auto path_within(const std::filesystem::path& candidate, const std::filesystem::path& root)
-    -> bool {
-    const auto mismatch =
-        std::mismatch(root.begin(), root.end(), candidate.begin(), candidate.end());
-    return mismatch.first == root.end();
+auto validate_audit_parent_chain(const std::filesystem::path& dir)
+    -> std::expected<void, std::string> {
+    if (!dir.is_absolute()) {
+        return std::unexpected("audit parent directory must be absolute: " + dir.string());
+    }
+    const auto norm = dir.lexically_normal();
+    std::filesystem::path current;
+    for (const auto& part : norm) {
+        current /= part;
+        if (current == current.root_path()) {
+            continue;
+        }
+        struct ::stat st{};
+        if (::lstat(current.c_str(), &st) != 0) {
+            if (errno == ENOENT) {
+                if (::mkdir(current.c_str(), 0700) != 0) {
+                    return std::unexpected(
+                        "cannot create audit directory component '" + current.string() +
+                        "': " + std::strerror(errno)
+                    );
+                }
+                if (::lstat(current.c_str(), &st) != 0) {
+                    return std::unexpected(
+                        "cannot stat newly created audit directory '" + current.string() +
+                        "': " + std::strerror(errno)
+                    );
+                }
+            } else {
+                return std::unexpected(
+                    "cannot stat audit directory component '" + current.string() +
+                    "': " + std::strerror(errno)
+                );
+            }
+        }
+        if (S_ISLNK(st.st_mode)) {
+            return std::unexpected(
+                "audit directory path component is a symlink: '" + current.string() + "'"
+            );
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            return std::unexpected(
+                "audit directory path component is not a directory: '" + current.string() + "'"
+            );
+        }
+        if (current != "/home" && st.st_uid != ::geteuid() && st.st_uid != 0) {
+            return std::unexpected(
+                "audit directory path component not owned by current user: '" + current.string() +
+                "'"
+            );
+        }
+    }
+    return {};
 }
 
 auto audit_destination(
     const std::optional<std::filesystem::path>& requested, const glove::container::profile& profile
 ) -> std::expected<std::optional<std::filesystem::path>, std::string> {
-    if (!requested) {
-        return std::optional<std::filesystem::path>{};
-    }
-    auto absolute = resolve_absolute(*requested);
-    if (!absolute) {
-        return std::unexpected(absolute.error());
-    }
-    std::error_code ec;
-    auto destination = std::filesystem::weakly_canonical(*absolute, ec);
-    if (ec) {
-        return std::unexpected(std::string{"cannot resolve audit destination: "} + ec.message());
-    }
-    for (const auto& rule : profile.filesystem) {
-        if (path_within(destination, std::filesystem::path{rule.path})) {
+    if (requested) {
+        auto absolute = resolve_absolute(*requested);
+        if (!absolute) {
+            return std::unexpected(absolute.error());
+        }
+        std::error_code ec;
+        auto destination = std::filesystem::weakly_canonical(*absolute, ec);
+        if (ec) {
             return std::unexpected(
-                std::string{"audit destination must be outside every agent-visible path: '"} +
-                destination.string() + "'"
+                std::string{"cannot resolve audit destination: "} + ec.message()
             );
         }
+        for (const auto& rule : profile.filesystem) {
+            if (path_within(destination, std::filesystem::path{rule.path})) {
+                return std::unexpected(
+                    std::string{"audit destination must be outside every agent-visible path: '"} +
+                    destination.string() + "'"
+                );
+            }
+        }
+        return std::optional<std::filesystem::path>{std::move(destination)};
     }
-    return std::optional<std::filesystem::path>{std::move(destination)};
+
+    // Default to a host state log file (`<XDG_STATE_HOME>/glove/logs/session.jsonl`)
+    // when outside every agent-visible path so launch/egress/MCP audit events are
+    // persisted without writing to the interactive terminal.
+    std::optional<std::filesystem::path> state_base;
+    if (const char* xdg_state = std::getenv("XDG_STATE_HOME");
+        xdg_state != nullptr && *xdg_state == '/') {
+        state_base = std::filesystem::path{xdg_state} / "glove" / "logs";
+    } else if (const char* home = std::getenv("HOME"); home != nullptr && *home == '/') {
+        state_base = std::filesystem::path{home} / ".local" / "state" / "glove" / "logs";
+    }
+    if (state_base) {
+        auto valid_chain = validate_audit_parent_chain(*state_base);
+        if (!valid_chain) {
+            return std::unexpected("insecure default audit directory: " + valid_chain.error());
+        }
+        std::error_code ec;
+        std::filesystem::permissions(
+            *state_base,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace,
+            ec
+        );
+        const auto default_log = *state_base / "session.jsonl";
+        for (const auto& rule : profile.filesystem) {
+            if (path_within(default_log, std::filesystem::path{rule.path}) ||
+                path_within(*state_base, std::filesystem::path{rule.path})) {
+                return std::unexpected(
+                    std::string{"default audit log is exposed to agent filesystem mount: '"} +
+                    rule.path + "'"
+                );
+            }
+        }
+        return std::optional<std::filesystem::path>{default_log};
+    }
+    return std::optional<std::filesystem::path>{};
 }
 
 #if defined(GLOVE_HAS_REFLECTION)
@@ -603,46 +841,20 @@ auto build_registry(const std::vector<upstream_spec>& upstreams)
     return registry;
 }
 
-auto build_audit_sink(
-    const std::optional<std::filesystem::path>& path, const glove::container::profile& profile
-) -> std::expected<std::shared_ptr<glove::audit::sink>, std::string> {
+auto build_audit_sink(const std::optional<std::filesystem::path>& path, bool is_default_log)
+    -> std::expected<std::shared_ptr<glove::audit::sink>, std::string> {
     if (path) {
-        return glove::audit::make_jsonl_sink(*path);
-    }
-    // Default to a host state log file (`<XDG_STATE_HOME>/glove/logs/session.jsonl`)
-    // when outside every agent-visible path so launch/egress/MCP audit events are
-    // persisted without writing to the interactive terminal.
-    std::optional<std::filesystem::path> state_base;
-    if (const char* xdg_state = std::getenv("XDG_STATE_HOME");
-        xdg_state != nullptr && *xdg_state == '/') {
-        state_base = std::filesystem::path{xdg_state} / "glove" / "logs";
-    } else if (const char* home = std::getenv("HOME"); home != nullptr && *home == '/') {
-        state_base = std::filesystem::path{home} / ".local" / "state" / "glove" / "logs";
-    }
-    if (state_base) {
-        std::error_code ec;
-        std::filesystem::create_directories(*state_base, ec);
-        if (!ec) {
-            std::filesystem::permissions(
-                *state_base,
-                std::filesystem::perms::owner_all,
-                std::filesystem::perm_options::replace,
-                ec
-            );
-            const auto default_log = *state_base / "session.jsonl";
-            bool exposed = false;
-            for (const auto& rule : profile.filesystem) {
-                if (path_within(default_log, std::filesystem::path{rule.path})) {
-                    exposed = true;
-                    break;
-                }
-            }
-            if (!exposed) {
-                if (auto file_sink = glove::audit::make_jsonl_sink(default_log)) {
-                    return file_sink;
-                }
-            }
+        glove::audit::jsonl_sink_limits limits{};
+        if (is_default_log) {
+            limits.max_file_bytes = 10U * 1024U * 1024U;
         }
+        auto file_sink = glove::audit::make_jsonl_sink(*path, limits);
+        if (!file_sink) {
+            return std::unexpected(
+                "failed to open audit journal '" + path->string() + "': " + file_sink.error()
+            );
+        }
+        return *file_sink;
     }
     return glove::audit::make_memory_sink();
 }
@@ -1314,7 +1526,8 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (!audit_path) {
         return std::unexpected(audit_path.error());
     }
-    auto sink = build_audit_sink(*audit_path, *profile);
+    const bool is_default_log = !opts.audit_log.has_value() && audit_path->has_value();
+    auto sink = build_audit_sink(*audit_path, is_default_log);
     if (!sink) {
         return std::unexpected(sink.error());
     }
@@ -1332,6 +1545,17 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (!spawner) {
         return std::unexpected(std::string{"no platform spawner available"});
     }
+    if (audit_path && *audit_path) {
+        for (const auto& rule : profile->filesystem) {
+            if (path_within(**audit_path, std::filesystem::path{rule.path})) {
+                return std::unexpected(
+                    std::string{"audit destination is exposed by final launch profile mount: '"} +
+                    rule.path + "'"
+                );
+            }
+        }
+    }
+
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
@@ -1382,7 +1606,8 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     if (!audit_path) {
         return std::unexpected(audit_path.error());
     }
-    auto sink = build_audit_sink(*audit_path, *profile);
+    const bool is_default_log = !opts.audit_log.has_value() && audit_path->has_value();
+    auto sink = build_audit_sink(*audit_path, is_default_log);
     if (!sink) {
         return std::unexpected(sink.error());
     }
@@ -1490,6 +1715,17 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
             return std::unexpected(std::string{"profile: "} + revalidated.error());
         }
         *profile = std::move(*revalidated);
+    }
+
+    if (audit_path && *audit_path) {
+        for (const auto& rule : profile->filesystem) {
+            if (path_within(**audit_path, std::filesystem::path{rule.path})) {
+                return std::unexpected(
+                    std::string{"audit destination is exposed by final launch profile mount: '"} +
+                    rule.path + "'"
+                );
+            }
+        }
     }
 
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());

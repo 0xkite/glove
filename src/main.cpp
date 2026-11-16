@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <charconv>
@@ -543,6 +544,13 @@ auto paths_overlap(const std::filesystem::path& a, const std::filesystem::path& 
     return mb == nb.end();
 }
 
+auto is_subpath_of(const std::filesystem::path& path, const std::filesystem::path& base) -> bool {
+    const auto np = path.lexically_normal();
+    const auto nb = base.lexically_normal();
+    const auto [mb, _] = std::mismatch(nb.begin(), nb.end(), np.begin(), np.end());
+    return mb == nb.end();
+}
+
 void add_non_overlapping_read_dir(glove::run::options& opts, const std::filesystem::path& dir) {
     std::error_code ec;
     if (!std::filesystem::exists(dir, ec) || ec) {
@@ -551,6 +559,14 @@ void add_non_overlapping_read_dir(glove::run::options& opts, const std::filesyst
     const auto abs = std::filesystem::weakly_canonical(dir, ec);
     if (ec || abs.empty() || abs == abs.root_path()) {
         return;
+    }
+    // Never expose the whole user home or sensitive credential dotfiles.
+    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+        const std::filesystem::path home_path{home};
+        if (abs == home_path || paths_overlap(abs, home_path / ".ssh") ||
+            paths_overlap(abs, home_path / ".gnupg") || paths_overlap(abs, home_path / ".aws")) {
+            return;
+        }
     }
     // System directories (/usr, /bin, /lib, /etc) are already mounted by the spawner.
     for (const char* sys_root : {"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"}) {
@@ -577,6 +593,43 @@ void add_non_overlapping_read_dir(glove::run::options& opts, const std::filesyst
         }
     }
     opts.readable.push_back(abs.string());
+}
+
+void add_verified_agent_read_dir(
+    glove::run::options& opts,
+    const std::filesystem::path& dir,
+    std::span<const std::filesystem::path> approved_roots
+) {
+    struct ::stat st{};
+    if (::lstat(dir.c_str(), &st) != 0 || st.st_uid != ::geteuid()) {
+        return;
+    }
+    std::error_code ec;
+    const auto canon = std::filesystem::canonical(dir, ec);
+    if (ec || canon.empty()) {
+        return;
+    }
+    struct ::stat cst{};
+    if (::stat(canon.c_str(), &cst) != 0 || !S_ISDIR(cst.st_mode) || cst.st_uid != ::geteuid()) {
+        return;
+    }
+    const std::string canon_str = canon.string();
+    for (std::string_view sensitive : {".ssh", ".gnupg", ".aws", ".azure", ".kube", "auth.json"}) {
+        if (canon_str.find(sensitive) != std::string::npos) {
+            return;
+        }
+    }
+    bool inside_approved = false;
+    for (const auto& root : approved_roots) {
+        if (is_subpath_of(canon, root)) {
+            inside_approved = true;
+            break;
+        }
+    }
+    if (!inside_approved) {
+        return;
+    }
+    add_non_overlapping_read_dir(opts, canon);
 }
 
 void add_unique_path_dir(glove::run::options& opts, const std::filesystem::path& dir) {
@@ -696,21 +749,36 @@ auto attach_agent_harness_closure(
         add_unique_path_dir(opts, home_dir / "go" / "bin");
         add_unique_path_dir(opts, std::filesystem::path{"/usr/local/bin"});
         const auto pi_agent_dir = home_dir / ".pi" / "agent";
+        const std::filesystem::path dotfiles_dir = home_dir / "Documents" / "depend" / "dotfiles";
+        const std::filesystem::path alt_dotfiles_dir = home_dir / ".dotfiles";
+        const std::array<std::filesystem::path, 3> approved_pi_roots{
+            pi_agent_dir, dotfiles_dir, alt_dotfiles_dir
+        };
         for (const char* sub :
              {"bin", "install", "npm", "skills", "pi-subagents", "pi-web-access", "missions"}) {
-            add_non_overlapping_read_dir(opts, pi_agent_dir / sub);
+            add_verified_agent_read_dir(opts, pi_agent_dir / sub, approved_pi_roots);
         }
         add_unique_path_dir(opts, pi_agent_dir / "bin");
-        add_non_overlapping_read_dir(
-            opts,
-            home_dir / "Documents" / "depend" / "dotfiles" / "pi" / ".pi" / "agent" / "packages"
+        add_verified_agent_read_dir(
+            opts, dotfiles_dir / "pi" / ".pi" / "agent" / "packages", approved_pi_roots
         );
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");
         add_unique_path_dir(opts, home_dir / ".local" / "share" / "pi-node" / "current" / "bin");
-        add_non_overlapping_read_dir(opts, home_dir / ".config" / "sage");
-        add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "sage");
+
+        const std::array<std::filesystem::path, 3> approved_sage_config_roots{
+            home_dir / ".config" / "sage", dotfiles_dir, alt_dotfiles_dir
+        };
+        add_verified_agent_read_dir(
+            opts, home_dir / ".config" / "sage", approved_sage_config_roots
+        );
+        const std::array<std::filesystem::path, 1> approved_sage_share_roots{
+            home_dir / ".local" / "share" / "sage"
+        };
+        add_verified_agent_read_dir(
+            opts, home_dir / ".local" / "share" / "sage", approved_sage_share_roots
+        );
 
         const auto nvm_nodes = home_dir / ".nvm" / "versions" / "node";
         if (std::filesystem::is_directory(nvm_nodes, ec) && !ec) {
