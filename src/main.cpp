@@ -659,12 +659,17 @@ auto attach_agent_harness_closure(
         const std::filesystem::path home_dir{home};
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "bin");
         add_unique_path_dir(opts, home_dir / ".local" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".cargo" / "bin");
+        add_unique_path_dir(opts, home_dir / ".cargo" / "bin");
+        add_unique_path_dir(opts, std::filesystem::path{"/usr/local/bin"});
         add_non_overlapping_read_dir(opts, home_dir / ".pi" / "agent");
         add_unique_path_dir(opts, home_dir / ".pi" / "agent" / "bin");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");
         add_unique_path_dir(opts, home_dir / ".local" / "share" / "pi-node" / "current" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".config" / "sage");
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "sage");
 
         const auto nvm_nodes = home_dir / ".nvm" / "versions" / "node";
         if (std::filesystem::is_directory(nvm_nodes, ec) && !ec) {
@@ -678,6 +683,26 @@ auto attach_agent_harness_closure(
                 add_non_overlapping_read_dir(opts, chosen_node);
                 add_unique_path_dir(opts, chosen_node / "bin");
             }
+        }
+    }
+
+    // When launching an interactive agent harness without a mediated preset or
+    // explicit egress list, allow standard LLM provider endpoints through the
+    // audited egress proxy so configured cloud models (DeepSeek, Anthropic,
+    // OpenAI, Gemini, RunInfra, Mistral, OpenRouter) can connect.
+    if (opts.egress.empty() && !opts.agent_preset.has_value()) {
+        for (const char* host : {
+                 "api.deepseek.com",
+                 "api.runinfra.ai",
+                 "api.anthropic.com",
+                 "api.openai.com",
+                 "api.mistral.ai",
+                 "api.kimi.com",
+                 "openrouter.ai",
+                 "generativelanguage.googleapis.com",
+                 "api.individual.githubcopilot.com",
+             }) {
+            opts.egress.push_back(glove::net::egress_rule{.host = host, .port = 443});
         }
     }
     return resolved_bin;
@@ -944,12 +969,31 @@ auto list_env_profiles() -> int {
             }
         }
         const bool running = pid > 0 && ::kill(static_cast<::pid_t>(pid), 0) == 0;
+        std::size_t read_count = 0;
+        if (auto it = parsed->find("readable"); it != parsed->end()) {
+            if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+                read_count = arr->size();
+            }
+        }
+        std::size_t mcp_count = 0;
+        if (auto it = parsed->find("upstreams"); it != parsed->end()) {
+            if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+                mcp_count = arr->size();
+            }
+        }
         std::printf(
-            "  %-16s [%s] agent=%s workspace=%s  (launch: `glove shell %s`)\n",
+            "  %c %-14s %-16s agent=%-6s mcp=%zu reads=%zu workspace=%s\n"
+            "      launch: glove shell %s   |   update: glove shell %s --save %s [--read <path> "
+            "...]\n",
+            running ? '*' : '-',
             name.c_str(),
-            running ? ("RUNNING pid=" + std::to_string(pid)).c_str() : "SAVED",
+            running ? ("RUNNING(" + std::to_string(pid) + ")").c_str() : "SAVED",
             agent.empty() ? "auto" : agent.c_str(),
+            mcp_count,
+            read_count,
             ws.empty() ? "<ephemeral>" : ws.c_str(),
+            name.c_str(),
+            name.c_str(),
             name.c_str()
         );
     }
