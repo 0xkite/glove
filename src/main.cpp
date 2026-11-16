@@ -1,4 +1,5 @@
 #include "glove/host/config.hpp"
+#include "glove/host/runtime_policy.hpp"
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/json_codec.hpp"
 #include "glove/run/runner.hpp"
@@ -11,6 +12,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -183,6 +185,14 @@ void print_exec_usage() {
         "  --read <path>           expose one additional path read-only\n"
         "  --write <path>          expose one additional path read-write\n"
         "  --env <name>            copy one named host environment variable\n"
+        "  --mcp, --upstream <spec>\n"
+        "                          attach an MCP server (`yams` or `<name>=<cmd>[,<arg>...]`);\n"
+        "                          all tools are allowed unless `--allow` is specified\n"
+        "  --allow <qualified.tool>\n"
+        "                          restrict MCP to an explicit allow-list of tools\n"
+        "  --allow-arg <tool>:<field>=<prefix>\n"
+        "                          argument prefix constraint on an allowed tool\n"
+        "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
@@ -263,6 +273,14 @@ void print_loop_usage() {
         "  --read <path>           expose one additional path read-only\n"
         "  --write <path>          expose one additional path read-write\n"
         "  --env <name>            copy one named host environment variable\n"
+        "  --mcp, --upstream <spec>\n"
+        "                          attach an MCP server (`yams` or `<name>=<cmd>[,<arg>...]`);\n"
+        "                          all tools are allowed unless `--allow` is specified\n"
+        "  --allow <qualified.tool>\n"
+        "                          restrict MCP to an explicit allow-list of tools\n"
+        "  --allow-arg <tool>:<field>=<prefix>\n"
+        "                          argument prefix constraint on an allowed tool\n"
+        "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS through the egress proxy\n"
@@ -577,6 +595,11 @@ void add_unique_path_dir(glove::run::options& opts, const std::filesystem::path&
 
 auto resolve_harness_executable(std::string_view name) -> std::optional<std::filesystem::path> {
     const std::string bin_name{name == "claude-code" ? "claude" : name};
+    auto is_usable_executable = [](const std::filesystem::path& candidate) -> bool {
+        std::error_code ec;
+        return std::filesystem::is_regular_file(candidate, ec) && !ec &&
+               ::access(candidate.c_str(), X_OK) == 0;
+    };
     std::error_code ec;
     if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
         const std::filesystem::path home_dir{home};
@@ -584,7 +607,7 @@ auto resolve_harness_executable(std::string_view name) -> std::optional<std::fil
                  home_dir / ".local" / "bin" / bin_name,
                  home_dir / ".pi" / "agent" / "bin" / bin_name,
              }) {
-            if (std::filesystem::exists(candidate, ec) && !ec) {
+            if (is_usable_executable(candidate)) {
                 return std::filesystem::absolute(candidate, ec);
             }
         }
@@ -592,7 +615,7 @@ auto resolve_harness_executable(std::string_view name) -> std::optional<std::fil
         if (std::filesystem::is_directory(nvm_nodes, ec) && !ec) {
             for (const auto& entry : std::filesystem::directory_iterator(nvm_nodes, ec)) {
                 const auto candidate = entry.path() / "bin" / bin_name;
-                if (std::filesystem::exists(candidate, ec) && !ec) {
+                if (is_usable_executable(candidate)) {
                     return std::filesystem::absolute(candidate, ec);
                 }
             }
@@ -606,7 +629,7 @@ auto resolve_harness_executable(std::string_view name) -> std::optional<std::fil
                 colon == std::string_view::npos ? rest : rest.substr(0, colon);
             if (!dir.empty()) {
                 const auto candidate = std::filesystem::path{dir} / bin_name;
-                if (std::filesystem::exists(candidate, ec) && !ec) {
+                if (is_usable_executable(candidate)) {
                     return std::filesystem::absolute(candidate, ec);
                 }
             }
@@ -620,7 +643,7 @@ auto resolve_harness_executable(std::string_view name) -> std::optional<std::fil
 }
 
 // Mounts the agent harness binary + its symlink/runtime closure (~/.local/bin,
-// ~/.pi/agent, ~/.nvm/versions/node/<ver>, ~/.local/share/antigravity-cli, etc.)
+// non-credential ~/.pi/agent subdirs, ~/.nvm/versions/node/<ver>, etc.)
 // read-only into `opts` and prepends their `bin` directories to `extra_path_dirs`.
 auto attach_agent_harness_closure(
     glove::run::options& opts, std::string_view driver, std::optional<std::string_view> cmd_override
@@ -641,11 +664,15 @@ auto attach_agent_harness_closure(
         add_unique_path_dir(opts, found->parent_path());
         const auto canon = std::filesystem::weakly_canonical(*found, ec);
         if (!ec && canon.has_parent_path()) {
-            // If canonical path is `<root>/bin/<exe>` (e.g. ~/.pi/agent/bin/pi),
-            // expose `<root>` so sibling `install/` or `lib/` directories are readable.
+            // If canonical path is `<root>/bin/<exe>` (e.g. ~/.nvm/.../bin/pi),
+            // expose `<root>` unless `<root>` is `~/.pi/agent` (which contains
+            // host credentials/sessions and is mounted selectively below).
             const auto parent = canon.parent_path();
-            if (parent.filename() == "bin" && parent.has_parent_path()) {
-                add_non_overlapping_read_dir(opts, parent.parent_path());
+            const auto root = parent.parent_path();
+            const bool is_pi_agent_root =
+                root.filename() == "agent" && root.parent_path().filename() == ".pi";
+            if (parent.filename() == "bin" && parent.has_parent_path() && !is_pi_agent_root) {
+                add_non_overlapping_read_dir(opts, root);
             } else {
                 add_non_overlapping_read_dir(opts, parent);
             }
@@ -659,12 +686,21 @@ auto attach_agent_harness_closure(
         const std::filesystem::path home_dir{home};
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "bin");
         add_unique_path_dir(opts, home_dir / ".local" / "bin");
-        add_non_overlapping_read_dir(opts, home_dir / ".pi" / "agent");
-        add_unique_path_dir(opts, home_dir / ".pi" / "agent" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".cargo" / "bin");
+        add_unique_path_dir(opts, home_dir / ".cargo" / "bin");
+        add_unique_path_dir(opts, std::filesystem::path{"/usr/local/bin"});
+        const auto pi_agent_dir = home_dir / ".pi" / "agent";
+        for (const char* sub :
+             {"bin", "install", "npm", "skills", "pi-subagents", "pi-web-access", "missions"}) {
+            add_non_overlapping_read_dir(opts, pi_agent_dir / sub);
+        }
+        add_unique_path_dir(opts, pi_agent_dir / "bin");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");
         add_unique_path_dir(opts, home_dir / ".local" / "share" / "pi-node" / "current" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".config" / "sage");
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "sage");
 
         const auto nvm_nodes = home_dir / ".nvm" / "versions" / "node";
         if (std::filesystem::is_directory(nvm_nodes, ec) && !ec) {
@@ -678,6 +714,26 @@ auto attach_agent_harness_closure(
                 add_non_overlapping_read_dir(opts, chosen_node);
                 add_unique_path_dir(opts, chosen_node / "bin");
             }
+        }
+    }
+
+    // When launching an interactive agent harness without a mediated preset or
+    // explicit egress list, allow standard LLM provider endpoints through the
+    // audited egress proxy so configured cloud models (DeepSeek, Anthropic,
+    // OpenAI, Gemini, RunInfra, Mistral, OpenRouter) can connect.
+    if (opts.egress.empty() && !opts.agent_preset.has_value()) {
+        for (const char* host : {
+                 "api.deepseek.com",
+                 "api.runinfra.ai",
+                 "api.anthropic.com",
+                 "api.openai.com",
+                 "api.mistral.ai",
+                 "api.kimi.com",
+                 "openrouter.ai",
+                 "generativelanguage.googleapis.com",
+                 "api.individual.githubcopilot.com",
+             }) {
+            opts.egress.push_back(glove::net::egress_rule{.host = host, .port = 443});
         }
     }
     return resolved_bin;
@@ -703,6 +759,12 @@ auto ensure_workspace_directory(const std::optional<std::filesystem::path>& work
             std::filesystem::perm_options::replace,
             ec
         );
+        if (ec) {
+            return std::unexpected(
+                std::string{"cannot set permissions on workspace directory '"} +
+                workspace->string() + "': " + ec.message()
+            );
+        }
     }
     return {};
 }
@@ -719,14 +781,39 @@ auto resolve_envs_directory() -> std::optional<std::filesystem::path> {
 
 auto json_escape(std::string_view text) -> std::string {
     std::string out = "\"";
-    for (const char ch : text) {
-        if (ch == '"' || ch == '\\') {
-            out.push_back('\\');
-            out.push_back(ch);
-        } else if (ch == '\n') {
+    for (const char raw : text) {
+        const auto ch = static_cast<unsigned char>(raw);
+        switch (ch) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
             out += "\\n";
-        } else {
-            out.push_back(ch);
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (ch < 0x20U) {
+                char hex[7]{};
+                std::snprintf(hex, sizeof(hex), "\\u%04x", static_cast<unsigned int>(ch));
+                out += hex;
+            } else {
+                out.push_back(static_cast<char>(ch));
+            }
+            break;
         }
     }
     out.push_back('"');
@@ -745,11 +832,45 @@ auto json_string_array(const std::vector<std::string>& items) -> std::string {
     return out;
 }
 
+auto read_proc_starttime(long pid) noexcept -> std::int64_t {
+    if (pid <= 0) {
+        return 0;
+    }
+    const std::string stat_path = "/proc/" + std::to_string(pid) + "/stat";
+    std::ifstream in(stat_path, std::ios::binary);
+    if (!in) {
+        return 0;
+    }
+    std::string line;
+    std::getline(in, line);
+    const auto rparen = line.rfind(')');
+    if (rparen == std::string::npos || rparen + 2 >= line.size()) {
+        return 0;
+    }
+    std::istringstream iss(line.substr(rparen + 2));
+    std::string token;
+    // Field 3 is state (1st token after ')'); field 22 is starttime (20th token after ')').
+    for (int field = 3; field <= 22; ++field) {
+        if (!(iss >> token)) {
+            return 0;
+        }
+    }
+    std::int64_t value = 0;
+    const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value);
+    if (ec != std::errc{} || ptr != token.data() + token.size() || value <= 0) {
+        return 0;
+    }
+    return value;
+}
+
 void save_env_profile(
     std::string_view name, const glove::run::options& opts, std::string_view driver, long active_pid
 ) noexcept {
+    if (!glove::host::is_valid_policy_name(name)) {
+        return;
+    }
     const auto envs_dir = resolve_envs_directory();
-    if (!envs_dir || name.empty()) {
+    if (!envs_dir) {
         return;
     }
     std::error_code ec;
@@ -760,6 +881,9 @@ void save_env_profile(
     std::filesystem::permissions(
         *envs_dir, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec
     );
+    if (ec) {
+        return;
+    }
 
     std::vector<std::string> upstreams;
     for (const auto& u : opts.upstreams) {
@@ -781,18 +905,44 @@ void save_env_profile(
         allow_arg.push_back(r.tool_name + ":" + r.field + "=" + r.required_prefix);
     }
 
-    const auto path = *envs_dir / (std::string{name} + ".json");
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return;
+    auto to_abs_string = [](const std::filesystem::path& p) -> std::string {
+        if (p.empty()) {
+            return {};
+        }
+        std::error_code abs_ec;
+        auto canon = std::filesystem::weakly_canonical(p, abs_ec);
+        if (!abs_ec && !canon.empty()) {
+            return canon.string();
+        }
+        abs_ec.clear();
+        auto abs = std::filesystem::absolute(p, abs_ec);
+        return (!abs_ec && !abs.empty()) ? abs.lexically_normal().string() : p.string();
+    };
+    const std::string abs_workspace =
+        opts.workspace ? to_abs_string(*opts.workspace) : std::string{};
+    std::vector<std::string> abs_readable;
+    for (const auto& r : opts.readable) {
+        auto s = to_abs_string(std::filesystem::path{r});
+        if (!s.empty() && std::ranges::find(abs_readable, s) == abs_readable.end()) {
+            abs_readable.push_back(std::move(s));
+        }
     }
+    std::vector<std::string> abs_writable;
+    for (const auto& w : opts.writable) {
+        auto s = to_abs_string(std::filesystem::path{w});
+        if (!s.empty() && std::ranges::find(abs_writable, s) == abs_writable.end()) {
+            abs_writable.push_back(std::move(s));
+        }
+    }
+
+    const std::int64_t starttime = read_proc_starttime(active_pid);
+    std::ostringstream out;
     out << "{\n"
         << "  \"name\": " << json_escape(name) << ",\n"
-        << "  \"workspace\": " << json_escape(opts.workspace ? opts.workspace->string() : "")
-        << ",\n"
+        << "  \"workspace\": " << json_escape(abs_workspace) << ",\n"
         << "  \"agent\": " << json_escape(driver) << ",\n"
-        << "  \"readable\": " << json_string_array(opts.readable) << ",\n"
-        << "  \"writable\": " << json_string_array(opts.writable) << ",\n"
+        << "  \"readable\": " << json_string_array(abs_readable) << ",\n"
+        << "  \"writable\": " << json_string_array(abs_writable) << ",\n"
         << "  \"env\": " << json_string_array(opts.environment_names) << ",\n"
         << "  \"upstreams\": " << json_string_array(upstreams) << ",\n"
         << "  \"allow\": " << json_string_array(opts.allow) << ",\n"
@@ -800,31 +950,64 @@ void save_env_profile(
         << "  \"egress\": " << json_string_array(egress) << ",\n"
         << "  \"bridge_port\": " << (opts.bridge_port ? static_cast<long>(*opts.bridge_port) : 0L)
         << ",\n"
-        << "  \"active_pid\": " << active_pid << "\n"
+        << "  \"active_pid\": " << active_pid << ",\n"
+        << "  \"active_starttime\": " << starttime << "\n"
         << "}\n";
-    out.close();
-    std::filesystem::permissions(
-        path,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace,
-        ec
-    );
+    const std::string serialized = out.str();
+    const auto path = *envs_dir / (std::string{name} + ".json");
+    const int fd =
+        ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return;
+    }
+    (void)::fchmod(fd, 0600);
+    std::size_t off = 0;
+    while (off < serialized.size()) {
+        const ssize_t n = ::write(fd, serialized.data() + off, serialized.size() - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    (void)::close(fd);
 }
 
 auto load_env_profile(std::string_view name, glove::run::options& opts)
     -> std::expected<void, std::string> {
+    if (!glove::host::is_valid_policy_name(name)) {
+        return std::unexpected("invalid saved environment name '" + std::string{name} + "'");
+    }
     const auto envs_dir = resolve_envs_directory();
     if (!envs_dir) {
         return std::unexpected(std::string{"cannot resolve XDG config directory"});
     }
     const auto path = *envs_dir / (std::string{name} + ".json");
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
         return std::unexpected(
             "saved environment '" + std::string{name} + "' not found at " + path.string()
         );
     }
-    const std::string content((std::istreambuf_iterator<char>(in)), {});
+    std::string content;
+    std::array<char, 4096> buf{};
+    for (;;) {
+        const ssize_t n = ::read(fd, buf.data(), buf.size());
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            (void)::close(fd);
+            return std::unexpected("failed reading saved environment '" + std::string{name} + "'");
+        }
+        if (n == 0) {
+            break;
+        }
+        content.append(buf.data(), static_cast<std::size_t>(n));
+    }
+    (void)::close(fd);
     auto parsed = glove::reflect::detail::parse_json_object(content);
     if (!parsed) {
         return std::unexpected(
@@ -832,65 +1015,124 @@ auto load_env_profile(std::string_view name, glove::run::options& opts)
         );
     }
     if (auto it = parsed->find("workspace"); it != parsed->end()) {
-        if (const auto* s = std::get_if<std::string>(&it->second); s != nullptr && !s->empty()) {
+        const auto* s = std::get_if<std::string>(&it->second);
+        if (s == nullptr) {
+            return std::unexpected(
+                "invalid 'workspace' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        if (!s->empty()) {
             opts.workspace = std::filesystem::path{*s};
         }
     }
     if (auto it = parsed->find("agent"); it != parsed->end()) {
-        if (const auto* s = std::get_if<std::string>(&it->second); s != nullptr && !s->empty()) {
+        const auto* s = std::get_if<std::string>(&it->second);
+        if (s == nullptr) {
+            return std::unexpected(
+                "invalid 'agent' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        if (!s->empty()) {
             opts.agent_preset = *s;
         }
     }
     if (auto it = parsed->find("readable"); it != parsed->end()) {
-        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
-            opts.readable.insert(opts.readable.end(), arr->begin(), arr->end());
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'readable' in saved environment '" + std::string{name} + "'"
+            );
         }
+        opts.readable.insert(opts.readable.end(), arr->begin(), arr->end());
     }
     if (auto it = parsed->find("writable"); it != parsed->end()) {
-        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
-            opts.writable.insert(opts.writable.end(), arr->begin(), arr->end());
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'writable' in saved environment '" + std::string{name} + "'"
+            );
         }
+        opts.writable.insert(opts.writable.end(), arr->begin(), arr->end());
     }
     if (auto it = parsed->find("env"); it != parsed->end()) {
-        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
-            opts.environment_names.insert(opts.environment_names.end(), arr->begin(), arr->end());
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'env' in saved environment '" + std::string{name} + "'"
+            );
         }
+        opts.environment_names.insert(opts.environment_names.end(), arr->begin(), arr->end());
     }
     if (auto it = parsed->find("upstreams"); it != parsed->end()) {
-        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
-            for (const auto& spec : *arr) {
-                if (auto u = parse_upstream(spec)) {
-                    opts.upstreams.push_back(std::move(*u));
-                }
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'upstreams' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        for (const auto& spec : *arr) {
+            auto u = parse_upstream(spec);
+            if (!u) {
+                return std::unexpected(
+                    "invalid upstream in saved environment '" + std::string{name} +
+                    "': " + u.error()
+                );
             }
+            opts.upstreams.push_back(std::move(*u));
         }
     }
     if (auto it = parsed->find("allow"); it != parsed->end()) {
-        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
-            opts.allow.insert(opts.allow.end(), arr->begin(), arr->end());
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'allow' in saved environment '" + std::string{name} + "'"
+            );
         }
+        opts.allow.insert(opts.allow.end(), arr->begin(), arr->end());
     }
     if (auto it = parsed->find("allow_arg"); it != parsed->end()) {
-        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
-            for (const auto& spec : *arr) {
-                if (auto r = parse_allow_arg(spec)) {
-                    opts.prefix_rules.push_back(std::move(*r));
-                }
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'allow_arg' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        for (const auto& spec : *arr) {
+            auto r = parse_allow_arg(spec);
+            if (!r) {
+                return std::unexpected(
+                    "invalid allow_arg in saved environment '" + std::string{name} +
+                    "': " + r.error()
+                );
             }
+            opts.prefix_rules.push_back(std::move(*r));
         }
     }
     if (auto it = parsed->find("egress"); it != parsed->end()) {
-        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
-            for (const auto& spec : *arr) {
-                if (auto e = parse_egress(spec)) {
-                    opts.egress.push_back(std::move(*e));
-                }
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'egress' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        for (const auto& spec : *arr) {
+            auto e = parse_egress(spec);
+            if (!e) {
+                return std::unexpected(
+                    "invalid egress in saved environment '" + std::string{name} + "': " + e.error()
+                );
             }
+            opts.egress.push_back(std::move(*e));
         }
     }
     if (auto it = parsed->find("bridge_port"); it != parsed->end()) {
-        if (const auto* n = std::get_if<std::int64_t>(&it->second);
-            n != nullptr && *n >= 1 && *n <= 65535) {
+        const auto* n = std::get_if<std::int64_t>(&it->second);
+        if (n == nullptr || (*n != 0 && (*n < 1 || *n > 65535))) {
+            return std::unexpected(
+                "invalid 'bridge_port' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        if (*n >= 1 && *n <= 65535) {
             opts.bridge_port = static_cast<std::uint16_t>(*n);
         }
     }
@@ -943,13 +1185,41 @@ auto list_env_profiles() -> int {
                 pid = static_cast<long>(*n);
             }
         }
-        const bool running = pid > 0 && ::kill(static_cast<::pid_t>(pid), 0) == 0;
+        std::int64_t saved_starttime = 0;
+        if (auto it = parsed->find("active_starttime"); it != parsed->end()) {
+            if (const auto* n = std::get_if<std::int64_t>(&it->second)) {
+                saved_starttime = *n;
+            }
+        }
+        const bool pid_alive = pid > 0 && ::kill(static_cast<::pid_t>(pid), 0) == 0;
+        const std::int64_t live_starttime = pid_alive ? read_proc_starttime(pid) : 0;
+        const bool running =
+            pid_alive && (saved_starttime == 0 || live_starttime == saved_starttime);
+        std::size_t read_count = 0;
+        if (auto it = parsed->find("readable"); it != parsed->end()) {
+            if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+                read_count = arr->size();
+            }
+        }
+        std::size_t mcp_count = 0;
+        if (auto it = parsed->find("upstreams"); it != parsed->end()) {
+            if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+                mcp_count = arr->size();
+            }
+        }
         std::printf(
-            "  %-16s [%s] agent=%s workspace=%s  (launch: `glove shell %s`)\n",
+            "  %c %-14s %-16s agent=%-6s mcp=%zu reads=%zu workspace=%s\n"
+            "      launch: glove shell %s   |   update: glove shell %s --save %s [--read <path> "
+            "...]\n",
+            running ? '*' : '-',
             name.c_str(),
-            running ? ("RUNNING pid=" + std::to_string(pid)).c_str() : "SAVED",
+            running ? ("RUNNING(" + std::to_string(pid) + ")").c_str() : "SAVED",
             agent.empty() ? "auto" : agent.c_str(),
+            mcp_count,
+            read_count,
             ws.empty() ? "<ephemeral>" : ws.c_str(),
+            name.c_str(),
+            name.c_str(),
             name.c_str()
         );
     }
@@ -995,6 +1265,12 @@ auto shell_subcommand(std::span<char* const> args) -> int {
             }
             if (a == "--save") {
                 save_name = std::string{args[i + 1]};
+                if (!glove::host::is_valid_policy_name(*save_name)) {
+                    std::fprintf(
+                        stderr, "glove shell: invalid environment name '%s'\n", save_name->c_str()
+                    );
+                    return 2;
+                }
             } else {
                 load_name = std::string{args[i + 1]};
             }
@@ -1109,6 +1385,11 @@ auto shell_subcommand(std::span<char* const> args) -> int {
     } else if (!resolved_bin.empty() && std::filesystem::path{resolved_bin}.is_absolute()) {
         opts.agent_argv.push_back(resolved_bin);
         opts.agent_argv.insert(opts.agent_argv.end(), trailing_args.begin(), trailing_args.end());
+    } else if (had_explicit_agent) {
+        std::fprintf(
+            stderr, "glove shell: agent '%s' is not installed or not executable\n", driver.c_str()
+        );
+        return 1;
     } else {
         opts.agent_argv.push_back(std::filesystem::exists("/bin/bash") ? "/bin/bash" : "/bin/sh");
         opts.agent_argv.insert(opts.agent_argv.end(), trailing_args.begin(), trailing_args.end());
