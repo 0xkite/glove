@@ -158,6 +158,7 @@ auto run(const std::filesystem::path& self) -> int {
     prof.home_dir = ws.string();
     prof.work_dir = ws.string();
     prof.environment = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin"};
+    prof.escape_policy = glove::container::profile::seccomp_escape_policy::deny_errno;
     // LeakSanitizer cannot trace the nested exec into the isolated PID
     // namespace; keep ASan/UBSan active and disable only child leak tracing.
     prof.environment.emplace_back("ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0");

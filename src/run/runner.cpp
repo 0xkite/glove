@@ -1765,7 +1765,27 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
     }
-    auto exit_code = glove::container::exec_contained(*profile, opts.agent_argv);
+    auto exit_code = glove::container::exec_contained(
+        *profile,
+        opts.agent_argv,
+        [sink = *sink](const glove::container::containment_escape_event& escape_event) {
+            const std::string detail = escape_event.mechanism + ":" + escape_event.detail +
+                                       " (pid=" + std::to_string(escape_event.pid) + ")";
+            static_cast<void>(record(
+                sink,
+                glove::audit::action::control,
+                "seccomp_escape_detected",
+                glove::mcp::tool_call_status::execution_error,
+                detail
+            ));
+            static_cast<void>(std::fprintf(
+                stderr,
+                "glove security: terminated sandbox after escape syscall '%s' (pid %d)\n",
+                escape_event.detail.c_str(),
+                static_cast<int>(escape_event.pid)
+            ));
+        }
+    );
     if (!exit_code) {
         return std::unexpected(exit_code.error());
     }

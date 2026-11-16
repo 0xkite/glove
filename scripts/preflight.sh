@@ -403,12 +403,18 @@ manifest_fuzz_corpus="${fuzz_workspace}/change_manifest"
 session_plan_fuzz_corpus="${fuzz_workspace}/session_plan"
 journal_fuzz_corpus="${fuzz_workspace}/change_apply_journal"
 bundle_fuzz_corpus="${fuzz_workspace}/library_bundle"
+http_syntax_fuzz_corpus="${fuzz_workspace}/http_syntax"
+egress_proxy_fuzz_corpus="${fuzz_workspace}/egress_proxy"
+container_profile_fuzz_corpus="${fuzz_workspace}/container_profile"
 cp -R fuzz/corpus/mcp_codec "${mcp_fuzz_corpus}"
 cp -R fuzz/corpus/policy_jsonpath "${policy_fuzz_corpus}"
 cp -R fuzz/corpus/change_manifest "${manifest_fuzz_corpus}"
 cp -R fuzz/corpus/session_plan "${session_plan_fuzz_corpus}"
 cp -R fuzz/corpus/change_apply_journal "${journal_fuzz_corpus}"
 cp -R fuzz/corpus/library_bundle "${bundle_fuzz_corpus}"
+cp -R fuzz/corpus/http_syntax "${http_syntax_fuzz_corpus}"
+cp -R fuzz/corpus/egress_proxy "${egress_proxy_fuzz_corpus}"
+cp -R fuzz/corpus/container_profile "${container_profile_fuzz_corpus}"
 apple_stats_fuzz_corpus="${fuzz_workspace}/apple_container_stats"
 cp -R fuzz/corpus/apple_container_stats "${apple_stats_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
@@ -447,6 +453,24 @@ UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
         -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
         -artifact_prefix="${bundle_fuzz_corpus}/" \
         "${bundle_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_http_syntax_fuzzer" \
+        -runs=10000 -max_len=32768 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${http_syntax_fuzz_corpus}/" \
+        "${http_syntax_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_egress_proxy_fuzzer" \
+        -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${egress_proxy_fuzz_corpus}/" \
+        "${egress_proxy_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_container_profile_fuzzer" \
+        -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${container_profile_fuzz_corpus}/" \
+        "${container_profile_fuzz_corpus}"
 # The Apple container-stats parser fuzzer is only built on platforms with that
 # runtime (macOS); run it when present so the target stops being built-but-idle.
 if [[ -x "${BUILD_ROOT}/fuzz/fuzz/glove_apple_container_stats_fuzzer" ]]; then

@@ -1,5 +1,7 @@
 #include "glove/net/egress_proxy.hpp"
 
+#include "egress_connect_parser.hpp"
+
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -33,51 +35,11 @@ constexpr std::size_t max_request_bytes = 8192;
 constexpr int poll_tick_ms = 200;
 constexpr std::size_t relay_chunk = 16384;
 
-auto lower_ascii(std::string value) -> std::string {
-    std::transform(value.begin(), value.end(), value.begin(), [](char c) {
-        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    });
-    return value;
-}
-
-auto normalise_host(std::string host) -> std::expected<std::string, std::string> {
-    host = lower_ascii(std::move(host));
-    while (!host.empty() && host.back() == '.') {
-        host.pop_back();
-    }
-    const std::size_t start = !host.empty() && host.front() == '.' ? 1 : 0;
-    if (start == host.size() || host.find_first_of("/@?#[]\\", start) != std::string::npos ||
-        host.find("..", start) != std::string::npos) {
-        return std::unexpected(std::string{"invalid egress host: '"} + host + "'");
-    }
-    for (std::size_t i = start; i < host.size(); ++i) {
-        const auto c = static_cast<unsigned char>(host[i]);
-        if (!(std::isalnum(c) || host[i] == '-' || host[i] == '.' || host[i] == ':')) {
-            return std::unexpected(std::string{"invalid egress host: '"} + host + "'");
-        }
-    }
-    return host;
-}
-
-auto host_matches(std::string_view allowed, std::string_view host) -> bool {
-    if (allowed.starts_with('.')) {
-        allowed.remove_prefix(1);
-        return host == allowed || (host.size() > allowed.size() && host.ends_with(allowed) &&
-                                   host[host.size() - allowed.size() - 1] == '.');
-    }
-    return host == allowed;
-}
-
-auto matching_rule(
-    const std::vector<egress_rule>& allow, const std::string& host, std::uint16_t port
-) -> const egress_rule* {
-    for (const auto& rule : allow) {
-        if (rule.port == port && host_matches(rule.host, host)) {
-            return &rule;
-        }
-    }
-    return nullptr;
-}
+using detail::authenticated;
+using detail::host_matches;
+using detail::matching_rule;
+using detail::normalise_host;
+using detail::parse_connect;
 
 auto base64(std::string_view input) -> std::string {
     constexpr std::string_view alphabet =
@@ -158,98 +120,6 @@ auto read_request(int fd, const std::atomic<bool>& stop) -> std::string {
         buffer.append(chunk.data(), static_cast<std::size_t>(got));
     }
     return buffer;
-}
-
-auto parse_connect(std::string_view request, std::string& host, std::uint16_t& port) -> bool {
-    const auto eol = request.find("\r\n");
-    std::string_view line = request.substr(0, eol);
-    constexpr std::string_view verb = "CONNECT ";
-    if (!line.starts_with(verb)) {
-        return false;
-    }
-    line.remove_prefix(verb.size());
-    const auto space = line.find(' ');
-    if (space == std::string_view::npos) {
-        return false;
-    }
-    const std::string_view authority = line.substr(0, space);
-    std::string_view port_text;
-    if (authority.starts_with('[')) {
-        const auto bracket = authority.find(']');
-        if (bracket == std::string_view::npos || bracket + 1 >= authority.size() ||
-            authority[bracket + 1] != ':') {
-            return false;
-        }
-        host = std::string{authority.substr(1, bracket - 1)};
-        port_text = authority.substr(bracket + 2);
-    } else {
-        const auto colon = authority.rfind(':');
-        if (colon == std::string_view::npos) {
-            return false;
-        }
-        host = std::string{authority.substr(0, colon)};
-        port_text = authority.substr(colon + 1);
-    }
-    unsigned parsed = 0;
-    if (host.empty() || port_text.empty()) {
-        return false;
-    }
-    for (const char c : port_text) {
-        if (c < '0' || c > '9') {
-            return false;
-        }
-        parsed = parsed * 10U + static_cast<unsigned>(c - '0');
-        if (parsed > 65535U) {
-            return false;
-        }
-    }
-    port = static_cast<std::uint16_t>(parsed);
-    auto normal = normalise_host(std::move(host));
-    if (!normal || port == 0) {
-        return false;
-    }
-    host = std::move(*normal);
-    return true;
-}
-
-// Compare a caller-supplied credential against the fixed expected token in time
-// that depends only on the expected token's length, never on the attacker's
-// input or on where the first mismatch is. The loop runs `expected.size()`
-// times regardless of `provided`; a length mismatch is folded into the result.
-auto constant_time_equal(std::string_view provided, std::string_view expected) noexcept -> bool {
-    unsigned difference = static_cast<unsigned>(provided.size() ^ expected.size());
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-        const unsigned provided_byte =
-            index < provided.size() ? static_cast<unsigned char>(provided[index]) : 0U;
-        difference |= (provided_byte ^ static_cast<unsigned char>(expected[index]));
-    }
-    return difference == 0U;
-}
-
-auto authenticated(std::string_view request, std::string_view expected) -> bool {
-    const auto request_line_end = request.find("\r\n");
-    if (request_line_end == std::string_view::npos) {
-        return false;
-    }
-    auto cursor = request_line_end + 2U;
-    while (cursor < request.size()) {
-        const auto end = request.find("\r\n", cursor);
-        if (end == cursor || end == std::string_view::npos) {
-            break;
-        }
-        const auto line = request.substr(cursor, end - cursor);
-        const auto colon = line.find(':');
-        if (colon != std::string_view::npos &&
-            lower_ascii(std::string{line.substr(0, colon)}) == "proxy-authorization") {
-            auto value = line.substr(colon + 1);
-            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-                value.remove_prefix(1);
-            }
-            return constant_time_equal(value, expected);
-        }
-        cursor = end + 2;
-    }
-    return false;
 }
 
 auto private_ipv4(std::uint32_t address) -> bool {

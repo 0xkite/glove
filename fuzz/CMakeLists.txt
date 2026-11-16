@@ -164,6 +164,38 @@ target_link_libraries(
 )
 glove_configure_fuzzer(glove_library_bundle_fuzzer)
 
+add_executable(glove_http_syntax_fuzzer http_syntax_fuzzer.cpp)
+target_link_libraries(glove_http_syntax_fuzzer PRIVATE glove_options)
+target_include_directories(glove_http_syntax_fuzzer PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>
+)
+glove_configure_fuzzer(glove_http_syntax_fuzzer)
+
+add_executable(glove_egress_proxy_fuzzer egress_proxy_fuzzer.cpp)
+target_link_libraries(glove_egress_proxy_fuzzer PRIVATE glove_options)
+target_include_directories(glove_egress_proxy_fuzzer PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src>
+)
+glove_configure_fuzzer(glove_egress_proxy_fuzzer)
+
+add_library(glove_container_profile_fuzz_support STATIC
+    ${CMAKE_SOURCE_DIR}/src/container/profile.cpp
+)
+target_link_libraries(glove_container_profile_fuzz_support PUBLIC glove_options)
+target_include_directories(glove_container_profile_fuzz_support
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+)
+target_compile_options(glove_container_profile_fuzz_support PRIVATE -fsanitize=fuzzer-no-link)
+
+add_executable(glove_container_profile_fuzzer container_profile_fuzzer.cpp)
+target_link_libraries(
+    glove_container_profile_fuzzer
+    PRIVATE glove_container_profile_fuzz_support
+)
+glove_configure_fuzzer(glove_container_profile_fuzzer)
+
 # The Apple Container stats parser is compiled only on Apple platforms
 # (src/control/CMakeLists.txt), so this fuzzer only links there.
 if(APPLE)

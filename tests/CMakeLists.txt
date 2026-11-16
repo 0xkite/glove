@@ -916,6 +916,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME container_linux_seccomp_denial COMMAND container_linux_seccomp_denial_test)
     set_tests_properties(container_linux_seccomp_denial PROPERTIES TIMEOUT 30)
 
+    add_executable(container_linux_escape_monitor_test container/linux_escape_monitor_test.cpp)
+    target_link_libraries(container_linux_escape_monitor_test PRIVATE glove_kernel glove_net)
+    target_include_directories(container_linux_escape_monitor_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(container_linux_escape_monitor_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(container_linux_escape_monitor_test glove)
+    add_test(NAME container_linux_escape_monitor COMMAND container_linux_escape_monitor_test)
+    set_tests_properties(container_linux_escape_monitor PROPERTIES TIMEOUT 30)
+
     add_executable(container_linux_loopback_listen_test container/linux_loopback_listen_test.cpp)
     target_link_libraries(container_linux_loopback_listen_test PRIVATE glove_kernel)
     add_test(NAME container_linux_loopback_listen COMMAND container_linux_loopback_listen_test)
