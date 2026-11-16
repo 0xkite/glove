@@ -237,8 +237,8 @@ auto path_within(const std::filesystem::path& candidate, const std::filesystem::
     -> bool {
     const auto nc = candidate.lexically_normal();
     const auto nr = root.lexically_normal();
-    const auto mismatch = std::mismatch(nr.begin(), nr.end(), nc.begin(), nc.end());
-    return mismatch.first == nr.end();
+    const auto [mr, mc] = std::ranges::mismatch(nr, nc);
+    return mr == nr.end();
 }
 
 void copy_regular_file_0600(
@@ -250,6 +250,8 @@ void copy_regular_file_0600(
     if (::lstat(src.c_str(), &link_st) != 0 || link_st.st_uid != ::geteuid()) {
         return;
     }
+    std::filesystem::path open_path = src;
+    struct ::stat expected_st = link_st;
     if (S_ISLNK(link_st.st_mode)) {
         if (!allow_owner_symlink) {
             return;
@@ -290,24 +292,31 @@ void copy_regular_file_0600(
         const char* home = std::getenv("HOME");
         if (home != nullptr && *home != '\0') {
             const std::filesystem::path home_path{home};
+            std::error_code home_ec;
+            const auto canon_home = std::filesystem::canonical(home_path, home_ec);
+            if (home_ec || canon_home.empty()) {
+                return;
+            }
             const bool in_approved =
-                path_within(target, home_path / ".pi") ||
-                path_within(target, home_path / "Documents" / "depend" / "dotfiles") ||
-                path_within(target, home_path / ".dotfiles") ||
+                path_within(target, canon_home / ".pi") ||
+                path_within(target, canon_home / "Documents" / "depend" / "dotfiles") ||
+                path_within(target, canon_home / ".dotfiles") ||
                 path_within(target, src.parent_path());
             if (!in_approved) {
                 return;
             }
         }
+        open_path = target;
+        expected_st = target_st;
     }
-    const int open_flags = O_RDONLY | O_CLOEXEC | (allow_owner_symlink ? 0 : O_NOFOLLOW);
-    const int in_fd = ::open(src.c_str(), open_flags);
+    const int in_fd = ::open(open_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (in_fd < 0) {
         return;
     }
     struct ::stat before{};
     constexpr std::uint64_t kMaxGuestConfigBytes = 4U * 1024U * 1024U;
     if (::fstat(in_fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_uid != ::geteuid() ||
+        before.st_dev != expected_st.st_dev || before.st_ino != expected_st.st_ino ||
         before.st_size < 0 || static_cast<std::uint64_t>(before.st_size) > kMaxGuestConfigBytes) {
         (void)::close(in_fd);
         return;
@@ -520,36 +529,30 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
             if (::lstat(src_dir.c_str(), &st) != 0 || st.st_uid != ::geteuid()) {
                 continue;
             }
-            if (S_ISLNK(st.st_mode)) {
-                std::error_code canon_ec;
-                const auto canon = std::filesystem::canonical(src_dir, canon_ec);
-                if (canon_ec || canon.empty()) {
-                    continue;
-                }
-                struct ::stat cst{};
-                if (::stat(canon.c_str(), &cst) != 0 || !S_ISDIR(cst.st_mode) ||
-                    cst.st_uid != ::geteuid()) {
-                    continue;
-                }
-                const std::string canon_str = canon.string();
-                if (canon_str.find(".ssh") != std::string::npos ||
-                    canon_str.find("auth.json") != std::string::npos) {
-                    continue;
-                }
-                const bool in_approved =
-                    path_within(canon, host_pi_dir) ||
-                    path_within(canon, host_home / "Documents" / "depend" / "dotfiles") ||
-                    path_within(canon, host_home / ".dotfiles");
-                if (!in_approved) {
-                    continue;
-                }
-                if (!std::filesystem::exists(dst_link, ec)) {
-                    std::filesystem::create_directory_symlink(canon, dst_link, ec);
-                }
-            } else if (S_ISDIR(st.st_mode)) {
-                if (!std::filesystem::exists(dst_link, ec)) {
-                    std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
-                }
+            std::error_code canon_ec;
+            const auto canon = std::filesystem::canonical(src_dir, canon_ec);
+            if (canon_ec || canon.empty()) {
+                continue;
+            }
+            struct ::stat cst{};
+            if (::stat(canon.c_str(), &cst) != 0 || !S_ISDIR(cst.st_mode) ||
+                cst.st_uid != ::geteuid()) {
+                continue;
+            }
+            const std::string canon_str = canon.string();
+            if (canon_str.find(".ssh") != std::string::npos ||
+                canon_str.find("auth.json") != std::string::npos) {
+                continue;
+            }
+            const bool in_approved =
+                path_within(canon, host_pi_dir) ||
+                path_within(canon, host_home / "Documents" / "depend" / "dotfiles") ||
+                path_within(canon, host_home / ".dotfiles");
+            if (!in_approved) {
+                continue;
+            }
+            if (!std::filesystem::exists(dst_link, ec)) {
+                std::filesystem::create_directory_symlink(canon, dst_link, ec);
             }
         }
         profile.environment.push_back("PI_CODING_AGENT_DIR=" + guest_pi_dir.string());
@@ -568,38 +571,31 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
         if (::lstat(src_dir.c_str(), &st) != 0 || st.st_uid != ::geteuid()) {
             continue;
         }
-        if (S_ISLNK(st.st_mode)) {
-            std::error_code canon_ec;
-            const auto canon = std::filesystem::canonical(src_dir, canon_ec);
-            if (canon_ec || canon.empty()) {
-                continue;
-            }
-            struct ::stat cst{};
-            if (::stat(canon.c_str(), &cst) != 0 || !S_ISDIR(cst.st_mode) ||
-                cst.st_uid != ::geteuid()) {
-                continue;
-            }
-            const std::string canon_str = canon.string();
-            if (canon_str.find(".ssh") != std::string::npos ||
-                canon_str.find(".gnupg") != std::string::npos) {
-                continue;
-            }
-            const bool in_approved =
-                path_within(canon, host_home / rel) ||
-                path_within(canon, host_home / "Documents" / "depend" / "dotfiles") ||
-                path_within(canon, host_home / ".dotfiles");
-            if (!in_approved) {
-                continue;
-            }
-            if (!std::filesystem::exists(dst_link, ec)) {
-                std::filesystem::create_directories(dst_link.parent_path(), ec);
-                std::filesystem::create_directory_symlink(canon, dst_link, ec);
-            }
-        } else if (S_ISDIR(st.st_mode)) {
-            if (!std::filesystem::exists(dst_link, ec)) {
-                std::filesystem::create_directories(dst_link.parent_path(), ec);
-                std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
-            }
+        std::error_code canon_ec;
+        const auto canon = std::filesystem::canonical(src_dir, canon_ec);
+        if (canon_ec || canon.empty()) {
+            continue;
+        }
+        struct ::stat cst{};
+        if (::stat(canon.c_str(), &cst) != 0 || !S_ISDIR(cst.st_mode) ||
+            cst.st_uid != ::geteuid()) {
+            continue;
+        }
+        const std::string canon_str = canon.string();
+        if (canon_str.find(".ssh") != std::string::npos ||
+            canon_str.find(".gnupg") != std::string::npos) {
+            continue;
+        }
+        const bool in_approved =
+            path_within(canon, host_home / rel) ||
+            path_within(canon, host_home / "Documents" / "depend" / "dotfiles") ||
+            path_within(canon, host_home / ".dotfiles");
+        if (!in_approved) {
+            continue;
+        }
+        if (!std::filesystem::exists(dst_link, ec)) {
+            std::filesystem::create_directories(dst_link.parent_path(), ec);
+            std::filesystem::create_directory_symlink(canon, dst_link, ec);
         }
     }
     if (const auto rustup_dir = host_home / ".rustup";
@@ -641,57 +637,83 @@ auto prepare_profile(const options& opts, const std::filesystem::path& runtime_r
 }
 
 auto validate_audit_parent_chain(const std::filesystem::path& dir)
-    -> std::expected<void, std::string> {
+    -> std::expected<int, std::string> {
     if (!dir.is_absolute()) {
         return std::unexpected("audit parent directory must be absolute: " + dir.string());
     }
     const auto norm = dir.lexically_normal();
-    std::filesystem::path current;
+    int current_fd = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (current_fd < 0) {
+        return std::unexpected(std::string{"cannot open root directory: "} + std::strerror(errno));
+    }
     for (const auto& part : norm) {
-        current /= part;
-        if (current == current.root_path()) {
+        const std::string name = part.string();
+        if (name.empty() || name == "/") {
             continue;
         }
-        struct ::stat st{};
-        if (::lstat(current.c_str(), &st) != 0) {
-            if (errno == ENOENT) {
-                if (::mkdir(current.c_str(), 0700) != 0) {
-                    return std::unexpected(
-                        "cannot create audit directory component '" + current.string() +
-                        "': " + std::strerror(errno)
-                    );
-                }
-                if (::lstat(current.c_str(), &st) != 0) {
-                    return std::unexpected(
-                        "cannot stat newly created audit directory '" + current.string() +
-                        "': " + std::strerror(errno)
-                    );
-                }
-            } else {
+        int next_fd =
+            ::openat(current_fd, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next_fd < 0 && errno == ENOENT) {
+            if (::mkdirat(current_fd, name.c_str(), 0700) != 0 && errno != EEXIST) {
+                const int err = errno;
+                (void)::close(current_fd);
                 return std::unexpected(
-                    "cannot stat audit directory component '" + current.string() +
-                    "': " + std::strerror(errno)
+                    "cannot create audit directory component '" + name + "': " + std::strerror(err)
                 );
             }
+            next_fd =
+                ::openat(current_fd, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         }
-        if (S_ISLNK(st.st_mode)) {
+        if (next_fd < 0) {
+            const int err = errno;
+            (void)::close(current_fd);
             return std::unexpected(
-                "audit directory path component is a symlink: '" + current.string() + "'"
+                "cannot open audit directory component '" + name + "': " + std::strerror(err)
+            );
+        }
+        (void)::close(current_fd);
+        current_fd = next_fd;
+
+        struct ::stat st{};
+        if (::fstat(current_fd, &st) != 0) {
+            const int err = errno;
+            (void)::close(current_fd);
+            return std::unexpected(
+                "cannot stat audit directory component '" + name + "': " + std::strerror(err)
             );
         }
         if (!S_ISDIR(st.st_mode)) {
+            (void)::close(current_fd);
+            return std::unexpected("audit directory component is not a directory: '" + name + "'");
+        }
+        // Reject group/world-writable directories unless sticky bit is set (e.g. /tmp).
+        if ((st.st_mode & 0022) != 0 && !(st.st_mode & S_ISVTX)) {
+            (void)::close(current_fd);
             return std::unexpected(
-                "audit directory path component is not a directory: '" + current.string() + "'"
+                "audit directory component has unsafe permissions (group/world writable): '" +
+                name + "'"
             );
         }
-        if (current != "/home" && st.st_uid != ::geteuid() && st.st_uid != 0) {
+        // Verify ownership: root or current user.
+        if (st.st_uid != ::geteuid() && st.st_uid != 0) {
+            (void)::close(current_fd);
             return std::unexpected(
-                "audit directory path component not owned by current user: '" + current.string() +
-                "'"
+                "audit directory component not owned by current user or root: '" + name + "'"
             );
+        }
+        // Tighten permissions on user-owned components:
+        if (st.st_uid == ::geteuid()) {
+            if (::fchmod(current_fd, 0700) != 0) {
+                const int err = errno;
+                (void)::close(current_fd);
+                return std::unexpected(
+                    "cannot tighten permissions on audit directory component '" + name +
+                    "': " + std::strerror(err)
+                );
+            }
         }
     }
-    return {};
+    return current_fd;
 }
 
 auto audit_destination(
@@ -735,6 +757,7 @@ auto audit_destination(
         if (!valid_chain) {
             return std::unexpected("insecure default audit directory: " + valid_chain.error());
         }
+        (void)::close(*valid_chain);
         std::error_code ec;
         std::filesystem::permissions(
             *state_base,
@@ -742,6 +765,11 @@ auto audit_destination(
             std::filesystem::perm_options::replace,
             ec
         );
+        if (ec) {
+            return std::unexpected(
+                "cannot set 0700 permissions on audit directory: " + ec.message()
+            );
+        }
         const auto default_log = *state_base / "session.jsonl";
         for (const auto& rule : profile.filesystem) {
             if (path_within(default_log, std::filesystem::path{rule.path}) ||

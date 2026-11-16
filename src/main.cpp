@@ -547,7 +547,7 @@ auto paths_overlap(const std::filesystem::path& a, const std::filesystem::path& 
 auto is_subpath_of(const std::filesystem::path& path, const std::filesystem::path& base) -> bool {
     const auto np = path.lexically_normal();
     const auto nb = base.lexically_normal();
-    const auto [mb, _] = std::mismatch(nb.begin(), nb.end(), np.begin(), np.end());
+    const auto [mb, mp] = std::ranges::mismatch(nb, np);
     return mb == nb.end();
 }
 
@@ -563,8 +563,13 @@ void add_non_overlapping_read_dir(glove::run::options& opts, const std::filesyst
     // Never expose the whole user home or sensitive credential dotfiles.
     if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
         const std::filesystem::path home_path{home};
-        if (abs == home_path || paths_overlap(abs, home_path / ".ssh") ||
-            paths_overlap(abs, home_path / ".gnupg") || paths_overlap(abs, home_path / ".aws")) {
+        std::error_code home_ec;
+        const auto canon_home = std::filesystem::canonical(home_path, home_ec);
+        if (home_ec || canon_home.empty()) {
+            return;
+        }
+        if (abs == canon_home || paths_overlap(abs, canon_home / ".ssh") ||
+            paths_overlap(abs, canon_home / ".gnupg") || paths_overlap(abs, canon_home / ".aws")) {
             return;
         }
     }
