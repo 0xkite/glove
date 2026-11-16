@@ -329,10 +329,23 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
             }
         }
         profile.environment.push_back("PI_CODING_AGENT_DIR=" + guest_pi_dir.string());
-        if (opts.egress.empty()) {
-            profile.environment.push_back("PI_OFFLINE=1");
-            profile.environment.push_back("NPM_CONFIG_OFFLINE=true");
-            profile.environment.push_back("NPM_CONFIG_UPDATE_NOTIFIER=false");
+        profile.environment.push_back("PI_OFFLINE=1");
+        profile.environment.push_back("NPM_CONFIG_OFFLINE=true");
+        profile.environment.push_back("NPM_CONFIG_UPDATE_NOTIFIER=false");
+    }
+
+    // Symlink read-only Sage config and skill libraries into the guest HOME so
+    // agent plugins invoking `sage` can read local libraries without mutating them.
+    for (const auto& rel : {
+             std::filesystem::path{".config"} / "sage",
+             std::filesystem::path{".local"} / "share" / "sage",
+         }) {
+        const auto src_dir = host_home / rel;
+        const auto dst_link = guest_home / rel;
+        if (std::filesystem::is_directory(src_dir, ec) && !ec &&
+            !std::filesystem::exists(dst_link, ec)) {
+            std::filesystem::create_directories(dst_link.parent_path(), ec);
+            std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
         }
     }
 
