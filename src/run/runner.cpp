@@ -1309,10 +1309,15 @@ public:
         if (sock_path.string().size() >= sizeof(::sockaddr_un{}.sun_path)) {
             return std::unexpected(std::string{"MCP socket path is too long"});
         }
+#if defined(SOCK_CLOEXEC)
         const int listen_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+        const int listen_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
         if (listen_fd < 0) {
             return std::unexpected(std::string{"socket(AF_UNIX): "} + std::strerror(errno));
         }
+        (void)::fcntl(listen_fd, F_SETFD, FD_CLOEXEC);
         ::unlink(sock_path.c_str());
         ::sockaddr_un addr{};
         addr.sun_family = AF_UNIX;

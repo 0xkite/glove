@@ -1957,11 +1957,16 @@ auto mcp_bridge_subcommand(std::span<char* const> args) -> int {
         std::fprintf(stderr, "glove mcp-bridge: missing or invalid socket path\n");
         return 2;
     }
+#if defined(SOCK_CLOEXEC)
     const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+#else
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
     if (fd < 0) {
         std::fprintf(stderr, "glove mcp-bridge: socket: %s\n", std::strerror(errno));
         return 1;
     }
+    (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
     ::sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1U);
