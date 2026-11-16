@@ -905,15 +905,44 @@ void save_env_profile(
         allow_arg.push_back(r.tool_name + ":" + r.field + "=" + r.required_prefix);
     }
 
+    auto to_abs_string = [](const std::filesystem::path& p) -> std::string {
+        if (p.empty()) {
+            return {};
+        }
+        std::error_code abs_ec;
+        auto canon = std::filesystem::weakly_canonical(p, abs_ec);
+        if (!abs_ec && !canon.empty()) {
+            return canon.string();
+        }
+        abs_ec.clear();
+        auto abs = std::filesystem::absolute(p, abs_ec);
+        return (!abs_ec && !abs.empty()) ? abs.lexically_normal().string() : p.string();
+    };
+    const std::string abs_workspace =
+        opts.workspace ? to_abs_string(*opts.workspace) : std::string{};
+    std::vector<std::string> abs_readable;
+    for (const auto& r : opts.readable) {
+        auto s = to_abs_string(std::filesystem::path{r});
+        if (!s.empty() && std::ranges::find(abs_readable, s) == abs_readable.end()) {
+            abs_readable.push_back(std::move(s));
+        }
+    }
+    std::vector<std::string> abs_writable;
+    for (const auto& w : opts.writable) {
+        auto s = to_abs_string(std::filesystem::path{w});
+        if (!s.empty() && std::ranges::find(abs_writable, s) == abs_writable.end()) {
+            abs_writable.push_back(std::move(s));
+        }
+    }
+
     const std::int64_t starttime = read_proc_starttime(active_pid);
     std::ostringstream out;
     out << "{\n"
         << "  \"name\": " << json_escape(name) << ",\n"
-        << "  \"workspace\": " << json_escape(opts.workspace ? opts.workspace->string() : "")
-        << ",\n"
+        << "  \"workspace\": " << json_escape(abs_workspace) << ",\n"
         << "  \"agent\": " << json_escape(driver) << ",\n"
-        << "  \"readable\": " << json_string_array(opts.readable) << ",\n"
-        << "  \"writable\": " << json_string_array(opts.writable) << ",\n"
+        << "  \"readable\": " << json_string_array(abs_readable) << ",\n"
+        << "  \"writable\": " << json_string_array(abs_writable) << ",\n"
         << "  \"env\": " << json_string_array(opts.environment_names) << ",\n"
         << "  \"upstreams\": " << json_string_array(upstreams) << ",\n"
         << "  \"allow\": " << json_string_array(opts.allow) << ",\n"
