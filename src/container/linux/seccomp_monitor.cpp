@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -170,10 +171,13 @@ struct seccomp_escape_monitor::implementation final {
     int stop_read_fd = -1;
     int stop_write_fd = -1;
     ::pid_t child_pid = -1;
+    notif_pair_guard buffers;
     seccomp_escape_callback on_escape;
     seccomp_kill_callback kill_container;
     std::atomic<bool> escape_detected{false};
     mutable std::mutex mutex;
+    std::condition_variable ready_cv;
+    bool ready = false;
     std::string detected_syscall;
     std::thread worker;
 
@@ -195,12 +199,26 @@ struct seccomp_escape_monitor::implementation final {
         }
     }
 
-    void run() noexcept {
-        notif_pair_guard buffers;
-        if (::seccomp_notify_alloc(&buffers.req, &buffers.resp) != 0 || buffers.req == nullptr ||
-            buffers.resp == nullptr) {
-            return;
+    void terminate_sandbox(::pid_t offending_pid = -1) noexcept {
+        if (kill_container) {
+            try {
+                kill_container();
+            } catch (...) {}
         }
+        if (offending_pid > 0) {
+            (void)::kill(offending_pid, SIGKILL);
+        }
+        if (child_pid > 0) {
+            (void)::kill(child_pid, SIGKILL);
+        }
+    }
+
+    void run() noexcept {
+        {
+            const std::lock_guard lock{mutex};
+            ready = true;
+        }
+        ready_cv.notify_all();
 
         std::array<::pollfd, 2> pfds{{
             {.fd = notif_fd, .events = POLLIN, .revents = 0},
@@ -210,11 +228,12 @@ struct seccomp_escape_monitor::implementation final {
         for (;;) {
             pfds[0].revents = 0;
             pfds[1].revents = 0;
-            const int ready = ::poll(pfds.data(), pfds.size(), -1);
-            if (ready < 0) {
+            const int ready_count = ::poll(pfds.data(), pfds.size(), -1);
+            if (ready_count < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
+                terminate_sandbox();
                 break;
             }
             if ((pfds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
@@ -226,35 +245,31 @@ struct seccomp_escape_monitor::implementation final {
                     if (rc == -EINTR || rc == -ENOENT) {
                         continue;
                     }
+                    terminate_sandbox();
                     break;
                 }
                 if (::seccomp_notify_id_valid(notif_fd, buffers.req->id) != 0) {
                     continue;
                 }
-                const std::string syscall_name = describe_syscall(*buffers.req);
                 escape_detected.store(true, std::memory_order_release);
-                {
+                terminate_sandbox(static_cast<::pid_t>(buffers.req->pid));
+                std::string syscall_name;
+                try {
+                    syscall_name = describe_syscall(*buffers.req);
                     const std::lock_guard lock{mutex};
                     if (detected_syscall.empty()) {
                         detected_syscall = syscall_name;
                     }
-                }
-                if (kill_container) {
-                    try {
-                        kill_container();
-                    } catch (...) {}
-                }
-                if (buffers.req->pid > 0) {
-                    (void)::kill(static_cast<::pid_t>(buffers.req->pid), SIGKILL);
-                }
-                if (child_pid > 0) {
-                    (void)::kill(child_pid, SIGKILL);
+                } catch (...) {
+                    syscall_name.clear();
                 }
                 if (on_escape) {
                     try {
                         on_escape(
                             seccomp_escape_info{
-                                .syscall_name = syscall_name,
+                                .syscall_name = syscall_name.empty()
+                                                    ? std::string{"seccomp_trapped_syscall"}
+                                                    : syscall_name,
                                 .pid = static_cast<::pid_t>(buffers.req->pid),
                             }
                         );
@@ -267,7 +282,11 @@ struct seccomp_escape_monitor::implementation final {
                 (void)::seccomp_notify_respond(notif_fd, buffers.resp);
                 continue;
             }
-            if ((pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            if ((pfds[0].revents & (POLLERR | POLLNVAL)) != 0) {
+                terminate_sandbox();
+                break;
+            }
+            if ((pfds[0].revents & POLLHUP) != 0) {
                 break;
             }
         }
@@ -301,10 +320,18 @@ auto seccomp_escape_monitor::start(
     impl->child_pid = child_pid;
     impl->on_escape = std::move(on_escape);
     impl->kill_container = std::move(kill_container);
+    if (::seccomp_notify_alloc(&impl->buffers.req, &impl->buffers.resp) != 0 ||
+        impl->buffers.req == nullptr || impl->buffers.resp == nullptr) {
+        return std::unexpected(std::string{"seccomp_notify_alloc failed"});
+    }
     try {
         impl->worker = std::thread{[raw = impl.get()] { raw->run(); }};
     } catch (const std::system_error& err) {
         return std::unexpected(std::string{"start seccomp_escape_monitor: "} + err.what());
+    }
+    {
+        std::unique_lock lock{impl->mutex};
+        impl->ready_cv.wait(lock, [&] { return impl->ready; });
     }
     return std::unique_ptr<seccomp_escape_monitor>{new seccomp_escape_monitor{std::move(impl)}};
 }
