@@ -1,6 +1,6 @@
 // End-to-end invariants for `glove shell` and `glove loop`:
 // 1. `glove shell` without `--workspace` creates an ephemeral private runtime dir.
-// 2. `glove shell --workspace <missing>` fails closed without auto-creating it.
+// 2. `glove shell --workspace <missing>` auto-creates the workspace directory.
 // 3. `glove loop` reads `@prompt`, runs `--verify` offline inside the sandbox,
 //    feeds verification failure output into the next turn, and exits 0 when
 //    verification passes.
