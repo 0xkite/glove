@@ -96,9 +96,18 @@ auto resolve_absolute(std::filesystem::path path) -> std::expected<std::string, 
 }
 
 auto append_selected_environment(
-    glove::container::profile& profile, const std::vector<std::string>& names
+    glove::container::profile& profile,
+    const std::vector<std::string>& names,
+    const std::vector<std::string>& extra_path_dirs
 ) -> std::expected<void, std::string> {
-    profile.environment = {"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "TERM=xterm-256color"};
+    std::string path_entry = "PATH=";
+    for (const auto& dir : extra_path_dirs) {
+        if (!dir.empty()) {
+            path_entry += dir + ":";
+        }
+    }
+    path_entry += "/usr/bin:/bin:/usr/sbin:/sbin";
+    profile.environment = {std::move(path_entry), "TERM=xterm-256color"};
     for (const auto& name : names) {
         if (name.empty() || name.find('=') != std::string::npos) {
             return std::unexpected(std::string{"--env requires a variable name, not NAME=VALUE"});
@@ -139,7 +148,8 @@ auto build_profile(const options& opts, const std::filesystem::path& runtime_roo
     -> std::expected<glove::container::profile, std::string> {
     glove::container::profile profile;
     profile.allow_loopback_listen = opts.allow_loopback_listen;
-    if (auto environment = append_selected_environment(profile, opts.environment_names);
+    if (auto environment =
+            append_selected_environment(profile, opts.environment_names, opts.extra_path_dirs);
         !environment) {
         return std::unexpected(environment.error());
     }
