@@ -370,6 +370,37 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
              }) {
             copy_regular_file_0600(host_pi_dir / name, guest_pi_dir / name, true);
         }
+        // Rewrite host-relative `../../` package paths in the staged guest
+        // `settings.json` (which on the host sit under `<HOME>/.pi/agent`) so
+        // local packages like `../../Documents/depend/dotfiles/pi/.pi/agent/packages/lsp-pi-cpp`
+        // resolve from the ephemeral guest `PI_CODING_AGENT_DIR`.
+        {
+            const auto guest_settings = guest_pi_dir / "settings.json";
+            std::ifstream settings_in(guest_settings, std::ios::binary);
+            if (settings_in) {
+                std::string settings_text((std::istreambuf_iterator<char>(settings_in)), {});
+                settings_in.close();
+                const std::string needle = "\"../../";
+                const std::string replacement = "\"" + host_home.string() + "/";
+                std::size_t pos = 0;
+                bool modified = false;
+                while ((pos = settings_text.find(needle, pos)) != std::string::npos) {
+                    settings_text.replace(pos, needle.size(), replacement);
+                    pos += replacement.size();
+                    modified = true;
+                }
+                if (modified) {
+                    const int sfd = ::open(
+                        guest_settings.c_str(), O_WRONLY | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600
+                    );
+                    if (sfd >= 0) {
+                        (void)::write(sfd, settings_text.data(), settings_text.size());
+                        (void)::fchmod(sfd, 0600);
+                        (void)::close(sfd);
+                    }
+                }
+            }
+        }
         const auto guest_auth = guest_pi_dir / "auth.json";
         if (!opts.agent_preset.has_value() && !opts.egress.empty()) {
             // When direct provider egress is explicitly enabled without a
@@ -402,11 +433,12 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
         profile.environment.push_back("PI_CODING_AGENT_DIR=" + guest_pi_dir.string());
     }
 
-    // Symlink read-only Sage config and skill libraries into the guest HOME so
-    // agent plugins invoking `sage` can read local libraries without mutating them.
+    // Symlink read-only Sage config, skill libraries, and rustup toolchains
+    // into the guest HOME so agent plugins and Rust tools (`cargo`/`rustc`) work offline.
     for (const auto& rel : {
              std::filesystem::path{".config"} / "sage",
              std::filesystem::path{".local"} / "share" / "sage",
+             std::filesystem::path{".rustup"},
          }) {
         const auto src_dir = host_home / rel;
         const auto dst_link = guest_home / rel;
@@ -415,6 +447,10 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
             std::filesystem::create_directories(dst_link.parent_path(), ec);
             std::filesystem::create_directory_symlink(src_dir, dst_link, ec);
         }
+    }
+    if (const auto rustup_dir = host_home / ".rustup";
+        std::filesystem::is_directory(rustup_dir, ec) && !ec) {
+        profile.environment.push_back("RUSTUP_HOME=" + rustup_dir.string());
     }
 
     const auto host_agy_dir = host_home / ".gemini" / "antigravity-cli";
@@ -567,12 +603,48 @@ auto build_registry(const std::vector<upstream_spec>& upstreams)
     return registry;
 }
 
-auto build_audit_sink(const std::optional<std::filesystem::path>& path)
-    -> std::expected<std::shared_ptr<glove::audit::sink>, std::string> {
-    if (!path) {
-        return glove::audit::make_memory_sink();
+auto build_audit_sink(
+    const std::optional<std::filesystem::path>& path, const glove::container::profile& profile
+) -> std::expected<std::shared_ptr<glove::audit::sink>, std::string> {
+    if (path) {
+        return glove::audit::make_jsonl_sink(*path);
     }
-    return glove::audit::make_jsonl_sink(*path);
+    // Default to a host state log file (`<XDG_STATE_HOME>/glove/logs/session.jsonl`)
+    // when outside every agent-visible path so launch/egress/MCP audit events are
+    // persisted without writing to the interactive terminal.
+    std::optional<std::filesystem::path> state_base;
+    if (const char* xdg_state = std::getenv("XDG_STATE_HOME");
+        xdg_state != nullptr && *xdg_state == '/') {
+        state_base = std::filesystem::path{xdg_state} / "glove" / "logs";
+    } else if (const char* home = std::getenv("HOME"); home != nullptr && *home == '/') {
+        state_base = std::filesystem::path{home} / ".local" / "state" / "glove" / "logs";
+    }
+    if (state_base) {
+        std::error_code ec;
+        std::filesystem::create_directories(*state_base, ec);
+        if (!ec) {
+            std::filesystem::permissions(
+                *state_base,
+                std::filesystem::perms::owner_all,
+                std::filesystem::perm_options::replace,
+                ec
+            );
+            const auto default_log = *state_base / "session.jsonl";
+            bool exposed = false;
+            for (const auto& rule : profile.filesystem) {
+                if (path_within(default_log, std::filesystem::path{rule.path})) {
+                    exposed = true;
+                    break;
+                }
+            }
+            if (!exposed) {
+                if (auto file_sink = glove::audit::make_jsonl_sink(default_log)) {
+                    return file_sink;
+                }
+            }
+        }
+    }
+    return glove::audit::make_memory_sink();
 }
 
 auto record(
@@ -612,17 +684,8 @@ auto start_egress(
                                           : glove::mcp::tool_call_status::invalid_arguments;
         if (auto audited = record(sink, glove::audit::action::egress, target, status, event.detail);
             !audited) {
-            std::fprintf(stderr, "glove audit: %s\n", audited.error().c_str());
             return std::unexpected(audited.error());
         }
-        std::fprintf(
-            stderr,
-            "glove egress: %s %s%s%s\n",
-            event.allowed ? "ALLOW" : "DENY",
-            target.c_str(),
-            event.detail.empty() ? "" : " — ",
-            event.detail.c_str()
-        );
         return {};
     };
     auto proxy = glove::net::start_egress_proxy(std::move(proxy_options));
@@ -773,14 +836,6 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
                 record(sink, glove::audit::action::egress, subject, status, event.detail);
             !audited) {
             return std::unexpected(audited.error());
-        }
-        if (!event.allowed) {
-            std::fprintf(
-                stderr,
-                "glove credential proxy: DENY %s — %s\n",
-                subject.c_str(),
-                event.detail.c_str()
-            );
         }
         return {};
     };
@@ -1259,7 +1314,7 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (!audit_path) {
         return std::unexpected(audit_path.error());
     }
-    auto sink = build_audit_sink(*audit_path);
+    auto sink = build_audit_sink(*audit_path, *profile);
     if (!sink) {
         return std::unexpected(sink.error());
     }
@@ -1327,7 +1382,7 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     if (!audit_path) {
         return std::unexpected(audit_path.error());
     }
-    auto sink = build_audit_sink(*audit_path);
+    auto sink = build_audit_sink(*audit_path, *profile);
     if (!sink) {
         return std::unexpected(sink.error());
     }
