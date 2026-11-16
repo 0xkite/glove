@@ -13,10 +13,12 @@
 
 #include <glaze/glaze.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <expected>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -95,8 +97,17 @@ public:
         }
         const auto& obj = doc.get_object();
         const auto it = obj.find("path");
-        if (it == obj.end() || !it->second.is_string() ||
-            !it->second.get_string().starts_with("/workspace/")) {
+        if (it == obj.end() || !it->second.is_string()) {
+            std::abort();
+        }
+        auto candidate = std::filesystem::path{it->second.get_string()}.lexically_normal();
+        if (!candidate.has_filename() && candidate != candidate.root_path()) {
+            candidate = candidate.parent_path();
+        }
+        const std::filesystem::path root{"/workspace"};
+        const auto mismatch =
+            std::mismatch(root.begin(), root.end(), candidate.begin(), candidate.end());
+        if (!candidate.is_absolute() || mismatch.first != root.end()) {
             std::abort();
         }
         return glove::mcp::tool_call_result{

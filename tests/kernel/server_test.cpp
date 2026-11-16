@@ -85,8 +85,8 @@ public:
             return glove::mcp::tool_call_result{
                 .status = glove::mcp::tool_call_status::ok,
                 .content = "ok",
-                .structured_json =
-                    "{\n  \"nested\": {\n    \"ok\": true,\n    \"msg\": \"hi\\u0001\"\n  }\n}",
+                .structured_json = "{\n  \"nested\": {\n    \"ok\": true,\n    \"exact\": "
+                                   "9007199254740993,\n    \"msg\": \"hi\\u0001\"\n  }\n}",
                 .error_message = "",
             };
         }
@@ -243,6 +243,7 @@ auto run_raw_json_normalization() -> int {
     reply = agent.recv();
     REQUIRE(reply.has_value());
     REQUIRE(reply->find('\n') == std::string::npos);
+    REQUIRE(reply->find(R"("exact":9007199254740993)") != std::string::npos);
     REQUIRE(reply->find(R"("nested":{"ok":true)") != std::string::npos);
 
     REQUIRE(

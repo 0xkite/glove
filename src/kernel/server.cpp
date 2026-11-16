@@ -50,18 +50,19 @@ auto write_json_safe(const auto& value) -> std::expected<std::string, std::strin
 }
 
 auto normalize_raw_json(std::string_view raw) -> std::expected<glz::raw_json, std::string> {
-    glz::generic parsed;
     std::string buf{raw};
-    if (auto ec = glz::read_json(parsed, buf); ec) {
+    if (auto ec = glz::validate_json(buf); ec) {
         return std::unexpected(
             std::string{"invalid raw JSON fragment: "} + glz::format_error(ec, buf)
         );
     }
-    auto compact = write_json_safe(parsed);
-    if (!compact) {
-        return std::unexpected(compact.error());
+    auto compact = glz::minify_json(buf);
+    if (std::any_of(compact.begin(), compact.end(), [](unsigned char ch) { return ch < 0x20U; })) {
+        return std::unexpected(
+            std::string{"invalid raw JSON fragment: unescaped control character"}
+        );
     }
-    return glz::raw_json{std::move(*compact)};
+    return glz::raw_json{std::move(compact)};
 }
 
 auto encode_initialize_response(std::int64_t id, const server_identity& self)
