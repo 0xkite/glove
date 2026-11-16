@@ -8,6 +8,8 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -18,6 +20,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <expected>
 #include <filesystem>
 #include <fstream>
@@ -339,6 +342,97 @@ auto parse_sandbox_flag(
         i += 2;
         return 0;
     }
+    if (a == "--upstream") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --upstream needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        auto spec = parse_upstream(args[i + 1]);
+        if (!spec) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: %s\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data(),
+                spec.error().c_str()
+            );
+            return 2;
+        }
+        opts.upstreams.push_back(std::move(*spec));
+        i += 2;
+        return 0;
+    }
+    if (a == "--allow") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --allow needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        opts.allow.emplace_back(args[i + 1]);
+        i += 2;
+        return 0;
+    }
+    if (a == "--allow-arg") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --allow-arg needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        auto rule = parse_allow_arg(args[i + 1]);
+        if (!rule) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: %s\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data(),
+                rule.error().c_str()
+            );
+            return 2;
+        }
+        opts.prefix_rules.push_back(std::move(*rule));
+        i += 2;
+        return 0;
+    }
+    if (a == "--bridge-port") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --bridge-port needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        int port_val = 0;
+        const std::string_view pstr{args[i + 1]};
+        const auto [ptr, ec] = std::from_chars(pstr.data(), pstr.data() + pstr.size(), port_val);
+        if (pstr.empty() || ec != std::errc{} || ptr != pstr.data() + pstr.size() || port_val < 1 ||
+            port_val > 65535) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --bridge-port must be an integer in [1, 65535]\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        opts.bridge_port = static_cast<std::uint16_t>(port_val);
+        i += 2;
+        return 0;
+    }
     return std::nullopt;
 }
 
@@ -502,6 +596,7 @@ auto resolve_harness_executable(std::string_view name) -> std::optional<std::fil
 auto attach_agent_harness_closure(
     glove::run::options& opts, std::string_view driver, std::optional<std::string_view> cmd_override
 ) -> std::string {
+    opts.seed_guest_agent_home = true;
     std::error_code ec;
     std::string resolved_bin;
     if (cmd_override && !cmd_override->empty()) {
@@ -621,6 +716,7 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         ++i;
     }
 
+    const bool had_explicit_agent = opts.agent_preset.has_value();
     std::string driver = opts.agent_preset.value_or("");
     if (driver.empty()) {
         for (std::string_view candidate : {"pi", "agy", "claude", "codex"}) {
@@ -653,10 +749,12 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         opts.agent_preset.reset();
     }
 
-    const std::string resolved_bin =
-        driver.empty() ? std::string{} : attach_agent_harness_closure(opts, driver, std::nullopt);
+    const bool explicit_cmd = !trailing_args.empty() && !trailing_args.front().starts_with('-');
+    const std::string resolved_bin = (driver.empty() || (explicit_cmd && !had_explicit_agent))
+                                         ? std::string{}
+                                         : attach_agent_harness_closure(opts, driver, std::nullopt);
 
-    if (!trailing_args.empty() && !trailing_args.front().starts_with('-')) {
+    if (explicit_cmd) {
         // Explicit command after `--` (e.g. `glove shell -- /bin/sh -c ...`).
         opts.agent_argv = std::move(trailing_args);
     } else if (!resolved_bin.empty() && std::filesystem::path{resolved_bin}.is_absolute()) {
@@ -1123,6 +1221,88 @@ void print_usage() {
     );
 }
 
+auto mcp_bridge_subcommand(std::span<char* const> args) -> int {
+    std::string sock_path;
+    if (!args.empty()) {
+        sock_path = args[0];
+    } else if (const char* env_sock = std::getenv("GLOVE_MCP_SOCKET"); env_sock != nullptr) {
+        sock_path = env_sock;
+    }
+    if (sock_path.empty() || sock_path.size() >= sizeof(::sockaddr_un{}.sun_path)) {
+        std::fprintf(stderr, "glove mcp-bridge: missing or invalid socket path\n");
+        return 2;
+    }
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        std::fprintf(stderr, "glove mcp-bridge: socket: %s\n", std::strerror(errno));
+        return 1;
+    }
+    ::sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1U);
+    if (::connect(fd, reinterpret_cast<const ::sockaddr*>(&addr), sizeof(addr)) != 0) {
+        std::fprintf(
+            stderr, "glove mcp-bridge: connect(%s): %s\n", sock_path.c_str(), std::strerror(errno)
+        );
+        (void)::close(fd);
+        return 1;
+    }
+
+    std::array<::pollfd, 2> pfds{{
+        {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0},
+        {.fd = fd, .events = POLLIN, .revents = 0},
+    }};
+    std::array<char, 4096> buf{};
+    for (;;) {
+        const int ready = ::poll(pfds.data(), pfds.size(), -1);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pfds[0].fd >= 0 && (pfds[0].revents & (POLLIN | POLLHUP)) != 0) {
+            const ::ssize_t n = ::read(STDIN_FILENO, buf.data(), buf.size());
+            if (n <= 0) {
+                (void)::shutdown(fd, SHUT_WR);
+                pfds[0].fd = -1;
+                pfds[0].events = 0;
+                pfds[0].revents = 0;
+            } else {
+                std::size_t off = 0;
+                while (off < static_cast<std::size_t>(n)) {
+                    const ::ssize_t w = ::send(
+                        fd, buf.data() + off, static_cast<std::size_t>(n) - off, MSG_NOSIGNAL
+                    );
+                    if (w <= 0) {
+                        (void)::close(fd);
+                        return 0;
+                    }
+                    off += static_cast<std::size_t>(w);
+                }
+            }
+        }
+        if ((pfds[1].revents & (POLLIN | POLLHUP)) != 0) {
+            const ::ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+            if (n <= 0) {
+                break;
+            }
+            std::size_t off = 0;
+            while (off < static_cast<std::size_t>(n)) {
+                const ::ssize_t w =
+                    ::write(STDOUT_FILENO, buf.data() + off, static_cast<std::size_t>(n) - off);
+                if (w <= 0) {
+                    (void)::close(fd);
+                    return 0;
+                }
+                off += static_cast<std::size_t>(w);
+            }
+        }
+    }
+    (void)::close(fd);
+    return 0;
+}
+
 } // namespace
 
 auto main(int argc, char** argv) -> int {
@@ -1131,6 +1311,11 @@ auto main(int argc, char** argv) -> int {
         return 0;
     }
     std::string_view sub{argv[1]};
+    if (sub == "mcp-bridge") {
+        return mcp_bridge_subcommand(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
     if (sub == "-V" || sub == "--version") {
         std::printf("glove %.*s\n", static_cast<int>(glove::version.size()), glove::version.data());
         return 0;
