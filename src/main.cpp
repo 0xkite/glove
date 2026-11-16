@@ -1546,9 +1546,23 @@ auto run_sandbox_verify(
     const glove::run::options& base_opts, const std::string& verify_cmd, int timeout_seconds
 ) -> std::expected<verify_outcome, std::string> {
     int pipe_fd[2] = {-1, -1};
+#if defined(__linux__)
     if (::pipe2(pipe_fd, O_CLOEXEC) != 0) {
         return std::unexpected(std::string{"pipe failed for --verify"});
     }
+#else
+    if (::pipe(pipe_fd) != 0) {
+        return std::unexpected(std::string{"pipe failed for --verify"});
+    }
+    for (const int fd : pipe_fd) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+            (void)::close(pipe_fd[0]);
+            (void)::close(pipe_fd[1]);
+            return std::unexpected(std::string{"fcntl(FD_CLOEXEC) failed for --verify"});
+        }
+    }
+#endif
     const ::pid_t child = ::fork();
     if (child < 0) {
         ::close(pipe_fd[0]);

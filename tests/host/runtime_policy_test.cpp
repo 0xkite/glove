@@ -710,7 +710,7 @@ auto run() -> int {
         ) != std::filesystem::canonical(managed_script)
     );
 
-    const auto xdg_root = std::filesystem::temp_directory_path() /
+    const auto xdg_root = std::filesystem::canonical(std::filesystem::temp_directory_path()) /
                           ("glove-xdg-policy-test-" + std::to_string(::getpid()));
     std::filesystem::remove_all(xdg_root);
     const glove::host::directories xdg_dirs{
