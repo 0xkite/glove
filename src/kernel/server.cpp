@@ -49,6 +49,21 @@ auto write_json_safe(const auto& value) -> std::expected<std::string, std::strin
     return std::move(*encoded);
 }
 
+auto normalize_raw_json(std::string_view raw) -> std::expected<glz::raw_json, std::string> {
+    glz::generic parsed;
+    std::string buf{raw};
+    if (auto ec = glz::read_json(parsed, buf); ec) {
+        return std::unexpected(
+            std::string{"invalid raw JSON fragment: "} + glz::format_error(ec, buf)
+        );
+    }
+    auto compact = write_json_safe(parsed);
+    if (!compact) {
+        return std::unexpected(compact.error());
+    }
+    return glz::raw_json{std::move(*compact)};
+}
+
 auto encode_initialize_response(std::int64_t id, const server_identity& self)
     -> std::expected<std::string, std::string> {
     glove::mcp::mcp_initialize_result result;
@@ -73,8 +88,17 @@ auto encode_tools_list_response(
         glove::mcp::mcp_tool_def def;
         def.name = t.name;
         def.description = t.description;
-        def.inputSchema =
-            glz::raw_json{t.input_schema_json.empty() ? std::string{"{}"} : t.input_schema_json};
+        if (t.input_schema_json.empty()) {
+            def.inputSchema = glz::raw_json{std::string{"{}"}};
+        } else {
+            auto normalized = normalize_raw_json(t.input_schema_json);
+            if (!normalized) {
+                return glove::mcp::codec::encode_response_with_error(
+                    id, err_internal_error, normalized.error()
+                );
+            }
+            def.inputSchema = std::move(*normalized);
+        }
         if (t.annotations.has_annotations) {
             glove::mcp::mcp_tool_annotations ann;
             ann.readOnlyHint = t.annotations.read_only_hint;
@@ -102,7 +126,13 @@ auto encode_tools_call_response(std::int64_t id, const glove::mcp::tool_call_res
         wire.isError && !result.error_message.empty() ? result.error_message : result.content;
     wire.content.push_back(std::move(block));
     if (!result.structured_json.empty()) {
-        wire.structuredContent = glz::raw_json{result.structured_json};
+        auto normalized = normalize_raw_json(result.structured_json);
+        if (!normalized) {
+            return glove::mcp::codec::encode_response_with_error(
+                id, err_internal_error, normalized.error()
+            );
+        }
+        wire.structuredContent = std::move(*normalized);
     }
     auto encoded = write_json_safe(wire);
     if (!encoded) {
