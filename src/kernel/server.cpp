@@ -33,6 +33,22 @@ constexpr std::int64_t err_method_not_found = -32601;
 constexpr std::int64_t err_invalid_params = -32602;
 constexpr std::int64_t err_internal_error = -32603;
 
+struct safe_write_opts_t : glz::opts {
+    bool escape_control_characters = true;
+};
+
+constexpr safe_write_opts_t safe_write_opts{};
+
+auto write_json_safe(const auto& value) -> std::expected<std::string, std::string> {
+    auto encoded = glz::write<safe_write_opts>(value);
+    if (!encoded) {
+        return std::unexpected(
+            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
+        );
+    }
+    return std::move(*encoded);
+}
+
 auto encode_initialize_response(std::int64_t id, const server_identity& self)
     -> std::expected<std::string, std::string> {
     glove::mcp::mcp_initialize_result result;
@@ -41,11 +57,9 @@ auto encode_initialize_response(std::int64_t id, const server_identity& self)
     result.serverInfo.version = self.version;
     result.capabilities = glz::raw_json{R"({"tools":{}})"};
 
-    auto encoded = glz::write_json(result);
+    auto encoded = write_json_safe(result);
     if (!encoded) {
-        return std::unexpected(
-            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
-        );
+        return std::unexpected(encoded.error());
     }
     return glove::mcp::codec::encode_response_with_result(id, *encoded);
 }
@@ -71,11 +85,9 @@ auto encode_tools_list_response(
         }
         wire.tools.push_back(std::move(def));
     }
-    auto encoded = glz::write_json(wire);
+    auto encoded = write_json_safe(wire);
     if (!encoded) {
-        return std::unexpected(
-            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
-        );
+        return std::unexpected(encoded.error());
     }
     return glove::mcp::codec::encode_response_with_result(id, *encoded);
 }
@@ -92,11 +104,9 @@ auto encode_tools_call_response(std::int64_t id, const glove::mcp::tool_call_res
     if (!result.structured_json.empty()) {
         wire.structuredContent = glz::raw_json{result.structured_json};
     }
-    auto encoded = glz::write_json(wire);
+    auto encoded = write_json_safe(wire);
     if (!encoded) {
-        return std::unexpected(
-            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
-        );
+        return std::unexpected(encoded.error());
     }
     return glove::mcp::codec::encode_response_with_result(id, *encoded);
 }

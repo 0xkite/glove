@@ -43,10 +43,11 @@ Run the change-apply journal target the same way, substituting
 Run the library-bundle target the same way, substituting
 `fuzz/corpus/library_bundle` and `glove_library_bundle_fuzzer`.
 
-Run the HTTP syntax, egress CONNECT proxy, and container profile fuzzers the
-same way, substituting `http_syntax`/`glove_http_syntax_fuzzer`,
-`egress_proxy`/`glove_egress_proxy_fuzzer`, and
-`container_profile`/`glove_container_profile_fuzzer`.
+Run the HTTP syntax, egress CONNECT proxy, container profile, and tool kernel
+fuzzers the same way, substituting `http_syntax`/`glove_http_syntax_fuzzer`,
+`egress_proxy`/`glove_egress_proxy_fuzzer`,
+`container_profile`/`glove_container_profile_fuzzer`, and
+`kernel_server`/`glove_kernel_server_fuzzer`.
 
 Crashes, sanitizer findings, or timeouts are failures. Minimize a reproducer
 before adding it to the checked corpus, and give each retained input a

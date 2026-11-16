@@ -144,6 +144,17 @@ auto run() -> int {
     REQUIRE(reply->find("\"id\":5") != std::string::npos);
     REQUIRE(reply->find("-32601") != std::string::npos);
 
+    // unknown method with quotes/backslashes/control escapes must still produce valid
+    // single-line JSON-RPC error without dropping the session.
+    REQUIRE(
+        agent.send(R"({"jsonrpc":"2.0","id":6,"method":"bad\\method\"name\n\u0000"})").has_value()
+    );
+    reply = agent.recv();
+    REQUIRE(reply.has_value());
+    REQUIRE(reply->find("\"id\":6") != std::string::npos);
+    REQUIRE(reply->find("-32601") != std::string::npos);
+    REQUIRE(reply->find('\n') == std::string::npos);
+
     // notification: no response should appear.
     REQUIRE(agent.send(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").has_value());
 

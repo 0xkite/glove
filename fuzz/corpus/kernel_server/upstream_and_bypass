@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"upstream.echo","arguments":{"msg":"hi"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fs.read_file","arguments":{"path":"/workspace/../etc/passwd"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fs.read_file","arguments":null}}
+{"jsonrpc":"2.0","id":5,"method":"unknown/method","params":{}}
+{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"ok","inputSchema":{"type":"object"}},{"name":"secret","description":"hidden","inputSchema":{}}]}}
+{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong"}],"structuredContent":{"ok":true},"isError":false}}

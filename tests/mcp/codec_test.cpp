@@ -201,6 +201,22 @@ auto test_parse_call_result_structured_content() -> int {
     return 0;
 }
 
+auto test_encode_response_with_error_escapes_special_and_control_bytes() -> int {
+    using namespace std::string_view_literals;
+    const std::string raw = std::string{"bad \"quote\" \\ slash \n line \x01"} + '\0' + "end";
+    auto frame = glove::mcp::codec::encode_response_with_error(42, -32601, raw);
+    REQUIRE(frame.has_value());
+    REQUIRE(frame->find('\n') == std::string::npos);
+    REQUIRE(frame->find('\0') == std::string::npos);
+    auto decoded = glove::mcp::codec::decode_response(*frame);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->id == 42);
+    REQUIRE(decoded->error.has_value());
+    REQUIRE(decoded->error->code == -32601);
+    REQUIRE(decoded->error->message == raw);
+    return 0;
+}
+
 } // namespace
 
 auto main() -> int {
@@ -244,6 +260,9 @@ auto main() -> int {
         return 1;
     }
     if (test_parse_prompts_list() != 0) {
+        return 1;
+    }
+    if (test_encode_response_with_error_escapes_special_and_control_bytes() != 0) {
         return 1;
     }
     return 0;
