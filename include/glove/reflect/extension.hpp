@@ -6,28 +6,28 @@
 // directly to `glove::kernel::registry` and MCP `tools/list` / `tools/call` without
 // hand-written JSON-Schema strings or manual argument deserialization.
 
-#if defined(GLOVE_HAS_REFLECTION)
+#include "glove/kernel/extension.hpp"
+#include "glove/mcp/messages.hpp"
+#include "glove/reflect/codegen.hpp"
+#include "glove/reflect/json_codec.hpp"
 
-#    include "glove/kernel/extension.hpp"
-#    include "glove/mcp/messages.hpp"
-#    include "glove/reflect/codegen.hpp"
-#    include "glove/reflect/json_codec.hpp"
-
-#    include <concepts>
-#    include <cstdint>
-#    include <expected>
-#    include <functional>
-#    include <limits>
-#    include <optional>
-#    include <string>
-#    include <string_view>
-#    include <type_traits>
-#    include <unordered_map>
-#    include <utility>
-#    include <variant>
-#    include <vector>
+#include <concepts>
+#include <cstdint>
+#include <expected>
+#include <functional>
+#include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace glove::reflect {
+
+#if defined(GLOVE_HAS_REFLECTION)
 namespace detail {
 
 template<class TargetT>
@@ -150,21 +150,32 @@ template<class ArgsT>
 }
 
 } // namespace detail
+#endif // GLOVE_HAS_REFLECTION
 
 class reflected_extension final : public glove::kernel::extension {
 public:
+    using handler_t =
+        std::function<std::expected<glove::mcp::tool_call_result, std::string>(std::string_view)>;
+
     explicit reflected_extension(std::string name) : name_{std::move(name)} {}
 
-    template<class ArgsT, class HandlerFn>
-    auto add_tool(HandlerFn&& handler) -> std::expected<void, std::string> {
-        auto descriptor = descriptor_of<ArgsT>();
+    auto add_descriptor_tool(glove::mcp::tool_descriptor descriptor, handler_t handler)
+        -> std::expected<void, std::string> {
         const std::string tool_name = descriptor.name;
         if (handlers_.contains(tool_name)) {
             return std::unexpected("duplicate reflected tool: " + tool_name);
         }
         descriptors_.push_back(std::move(descriptor));
-        handlers_.emplace(
-            tool_name,
+        handlers_.emplace(tool_name, std::move(handler));
+        return {};
+    }
+
+#if defined(GLOVE_HAS_REFLECTION)
+    template<class ArgsT, class HandlerFn>
+    auto add_tool(HandlerFn&& handler) -> std::expected<void, std::string> {
+        auto descriptor = descriptor_of<ArgsT>();
+        return add_descriptor_tool(
+            std::move(descriptor),
             [fn = std::forward<HandlerFn>(handler)](std::string_view arguments_json)
                 -> std::expected<glove::mcp::tool_call_result, std::string> {
                 auto parsed = detail::decode_reflected_args<ArgsT>(arguments_json);
@@ -179,8 +190,8 @@ public:
                 return fn(*parsed);
             }
         );
-        return {};
     }
+#endif
 
     auto name() const -> std::string_view override { return name_; }
 
@@ -203,14 +214,9 @@ public:
     }
 
 private:
-    using handler_t =
-        std::function<std::expected<glove::mcp::tool_call_result, std::string>(std::string_view)>;
-
     std::string name_;
     std::vector<glove::mcp::tool_descriptor> descriptors_;
     std::unordered_map<std::string, handler_t> handlers_;
 };
 
 } // namespace glove::reflect
-
-#endif // GLOVE_HAS_REFLECTION

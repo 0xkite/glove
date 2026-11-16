@@ -58,6 +58,12 @@ struct options {
     // Extra directories prepended to PATH inside the sandbox (used when
     // mounting an agent harness closure for `glove shell` / `glove loop`).
     std::vector<std::string> extra_path_dirs;
+    // Optional plain host-loopback TCP port bridged into the sandbox's private
+    // 127.0.0.1 (e.g. 8080 for a local llama.cpp server in Pi's models.json).
+    std::optional<std::uint16_t> bridge_port;
+    // Materialize guest agent configuration (e.g. ~/.pi/agent/models.json and
+    // settings.json) into the private sandbox HOME directory.
+    bool seed_guest_agent_home = false;
 };
 
 // Run the contained agent end-to-end: build the profile, spawn the agent,
