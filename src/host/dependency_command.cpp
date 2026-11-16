@@ -77,26 +77,30 @@ struct spawn_configuration {
     }
 };
 
-auto child_is_terminal(pid_t process) noexcept -> bool {
+auto child_is_terminal(pid_t process, bool wait_if_exiting = false) noexcept -> bool {
     siginfo_t observation{};
-    return ::waitid(P_PID, static_cast<id_t>(process), &observation, WEXITED | WNOHANG | WNOWAIT) ==
-               0 &&
-           observation.si_pid == process;
+    const int flags = WEXITED | WNOWAIT | (wait_if_exiting ? 0 : WNOHANG);
+    int rc = -1;
+    do {
+        rc = ::waitid(P_PID, static_cast<id_t>(process), &observation, flags);
+    } while (rc < 0 && errno == EINTR);
+    return rc == 0 && observation.si_pid == process;
 }
 
 auto sole_exited_group_leader(pid_t process) noexcept -> bool {
 #if defined(__APPLE__)
-    // Darwin killpg reports EPERM for a zombie-only group. Accept that case
-    // only when our unreaped child is terminal and the entire bounded group
-    // listing contains that child alone. Unknown/live members remain errors.
-    if (!child_is_terminal(process)) {
+    // Darwin killpg/kill can report EPERM while a child is mid-exit (P_WEXIT) or
+    // for a zombie-only group. Wait for our still-unreaped child to finish
+    // entering the exited state (without reaping it) and verify no other live
+    // members remain in the group.
+    if (!child_is_terminal(process, true)) {
         return false;
     }
     std::array<pid_t, 2> members{};
     const int bytes = ::proc_listpids(
         PROC_PGRP_ONLY, static_cast<std::uint32_t>(process), members.data(), sizeof(members)
     );
-    return bytes == static_cast<int>(sizeof(pid_t)) && members.front() == process;
+    return bytes == 0 || (bytes == static_cast<int>(sizeof(pid_t)) && members.front() == process);
 #else
     (void)process;
     return false;
@@ -129,19 +133,21 @@ public:
         // Retain the unreaped leader through both signals: neither its PID
         // nor the original PGID can be recycled while we own this child wait.
         stopped_command result;
+        int raw_group_error = 0;
         if (::kill(-process_, SIGKILL) != 0) {
-            const int error = errno;
-            if (error != ESRCH && (error != EPERM || !sole_exited_group_leader(process_))) {
-                result.group_error = error;
-            }
+            raw_group_error = errno;
         }
         // A leader can leave its original group. Signal the still-owned
         // child directly as well; group ESRCH alone does not prove its death.
         if (::kill(process_, SIGKILL) != 0) {
             const int error = errno;
-            if (!child_is_terminal(process_)) {
+            if (!child_is_terminal(process_, error == EPERM)) {
                 result.leader_error = error;
             }
+        }
+        if (raw_group_error != 0 && raw_group_error != ESRCH &&
+            (raw_group_error != EPERM || !sole_exited_group_leader(process_))) {
+            result.group_error = raw_group_error;
         }
         pid_t waited = -1;
         do {

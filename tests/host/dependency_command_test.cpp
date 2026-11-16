@@ -99,6 +99,9 @@ auto command_cases(const std::filesystem::path& root) -> int {
         "/bin/sh", {"-c", "dd if=/dev/zero bs=1024 count=1025 2>/dev/null"}, 5s
     );
     REQUIRE(!overflow);
+    if (overflow.error().find("output limit") == std::string::npos) {
+        std::fprintf(stderr, "unexpected overflow error: %s\n", overflow.error().c_str());
+    }
     REQUIRE(overflow.error().find("output limit") != std::string::npos);
     for (const auto& script : {
              "exec /bin/sleep 10",
