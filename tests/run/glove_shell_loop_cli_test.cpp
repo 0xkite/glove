@@ -99,12 +99,13 @@ auto run() -> int {
         REQUIRE(!std::filesystem::exists(tmp_path, ec));
     }
 
-    // 2. Explicit missing `--workspace` must fail closed (never auto-create).
-    const auto missing_ws = base / "does-not-exist";
+    // 2. Explicit missing `--workspace` is auto-created by `glove shell`.
+    const auto auto_ws = base / "auto-created-workspace";
+    REQUIRE(!std::filesystem::exists(auto_ws, ec));
     REQUIRE(
-        run_glove({GLOVE_BIN, "shell", "--workspace", missing_ws.string(), "--", "/bin/true"}) != 0
+        run_glove({GLOVE_BIN, "shell", "--workspace", auto_ws.string(), "--", "/bin/true"}) == 0
     );
-    REQUIRE(!std::filesystem::exists(missing_ws, ec));
+    REQUIRE(std::filesystem::is_directory(auto_ws, ec));
 
     // 3. `glove loop` with `@prompt` file and `--verify` feedback across 2 turns.
     const auto prompt_file = base / "prompt.txt";

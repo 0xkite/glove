@@ -8,7 +8,7 @@ Glove provides these execution surfaces:
 | ------------- | ----------------------------------------------------------- | --------------------------- |
 | `glove run`   | Contain an agent and mediate MCP tool calls                 | Public CLI                  |
 | `glove exec`  | Contain a direct agent process                              | Public CLI                  |
-| `glove shell` | Interactive sandboxed workspace shell (`bash`/`sh` default) | Public CLI                  |
+| `glove shell` | Interactive sandboxed agent prompt TUI inside the workspace | Public CLI                  |
 | `glove loop`  | Seeded agent feedback loop with offline `--verify`          | Public CLI                  |
 | `glove pi`    | Native macOS Pi with host-only provider credentials         | Prototype CLI; unqualified installed compatibility |
 | `gloved`      | Validate Sage plans, persist sessions, and deliver receipts | Owner-local control service |

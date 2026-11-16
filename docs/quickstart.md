@@ -34,17 +34,18 @@ mkdir -p /tmp/glove-work
 Pass `--allow-loopback-listen` for runtimes (such as `agy`) that bind a
 private `127.0.0.1:0` socket inside the isolated network namespace.
 
-## Interactive workspace shell
+## Interactive agent workspace shell
 
 ```sh
 ./build/dev/src/glove shell --workspace /tmp/glove-work
 ```
 
-- When `-- <command argv>...` is omitted, `glove shell` defaults to `/bin/bash`
-  (or `/bin/sh`).
-- When `--workspace` is omitted, Glove creates an ephemeral private runtime
-  directory and removes it on exit. An explicit `--workspace` path must already
-  exist.
+- `glove shell` launches the interactive agent harness prompt (`--agent pi`,
+  `--agent agy`, `--agent claude`, or `--agent codex`, auto-detected when
+  omitted) directly inside the workspace with its runtime closure mounted.
+- When `--workspace` is provided and does not exist yet, `glove shell` creates
+  it automatically. When `--workspace` is omitted, Glove creates an ephemeral
+  private runtime directory and removes it on exit.
 
 ## Seeded agent feedback loop
 
