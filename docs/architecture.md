@@ -4,12 +4,14 @@
 
 Glove provides these execution surfaces:
 
-| Surface      | Purpose                                                     | Current boundary            |
-| ------------ | ----------------------------------------------------------- | --------------------------- |
-| `glove run`  | Contain an agent and mediate MCP tool calls                 | Public CLI                  |
-| `glove exec` | Contain a direct agent process                              | Public CLI                  |
-| `glove pi`   | Native macOS Pi with host-only provider credentials         | Prototype CLI; unqualified installed compatibility |
-| `gloved`     | Validate Sage plans, persist sessions, and deliver receipts | Owner-local control service |
+| Surface       | Purpose                                                     | Current boundary            |
+| ------------- | ----------------------------------------------------------- | --------------------------- |
+| `glove run`   | Contain an agent and mediate MCP tool calls                 | Public CLI                  |
+| `glove exec`  | Contain a direct agent process                              | Public CLI                  |
+| `glove shell` | Interactive sandboxed agent prompt TUI inside the workspace | Public CLI                  |
+| `glove loop`  | Seeded agent feedback loop with offline `--verify`          | Public CLI                  |
+| `glove pi`    | Native macOS Pi with host-only provider credentials         | Prototype CLI; unqualified installed compatibility |
+| `gloved`      | Validate Sage plans, persist sessions, and deliver receipts | Owner-local control service |
 
 The `run` and `exec` CLI surfaces support local containment. Native Pi has
 synthetic fixture coverage, not installed-harness or live-provider acceptance.
@@ -269,9 +271,12 @@ observed the response; that byte is never processed concurrently and the next
 request boundary still applies. A protocol that needs causal no-pipelining proof
 must add an explicit versioned credit or acknowledgement.
 
-`glove exec` bypasses the MCP kernel. It is intended for agents that manage
-their own tool protocol, so its security boundary is the OS sandbox and explicit
-filesystem/environment exposure.
+`glove exec`, `glove shell`, and `glove loop` bypass the MCP kernel. They are
+intended for interactive inspection or self-driving agents that manage their own
+tool protocol, so their security boundary is the OS sandbox and explicit
+filesystem/environment exposure. Passing `--allow-loopback-listen` brings up
+the private `lo` interface and permits `127.0.0.1` `bind`/`listen`/`accept`
+inside `CLONE_NEWNET` without granting external network egress.
 
 When `--herdr` is passed inside an outer Herdr terminal pane (`HERDR_ENV=1`, `HERDR_PANE_ID`),
 Glove's host runner reports lifecycle states (`working`, `done`) and releases authority

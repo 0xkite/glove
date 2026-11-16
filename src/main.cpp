@@ -189,13 +189,16 @@ void print_exec_usage() {
 void print_shell_usage() {
     std::fprintf(
         stderr,
-        "usage: glove shell [options] [-- <command argv>...]\n"
+        "usage: glove shell [options] [-- <agent args or command>...]\n"
         "\n"
-        "Drop into an interactive sandboxed workspace shell (defaults to /bin/bash\n"
-        "or /bin/sh when no command is given).\n"
+        "Launch an interactive agent harness prompt TUI (pi, agy, claude, or codex)\n"
+        "directly inside the workspace (auto-creating --workspace if needed).\n"
         "\n"
         "options:\n"
-        "  --workspace <path>      read-write workspace for the shell\n"
+        "  --workspace <path>      read-write workspace (auto-created if missing;\n"
+        "                          omitted: ephemeral private workspace)\n"
+        "  --agent <name>          agent harness to launch: pi, agy, claude, or codex\n"
+        "                          (omitted: auto-detects installed harness)\n"
         "  --read <path>           expose one additional path read-only\n"
         "  --write <path>          expose one additional path read-write\n"
         "  --env <name>            copy one named host environment variable\n"
@@ -203,9 +206,8 @@ void print_shell_usage() {
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS through the egress proxy\n"
         "  --allow-loopback-listen allow private-loopback bind/listen inside the\n"
-        "                          sandbox network namespace\n"
+        "                          sandbox network namespace (enabled by default)\n"
         "  --herdr                 report lifecycle to host Herdr\n"
-        "  --agent <preset>        mediate provider credentials (claude-code, codex, pi)\n"
         "  -h, --help              show this help and exit\n"
     );
 }
@@ -389,8 +391,201 @@ auto exec_subcommand(std::span<char* const> args) -> int {
     return *code;
 }
 
+auto paths_overlap(const std::filesystem::path& a, const std::filesystem::path& b) -> bool {
+    const auto na = a.lexically_normal();
+    const auto nb = b.lexically_normal();
+    const auto [ma, _] = std::mismatch(na.begin(), na.end(), nb.begin(), nb.end());
+    if (ma == na.end()) {
+        return true;
+    }
+    const auto [mb, __] = std::mismatch(nb.begin(), nb.end(), na.begin(), na.end());
+    return mb == nb.end();
+}
+
+void add_non_overlapping_read_dir(glove::run::options& opts, const std::filesystem::path& dir) {
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec) || ec) {
+        return;
+    }
+    const auto abs = std::filesystem::weakly_canonical(dir, ec);
+    if (ec || abs.empty() || abs == abs.root_path()) {
+        return;
+    }
+    // System directories (/usr, /bin, /lib, /etc) are already mounted by the spawner.
+    for (const char* sys_root : {"/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"}) {
+        if (paths_overlap(abs, std::filesystem::path{sys_root})) {
+            return;
+        }
+    }
+    if (opts.workspace) {
+        const auto ws_abs = std::filesystem::weakly_canonical(*opts.workspace, ec);
+        if (!ec && paths_overlap(abs, ws_abs)) {
+            return;
+        }
+    }
+    for (const auto& existing : opts.writable) {
+        const auto ex_abs = std::filesystem::weakly_canonical(existing, ec);
+        if (!ec && paths_overlap(abs, ex_abs)) {
+            return;
+        }
+    }
+    for (const auto& existing : opts.readable) {
+        const auto ex_abs = std::filesystem::weakly_canonical(existing, ec);
+        if (!ec && paths_overlap(abs, ex_abs)) {
+            return;
+        }
+    }
+    opts.readable.push_back(abs.string());
+}
+
+void add_unique_path_dir(glove::run::options& opts, const std::filesystem::path& dir) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec) || ec) {
+        return;
+    }
+    const std::string s = dir.lexically_normal().string();
+    for (const auto& existing : opts.extra_path_dirs) {
+        if (existing == s) {
+            return;
+        }
+    }
+    opts.extra_path_dirs.push_back(s);
+}
+
+auto resolve_harness_executable(std::string_view name) -> std::optional<std::filesystem::path> {
+    const std::string bin_name{name == "claude-code" ? "claude" : name};
+    std::error_code ec;
+    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+        const std::filesystem::path home_dir{home};
+        for (const auto& candidate : {
+                 home_dir / ".local" / "bin" / bin_name,
+                 home_dir / ".pi" / "agent" / "bin" / bin_name,
+             }) {
+            if (std::filesystem::exists(candidate, ec) && !ec) {
+                return std::filesystem::absolute(candidate, ec);
+            }
+        }
+        const auto nvm_nodes = home_dir / ".nvm" / "versions" / "node";
+        if (std::filesystem::is_directory(nvm_nodes, ec) && !ec) {
+            for (const auto& entry : std::filesystem::directory_iterator(nvm_nodes, ec)) {
+                const auto candidate = entry.path() / "bin" / bin_name;
+                if (std::filesystem::exists(candidate, ec) && !ec) {
+                    return std::filesystem::absolute(candidate, ec);
+                }
+            }
+        }
+    }
+    if (const char* path_env = std::getenv("PATH"); path_env != nullptr) {
+        std::string_view rest{path_env};
+        while (!rest.empty()) {
+            const auto colon = rest.find(':');
+            const std::string_view dir =
+                colon == std::string_view::npos ? rest : rest.substr(0, colon);
+            if (!dir.empty()) {
+                const auto candidate = std::filesystem::path{dir} / bin_name;
+                if (std::filesystem::exists(candidate, ec) && !ec) {
+                    return std::filesystem::absolute(candidate, ec);
+                }
+            }
+            if (colon == std::string_view::npos) {
+                break;
+            }
+            rest.remove_prefix(colon + 1);
+        }
+    }
+    return std::nullopt;
+}
+
+// Mounts the agent harness binary + its symlink/runtime closure (~/.local/bin,
+// ~/.pi/agent, ~/.nvm/versions/node/<ver>, ~/.local/share/antigravity-cli, etc.)
+// read-only into `opts` and prepends their `bin` directories to `extra_path_dirs`.
+auto attach_agent_harness_closure(
+    glove::run::options& opts, std::string_view driver, std::optional<std::string_view> cmd_override
+) -> std::string {
+    std::error_code ec;
+    std::string resolved_bin;
+    if (cmd_override && !cmd_override->empty()) {
+        resolved_bin = std::string{*cmd_override};
+        const std::filesystem::path p{resolved_bin};
+        if (p.is_absolute() && p.has_parent_path()) {
+            add_non_overlapping_read_dir(opts, p.parent_path());
+            add_unique_path_dir(opts, p.parent_path());
+        }
+    } else if (auto found = resolve_harness_executable(driver)) {
+        resolved_bin = found->string();
+        add_non_overlapping_read_dir(opts, found->parent_path());
+        add_unique_path_dir(opts, found->parent_path());
+        const auto canon = std::filesystem::weakly_canonical(*found, ec);
+        if (!ec && canon.has_parent_path()) {
+            // If canonical path is `<root>/bin/<exe>` (e.g. ~/.pi/agent/bin/pi),
+            // expose `<root>` so sibling `install/` or `lib/` directories are readable.
+            const auto parent = canon.parent_path();
+            if (parent.filename() == "bin" && parent.has_parent_path()) {
+                add_non_overlapping_read_dir(opts, parent.parent_path());
+            } else {
+                add_non_overlapping_read_dir(opts, parent);
+            }
+            add_unique_path_dir(opts, parent);
+        }
+    } else {
+        resolved_bin = driver == "claude-code" ? std::string{"claude"} : std::string{driver};
+    }
+
+    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+        const std::filesystem::path home_dir{home};
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "bin");
+        add_unique_path_dir(opts, home_dir / ".local" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".pi" / "agent");
+        add_unique_path_dir(opts, home_dir / ".pi" / "agent" / "bin");
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
+        add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");
+        add_unique_path_dir(opts, home_dir / ".local" / "share" / "pi-node" / "current" / "bin");
+
+        const auto nvm_nodes = home_dir / ".nvm" / "versions" / "node";
+        if (std::filesystem::is_directory(nvm_nodes, ec) && !ec) {
+            std::filesystem::path chosen_node;
+            for (const auto& entry : std::filesystem::directory_iterator(nvm_nodes, ec)) {
+                if (entry.is_directory(ec) && entry.path() > chosen_node) {
+                    chosen_node = entry.path();
+                }
+            }
+            if (!chosen_node.empty()) {
+                add_non_overlapping_read_dir(opts, chosen_node);
+                add_unique_path_dir(opts, chosen_node / "bin");
+            }
+        }
+    }
+    return resolved_bin;
+}
+
+auto ensure_workspace_directory(const std::optional<std::filesystem::path>& workspace)
+    -> std::expected<void, std::string> {
+    if (!workspace) {
+        return {};
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(*workspace, ec)) {
+        std::filesystem::create_directories(*workspace, ec);
+        if (ec) {
+            return std::unexpected(
+                std::string{"cannot create workspace directory '"} + workspace->string() +
+                "': " + ec.message()
+            );
+        }
+        std::filesystem::permissions(
+            *workspace,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace,
+            ec
+        );
+    }
+    return {};
+}
+
 auto shell_subcommand(std::span<char* const> args) -> int {
     glove::run::options opts;
+    opts.allow_loopback_listen = true;
     std::size_t i = 0;
     while (i < args.size()) {
         std::string_view a{args[i]};
@@ -414,17 +609,64 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         print_shell_usage();
         return 2;
     }
+
+    if (auto ws_ok = ensure_workspace_directory(opts.workspace); !ws_ok) {
+        std::fprintf(stderr, "glove shell: %s\n", ws_ok.error().c_str());
+        return 1;
+    }
+
+    std::vector<std::string> trailing_args;
     while (i < args.size()) {
-        opts.agent_argv.emplace_back(args[i]);
+        trailing_args.emplace_back(args[i]);
         ++i;
     }
-    if (opts.agent_argv.empty()) {
-        if (std::filesystem::exists("/bin/bash")) {
-            opts.agent_argv.emplace_back("/bin/bash");
-        } else {
-            opts.agent_argv.emplace_back("/bin/sh");
+
+    std::string driver = opts.agent_preset.value_or("");
+    if (driver.empty()) {
+        for (std::string_view candidate : {"pi", "agy", "claude", "codex"}) {
+            if (resolve_harness_executable(candidate).has_value()) {
+                driver = std::string{candidate};
+                break;
+            }
         }
     }
+
+    // Only activate the host credentialed reverse endpoint when the required
+    // provider API key is present on the host and raw egress is not requested.
+    if (driver == "agy" || !opts.egress.empty()) {
+        opts.agent_preset.reset();
+    } else if (driver == "pi" || driver == "claude" || driver == "claude-code") {
+        const char* key = std::getenv("ANTHROPIC_API_KEY");
+        if (key != nullptr && *key != '\0') {
+            opts.agent_preset = driver;
+        } else {
+            opts.agent_preset.reset();
+        }
+    } else if (driver == "codex") {
+        const char* key = std::getenv("OPENAI_API_KEY");
+        if (key != nullptr && *key != '\0') {
+            opts.agent_preset = driver;
+        } else {
+            opts.agent_preset.reset();
+        }
+    } else {
+        opts.agent_preset.reset();
+    }
+
+    const std::string resolved_bin =
+        driver.empty() ? std::string{} : attach_agent_harness_closure(opts, driver, std::nullopt);
+
+    if (!trailing_args.empty() && !trailing_args.front().starts_with('-')) {
+        // Explicit command after `--` (e.g. `glove shell -- /bin/sh -c ...`).
+        opts.agent_argv = std::move(trailing_args);
+    } else if (!resolved_bin.empty() && std::filesystem::path{resolved_bin}.is_absolute()) {
+        opts.agent_argv.push_back(resolved_bin);
+        opts.agent_argv.insert(opts.agent_argv.end(), trailing_args.begin(), trailing_args.end());
+    } else {
+        opts.agent_argv.push_back(std::filesystem::exists("/bin/bash") ? "/bin/bash" : "/bin/sh");
+        opts.agent_argv.insert(opts.agent_argv.end(), trailing_args.begin(), trailing_args.end());
+    }
+
     auto code = glove::run::exec(opts);
     if (!code) {
         std::fprintf(stderr, "glove shell: %s\n", code.error().c_str());
@@ -661,8 +903,14 @@ auto loop_subcommand(std::span<char* const> args) -> int {
         opts.agent_preset = driver;
     }
 
-    const std::string bin =
-        cmd_override.value_or(driver == "claude-code" ? std::string{"claude"} : driver);
+    if (auto ws_ok = ensure_workspace_directory(opts.workspace); !ws_ok) {
+        std::fprintf(stderr, "glove loop: %s\n", ws_ok.error().c_str());
+        return 1;
+    }
+
+    const std::string bin = attach_agent_harness_closure(
+        opts, driver, cmd_override ? std::optional<std::string_view>{*cmd_override} : std::nullopt
+    );
 
     std::string current_prompt = *base_prompt;
     const int total_turns = verify_cmd ? max_iterations : 1;

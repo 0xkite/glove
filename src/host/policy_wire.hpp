@@ -89,11 +89,40 @@ struct onboarding_plan_report {
     bool inherited_host_state = false;
 };
 
+struct installed_policy_item {
+    std::string name;
+    std::string path;
+    bool valid = false;
+    std::string error;
+};
+
+struct policy_list_report {
+    std::uint8_t schema_version = 1;
+    std::string directory;
+    std::vector<installed_policy_item> policies;
+};
+
+struct policy_install_report {
+    std::uint8_t schema_version = 1;
+    std::string name;
+    std::string source_path;
+    std::string installed_path;
+};
+
+struct policy_remove_report {
+    std::uint8_t schema_version = 1;
+    std::string name;
+    bool removed = true;
+};
+
 [[nodiscard]] auto encode(const detection_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const stage_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const pi_adoption_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const validation_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const prepared_policy_report& report) -> result<std::string>;
 [[nodiscard]] auto encode(const onboarding_plan_report& report) -> result<std::string>;
+[[nodiscard]] auto encode(const policy_list_report& report) -> result<std::string>;
+[[nodiscard]] auto encode(const policy_install_report& report) -> result<std::string>;
+[[nodiscard]] auto encode(const policy_remove_report& report) -> result<std::string>;
 
 } // namespace glove::host::policy_wire

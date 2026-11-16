@@ -1551,4 +1551,430 @@ auto validate_session_policy_file(const std::filesystem::path& path) -> result<v
     return {};
 }
 
+namespace {
+
+class scoped_fd {
+public:
+    explicit scoped_fd(int fd = -1) noexcept : fd_{fd} {}
+
+    scoped_fd(const scoped_fd&) = delete;
+    auto operator=(const scoped_fd&) -> scoped_fd& = delete;
+
+    scoped_fd(scoped_fd&& other) noexcept : fd_{other.fd_} { other.fd_ = -1; }
+
+    auto operator=(scoped_fd&& other) noexcept -> scoped_fd& {
+        if (this != &other) {
+            if (fd_ >= 0) {
+                (void)::close(fd_);
+            }
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+
+    ~scoped_fd() {
+        if (fd_ >= 0) {
+            (void)::close(fd_);
+        }
+    }
+
+    [[nodiscard]] auto get() const noexcept -> int { return fd_; }
+
+private:
+    int fd_ = -1;
+};
+
+auto verify_owner_directory_fd(int fd, std::string_view label, bool require_0700) -> result<void> {
+    struct ::stat st{};
+    if (::fstat(fd, &st) != 0) {
+        return std::unexpected(
+            "stat " + std::string{label} + ": " + std::string{std::strerror(errno)}
+        );
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        return std::unexpected(std::string{label} + " is not a regular directory");
+    }
+    if (st.st_uid != ::geteuid()) {
+        return std::unexpected(std::string{label} + " is not owned by the current user");
+    }
+    const auto mode_mask = require_0700 ? 077U : static_cast<unsigned int>(S_IWGRP | S_IWOTH);
+    if ((static_cast<unsigned int>(st.st_mode) & mode_mask) != 0U) {
+        return std::unexpected(
+            std::string{label} + (require_0700 ? " must not grant group/other permissions"
+                                               : " must not be group/other writable")
+        );
+    }
+    return {};
+}
+
+// Opens and verifies the XDG policy store hierarchy (`<xdg_config_home>/glove/policies`)
+// descriptor-first using `O_DIRECTORY | O_NOFOLLOW` and `openat`/`mkdirat`.
+// When `create_if_missing` is false and a component is absent (`ENOENT`), any
+// existing ancestors are still validated and an empty `scoped_fd{-1}` is returned.
+auto open_verified_policy_store(const directories& values, bool create_if_missing)
+    -> result<scoped_fd> {
+    const auto config_dir = values.config.lexically_normal();
+    if (!config_dir.is_absolute() || config_dir != values.config || !config_dir.has_parent_path() ||
+        !config_dir.has_filename()) {
+        return std::unexpected(
+            std::string{"XDG config directory must be a normalized absolute path"}
+        );
+    }
+    const auto xdg_parent = config_dir.parent_path();
+    const auto xdg_base = xdg_parent.parent_path();
+    if (xdg_base.empty() || !xdg_parent.has_filename()) {
+        return std::unexpected(std::string{"XDG config parent must have a base directory"});
+    }
+
+    if (create_if_missing) {
+        std::error_code ec;
+        if (!std::filesystem::exists(xdg_base, ec)) {
+            std::filesystem::create_directories(xdg_base, ec);
+            if (ec) {
+                return std::unexpected(
+                    "create XDG base directory '" + xdg_base.string() + "': " + ec.message()
+                );
+            }
+        }
+    }
+
+    constexpr int dir_flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+    scoped_fd base_fd{::open(xdg_base.c_str(), dir_flags)};
+    if (base_fd.get() < 0) {
+        if (!create_if_missing && errno == ENOENT) {
+            return scoped_fd{-1};
+        }
+        return std::unexpected(
+            "open XDG base directory '" + xdg_base.string() + "': " + std::strerror(errno)
+        );
+    }
+    {
+        struct ::stat base_st{};
+        if (::fstat(base_fd.get(), &base_st) != 0 || !S_ISDIR(base_st.st_mode)) {
+            return std::unexpected("XDG base directory is invalid: " + xdg_base.string());
+        }
+        if (base_st.st_uid != ::geteuid() && base_st.st_uid != 0) {
+            return std::unexpected("XDG base directory is not owned by the current user or root");
+        }
+        if (base_st.st_uid == ::geteuid() &&
+            (static_cast<unsigned int>(base_st.st_mode) & (S_IWGRP | S_IWOTH)) != 0U) {
+            return std::unexpected("XDG base directory must not be group/other writable");
+        }
+    }
+
+    const auto step_into = [&](int parent_fd,
+                               const std::string& name,
+                               std::string_view label,
+                               bool require_0700) -> result<scoped_fd> {
+        if (create_if_missing) {
+            if (::mkdirat(parent_fd, name.c_str(), 0700) != 0 && errno != EEXIST) {
+                return std::unexpected(
+                    "create " + std::string{label} + ": " + std::string{std::strerror(errno)}
+                );
+            }
+        }
+        scoped_fd child_fd{::openat(parent_fd, name.c_str(), dir_flags)};
+        if (child_fd.get() < 0) {
+            if (!create_if_missing && errno == ENOENT) {
+                return scoped_fd{-1};
+            }
+            return std::unexpected(
+                "open " + std::string{label} + ": " + std::string{std::strerror(errno)}
+            );
+        }
+        if (auto ok = verify_owner_directory_fd(child_fd.get(), label, require_0700); !ok) {
+            return std::unexpected(ok.error());
+        }
+        return child_fd;
+    };
+
+    auto xdg_fd = step_into(
+        base_fd.get(), xdg_parent.filename().string(), "XDG config parent directory", false
+    );
+    if (!xdg_fd || xdg_fd->get() < 0) {
+        return xdg_fd;
+    }
+    auto glove_fd =
+        step_into(xdg_fd->get(), config_dir.filename().string(), "Glove config directory", true);
+    if (!glove_fd || glove_fd->get() < 0) {
+        return glove_fd;
+    }
+    auto policies_fd = step_into(glove_fd->get(), "policies", "policy directory", true);
+    if (!policies_fd || policies_fd->get() < 0) {
+        return policies_fd;
+    }
+
+    const auto policy_dir = default_policy_directory(values);
+    struct ::stat fd_st{};
+    struct ::stat path_st{};
+    if (::fstat(policies_fd->get(), &fd_st) != 0 || ::lstat(policy_dir.c_str(), &path_st) != 0 ||
+        fd_st.st_dev != path_st.st_dev || fd_st.st_ino != path_st.st_ino) {
+        return std::unexpected(
+            std::string{"policy directory identity changed during verification"}
+        );
+    }
+    return policies_fd;
+}
+
+auto read_bounded_policy_source(const std::filesystem::path& source) -> result<std::string> {
+    scoped_fd fd{::open(source.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    if (fd.get() < 0) {
+        return std::unexpected(
+            "open policy source '" + source.string() + "': " + std::strerror(errno)
+        );
+    }
+    struct ::stat before{};
+    if (::fstat(fd.get(), &before) != 0 || !S_ISREG(before.st_mode) ||
+        before.st_uid != ::geteuid() ||
+        (static_cast<unsigned int>(before.st_mode) & (S_IWGRP | S_IWOTH)) != 0U ||
+        before.st_size <= 0 || static_cast<std::uint64_t>(before.st_size) > 1024U * 1024U) {
+        return std::unexpected(
+            "policy source ownership, permissions, or size is unsafe: " + source.string()
+        );
+    }
+    std::string contents(static_cast<std::size_t>(before.st_size), '\0');
+    std::size_t offset = 0;
+    while (offset < contents.size()) {
+        const ::ssize_t n = ::read(fd.get(), contents.data() + offset, contents.size() - offset);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return std::unexpected("read policy source failed: " + source.string());
+        }
+        offset += static_cast<std::size_t>(n);
+    }
+    char extra = '\0';
+    const ::ssize_t trailing = ::read(fd.get(), &extra, 1);
+    struct ::stat after{};
+    if (trailing != 0 || ::fstat(fd.get(), &after) != 0 || after.st_dev != before.st_dev ||
+        after.st_ino != before.st_ino || after.st_size != before.st_size ||
+        after.st_mtime != before.st_mtime) {
+        return std::unexpected("policy source changed while reading: " + source.string());
+    }
+    return contents;
+}
+
+auto normalize_policy_name(std::string_view raw) -> result<std::string> {
+    if (raw.size() > 5U && raw.ends_with(".json")) {
+        raw.remove_suffix(5U);
+    }
+    if (!is_valid_policy_name(raw)) {
+        return std::unexpected(
+            "invalid policy name '" + std::string{raw} +
+            "' (use 1-64 chars from [A-Za-z0-9._-], not starting with '.')"
+        );
+    }
+    return std::string{raw};
+}
+
+} // namespace
+
+auto is_valid_policy_name(std::string_view name) -> bool {
+    if (name.empty() || name.size() > 64U || name.front() == '.') {
+        return false;
+    }
+    return std::ranges::all_of(name, [](unsigned char ch) {
+        return std::isalnum(ch) != 0 || ch == '-' || ch == '_' || ch == '.';
+    });
+}
+
+auto resolve_policy_reference(std::string_view name_or_path, const directories& values)
+    -> result<std::filesystem::path> {
+    if (name_or_path.empty()) {
+        return std::unexpected(std::string{"policy reference cannot be empty"});
+    }
+    const std::filesystem::path candidate{name_or_path};
+    if (candidate.is_absolute()) {
+        return candidate;
+    }
+    if (name_or_path.find('/') != std::string_view::npos ||
+        name_or_path.find('\\') != std::string_view::npos) {
+        return std::unexpected(
+            "relative policy path is not allowed; pass an absolute path or an installed policy name"
+        );
+    }
+    auto normalized = normalize_policy_name(name_or_path);
+    if (!normalized) {
+        return std::unexpected(normalized.error());
+    }
+    auto store_fd = open_verified_policy_store(values, false);
+    if (!store_fd) {
+        return std::unexpected(store_fd.error());
+    }
+    const std::string filename = *normalized + ".json";
+    if (store_fd->get() >= 0) {
+        struct ::stat entry_st{};
+        if (::fstatat(store_fd->get(), filename.c_str(), &entry_st, AT_SYMLINK_NOFOLLOW) == 0) {
+            if (!S_ISREG(entry_st.st_mode) || entry_st.st_uid != ::geteuid() ||
+                (static_cast<unsigned int>(entry_st.st_mode) & 077U) != 0U) {
+                return std::unexpected(
+                    "installed policy entry '" + filename + "' has unsafe type, owner, or mode"
+                );
+            }
+        } else if (errno != ENOENT) {
+            return std::unexpected(
+                "stat installed policy '" + filename + "': " + std::strerror(errno)
+            );
+        }
+    }
+    return default_policy_directory(values) / filename;
+}
+
+auto install_policy_file(
+    const std::filesystem::path& source, std::string_view name, const directories& values
+) -> result<std::filesystem::path> {
+    auto normalized = normalize_policy_name(name);
+    if (!normalized) {
+        return std::unexpected(normalized.error());
+    }
+    auto contents = read_bounded_policy_source(source);
+    if (!contents) {
+        return std::unexpected(contents.error());
+    }
+    if (auto valid = validate_session_policy_file(source); !valid) {
+        return std::unexpected(valid.error());
+    }
+
+    auto store_fd = open_verified_policy_store(values, true);
+    if (!store_fd || store_fd->get() < 0) {
+        return std::unexpected(
+            store_fd ? std::string{"failed to open policy directory"} : store_fd.error()
+        );
+    }
+
+    const auto policy_dir = default_policy_directory(values);
+    const std::string dest_name = *normalized + ".json";
+    const std::string tmp_name = "." + dest_name + ".tmp." + std::to_string(::getpid());
+    const auto dest = policy_dir / dest_name;
+
+    const int fd = ::openat(
+        store_fd->get(),
+        tmp_name.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+        0600
+    );
+    if (fd < 0) {
+        return std::unexpected(
+            "create staging policy file failed: " + std::string{std::strerror(errno)}
+        );
+    }
+    std::size_t written = 0;
+    while (written < contents->size()) {
+        const ::ssize_t n = ::write(fd, contents->data() + written, contents->size() - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            const int saved = errno;
+            (void)::close(fd);
+            (void)::unlinkat(store_fd->get(), tmp_name.c_str(), 0);
+            return std::unexpected(
+                "write policy file failed: " + std::string{std::strerror(saved)}
+            );
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    (void)::fchmod(fd, 0600);
+    (void)::fsync(fd);
+    (void)::close(fd);
+
+    if (auto staged_valid = validate_session_policy_file(policy_dir / tmp_name); !staged_valid) {
+        (void)::unlinkat(store_fd->get(), tmp_name.c_str(), 0);
+        return std::unexpected(staged_valid.error());
+    }
+
+    if (::renameat(store_fd->get(), tmp_name.c_str(), store_fd->get(), dest_name.c_str()) != 0) {
+        const int saved = errno;
+        (void)::unlinkat(store_fd->get(), tmp_name.c_str(), 0);
+        return std::unexpected("install policy file failed: " + std::string{std::strerror(saved)});
+    }
+    (void)::fsync(store_fd->get());
+    if (auto revalidated = validate_session_policy_file(dest); !revalidated) {
+        return std::unexpected(revalidated.error());
+    }
+    return dest;
+}
+
+auto list_installed_policies(const directories& values)
+    -> result<std::vector<installed_policy_entry>> {
+    auto store_fd = open_verified_policy_store(values, false);
+    if (!store_fd) {
+        return std::unexpected(store_fd.error());
+    }
+    if (store_fd->get() < 0) {
+        return std::vector<installed_policy_entry>{};
+    }
+    const auto policy_dir = default_policy_directory(values);
+
+    std::vector<installed_policy_entry> entries;
+    std::error_code ec;
+    for (const auto& item : std::filesystem::directory_iterator(policy_dir, ec)) {
+        if (ec) {
+            return std::unexpected("list policy directory failed: " + ec.message());
+        }
+        const auto& path = item.path();
+        if (path.extension() != ".json") {
+            continue;
+        }
+        const std::string filename = path.filename().string();
+        if (!filename.empty() && filename.front() == '.') {
+            continue;
+        }
+        struct ::stat entry_st{};
+        if (::fstatat(store_fd->get(), filename.c_str(), &entry_st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISREG(entry_st.st_mode) || entry_st.st_uid != ::geteuid()) {
+            entries.push_back(
+                installed_policy_entry{
+                    .name = path.stem().string(),
+                    .path = path,
+                    .valid = false,
+                    .error = "policy entry is not an owner-owned regular file",
+                }
+            );
+            continue;
+        }
+        auto valid = validate_session_policy_file(path);
+        entries.push_back(
+            installed_policy_entry{
+                .name = path.stem().string(),
+                .path = path,
+                .valid = valid.has_value(),
+                .error = valid ? std::string{} : valid.error(),
+            }
+        );
+    }
+    std::ranges::sort(entries, {}, &installed_policy_entry::name);
+    return entries;
+}
+
+auto remove_installed_policy(std::string_view name, const directories& values) -> result<void> {
+    auto normalized = normalize_policy_name(name);
+    if (!normalized) {
+        return std::unexpected(normalized.error());
+    }
+    auto store_fd = open_verified_policy_store(values, false);
+    if (!store_fd) {
+        return std::unexpected(store_fd.error());
+    }
+    const std::string filename = *normalized + ".json";
+    const auto dest = default_policy_directory(values) / filename;
+    if (store_fd->get() < 0) {
+        return std::unexpected("policy '" + *normalized + "' not found at " + dest.string());
+    }
+    struct ::stat st{};
+    if (::fstatat(store_fd->get(), filename.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        return std::unexpected("policy '" + *normalized + "' not found at " + dest.string());
+    }
+    if (!S_ISREG(st.st_mode) || st.st_uid != ::geteuid()) {
+        return std::unexpected("refusing to remove non-regular policy path: " + dest.string());
+    }
+    if (::unlinkat(store_fd->get(), filename.c_str(), 0) != 0) {
+        return std::unexpected("remove policy failed: " + std::string{std::strerror(errno)});
+    }
+    (void)::fsync(store_fd->get());
+    return {};
+}
+
 } // namespace glove::host

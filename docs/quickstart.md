@@ -31,5 +31,37 @@ mkdir -p /tmp/glove-work
   -- /absolute/path/to/agent --version
 ```
 
-`run` and `exec` are explicit local containment surfaces. They do not make
-remote Sage launch available, and direct Linux execution remains offline.
+Pass `--allow-loopback-listen` for runtimes (such as `agy`) that bind a
+private `127.0.0.1:0` socket inside the isolated network namespace.
+
+## Interactive agent workspace shell
+
+```sh
+./build/dev/src/glove shell --workspace /tmp/glove-work
+```
+
+- `glove shell` launches the interactive agent harness prompt (`--agent pi`,
+  `--agent agy`, `--agent claude`, or `--agent codex`, auto-detected when
+  omitted) directly inside the workspace with its runtime closure mounted.
+- When `--workspace` is provided and does not exist yet, `glove shell` creates
+  it automatically. When `--workspace` is omitted, Glove creates an ephemeral
+  private runtime directory and removes it on exit.
+
+## Seeded agent feedback loop
+
+```sh
+./build/dev/src/glove loop \
+  --workspace /tmp/glove-work \
+  --agent pi \
+  --prompt "Write a findings summary to report.md" \
+  --verify "test -s report.md" \
+  --max-iterations 5
+```
+
+`--verify` runs offline inside the sandbox after each turn and feeds failure
+output back into the next iteration until it passes or `--max-iterations` is
+reached.
+
+`run`, `exec`, `shell`, and `loop` are explicit local containment surfaces. They
+do not make remote Sage launch available, and direct Linux execution remains
+offline unless `--egress-allow` or `--agent` is specified.

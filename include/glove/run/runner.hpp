@@ -55,6 +55,9 @@ struct options {
     // Permit private-loopback socket binding/listening inside the sandbox's
     // isolated network namespace (required by runtimes like agy).
     bool allow_loopback_listen = false;
+    // Extra directories prepended to PATH inside the sandbox (used when
+    // mounting an agent harness closure for `glove shell` / `glove loop`).
+    std::vector<std::string> extra_path_dirs;
 };
 
 // Run the contained agent end-to-end: build the profile, spawn the agent,
