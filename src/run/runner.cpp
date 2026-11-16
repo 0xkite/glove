@@ -14,16 +14,24 @@
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
+#include "glove/reflect/codegen.hpp"
+#include "glove/reflect/extension.hpp"
 
 #include "provider_endpoint.hpp"
 
+#include <fcntl.h>
+#include <poll.h>
 #include <spawn.h>
 #include <sys/random.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -32,10 +40,12 @@
 #include <cstring>
 #include <expected>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -219,6 +229,106 @@ auto provision(const glove::container::profile& profile) -> std::expected<void, 
     return {};
 }
 
+void copy_regular_file_0600(
+    const std::filesystem::path& src, const std::filesystem::path& dst
+) noexcept {
+    std::error_code ec;
+    if (!std::filesystem::exists(src, ec) || ec) {
+        return;
+    }
+    std::ifstream in(src, std::ios::binary);
+    if (!in) {
+        return;
+    }
+    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return;
+    }
+    out << in.rdbuf();
+    out.close();
+    std::filesystem::permissions(
+        dst,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace,
+        ec
+    );
+}
+
+auto detect_loopback_port_in_models_json(const std::filesystem::path& models_json_path)
+    -> std::optional<std::uint16_t> {
+    std::ifstream in(models_json_path, std::ios::binary);
+    if (!in) {
+        return std::nullopt;
+    }
+    std::string content((std::istreambuf_iterator<char>(in)), {});
+    for (std::string_view prefix :
+         {std::string_view{"http://127.0.0.1:"}, std::string_view{"http://localhost:"}}) {
+        const auto pos = content.find(prefix);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        std::size_t idx = pos + prefix.size();
+        unsigned port = 0;
+        std::size_t digits = 0;
+        while (idx < content.size() && content[idx] >= '0' && content[idx] <= '9' && digits < 6) {
+            port = port * 10U + static_cast<unsigned>(content[idx] - '0');
+            ++idx;
+            ++digits;
+        }
+        if (digits > 0 && port >= 1U && port <= 65535U) {
+            return static_cast<std::uint16_t>(port);
+        }
+    }
+    return std::nullopt;
+}
+
+void provision_guest_agent_home(const options& opts, glove::container::profile& profile) noexcept {
+    if (!opts.seed_guest_agent_home || !profile.home_dir) {
+        return;
+    }
+    const char* host_home_env = std::getenv("HOME");
+    if (host_home_env == nullptr || *host_home_env == '\0') {
+        return;
+    }
+    std::error_code ec;
+    const std::filesystem::path host_home{host_home_env};
+    const std::filesystem::path guest_home{*profile.home_dir};
+
+    const auto host_pi_dir = host_home / ".pi" / "agent";
+    if (std::filesystem::is_directory(host_pi_dir, ec) && !ec) {
+        const auto guest_pi_dir = guest_home / ".pi" / "agent";
+        std::filesystem::create_directories(guest_pi_dir / "sessions", ec);
+        std::filesystem::permissions(
+            guest_pi_dir,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace,
+            ec
+        );
+        for (const char* name :
+             {"settings.json", "models.json", "models-store.json", "auth.json"}) {
+            copy_regular_file_0600(host_pi_dir / name, guest_pi_dir / name);
+        }
+        profile.environment.push_back("PI_CODING_AGENT_DIR=" + guest_pi_dir.string());
+    }
+
+    const auto host_agy_dir = host_home / ".gemini" / "antigravity-cli";
+    if (std::filesystem::is_directory(host_agy_dir, ec) && !ec) {
+        const auto guest_agy_dir = guest_home / ".gemini" / "antigravity-cli";
+        std::filesystem::create_directories(guest_agy_dir, ec);
+        for (const char* name : {"settings.json", "installation_id"}) {
+            copy_regular_file_0600(host_agy_dir / name, guest_agy_dir / name);
+        }
+    }
+    const auto host_agy_cfg = host_home / ".config" / "antigravity";
+    if (std::filesystem::is_directory(host_agy_cfg, ec) && !ec) {
+        const auto guest_agy_cfg = guest_home / ".config" / "antigravity";
+        std::filesystem::create_directories(guest_agy_cfg, ec);
+        copy_regular_file_0600(
+            host_agy_cfg / "credential-user-scope", guest_agy_cfg / "credential-user-scope"
+        );
+    }
+}
+
 auto prepare_profile(const options& opts, const std::filesystem::path& runtime_root)
     -> std::expected<glove::container::profile, std::string> {
     auto raw = build_profile(opts, runtime_root);
@@ -232,6 +342,7 @@ auto prepare_profile(const options& opts, const std::filesystem::path& runtime_r
     if (auto prepared = provision(*validated); !prepared) {
         return std::unexpected(prepared.error());
     }
+    provision_guest_agent_home(opts, *validated);
     auto revalidated = glove::container::validate(*validated);
     if (!revalidated) {
         return std::unexpected(
@@ -274,9 +385,62 @@ auto audit_destination(
     return std::optional<std::filesystem::path>{std::move(destination)};
 }
 
+#if defined(GLOVE_HAS_REFLECTION)
+struct[[= glove::reflect::tool_meta{
+    "sandbox_info", "Inspect active Glove sandbox boundaries and mediated upstreams"
+}]] sandbox_info_args {
+    [[= glove::reflect::param_meta{
+        "detail", "Include upstream count in response", false
+    }]] std::optional<bool>
+        detail;
+};
+#endif
+
 auto build_registry(const std::vector<upstream_spec>& upstreams)
     -> std::expected<std::unique_ptr<glove::kernel::registry>, std::string> {
     auto registry = std::make_unique<glove::kernel::registry>();
+    auto reflected = std::make_unique<glove::reflect::reflected_extension>("glove");
+    const std::size_t upstream_count = upstreams.size();
+#if defined(GLOVE_HAS_REFLECTION)
+    if (auto added = reflected->add_tool<sandbox_info_args>(
+            [upstream_count](const sandbox_info_args&)
+                -> std::expected<glove::mcp::tool_call_result, std::string> {
+                return glove::mcp::tool_call_result{
+                    .status = glove::mcp::tool_call_status::ok,
+                    .content = "glove_sandboxed=true upstreams=" + std::to_string(upstream_count),
+                    .structured_json = {},
+                    .error_message = {},
+                };
+            }
+        );
+        !added) {
+        return std::unexpected(added.error());
+    }
+#else
+    if (auto added = reflected->add_descriptor_tool(
+            glove::mcp::tool_descriptor{
+                .name = "sandbox_info",
+                .description = "Inspect active Glove sandbox boundaries and mediated upstreams",
+                .input_schema_json = R"({"type":"object","properties":{},"required":[]})",
+                .annotations = {},
+            },
+            [upstream_count](std::string_view)
+                -> std::expected<glove::mcp::tool_call_result, std::string> {
+                return glove::mcp::tool_call_result{
+                    .status = glove::mcp::tool_call_status::ok,
+                    .content = "glove_sandboxed=true upstreams=" + std::to_string(upstream_count),
+                    .structured_json = {},
+                    .error_message = {},
+                };
+            }
+        );
+        !added) {
+        return std::unexpected(added.error());
+    }
+#endif
+    if (auto added = registry->add(std::move(reflected)); !added) {
+        return std::unexpected(added.error());
+    }
     for (const auto& upstream : upstreams) {
         if (upstream.argv.empty()) {
             return std::unexpected(std::string{"upstream '"} + upstream.name + "': empty argv");
@@ -685,6 +849,208 @@ private:
     std::string agent_name_;
 };
 
+class socket_mcp_transport final : public glove::mcp::transport {
+public:
+    explicit socket_mcp_transport(int fd) noexcept : fd_{fd} {}
+
+    ~socket_mcp_transport() override {
+        if (fd_ >= 0) {
+            (void)::close(fd_);
+        }
+    }
+
+    auto send(std::string_view frame) -> std::expected<void, std::string> override {
+        std::string line{frame};
+        line.push_back('\n');
+        std::size_t sent = 0;
+        while (sent < line.size()) {
+            const ::ssize_t n = ::send(fd_, line.data() + sent, line.size() - sent, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return std::unexpected(std::string{"mcp socket write: "} + std::strerror(errno));
+            }
+            sent += static_cast<std::size_t>(n);
+        }
+        return {};
+    }
+
+    auto recv() -> std::expected<std::string, std::string> override {
+        for (;;) {
+            const auto nl = buffer_.find('\n');
+            if (nl != std::string::npos) {
+                std::string line = buffer_.substr(0, nl);
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                buffer_.erase(0, nl + 1U);
+                return line;
+            }
+            std::array<char, 4096> chunk{};
+            const ::ssize_t n = ::recv(fd_, chunk.data(), chunk.size(), 0);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return std::unexpected(std::string{"mcp socket read: "} + std::strerror(errno));
+            }
+            if (n == 0) {
+                if (!buffer_.empty()) {
+                    std::string tail = std::move(buffer_);
+                    buffer_.clear();
+                    return tail;
+                }
+                return std::unexpected(std::string{"EOF"});
+            }
+            buffer_.append(chunk.data(), static_cast<std::size_t>(n));
+        }
+    }
+
+private:
+    int fd_ = -1;
+    std::string buffer_;
+};
+
+class mcp_socket_bridge {
+public:
+    static auto start(
+        const std::filesystem::path& sock_path,
+        glove::kernel::registry& registry,
+        std::shared_ptr<glove::policy::engine> policy,
+        std::shared_ptr<glove::audit::sink> sink
+    ) -> std::expected<std::unique_ptr<mcp_socket_bridge>, std::string> {
+        if (sock_path.string().size() >= sizeof(::sockaddr_un{}.sun_path)) {
+            return std::unexpected(std::string{"MCP socket path is too long"});
+        }
+        const int listen_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (listen_fd < 0) {
+            return std::unexpected(std::string{"socket(AF_UNIX): "} + std::strerror(errno));
+        }
+        ::unlink(sock_path.c_str());
+        ::sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1U);
+        if (::bind(listen_fd, reinterpret_cast<const ::sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            ::chmod(sock_path.c_str(), 0600) != 0 || ::listen(listen_fd, 8) != 0) {
+            const int saved = errno;
+            (void)::close(listen_fd);
+            (void)::unlink(sock_path.c_str());
+            return std::unexpected(std::string{"bind/listen MCP socket: "} + std::strerror(saved));
+        }
+        return std::unique_ptr<mcp_socket_bridge>(new mcp_socket_bridge(
+            listen_fd, sock_path, registry, std::move(policy), std::move(sink)
+        ));
+    }
+
+    ~mcp_socket_bridge() {
+        stopping_.store(true);
+        if (listen_fd_ >= 0) {
+            (void)::shutdown(listen_fd_, SHUT_RDWR);
+            (void)::close(listen_fd_);
+            listen_fd_ = -1;
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        (void)::unlink(sock_path_.c_str());
+    }
+
+private:
+    mcp_socket_bridge(
+        int listen_fd,
+        std::filesystem::path sock_path,
+        glove::kernel::registry& registry,
+        std::shared_ptr<glove::policy::engine> policy,
+        std::shared_ptr<glove::audit::sink> sink
+    )
+        : listen_fd_{listen_fd},
+          sock_path_{std::move(sock_path)},
+          registry_{registry},
+          policy_{std::move(policy)},
+          sink_{std::move(sink)},
+          worker_{[this] { serve_loop(); }} {}
+
+    void serve_loop() {
+        while (!stopping_.load()) {
+            ::pollfd pfd{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+            const int ready = ::poll(&pfd, 1, 100);
+            if (ready <= 0) {
+                continue;
+            }
+            const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
+            if (client_fd < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            (void)::fcntl(client_fd, F_SETFD, FD_CLOEXEC);
+            socket_mcp_transport transport{client_fd};
+            glove::kernel::server::options server_options{
+                .identity = {.name = "glove", .version = "0.0.1"},
+                .policy = policy_,
+                .audit = sink_,
+            };
+            glove::kernel::server server{transport, registry_, std::move(server_options)};
+            (void)server.run();
+        }
+    }
+
+    int listen_fd_ = -1;
+    std::filesystem::path sock_path_;
+    glove::kernel::registry& registry_;
+    std::shared_ptr<glove::policy::engine> policy_;
+    std::shared_ptr<glove::audit::sink> sink_;
+    std::atomic<bool> stopping_{false};
+    std::thread worker_;
+};
+
+void write_guest_mcp_configs(
+    const glove::container::profile& profile,
+    const std::filesystem::path& glove_exe,
+    const std::filesystem::path& sock_path
+) noexcept {
+    if (!profile.home_dir) {
+        return;
+    }
+    std::error_code ec;
+    const std::filesystem::path guest_home{*profile.home_dir};
+    const std::string mcp_json = "{\n"
+                                 "  \"mcpServers\": {\n"
+                                 "    \"glove\": {\n"
+                                 "      \"command\": \"" +
+                                 glove_exe.string() +
+                                 "\",\n"
+                                 "      \"args\": [\"mcp-bridge\", \"" +
+                                 sock_path.string() +
+                                 "\"],\n"
+                                 "      \"directTools\": true\n"
+                                 "    }\n"
+                                 "  }\n"
+                                 "}\n";
+    for (const auto& rel : {
+             std::filesystem::path{".pi"} / "agent" / "mcp.json",
+             std::filesystem::path{".pi"} / "agent" / "mcp-adapter.json",
+             std::filesystem::path{".gemini"} / "antigravity-cli" / "mcp_config.json",
+             std::filesystem::path{".claude.json"},
+         }) {
+        const auto dst = guest_home / rel;
+        std::filesystem::create_directories(dst.parent_path(), ec);
+        std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out << mcp_json;
+            out.close();
+            std::filesystem::permissions(
+                dst,
+                std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                std::filesystem::perm_options::replace,
+                ec
+            );
+        }
+    }
+}
+
 } // namespace
 
 auto execute(const options& opts) -> std::expected<int, std::string> {
@@ -800,12 +1166,75 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
             return std::unexpected(std::string{"profile: "} + revalidated.error());
         }
         *profile = std::move(*revalidated);
+    } else if (!profile->proxy) {
+        std::optional<std::uint16_t> target_port = opts.bridge_port;
+        if (!target_port && opts.seed_guest_agent_home && profile->home_dir) {
+            target_port = detect_loopback_port_in_models_json(
+                std::filesystem::path{*profile->home_dir} / ".pi" / "agent" / "models.json"
+            );
+        }
+        if (target_port && *target_port != 0) {
+            profile->bridge_endpoint =
+                glove::container::bridge_endpoint_settings{.port = *target_port};
+            auto revalidated = glove::container::validate(*profile);
+            if (!revalidated) {
+                return std::unexpected(std::string{"profile: "} + revalidated.error());
+            }
+            *profile = std::move(*revalidated);
+        }
     }
 
     auto reporter = herdr_reporter::create(opts.herdr, opts.agent_argv.front());
     if (!reporter) {
         return std::unexpected(reporter.error());
     }
+
+    std::unique_ptr<glove::kernel::registry> mcp_registry;
+    std::unique_ptr<mcp_socket_bridge> mcp_bridge;
+    if (!opts.upstreams.empty() || !opts.allow.empty()) {
+        auto built_reg = build_registry(opts.upstreams);
+        if (!built_reg) {
+            return std::unexpected(built_reg.error());
+        }
+        mcp_registry = std::move(*built_reg);
+        std::shared_ptr<glove::policy::engine> policy = glove::policy::make_jsonpath_engine(
+            {.allow = opts.allow,
+             .deny = {},
+             .prefix_rules = opts.prefix_rules,
+             .default_decision = glove::policy::decision::deny}
+        );
+        const auto sock_path = runtime->root() / "tmp" / "glove-mcp.sock";
+        auto started_bridge =
+            mcp_socket_bridge::start(sock_path, *mcp_registry, std::move(policy), *sink);
+        if (!started_bridge) {
+            return std::unexpected(started_bridge.error());
+        }
+        mcp_bridge = std::move(*started_bridge);
+        profile->allow_loopback_listen = true;
+        profile->environment.push_back("GLOVE_MCP_SOCKET=" + sock_path.string());
+        std::error_code ec;
+        auto self_exe = std::filesystem::canonical("/proc/self/exe", ec);
+        if (!ec && self_exe.has_parent_path()) {
+            const std::string self_dir = self_exe.parent_path().string();
+            bool covered = false;
+            for (const auto& rule : profile->filesystem) {
+                if (path_within(self_exe.parent_path(), std::filesystem::path{rule.path})) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                profile->filesystem.push_back({.path = self_dir, .writable = false});
+            }
+            write_guest_mcp_configs(*profile, self_exe, sock_path);
+        }
+        auto revalidated = glove::container::validate(*profile);
+        if (!revalidated) {
+            return std::unexpected(std::string{"profile: "} + revalidated.error());
+        }
+        *profile = std::move(*revalidated);
+    }
+
     std::string readable;
     std::string writable;
     for (const auto& rule : profile->filesystem) {
