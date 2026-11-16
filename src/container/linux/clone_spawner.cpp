@@ -584,9 +584,19 @@ auto make_mount_target(const std::string& target, const struct ::stat& source_st
     return {};
 }
 
+constexpr std::array<const char*, 6> allowed_sandbox_device_nodes{
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+};
+
 auto is_allowed_sandbox_device_node(std::string_view path) noexcept -> bool {
-    return path == "/dev/null" || path == "/dev/zero" || path == "/dev/full" ||
-           path == "/dev/random" || path == "/dev/urandom" || path == "/dev/tty";
+    return std::ranges::any_of(allowed_sandbox_device_nodes, [path](const char* allowed) {
+        return path == allowed;
+    });
 }
 
 auto open_bind_source_fd(const std::string& source, bool allow_symlinks) -> owned_fd {
@@ -1532,7 +1542,7 @@ auto setup_landlock(
 #    ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
     dev_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
 #    endif
-    for (const auto* dev : {"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/tty"}) {
+    for (const auto* dev : allowed_sandbox_device_nodes) {
         if (auto r = add_rule(dev, dev_access); !r) {
             return r;
         }
