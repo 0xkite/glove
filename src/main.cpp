@@ -1,4 +1,6 @@
+#include "glove/host/config.hpp"
 #include "glove/policy/engine.hpp"
+#include "glove/reflect/json_codec.hpp"
 #include "glove/run/runner.hpp"
 #include "glove/term/terminal.hpp"
 #include "glove/version.hpp"
@@ -126,12 +128,23 @@ auto parse_egress(std::string_view spec) -> std::expected<glove::net::egress_rul
     return rule;
 }
 
-// Split a `--upstream` value of the form `<name>=<cmd>[,<arg>...]`.
+// Split a `--upstream` / `--mcp` value of the form `<name>=<cmd>[,<arg>...]`
+// or shorthand `<name>` (e.g. `yams` -> `yams=/usr/local/bin/yams,serve,--quiet`).
 auto parse_upstream(std::string_view spec)
     -> std::expected<glove::run::upstream_spec, std::string> {
     auto eq = spec.find('=');
     if (eq == std::string_view::npos) {
-        return std::unexpected(std::string{"--upstream needs name=cmd[,arg...]"});
+        if (spec == "yams") {
+            std::string bin = "/usr/local/bin/yams";
+            if (!std::filesystem::exists(bin) && std::filesystem::exists("/usr/bin/yams")) {
+                bin = "/usr/bin/yams";
+            }
+            return glove::run::upstream_spec{
+                .name = "yams",
+                .argv = {std::move(bin), "serve", "--quiet"},
+            };
+        }
+        return std::unexpected(std::string{"--upstream needs name=cmd[,arg...] (or 'yams')"});
     }
     glove::run::upstream_spec out;
     out.name = std::string{spec.substr(0, eq)};
@@ -192,10 +205,16 @@ void print_exec_usage() {
 void print_shell_usage() {
     std::fprintf(
         stderr,
-        "usage: glove shell [options] [-- <agent args or command>...]\n"
+        "usage: glove shell [<env-name>] [options] [-- <agent args or command>...]\n"
         "\n"
         "Launch an interactive agent harness prompt TUI (pi, agy, claude, or codex)\n"
         "directly inside the workspace (auto-creating --workspace if needed).\n"
+        "\n"
+        "saved environments (<XDG_CONFIG_HOME>/glove/envs/<name>.json):\n"
+        "  --save <name>           save this environment configuration for quick launch\n"
+        "  --load <name>           load a saved environment (or pass <name> positionally)\n"
+        "  --last                  launch the most recently used environment\n"
+        "  --list                  list saved and currently running environments\n"
         "\n"
         "options:\n"
         "  --workspace <path>      read-write workspace (auto-created if missing;\n"
@@ -205,6 +224,14 @@ void print_shell_usage() {
         "  --read <path>           expose one additional path read-only\n"
         "  --write <path>          expose one additional path read-write\n"
         "  --env <name>            copy one named host environment variable\n"
+        "  --mcp, --upstream <spec>\n"
+        "                          attach an MCP server (`yams` or `<name>=<cmd>[,<arg>...]`);\n"
+        "                          all tools are allowed unless `--allow` is specified\n"
+        "  --allow <qualified.tool>\n"
+        "                          restrict MCP to an explicit allow-list of tools\n"
+        "  --allow-arg <tool>:<field>=<prefix>\n"
+        "                          argument prefix constraint on an allowed tool\n"
+        "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS through the egress proxy\n"
@@ -342,13 +369,15 @@ auto parse_sandbox_flag(
         i += 2;
         return 0;
     }
-    if (a == "--upstream") {
+    if (a == "--upstream" || a == "--mcp") {
         if (i + 1 >= args.size()) {
             std::fprintf(
                 stderr,
-                "glove %.*s: --upstream needs an argument\n",
+                "glove %.*s: %.*s needs an argument\n",
                 static_cast<int>(cmd_name.size()),
-                cmd_name.data()
+                cmd_name.data(),
+                static_cast<int>(a.size()),
+                a.data()
             );
             return 2;
         }
@@ -678,9 +707,263 @@ auto ensure_workspace_directory(const std::optional<std::filesystem::path>& work
     return {};
 }
 
+auto resolve_envs_directory() -> std::optional<std::filesystem::path> {
+    if (auto dirs = glove::host::resolve_directories(glove::host::current_environment())) {
+        return dirs->config / "envs";
+    }
+    if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+        return std::filesystem::path{home} / ".config" / "glove" / "envs";
+    }
+    return std::nullopt;
+}
+
+auto json_escape(std::string_view text) -> std::string {
+    std::string out = "\"";
+    for (const char ch : text) {
+        if (ch == '"' || ch == '\\') {
+            out.push_back('\\');
+            out.push_back(ch);
+        } else if (ch == '\n') {
+            out += "\\n";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+auto json_string_array(const std::vector<std::string>& items) -> std::string {
+    std::string out = "[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) {
+            out += ", ";
+        }
+        out += json_escape(items[i]);
+    }
+    out.push_back(']');
+    return out;
+}
+
+void save_env_profile(
+    std::string_view name, const glove::run::options& opts, std::string_view driver, long active_pid
+) noexcept {
+    const auto envs_dir = resolve_envs_directory();
+    if (!envs_dir || name.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(*envs_dir, ec);
+    if (ec) {
+        return;
+    }
+    std::filesystem::permissions(
+        *envs_dir, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec
+    );
+
+    std::vector<std::string> upstreams;
+    for (const auto& u : opts.upstreams) {
+        std::string spec = u.name + "=";
+        for (std::size_t j = 0; j < u.argv.size(); ++j) {
+            if (j > 0) {
+                spec.push_back(',');
+            }
+            spec += u.argv[j];
+        }
+        upstreams.push_back(std::move(spec));
+    }
+    std::vector<std::string> egress;
+    for (const auto& e : opts.egress) {
+        egress.push_back(e.host + ":" + std::to_string(e.port));
+    }
+    std::vector<std::string> allow_arg;
+    for (const auto& r : opts.prefix_rules) {
+        allow_arg.push_back(r.tool_name + ":" + r.field + "=" + r.required_prefix);
+    }
+
+    const auto path = *envs_dir / (std::string{name} + ".json");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return;
+    }
+    out << "{\n"
+        << "  \"name\": " << json_escape(name) << ",\n"
+        << "  \"workspace\": " << json_escape(opts.workspace ? opts.workspace->string() : "")
+        << ",\n"
+        << "  \"agent\": " << json_escape(driver) << ",\n"
+        << "  \"readable\": " << json_string_array(opts.readable) << ",\n"
+        << "  \"writable\": " << json_string_array(opts.writable) << ",\n"
+        << "  \"env\": " << json_string_array(opts.environment_names) << ",\n"
+        << "  \"upstreams\": " << json_string_array(upstreams) << ",\n"
+        << "  \"allow\": " << json_string_array(opts.allow) << ",\n"
+        << "  \"allow_arg\": " << json_string_array(allow_arg) << ",\n"
+        << "  \"egress\": " << json_string_array(egress) << ",\n"
+        << "  \"bridge_port\": " << (opts.bridge_port ? static_cast<long>(*opts.bridge_port) : 0L)
+        << ",\n"
+        << "  \"active_pid\": " << active_pid << "\n"
+        << "}\n";
+    out.close();
+    std::filesystem::permissions(
+        path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace,
+        ec
+    );
+}
+
+auto load_env_profile(std::string_view name, glove::run::options& opts)
+    -> std::expected<void, std::string> {
+    const auto envs_dir = resolve_envs_directory();
+    if (!envs_dir) {
+        return std::unexpected(std::string{"cannot resolve XDG config directory"});
+    }
+    const auto path = *envs_dir / (std::string{name} + ".json");
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return std::unexpected(
+            "saved environment '" + std::string{name} + "' not found at " + path.string()
+        );
+    }
+    const std::string content((std::istreambuf_iterator<char>(in)), {});
+    auto parsed = glove::reflect::detail::parse_json_object(content);
+    if (!parsed) {
+        return std::unexpected(
+            "invalid saved environment '" + std::string{name} + "': " + parsed.error()
+        );
+    }
+    if (auto it = parsed->find("workspace"); it != parsed->end()) {
+        if (const auto* s = std::get_if<std::string>(&it->second); s != nullptr && !s->empty()) {
+            opts.workspace = std::filesystem::path{*s};
+        }
+    }
+    if (auto it = parsed->find("agent"); it != parsed->end()) {
+        if (const auto* s = std::get_if<std::string>(&it->second); s != nullptr && !s->empty()) {
+            opts.agent_preset = *s;
+        }
+    }
+    if (auto it = parsed->find("readable"); it != parsed->end()) {
+        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+            opts.readable.insert(opts.readable.end(), arr->begin(), arr->end());
+        }
+    }
+    if (auto it = parsed->find("writable"); it != parsed->end()) {
+        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+            opts.writable.insert(opts.writable.end(), arr->begin(), arr->end());
+        }
+    }
+    if (auto it = parsed->find("env"); it != parsed->end()) {
+        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+            opts.environment_names.insert(opts.environment_names.end(), arr->begin(), arr->end());
+        }
+    }
+    if (auto it = parsed->find("upstreams"); it != parsed->end()) {
+        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+            for (const auto& spec : *arr) {
+                if (auto u = parse_upstream(spec)) {
+                    opts.upstreams.push_back(std::move(*u));
+                }
+            }
+        }
+    }
+    if (auto it = parsed->find("allow"); it != parsed->end()) {
+        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+            opts.allow.insert(opts.allow.end(), arr->begin(), arr->end());
+        }
+    }
+    if (auto it = parsed->find("allow_arg"); it != parsed->end()) {
+        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+            for (const auto& spec : *arr) {
+                if (auto r = parse_allow_arg(spec)) {
+                    opts.prefix_rules.push_back(std::move(*r));
+                }
+            }
+        }
+    }
+    if (auto it = parsed->find("egress"); it != parsed->end()) {
+        if (const auto* arr = std::get_if<std::vector<std::string>>(&it->second)) {
+            for (const auto& spec : *arr) {
+                if (auto e = parse_egress(spec)) {
+                    opts.egress.push_back(std::move(*e));
+                }
+            }
+        }
+    }
+    if (auto it = parsed->find("bridge_port"); it != parsed->end()) {
+        if (const auto* n = std::get_if<std::int64_t>(&it->second);
+            n != nullptr && *n >= 1 && *n <= 65535) {
+            opts.bridge_port = static_cast<std::uint16_t>(*n);
+        }
+    }
+    return {};
+}
+
+auto list_env_profiles() -> int {
+    const auto envs_dir = resolve_envs_directory();
+    if (!envs_dir) {
+        std::fprintf(stderr, "glove shell: cannot resolve XDG config directory\n");
+        return 1;
+    }
+    std::printf("Saved environments (%s):\n", envs_dir->c_str());
+    std::error_code ec;
+    if (!std::filesystem::is_directory(*envs_dir, ec)) {
+        std::printf("  (none saved)\n");
+        return 0;
+    }
+    int count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(*envs_dir, ec)) {
+        if (entry.path().extension() != ".json") {
+            continue;
+        }
+        std::ifstream in(entry.path(), std::ios::binary);
+        if (!in) {
+            continue;
+        }
+        const std::string content((std::istreambuf_iterator<char>(in)), {});
+        auto parsed = glove::reflect::detail::parse_json_object(content);
+        if (!parsed) {
+            continue;
+        }
+        ++count;
+        const std::string name = entry.path().stem().string();
+        std::string ws;
+        if (auto it = parsed->find("workspace"); it != parsed->end()) {
+            if (const auto* s = std::get_if<std::string>(&it->second)) {
+                ws = *s;
+            }
+        }
+        std::string agent;
+        if (auto it = parsed->find("agent"); it != parsed->end()) {
+            if (const auto* s = std::get_if<std::string>(&it->second)) {
+                agent = *s;
+            }
+        }
+        long pid = 0;
+        if (auto it = parsed->find("active_pid"); it != parsed->end()) {
+            if (const auto* n = std::get_if<std::int64_t>(&it->second)) {
+                pid = static_cast<long>(*n);
+            }
+        }
+        const bool running = pid > 0 && ::kill(static_cast<::pid_t>(pid), 0) == 0;
+        std::printf(
+            "  %-16s [%s] agent=%s workspace=%s  (launch: `glove shell %s`)\n",
+            name.c_str(),
+            running ? ("RUNNING pid=" + std::to_string(pid)).c_str() : "SAVED",
+            agent.empty() ? "auto" : agent.c_str(),
+            ws.empty() ? "<ephemeral>" : ws.c_str(),
+            name.c_str()
+        );
+    }
+    if (count == 0) {
+        std::printf("  (none saved)\n");
+    }
+    return 0;
+}
+
 auto shell_subcommand(std::span<char* const> args) -> int {
     glove::run::options opts;
     opts.allow_loopback_listen = true;
+    std::optional<std::string> save_name;
+    std::optional<std::string> load_name;
     std::size_t i = 0;
     while (i < args.size()) {
         std::string_view a{args[i]};
@@ -692,10 +975,41 @@ auto shell_subcommand(std::span<char* const> args) -> int {
             print_shell_usage();
             return 0;
         }
+        if (a == "--list") {
+            return list_env_profiles();
+        }
+        if (a == "--last") {
+            load_name = "last";
+            ++i;
+            continue;
+        }
+        if (a == "--save" || a == "--load" || a == "--env-profile") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(
+                    stderr,
+                    "glove shell: %.*s needs an argument\n",
+                    static_cast<int>(a.size()),
+                    a.data()
+                );
+                return 2;
+            }
+            if (a == "--save") {
+                save_name = std::string{args[i + 1]};
+            } else {
+                load_name = std::string{args[i + 1]};
+            }
+            i += 2;
+            continue;
+        }
         if (const auto handled = parse_sandbox_flag(args, i, opts, "shell")) {
             if (*handled != 0) {
                 return *handled;
             }
+            continue;
+        }
+        if (i == 0 && !a.starts_with('-')) {
+            load_name = std::string{a};
+            ++i;
             continue;
         }
         std::fprintf(
@@ -703,6 +1017,40 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         );
         print_shell_usage();
         return 2;
+    }
+
+    if (load_name) {
+        glove::run::options loaded;
+        loaded.allow_loopback_listen = true;
+        if (auto ok = load_env_profile(*load_name, loaded); !ok) {
+            std::fprintf(stderr, "glove shell: %s\n", ok.error().c_str());
+            return 1;
+        }
+        if (opts.workspace) {
+            loaded.workspace = opts.workspace;
+        }
+        if (opts.agent_preset) {
+            loaded.agent_preset = opts.agent_preset;
+        }
+        if (opts.bridge_port) {
+            loaded.bridge_port = opts.bridge_port;
+        }
+        loaded.readable.insert(loaded.readable.end(), opts.readable.begin(), opts.readable.end());
+        loaded.writable.insert(loaded.writable.end(), opts.writable.begin(), opts.writable.end());
+        loaded.environment_names.insert(
+            loaded.environment_names.end(),
+            opts.environment_names.begin(),
+            opts.environment_names.end()
+        );
+        loaded.upstreams.insert(
+            loaded.upstreams.end(), opts.upstreams.begin(), opts.upstreams.end()
+        );
+        loaded.allow.insert(loaded.allow.end(), opts.allow.begin(), opts.allow.end());
+        loaded.prefix_rules.insert(
+            loaded.prefix_rules.end(), opts.prefix_rules.begin(), opts.prefix_rules.end()
+        );
+        loaded.egress.insert(loaded.egress.end(), opts.egress.begin(), opts.egress.end());
+        opts = std::move(loaded);
     }
 
     if (auto ws_ok = ensure_workspace_directory(opts.workspace); !ws_ok) {
@@ -749,6 +1097,7 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         opts.agent_preset.reset();
     }
 
+    const auto user_readable = opts.readable;
     const bool explicit_cmd = !trailing_args.empty() && !trailing_args.front().starts_with('-');
     const std::string resolved_bin = (driver.empty() || (explicit_cmd && !had_explicit_agent))
                                          ? std::string{}
@@ -765,7 +1114,24 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         opts.agent_argv.insert(opts.agent_argv.end(), trailing_args.begin(), trailing_args.end());
     }
 
+    glove::run::options saved_snapshot = opts;
+    saved_snapshot.readable = user_readable;
+    const long my_pid = static_cast<long>(::getpid());
+    if (save_name) {
+        save_env_profile(*save_name, saved_snapshot, driver, my_pid);
+    }
+    if (!explicit_cmd || save_name.has_value() || load_name.has_value()) {
+        save_env_profile("last", saved_snapshot, driver, my_pid);
+    }
+
     auto code = glove::run::exec(opts);
+
+    if (save_name) {
+        save_env_profile(*save_name, saved_snapshot, driver, 0);
+    }
+    if (!explicit_cmd || save_name.has_value() || load_name.has_value()) {
+        save_env_profile("last", saved_snapshot, driver, 0);
+    }
     if (!code) {
         std::fprintf(stderr, "glove shell: %s\n", code.error().c_str());
         return 1;
