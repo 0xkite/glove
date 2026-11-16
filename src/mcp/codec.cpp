@@ -36,8 +36,14 @@ template<class T> auto read_lenient(std::string_view buffer) -> std::expected<T,
     return value;
 }
 
+struct safe_write_opts_t : glz::opts {
+    bool escape_control_characters = true;
+};
+
+constexpr safe_write_opts_t safe_write_opts{};
+
 auto write_json_string(auto&& value) -> std::expected<std::string, std::string> {
-    auto got = glz::write_json(std::forward<decltype(value)>(value));
+    auto got = glz::write<safe_write_opts>(std::forward<decltype(value)>(value));
     if (!got) {
         return std::unexpected(
             std::string{"glaze write_json: "} + glz::format_error(got.error(), std::string{})
@@ -325,19 +331,19 @@ auto encode_response_with_result(std::int64_t id, std::string_view result_json)
 
 auto encode_response_with_error(std::int64_t id, std::int64_t code, std::string_view message)
     -> std::expected<std::string, std::string> {
-    if (message.find('\n') != std::string_view::npos ||
-        message.find('"') != std::string_view::npos) {
-        return std::unexpected(std::string{"error message contains illegal characters"});
+    auto encoded_message = write_json_string(message);
+    if (!encoded_message) {
+        return std::unexpected(encoded_message.error());
     }
     std::string out;
-    out.reserve(message.size() + 64);
+    out.reserve(encoded_message->size() + 64);
     out.append(R"({"jsonrpc":"2.0",)");
     append_id(out, id);
     out.append(R"(,"error":{"code":)");
     out.append(std::to_string(code));
-    out.append(R"(,"message":")");
-    out.append(message);
-    out.append(R"("}})");
+    out.append(R"(,"message":)");
+    out.append(*encoded_message);
+    out.append("}}");
     return out;
 }
 

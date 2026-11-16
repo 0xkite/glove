@@ -196,6 +196,39 @@ target_link_libraries(
 )
 glove_configure_fuzzer(glove_container_profile_fuzzer)
 
+add_library(glove_kernel_server_fuzz_support STATIC
+    ${CMAKE_SOURCE_DIR}/src/kernel/server.cpp
+    ${CMAKE_SOURCE_DIR}/src/kernel/registry.cpp
+    ${CMAKE_SOURCE_DIR}/src/kernel/mcp_extension.cpp
+    ${CMAKE_SOURCE_DIR}/src/kernel/reflect_json_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/policy/jsonpath_engine.cpp
+    ${CMAKE_SOURCE_DIR}/src/policy/allow_list_engine.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/client.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/jsonrpc_client.cpp
+    ${CMAKE_SOURCE_DIR}/src/mcp/in_memory_transport.cpp
+    ${CMAKE_SOURCE_DIR}/src/audit/memory_sink.cpp
+)
+target_link_libraries(glove_kernel_server_fuzz_support PUBLIC glove_options)
+target_link_libraries(glove_kernel_server_fuzz_support PRIVATE glaze::glaze)
+target_include_directories(glove_kernel_server_fuzz_support
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>
+)
+target_compile_options(glove_kernel_server_fuzz_support PRIVATE -fsanitize=fuzzer-no-link)
+
+add_executable(glove_kernel_server_fuzzer kernel_server_fuzzer.cpp)
+target_link_libraries(
+    glove_kernel_server_fuzzer
+    PRIVATE glove_kernel_server_fuzz_support glaze::glaze
+)
+target_include_directories(glove_kernel_server_fuzzer PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}>
+)
+glove_configure_fuzzer(glove_kernel_server_fuzzer)
+
 # The Apple Container stats parser is compiled only on Apple platforms
 # (src/control/CMakeLists.txt), so this fuzzer only links there.
 if(APPLE)

@@ -62,6 +62,43 @@ public:
     }
 };
 
+class raw_json_extension final : public glove::kernel::extension {
+public:
+    auto name() const -> std::string_view override { return "raw"; }
+
+    auto tools() -> std::expected<std::vector<glove::mcp::tool_descriptor>, std::string> override {
+        return std::vector<glove::mcp::tool_descriptor>{
+            {.name = "pretty",
+             .description = "Returns pretty-printed structured JSON.",
+             .input_schema_json = "{\n  \"type\": \"object\"\n}",
+             .annotations = {}},
+            {.name = "broken",
+             .description = "Returns malformed structured JSON.",
+             .input_schema_json = "{}",
+             .annotations = {}},
+        };
+    }
+
+    auto invoke(std::string_view tool_name, std::string_view /*arguments_json*/)
+        -> std::expected<glove::mcp::tool_call_result, std::string> override {
+        if (tool_name == "pretty") {
+            return glove::mcp::tool_call_result{
+                .status = glove::mcp::tool_call_status::ok,
+                .content = "ok",
+                .structured_json = "{\n  \"nested\": {\n    \"ok\": true,\n    \"exact\": "
+                                   "9007199254740993,\n    \"msg\": \"hi\\u0001\"\n  }\n}",
+                .error_message = "",
+            };
+        }
+        return glove::mcp::tool_call_result{
+            .status = glove::mcp::tool_call_status::ok,
+            .content = "bad",
+            .structured_json = "{not valid json",
+            .error_message = "",
+        };
+    }
+};
+
 auto run() -> int {
     glove::testing::mock_pair pair;
 
@@ -144,6 +181,17 @@ auto run() -> int {
     REQUIRE(reply->find("\"id\":5") != std::string::npos);
     REQUIRE(reply->find("-32601") != std::string::npos);
 
+    // unknown method with quotes/backslashes/control escapes must still produce valid
+    // single-line JSON-RPC error without dropping the session.
+    REQUIRE(
+        agent.send(R"({"jsonrpc":"2.0","id":6,"method":"bad\\method\"name\n\u0000"})").has_value()
+    );
+    reply = agent.recv();
+    REQUIRE(reply.has_value());
+    REQUIRE(reply->find("\"id\":6") != std::string::npos);
+    REQUIRE(reply->find("-32601") != std::string::npos);
+    REQUIRE(reply->find('\n') == std::string::npos);
+
     // notification: no response should appear.
     REQUIRE(agent.send(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").has_value());
 
@@ -165,8 +213,61 @@ auto run() -> int {
     return 0;
 }
 
+auto run_raw_json_normalization() -> int {
+    glove::testing::mock_pair pair;
+    glove::kernel::registry reg;
+    REQUIRE(reg.add(std::make_unique<raw_json_extension>()).has_value());
+
+    glove::kernel::server::options opts{
+        .identity = {.name = "glove-test", .version = "0.0.1"},
+        .policy = nullptr,
+        .audit = nullptr,
+    };
+    glove::kernel::server srv{pair.kernel_side(), reg, std::move(opts)};
+    std::thread server_thread{[&] { (void)srv.run(); }};
+
+    auto& agent = pair.agent_side();
+    REQUIRE(agent.send(R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})").has_value());
+    auto reply = agent.recv();
+    REQUIRE(reply.has_value());
+    REQUIRE(reply->find('\n') == std::string::npos);
+    REQUIRE(reply->find(R"("inputSchema":{"type":"object"})") != std::string::npos);
+
+    REQUIRE(
+        agent
+            .send(
+                R"({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"raw.pretty","arguments":{}}})"
+            )
+            .has_value()
+    );
+    reply = agent.recv();
+    REQUIRE(reply.has_value());
+    REQUIRE(reply->find('\n') == std::string::npos);
+    REQUIRE(reply->find(R"("exact":9007199254740993)") != std::string::npos);
+    REQUIRE(reply->find(R"("nested":{"ok":true)") != std::string::npos);
+
+    REQUIRE(
+        agent
+            .send(
+                R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"raw.broken","arguments":{}}})"
+            )
+            .has_value()
+    );
+    reply = agent.recv();
+    REQUIRE(reply.has_value());
+    REQUIRE(reply->find("\"id\":3") != std::string::npos);
+    REQUIRE(reply->find("-32603") != std::string::npos);
+
+    pair.close_agent_to_kernel();
+    server_thread.join();
+    return 0;
+}
+
 } // namespace
 
 auto main() -> int {
-    return run();
+    if (run() != 0) {
+        return 1;
+    }
+    return run_raw_json_normalization();
 }

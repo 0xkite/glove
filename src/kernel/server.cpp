@@ -33,6 +33,38 @@ constexpr std::int64_t err_method_not_found = -32601;
 constexpr std::int64_t err_invalid_params = -32602;
 constexpr std::int64_t err_internal_error = -32603;
 
+struct safe_write_opts_t : glz::opts {
+    bool escape_control_characters = true;
+};
+
+constexpr safe_write_opts_t safe_write_opts{};
+
+auto write_json_safe(const auto& value) -> std::expected<std::string, std::string> {
+    auto encoded = glz::write<safe_write_opts>(value);
+    if (!encoded) {
+        return std::unexpected(
+            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
+        );
+    }
+    return std::move(*encoded);
+}
+
+auto normalize_raw_json(std::string_view raw) -> std::expected<glz::raw_json, std::string> {
+    std::string buf{raw};
+    if (auto ec = glz::validate_json(buf); ec) {
+        return std::unexpected(
+            std::string{"invalid raw JSON fragment: "} + glz::format_error(ec, buf)
+        );
+    }
+    auto compact = glz::minify_json(buf);
+    if (std::any_of(compact.begin(), compact.end(), [](unsigned char ch) { return ch < 0x20U; })) {
+        return std::unexpected(
+            std::string{"invalid raw JSON fragment: unescaped control character"}
+        );
+    }
+    return glz::raw_json{std::move(compact)};
+}
+
 auto encode_initialize_response(std::int64_t id, const server_identity& self)
     -> std::expected<std::string, std::string> {
     glove::mcp::mcp_initialize_result result;
@@ -41,11 +73,9 @@ auto encode_initialize_response(std::int64_t id, const server_identity& self)
     result.serverInfo.version = self.version;
     result.capabilities = glz::raw_json{R"({"tools":{}})"};
 
-    auto encoded = glz::write_json(result);
+    auto encoded = write_json_safe(result);
     if (!encoded) {
-        return std::unexpected(
-            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
-        );
+        return std::unexpected(encoded.error());
     }
     return glove::mcp::codec::encode_response_with_result(id, *encoded);
 }
@@ -59,8 +89,17 @@ auto encode_tools_list_response(
         glove::mcp::mcp_tool_def def;
         def.name = t.name;
         def.description = t.description;
-        def.inputSchema =
-            glz::raw_json{t.input_schema_json.empty() ? std::string{"{}"} : t.input_schema_json};
+        if (t.input_schema_json.empty()) {
+            def.inputSchema = glz::raw_json{std::string{"{}"}};
+        } else {
+            auto normalized = normalize_raw_json(t.input_schema_json);
+            if (!normalized) {
+                return glove::mcp::codec::encode_response_with_error(
+                    id, err_internal_error, normalized.error()
+                );
+            }
+            def.inputSchema = std::move(*normalized);
+        }
         if (t.annotations.has_annotations) {
             glove::mcp::mcp_tool_annotations ann;
             ann.readOnlyHint = t.annotations.read_only_hint;
@@ -71,11 +110,9 @@ auto encode_tools_list_response(
         }
         wire.tools.push_back(std::move(def));
     }
-    auto encoded = glz::write_json(wire);
+    auto encoded = write_json_safe(wire);
     if (!encoded) {
-        return std::unexpected(
-            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
-        );
+        return std::unexpected(encoded.error());
     }
     return glove::mcp::codec::encode_response_with_result(id, *encoded);
 }
@@ -90,13 +127,17 @@ auto encode_tools_call_response(std::int64_t id, const glove::mcp::tool_call_res
         wire.isError && !result.error_message.empty() ? result.error_message : result.content;
     wire.content.push_back(std::move(block));
     if (!result.structured_json.empty()) {
-        wire.structuredContent = glz::raw_json{result.structured_json};
+        auto normalized = normalize_raw_json(result.structured_json);
+        if (!normalized) {
+            return glove::mcp::codec::encode_response_with_error(
+                id, err_internal_error, normalized.error()
+            );
+        }
+        wire.structuredContent = std::move(*normalized);
     }
-    auto encoded = glz::write_json(wire);
+    auto encoded = write_json_safe(wire);
     if (!encoded) {
-        return std::unexpected(
-            std::string{"glaze write_json: "} + glz::format_error(encoded.error(), std::string{})
-        );
+        return std::unexpected(encoded.error());
     }
     return glove::mcp::codec::encode_response_with_result(id, *encoded);
 }

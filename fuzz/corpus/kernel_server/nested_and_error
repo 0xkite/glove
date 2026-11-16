@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs.read_file","arguments":{"path":"/workspace/hello.txt","opts":{"encoding":"utf8"}}}}
+{"jsonrpc":"2.0","id":2,"method":"bad\\method\"name\n\u0000"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"upstream.echo","arguments":{"msg":"hi\u0001\n"}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"up","version":"1"}}}
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"e\u0001","inputSchema":{"type":"object"}}]}}
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok\u0000"}],"isError":false}}
