@@ -1437,20 +1437,6 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         *profile = std::move(*revalidated);
     }
 
-    std::string readable;
-    std::string writable;
-    for (const auto& rule : profile->filesystem) {
-        auto& output = rule.writable ? writable : readable;
-        output += (output.empty() ? "" : ", ") + rule.path;
-    }
-    std::fprintf(
-        stderr,
-        "glove: readable=[%s] writable=[%s] environment=%zu selected egress=%zu rule(s)\n",
-        readable.c_str(),
-        writable.c_str(),
-        opts.environment_names.size(),
-        opts.egress.size()
-    );
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
