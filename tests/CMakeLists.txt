@@ -1153,6 +1153,11 @@ set_tests_properties(reflect_codegen PROPERTIES TIMEOUT 10)
 add_executable(reflect_mcp_extension_test reflect/mcp_extension_test.cpp)
 target_link_libraries(reflect_mcp_extension_test PRIVATE glove_kernel glove_options)
 target_include_directories(reflect_mcp_extension_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR})
+# This target asserts its expectations with assert(). CMake defines NDEBUG for
+# Release, RelWithDebInfo, ASan, and TSan, which would compile every assertion
+# out and leave a test that cannot fail. -UNDEBUG is emitted after the preset
+# flags, so the assertions stay live in every configuration.
+target_compile_options(reflect_mcp_extension_test PRIVATE -UNDEBUG)
 add_test(NAME reflect_mcp_extension COMMAND reflect_mcp_extension_test)
 set_tests_properties(reflect_mcp_extension PROPERTIES TIMEOUT 10)
 if(GLOVE_REFLECTION_ENABLED)
