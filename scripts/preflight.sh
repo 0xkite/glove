@@ -42,14 +42,20 @@ formatted_for_clang_format="23.1.1"
 min_actionlint_version="1.7.12"
 for arg in "$@"; do
     case "${arg}" in
-        --skip-tidy) skip_tidy=1 ;;
-        *) echo "unknown arg: ${arg}" >&2; exit 2 ;;
+    --skip-tidy) skip_tidy=1 ;;
+    *)
+        echo "unknown arg: ${arg}" >&2
+        exit 2
+        ;;
     esac
 done
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
-fail() { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
-ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
+fail() {
+    printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2
+    exit 1
+}
+ok() { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 
 BUILD_ROOT="${GLOVE_PREFLIGHT_BUILD_ROOT-${ROOT}/build}"
 if [[ "${BUILD_ROOT}" != /* ]]; then
@@ -156,7 +162,7 @@ select_compiler() {
     resolved="$(command -v "${cxx_bin}")"
     local cache
     for cache in "${BUILD_ROOT}/dev/CMakeCache.txt" "${BUILD_ROOT}/asan/CMakeCache.txt" \
-                 "${BUILD_ROOT}/tsan/CMakeCache.txt"; do
+        "${BUILD_ROOT}/tsan/CMakeCache.txt"; do
         [[ -f "${cache}" ]] || continue
         local cached
         cached="$(sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p' "${cache}" | head -1)"
@@ -204,7 +210,7 @@ find_fuzzer_compiler() {
         done
     fi
     for candidate in clang++-26 clang++-25 clang++-24 clang++-23 clang++-22 clang++-21 \
-                     clang++-20 clang++-19 clang++-18 clang++; do
+        clang++-20 clang++-19 clang++-18 clang++; do
         if command -v "${candidate}" >/dev/null; then
             command -v "${candidate}"
             return
@@ -246,6 +252,14 @@ if [[ "${clang_format_version}" != "${formatted_for_clang_format}" ]]; then
         echo "    Formatter output can differ between versions; this run's format result is NOT authoritative."
         format_not_authoritative=1
     else
+        printf '%s\n' \
+            "  A rolling package manager can ship a newer clang-format; formatter" \
+            "  output is only stable per version, so the pin is not advisory." \
+            "  Install the exact version CI uses:" \
+            "    python3 -m venv \"\$HOME/.cache/glove-clang-format\"" \
+            "    \"\$HOME/.cache/glove-clang-format/bin/pip\" install clang-format==${formatted_for_clang_format}" \
+            "    export PATH=\"\$HOME/.cache/glove-clang-format/bin:\$PATH\"" \
+            "  Or point GLOVE_CLANG_FORMAT at an existing ${formatted_for_clang_format} binary." >&2
         fail "clang-format ${formatted_for_clang_format} required; found ${clang_format_version:-unknown}. A different version may format this tree differently. Set GLOVE_ALLOW_NEWER_CLANG_FORMAT=1 to proceed with a newer version anyway."
     fi
 fi
@@ -385,7 +399,7 @@ fi
 cmake --preset asan -B "${BUILD_ROOT}/asan" -DGLOVE_BUILD_FUZZERS=OFF
 cmake --build "${BUILD_ROOT}/asan"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     test_preset asan
 fuzzer_cxx="$(find_fuzzer_compiler)"
 fuzzer_symbolizer="$(dirname "${fuzzer_cxx}")/llvm-symbolizer"
@@ -420,74 +434,74 @@ cp -R fuzz/corpus/kernel_server "${kernel_server_fuzz_corpus}"
 apple_stats_fuzz_corpus="${fuzz_workspace}/apple_container_stats"
 cp -R fuzz/corpus/apple_container_stats "${apple_stats_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_mcp_codec_fuzzer" \
-        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${mcp_fuzz_corpus}/" \
-        "${mcp_fuzz_corpus}"
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${mcp_fuzz_corpus}/" \
+    "${mcp_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_policy_jsonpath_fuzzer" \
-        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${policy_fuzz_corpus}/" \
-        "${policy_fuzz_corpus}"
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${policy_fuzz_corpus}/" \
+    "${policy_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_change_manifest_fuzzer" \
-        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${manifest_fuzz_corpus}/" \
-        "${manifest_fuzz_corpus}"
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${manifest_fuzz_corpus}/" \
+    "${manifest_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_session_plan_fuzzer" \
-        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${session_plan_fuzz_corpus}/" \
-        "${session_plan_fuzz_corpus}"
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${session_plan_fuzz_corpus}/" \
+    "${session_plan_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_change_apply_journal_fuzzer" \
-        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${journal_fuzz_corpus}/" \
-        "${journal_fuzz_corpus}"
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${journal_fuzz_corpus}/" \
+    "${journal_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_library_bundle_fuzzer" \
-        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${bundle_fuzz_corpus}/" \
-        "${bundle_fuzz_corpus}"
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${bundle_fuzz_corpus}/" \
+    "${bundle_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_http_syntax_fuzzer" \
-        -runs=10000 -max_len=32768 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${http_syntax_fuzz_corpus}/" \
-        "${http_syntax_fuzz_corpus}"
+    -runs=10000 -max_len=32768 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${http_syntax_fuzz_corpus}/" \
+    "${http_syntax_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_egress_proxy_fuzzer" \
-        -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${egress_proxy_fuzz_corpus}/" \
-        "${egress_proxy_fuzz_corpus}"
+    -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${egress_proxy_fuzz_corpus}/" \
+    "${egress_proxy_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_container_profile_fuzzer" \
-        -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${container_profile_fuzz_corpus}/" \
-        "${container_profile_fuzz_corpus}"
+    -runs=10000 -max_len=16384 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${container_profile_fuzz_corpus}/" \
+    "${container_profile_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
-UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
     "${BUILD_ROOT}/fuzz/fuzz/glove_kernel_server_fuzzer" \
-        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-        -artifact_prefix="${kernel_server_fuzz_corpus}/" \
-        "${kernel_server_fuzz_corpus}"
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${kernel_server_fuzz_corpus}/" \
+    "${kernel_server_fuzz_corpus}"
 # The Apple container-stats parser fuzzer is only built on platforms with that
 # runtime (macOS); run it when present so the target stops being built-but-idle.
 if [[ -x "${BUILD_ROOT}/fuzz/fuzz/glove_apple_container_stats_fuzzer" ]]; then
     ASAN_OPTIONS="${asan_opts}" \
-    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+        UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
         "${BUILD_ROOT}/fuzz/fuzz/glove_apple_container_stats_fuzzer" \
-            -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
-            -artifact_prefix="${apple_stats_fuzz_corpus}/" \
-            "${apple_stats_fuzz_corpus}"
+        -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+        -artifact_prefix="${apple_stats_fuzz_corpus}/" \
+        "${apple_stats_fuzz_corpus}"
 fi
 if [[ "${lsan_skipped}" == "1" ]]; then
     ok "asan ok (leak detection NOT collected: ptrace restricted)"
