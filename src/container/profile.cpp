@@ -240,6 +240,13 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
             return std::unexpected(std::string{"duplicate filesystem rule: '"} + rule.path + "'");
         }
     }
+    if (copy.unix_socket_endpoint) {
+        auto endpoint = canonical_path(*copy.unix_socket_endpoint, "Unix socket endpoint");
+        if (!endpoint) {
+            return std::unexpected(endpoint.error());
+        }
+        copy.unix_socket_endpoint = std::move(*endpoint);
+    }
     std::vector<std::filesystem::path> fs_paths;
     fs_paths.reserve(copy.filesystem.size());
     for (const auto& rule : copy.filesystem) {

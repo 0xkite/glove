@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -248,6 +249,43 @@ auto test_endpoint(const std::string& probe) -> int {
     // explicitly or the documented deny-default network rule is false.
     if (::access("/private/var/run/syslog", F_OK) == 0) {
         REQUIRE(launch_probe(offline, probe, {"unix-dgram", "/private/var/run/syslog", "deny"}));
+    }
+
+    // A mediated Unix-domain broker (the MCP bridge) is reached with connect(),
+    // which SBPL treats as network-outbound, not as a file read. Both profiles
+    // below carry the same read grant, so the endpoint rule is the only
+    // difference: without it the blanket (deny network*) kills the bridge while
+    // the launch itself still looks healthy.
+    {
+        std::error_code socket_error;
+        const auto socket_dir = std::filesystem::temp_directory_path(socket_error);
+        REQUIRE(!socket_error);
+        const auto socket_path = socket_dir / "glove-endpoint-probe.sock";
+        std::filesystem::remove(socket_path, socket_error);
+        const std::string path_text = socket_path.string();
+        REQUIRE(path_text.size() < sizeof(::sockaddr_un::sun_path));
+
+        const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        REQUIRE(listener >= 0);
+        ::sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        std::memcpy(address.sun_path, path_text.c_str(), path_text.size() + 1U);
+        const bool bound =
+            ::bind(listener, reinterpret_cast<::sockaddr*>(&address), sizeof(address)) == 0;
+        const bool listening = bound && ::listen(listener, 4) == 0;
+        REQUIRE(listening);
+
+        glove::container::profile brokered;
+        brokered.filesystem.push_back({.path = socket_dir.string(), .writable = false});
+        brokered.unix_socket_endpoint = path_text;
+        REQUIRE(launch_probe(brokered, probe, {"unix-stream", path_text, "allow"}));
+
+        glove::container::profile without_endpoint;
+        without_endpoint.filesystem.push_back({.path = socket_dir.string(), .writable = false});
+        REQUIRE(launch_probe(without_endpoint, probe, {"unix-stream", path_text, "deny"}));
+
+        ::close(listener);
+        std::filesystem::remove(socket_path, socket_error);
     }
     glove::container::profile allowed;
     allowed.bridge_endpoint = glove::container::bridge_endpoint_settings{.port = port};

@@ -304,6 +304,18 @@ auto append_grant_root_guard(std::string& policy, std::string_view root) -> void
 }
 
 // system.sb provides the platform's dynamic-loader and Mach-service plumbing.
+// Opening terminal paths stays denied; CLOEXEC_DEFAULT leaves only inherited
+// stdio, whose terminal inspection and raw-mode commands an interactive agent
+// needs. Both the session path and exec_passthrough require it, and the grant is
+// scoped to TTY vnodes the process already holds.
+auto append_terminal_ioctl_rule(std::string& profile_text) -> void {
+    profile_text += "(allow file-ioctl (require-all (vnode-type TTY) (require-any";
+    for (const auto command : {TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF, TIOCGPGRP, TIOCGWINSZ}) {
+        profile_text += " (ioctl-command " + std::to_string(command) + ")";
+    }
+    profile_text += ")))\n";
+}
+
 auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::string {
     std::string p = "(version 1)\n(deny default)\n(import \"system.sb\")\n";
     p += "(allow process-exec*)\n(allow process-fork)\n(allow sysctl-read)\n";
@@ -332,7 +344,9 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
     // cannot silently widen the documented deny-default network boundary as
     // Apple regenerates system.sb. The bridge and proxy allows below carry
     // remote filters, so a path-filtered deny does not affect them.
-    p += "(deny network-outbound (subpath \"/private/var/run\") (subpath \"/var/run\"))\n";
+    // /var/run is a symlink to /private/var/run and rule strings are matched
+    // against the resolved path only, so a "/var/run" spelling matches nothing.
+    p += "(deny network-outbound (subpath \"/private/var/run\"))\n";
     if (prof.bridge_endpoint) {
         // SBPL rejects numeric hosts. Its localhost filter plus AF_INET selects
         // 127.0.0.1 only; TCP excludes an unrelated UDP service on the same port.
@@ -349,6 +363,15 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         p += "(allow network-outbound (require-all (remote tcp \"localhost:";
         p += std::to_string(prof.proxy->port);
         p += "\") (socket-domain AF_INET)))\n";
+    }
+    if (prof.unix_socket_endpoint) {
+        // connect() on a Unix socket is network-outbound, not a file read, so the
+        // unfiltered deny above would kill a mediated broker such as the MCP
+        // bridge. validate() stored the canonical path, which is the form the
+        // kernel matches; the caller's $TMPDIR spelling would never match.
+        p += "(allow network-outbound (literal \"";
+        p += sbpl_escape(*prof.unix_socket_endpoint);
+        p += "\"))\n";
     }
     p += "(deny file-write*)\n";
     for (const auto& rule : prof.filesystem) {
@@ -532,6 +555,11 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
         ::posix_spawn_file_actions_destroy(&actions);
         ::posix_spawnattr_destroy(&attr);
         return std::unexpected(compiled.error());
+    }
+    // An interactive agent owns its terminal but not the right to open other
+    // terminal paths; mirror the session path's scoped ioctl grant.
+    if (::isatty(STDIN_FILENO) != 0) {
+        append_terminal_ioctl_rule(argv_owned[2]);
     }
     std::vector<char*> argv_ptrs;
     std::vector<char*> envp;
@@ -728,14 +756,7 @@ auto macos_detail::prepare_launch_command(
     }
     auto arguments = sandboxed_argv(*checked, argv, std::move(*program));
     if (terminal_stdio) {
-        // Opening terminal paths stays denied. CLOEXEC_DEFAULT leaves only
-        // inherited stdio, whose terminal inspection/raw-mode commands are needed.
-        arguments[2] += "(allow file-ioctl (require-all (vnode-type TTY) (require-any";
-        for (const auto command :
-             {TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF, TIOCGPGRP, TIOCGWINSZ}) {
-            arguments[2] += " (ioctl-command " + std::to_string(command) + ")";
-        }
-        arguments[2] += ")))\n";
+        append_terminal_ioctl_rule(arguments[2]);
     }
     return macos_detail::launch_command{
         .arguments = std::move(arguments),

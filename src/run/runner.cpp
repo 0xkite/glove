@@ -1729,6 +1729,9 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         mcp_bridge = std::move(*started_bridge);
         profile->allow_loopback_listen = true;
         profile->filesystem.push_back({.path = mcp_runtime->root().string(), .writable = false});
+        // connect() to the bridge socket is network-outbound; validate() stores
+        // the canonical form because SBPL matches the resolved path.
+        profile->unix_socket_endpoint = sock_path.string();
         profile->environment.push_back("GLOVE_MCP_SOCKET=" + sock_path.string());
         if (auto self_exe = resolve_self_executable(); self_exe && self_exe->has_parent_path()) {
             const std::string self_dir = self_exe->parent_path().string();
