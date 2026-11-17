@@ -75,6 +75,38 @@ auto run() -> int {
     REQUIRE(home_denied);
     REQUIRE(ws_allowed);
     REQUIRE(outside_read_denied);
+
+    // The grant holder must not be able to replace the grant root itself. With
+    // no root guard an agent can unlink an empty root and plant a symlink; the
+    // next launch canonicalizes that path and silently grants the link target.
+    std::filesystem::create_directories(ws, ec);
+    REQUIRE(!ec);
+    std::string outside = std::string{home} + "/.glove_evil_root_" + std::to_string(::getpid());
+    std::filesystem::create_directories(outside, ec);
+    REQUIRE(!ec);
+
+    std::string replace = "if rmdir '" + ws + "' 2>/dev/null; then r=UNLINKED; ";
+    replace +=
+        "if ln -s '" + outside + "' '" + ws + "' 2>/dev/null; then l=REPLACED; else l=FAILED; fi; ";
+    replace += "else r=DENY; l=SKIPPED; fi; echo \"root_rmdir=$r root_link=$l\"";
+
+    auto replaced_or = spawner->spawn(prof, {"/bin/sh", "-c", replace});
+    REQUIRE(replaced_or.has_value());
+    auto replaced = std::move(*replaced_or);
+    auto replaced_line = replaced->transport().recv();
+    REQUIRE(replaced_line.has_value());
+    std::fprintf(stderr, "probe: %s\n", replaced_line->c_str());
+    const bool root_unlinked = replaced_line->find("root_rmdir=UNLINKED") != std::string::npos;
+    const bool root_replaced = replaced_line->find("root_link=REPLACED") != std::string::npos;
+    const bool still_directory =
+        std::filesystem::is_directory(ws, ec) && !std::filesystem::is_symlink(ws, ec);
+
+    std::filesystem::remove_all(ws, ec);
+    std::filesystem::remove_all(outside, ec);
+
+    REQUIRE(!root_unlinked);
+    REQUIRE(!root_replaced);
+    REQUIRE(still_directory);
     return 0;
 }
 

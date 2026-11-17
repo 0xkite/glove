@@ -242,6 +242,13 @@ auto test_endpoint(const std::string& probe) -> int {
 
     glove::container::profile offline;
     REQUIRE(launch_probe(offline, probe, {"connect", "4", "127.0.0.1", port_text, "deny"}));
+    // The imported system.sb carries one concrete network grant: the host
+    // syslog datagram socket. A filtered allow outranks the blanket
+    // (deny network*), so the generated profile must close that path class
+    // explicitly or the documented deny-default network rule is false.
+    if (::access("/private/var/run/syslog", F_OK) == 0) {
+        REQUIRE(launch_probe(offline, probe, {"unix-dgram", "/private/var/run/syslog", "deny"}));
+    }
     glove::container::profile allowed;
     allowed.bridge_endpoint = glove::container::bridge_endpoint_settings{.port = port};
     REQUIRE(launch_probe(allowed, probe, {"connect", "4", "127.0.0.1", port_text, "allow"}));
@@ -277,6 +284,22 @@ auto test_endpoint(const std::string& probe) -> int {
     ));
     REQUIRE(first_forwarded.load() == 1);
     REQUIRE(second_forwarded.load() == 1);
+
+    // A raw-CONNECT egress proxy selects the other SBPL egress branch. It must
+    // grant the same shape: one exact IPv4 loopback port, no IPv6, no
+    // neighbouring port, and no UDP. This branch previously carried no
+    // socket-domain filter, so `remote ip "localhost:PORT"` also admitted ::1.
+    glove::container::profile proxied;
+    proxied.proxy = glove::container::proxy_settings{
+        .port = port,
+        .url = "http://glove:fixture@127.0.0.1:" + port_text,
+    };
+    REQUIRE(launch_probe(proxied, probe, {"connect", "4", "127.0.0.1", port_text, "allow"}));
+    REQUIRE(launch_probe(proxied, probe, {"connect", "6", "::1", port_text, "deny"}));
+    REQUIRE(launch_probe(proxied, probe, {"connect", "6", "::ffff:127.0.0.1", port_text, "deny"}));
+    REQUIRE(launch_probe(proxied, probe, {"connect", "4", "127.0.0.1", other_port_text, "deny"}));
+    REQUIRE(launch_probe(proxied, probe, {"connect", "4", "192.0.2.1", port_text, "deny"}));
+    REQUIRE(launch_probe(proxied, probe, {"udp", "4", "127.0.0.1", port_text, "deny"}));
 
     auto mixed = allowed;
     mixed.proxy = glove::container::proxy_settings{

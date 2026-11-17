@@ -126,7 +126,10 @@ public:
     ~macos_agent_handle() override {
         transport_.reset();
         if (!waited_) {
-            (void)wait();
+            // A destructor cannot report. wait() already escalates SIGTERM to
+            // SIGKILL and blocks until the leader is reaped, so the only
+            // remaining failure is a waitpid() error such as ECHILD.
+            [[maybe_unused]] const auto drained = wait();
         }
     }
 
@@ -322,6 +325,13 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         append_parent_metadata_rules(p, rule.path);
     }
     p += "(deny network*)\n";
+    // The imported system profile grants exactly one network endpoint - the
+    // host syslog datagram socket - and a filtered allow outranks the
+    // unfiltered deny above. Close that path class explicitly so the import
+    // cannot silently widen the documented deny-default network boundary as
+    // Apple regenerates system.sb. The bridge and proxy allows below carry
+    // remote filters, so a path-filtered deny does not affect them.
+    p += "(deny network-outbound (subpath \"/private/var/run\") (subpath \"/var/run\"))\n";
     if (prof.bridge_endpoint) {
         // SBPL rejects numeric hosts. Its localhost filter plus AF_INET selects
         // 127.0.0.1 only; TCP excludes an unrelated UDP service on the same port.
@@ -330,9 +340,14 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         p += "\") (socket-domain AF_INET)))\n";
     }
     if (prof.proxy) {
-        p += "(allow network-outbound (remote ip \"localhost:";
+        // The egress proxy always advertises a numeric 127.0.0.1 URL, so the
+        // AF_INET socket-domain filter costs nothing and keeps this rule from
+        // also admitting IPv6 ::1. Without it, `remote ip "localhost:PORT"`
+        // matches both loopback families, which contradicts the documented
+        // "no IPv6 egress" boundary and the bridged-endpoint rule below.
+        p += "(allow network-outbound (require-all (remote tcp \"localhost:";
         p += std::to_string(prof.proxy->port);
-        p += "\"))\n";
+        p += "\") (socket-domain AF_INET)))\n";
     }
     p += "(deny file-write*)\n";
     for (const auto& rule : prof.filesystem) {
@@ -342,6 +357,11 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
             p += "\") (subpath \"";
             p += sbpl_escape(rule.path);
             p += "\"))\n";
+            // A writable grant lets its own holder unlink an empty root and
+            // replace it with a symlink. The next launch canonicalizes that
+            // path and would silently grant the link target, so keep the root
+            // node itself inside the grant. Children stay writable.
+            append_grant_root_guard(p, rule.path);
         }
     }
     for (const auto& file : prof.immutable_files) {

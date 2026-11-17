@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -423,6 +424,32 @@ auto mutation_probe(
     return std::unexpected(failure{"mutation unexpectedly permitted", EIO});
 }
 
+auto unix_datagram_probe(const char* path, std::string_view expected) -> result<void> {
+    if (expected != "allow" && expected != "deny") {
+        return std::unexpected(failure{"unix expectation", EINVAL});
+    }
+    ::sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const std::size_t length = ::strnlen(path, sizeof(address.sun_path));
+    if (length == 0U || length >= sizeof(address.sun_path)) {
+        return std::unexpected(failure{"unix path", EINVAL});
+    }
+    ::memcpy(address.sun_path, path, length + 1U);
+    const descriptor socket{::socket(AF_UNIX, SOCK_DGRAM, 0)};
+    if (socket.get() < 0) {
+        return check_expectation(std::unexpected(failure{"socket", errno}), expected == "deny");
+    }
+    const int rc = ::connect(
+        socket.get(),
+        reinterpret_cast<const ::sockaddr*>(&address),
+        static_cast<::socklen_t>(sizeof(address))
+    );
+    if (rc != 0) {
+        return check_expectation(std::unexpected(failure{"connect", errno}), expected == "deny");
+    }
+    return check_expectation(result<void>{}, expected == "deny");
+}
+
 auto run(int argc, char** argv) -> result<void> {
     if (argc < 2 || argc > 7) {
         return std::unexpected(failure{"argument count", EINVAL});
@@ -438,6 +465,9 @@ auto run(int argc, char** argv) -> result<void> {
     }
     if (mode == "mutate" && argc == 6) {
         return mutation_probe(argv[2], argv[3], argv[4], argv[5]);
+    }
+    if (mode == "unix-dgram" && argc == 4) {
+        return unix_datagram_probe(argv[2], argv[3]);
     }
     const bool http = mode == "http";
     const bool udp = mode == "udp";
