@@ -101,7 +101,7 @@ if ! cc -O1 -o "${work}/connprobe" "${work}/connprobe.c" 2>"${work}/cc.log"; the
     exit 1
 fi
 
-mkdir -p "${work}/w" "${work}/outside" "${work}/wx" "${work}/real"
+mkdir -p "${work}/w" "${work}/outside" "${work}/wx" "${work}/real" "${work}/guard"
 printf 'x\n' >"${work}/w/f"
 printf 'sibling\n' >"${work}/wx/f"
 printf 'secret\n' >"${work}/outside/secret"
@@ -128,6 +128,10 @@ classify() {
     local rc="$1" out="$2"
     if grep -qiE "Operation not permitted|Permission denied|errno=1 \(|errno=13 \(" <<<"${out}"; then
         echo sandbox-deny
+    elif [[ "${rc}" -eq 137 ]]; then
+        # The profile attached (with send-signal SIGKILL) to the denying rule:
+        # the sandbox terminated the caller at the syscall.
+        echo sandbox-kill
     elif [[ "${rc}" -eq 65 ]] && grep -q "^sandbox-exec:" <<<"${out}"; then
         # Compile failure, not a runtime denial. A profile that does not build
         # is a construction failure and must never be read as enforcement.
@@ -208,6 +212,15 @@ if [[ -S /private/var/run/syslog ]]; then
 else
     printf 'skip  Y1,Y2 /private/var/run/syslog is absent on this host\n'
 fi
+
+printf '== response modifiers: report is allow-only, send-signal SIGKILL terminates ==\n'
+probe R1 profile-error "(deny file-write* (with report))" /bin/true
+probe R2 sandbox-deny "${BASE}(allow file-write*)(deny file-write* (subpath \"${work_real}/guard\"))" /bin/sh -c "echo x > ${work_real}/guard/a"
+probe R3 sandbox-kill "${BASE}(allow file-write*)(deny file-write* (subpath \"${work_real}/guard\") (with send-signal SIGKILL))" /bin/sh -c "echo x > ${work_real}/guard/b"
+probe R4 allow "${BASE}(allow file-write*)(deny file-write* (subpath \"${work_real}/guard\") (with send-signal SIGKILL))" /bin/sh -c "echo x > ${work_real}/outside/c"
+probe R5 sandbox-deny "${BASE}(allow file-write*)(deny file-write* (subpath \"${work_real}/guard\") (with send-signal SIGTERM))" /bin/sh -c "echo x > ${work_real}/guard/d"
+probe R6 sandbox-kill "${BASE}(allow network-outbound (require-all (remote tcp \"localhost:${port}\") (socket-domain AF_INET)))(deny network* (with send-signal SIGKILL))" "${work}/connprobe" fam4 127.0.0.1 46000
+probe R7 allow "${BASE}(allow network-outbound (require-all (remote tcp \"localhost:${port}\") (socket-domain AF_INET)))(deny network* (with send-signal SIGKILL))" "${work}/connprobe" fam4 127.0.0.1 "${port}"
 
 printf '\ncases=%d unexpected=%d\n' "${cases}" "${unexpected}"
 [[ "${unexpected}" -eq 0 ]]

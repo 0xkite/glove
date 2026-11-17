@@ -55,6 +55,36 @@ Precedence is **specificity first, then source order**:
   outranks it. A later *unfiltered* deny cannot retract an earlier filtered
   allow; only an equal-or-more-specific deny can.
 
+## Response modifiers
+
+A rule can carry `(with ...)` modifiers that change what happens when it matches.
+These are the only lever SBPL gives for *reacting* to a violation.
+
+| Modifier | Valid on | Effect | Probe |
+| --- | --- | --- | --- |
+| `(with send-signal SIGKILL)` | allow or deny | terminates the calling process at the syscall | R3, R6 |
+| `(with send-signal SIGTERM)` | — | accepted but does **not** terminate; the caller continues and sees the ordinary denial | R5 |
+| `(with report)` | **allow only** | logs the allowed operation; rejected on a deny with `sandbox-exec: report modifier does not apply to deny action` | R1 |
+| `(with no-log)` | deny | accepted; suppresses logging | — |
+
+Precision holds: the signal fires only when that rule is the one that decides.
+A write outside the rule's filter, or a connection to an allowed port, is
+unaffected (R4, R7). Specificity still governs, so a filtered tripwire outranks
+the unfiltered `(deny default)` and even an unfiltered allow.
+
+This is the only in-kernel "stop the caller" primitive SBPL offers, and it is
+the macOS counterpart to the Linux seccomp `SCMP_ACT_NOTIFY` supervisor running
+its `terminate_container` policy: it needs no supervisor process and the agent
+cannot race it.
+
+It is also the *only* containment-violation signal a parent can observe,
+because `report` is rejected on denials. A child killed by a tripwire exits
+137; an ordinary denial is invisible to the parent, which sees only the agent's
+later exit code. Design consequence: put tripwires on operation classes that are
+never legitimate for a contained agent, and leave ordinary capability denials
+(an ungranted path or host) as plain `EPERM`, because agents probe those
+routinely and must keep running.
+
 ## Path filters
 
 `(literal <path>)`, `(subpath <path>)`, `(regex <pattern>)`, `(suffix <s>)`,
