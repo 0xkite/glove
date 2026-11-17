@@ -8,6 +8,7 @@
 #include "launch_command.hpp"
 #include "runtime_filesystem.hpp"
 
+#include <crt_externs.h>
 #include <spawn.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -403,6 +404,48 @@ auto sandboxed_argv(
     return out;
 }
 
+// A profile that does not compile is a construction failure, not an agent
+// exit. sandbox-exec reports a bad profile only on its own stderr with exit 65,
+// and only after posix_spawn has already succeeded, so the parent would record
+// it as the agent's own exit code and never learn that containment was absent.
+// Compile the exact text first by running it against /usr/bin/true: the probe
+// also proves the profile admits the dynamic loader and /usr/bin, which every
+// launch needs.
+auto profile_compiles(const std::string& profile_text) -> std::expected<void, std::string> {
+    std::vector<std::string> argv{"/usr/bin/sandbox-exec", "-p", profile_text, "/usr/bin/true"};
+    std::vector<char*> argv_ptrs;
+    argv_ptrs.reserve(argv.size() + 1);
+    for (auto& argument : argv) {
+        argv_ptrs.push_back(argument.data());
+    }
+    argv_ptrs.push_back(nullptr);
+    ::pid_t pid = -1;
+    char** environment = *_NSGetEnviron();
+    if (const int rc =
+            ::posix_spawn(&pid, argv[0].c_str(), nullptr, nullptr, argv_ptrs.data(), environment);
+        rc != 0) {
+        return std::unexpected(std::string{"profile probe: "} + std::strerror(rc));
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return std::unexpected(std::string{"profile probe: "} + std::strerror(errno));
+    }
+    if (!WIFEXITED(status)) {
+        return std::unexpected(std::string{"profile probe: terminated by signal"});
+    }
+    const int code = WEXITSTATUS(status);
+    if (code != 0) {
+        return std::unexpected(
+            "generated sandbox profile does not compile (sandbox-exec exit " +
+            std::to_string(code) + ")"
+        );
+    }
+    return {};
+}
+
 auto has_environment_name(const std::vector<std::string>& environment, std::string_view name)
     -> bool {
     return std::any_of(environment.begin(), environment.end(), [name](const std::string& entry) {
@@ -485,6 +528,11 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
 
     std::vector<std::string> argv_owned = sandboxed_argv(effective, argv, std::move(*resolved));
     std::vector<std::string> env_owned = sandboxed_env(effective);
+    if (auto compiled = profile_compiles(argv_owned[2]); !compiled) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::posix_spawnattr_destroy(&attr);
+        return std::unexpected(compiled.error());
+    }
     std::vector<char*> argv_ptrs;
     std::vector<char*> envp;
     argv_ptrs.reserve(argv_owned.size() + 1);
@@ -555,6 +603,14 @@ public:
         if (!resolved) {
             return std::unexpected(resolved.error());
         }
+        // Build and compile the profile before allocating pipes or spawn attributes,
+        // so a profile that does not build fails the launch rather than surfacing
+        // later as the agent's own exit code.
+        std::vector<std::string> argv_owned = sandboxed_argv(effective, argv, std::move(*resolved));
+        std::vector<std::string> env_owned = sandboxed_env(effective);
+        if (auto compiled = profile_compiles(argv_owned[2]); !compiled) {
+            return std::unexpected(compiled.error());
+        }
 
         // Two pipes: pipe_in carries parent→child (child stdin); pipe_out
         // carries child→parent (child stdout). Child stderr is inherited so
@@ -610,8 +666,6 @@ public:
             return std::unexpected(std::string{"spawnattr_setflags: "} + std::strerror(rc));
         }
 
-        std::vector<std::string> argv_owned = sandboxed_argv(effective, argv, std::move(*resolved));
-        std::vector<std::string> env_owned = sandboxed_env(effective);
         std::vector<char*> argv_ptrs;
         argv_ptrs.reserve(argv_owned.size() + 1);
         for (auto& a : argv_owned) {
