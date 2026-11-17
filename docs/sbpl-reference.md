@@ -122,10 +122,33 @@ cannot, get inode binding.
 | `file-write*` (allow) | `:355-360` | per writable grant |
 | `file-write-unlink/mode/owner/flags` (deny) | `:296-303` | grant-root guard |
 
-Never emitted, therefore covered only by `(deny default)`:
-`mach-lookup`, `ipc-posix-shm`, `process-info*`, `signal`, `iokit`, `device*`,
-`pseudo-tty`, `nvram`, `file-map-executable`. Nothing currently asserts these are
-denied.
+Never emitted, therefore handed to `(deny default)` **unless the import grants
+it**: `mach-lookup`, `ipc-posix-shm`, `process-info*`, `signal`, `iokit`,
+`device*`, `pseudo-tty`, `nvram`, `file-map-executable`. See the next section:
+three of those are in fact granted by the import, so "not emitted" means
+"unknown", not "denied". Nothing in the test suite currently asserts any of
+them.
+
+## What `(import "system.sb")` actually grants
+
+The import is not limited to dynamic-loader plumbing. Its rules are *filtered*
+allows, so they outrank `(deny default)`. Reading
+`/System/Library/Sandbox/Profiles/system.sb` (version 3, 12 KB) on this host:
+
+- `(allow mach-lookup (global-name ...))` for around twenty host services
+  (`:158`), and, under `(when (sbpl-version-compatible? 1) ...)`, an **empty XPC
+  prefix**: `(allow mach-lookup (xpc-service-name-prefix ""))` (`:21-23`).
+- `(allow ipc-posix-shm-read* (ipc-posix-name "apple.shm.notification_center")
+  (ipc-posix-name-prefix "apple.cfprefs."))` (`:154-156`).
+- Filtered write grants: `(allow file-read-data file-test-existence
+  file-write-data (subpath "/dev/fd"))` (`:119`) and `(allow file-write-create
+  (require-all (prefix "/cores/") (vnode-type REGULAR-FILE)))` (`:135`).
+- The syslog datagram socket (probes Y1/Y2).
+
+Consequence for auditing: an operation class the generator never mentions is
+*not* necessarily denied. It is denied only where the import grants nothing.
+The generator retracts the imported network grant explicitly
+(`sandbox_spawner.cpp:334`) and retracts none of the others.
 
 ## Reproducing
 
