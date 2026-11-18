@@ -1033,6 +1033,18 @@ if(APPLE)
         container_macos_denial_tag PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
     )
 
+    # Per-launch denial monitor: delivery at finish, unavailable and degraded
+    # streams, and two concurrent sessions.
+    add_executable(container_macos_denial_monitor_test container/macos_denial_monitor_test.cpp)
+    target_link_libraries(container_macos_denial_monitor_test PRIVATE glove_container)
+    target_include_directories(container_macos_denial_monitor_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+    )
+    add_test(NAME container_macos_denial_monitor COMMAND container_macos_denial_monitor_test)
+    set_tests_properties(
+        container_macos_denial_monitor PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
+    )
+
     # Stage 3: `glove exec` stdio-passthrough contain path (HOME→workspace,
     # writes outside denied). macOS-only.
     add_executable(container_macos_exec_test container/macos_exec_test.cpp)

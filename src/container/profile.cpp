@@ -1,5 +1,7 @@
 #include "glove/container/profile.hpp"
 
+#include "sandbox_denial_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -229,6 +231,9 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         return std::unexpected(bounded.error());
     }
     profile copy = p;
+    if (copy.denial_tag && !detail::is_denial_tag(*copy.denial_tag)) {
+        return std::unexpected(std::string{"denial tag must be 32 lowercase hex characters"});
+    }
     std::set<std::string> paths;
     for (auto& rule : copy.filesystem) {
         auto path = canonical_path(rule.path, "filesystem rule");

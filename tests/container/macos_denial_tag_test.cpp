@@ -216,6 +216,15 @@ auto structure(const std::filesystem::path& work, const std::filesystem::path& r
     REQUIRE(second->denial_tag != first->denial_tag);
     REQUIRE(profile_runs(*first));
 
+    // A tag chosen by the caller (the runner's monitor) is used as given.
+    constexpr std::string_view fixed_tag = "00112233445566778899aabbccddeeff";
+    auto fixed_profile = profile_a(work);
+    fixed_profile.denial_tag = std::string{fixed_tag};
+    const auto fixed = prepare_launch_command(fixed_profile, {"/bin/sh", "-c", "true"});
+    REQUIRE(fixed.has_value());
+    REQUIRE(fixed->denial_tag == fixed_tag);
+    REQUIRE(fixed->arguments.at(2).contains("(with message \"" + std::string{fixed_tag} + "\")"));
+
     const auto agent = root / "agent";
     const auto workspace = root / "workspace";
     std::error_code ec;

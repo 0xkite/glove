@@ -589,7 +589,10 @@ struct sandboxed_command {
 auto sandboxed_argv(
     const profile& prof, const std::vector<std::string>& argv, std::string resolved_program
 ) -> sandboxed_command {
-    sandboxed_command out{.argv = {}, .denial_tag = macos_detail::make_denial_tag()};
+    sandboxed_command out{
+        .argv = {},
+        .denial_tag = prof.denial_tag ? *prof.denial_tag : macos_detail::make_denial_tag(),
+    };
     out.argv.reserve(argv.size() + 3);
     out.argv.emplace_back("/usr/bin/sandbox-exec");
     out.argv.emplace_back("-p");

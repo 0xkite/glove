@@ -25,6 +25,7 @@ if(APPLE)
         macos/sandbox_spawner.cpp
         macos/runtime_filesystem.cpp
         macos/denial_stream.cpp
+        macos/denial_monitor.cpp
         linux/pty_session_channel.cpp
     )
     target_include_directories(glove_container PRIVATE

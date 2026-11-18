@@ -250,6 +250,12 @@ struct profile {
         deny_errno,
     };
     seccomp_escape_policy escape_policy = seccomp_escape_policy::terminate_container;
+
+    // Set only by the runner after it started denial telemetry. macOS gives
+    // every deny rule this tag instead of a fresh one; other backends ignore
+    // it. 32 lowercase hex characters. Not a secret from the contained
+    // process, which can read it.
+    std::optional<std::string> denial_tag;
 };
 
 // Validate and canonicalise a profile. Invalid, overlapping, contradictory,
