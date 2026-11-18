@@ -266,7 +266,10 @@ private:
     // Descendants outliving the leader are killed and proven gone before the
     // reap releases the PGID. Members that moved to another group are outside
     // this mechanism; macOS has no containing equivalent of a cgroup.
+    // A listing truncated by the fixed bound counts as live members, so a
+    // large group is still killed until it fits or the deadline passes.
     auto drain_group() -> std::string {
+        bool truncated = false;
         for (int spin = 0; spin < drain_polls; ++spin) {
             auto still_owned = observe(true);
             if (!still_owned) {
@@ -276,13 +279,19 @@ private:
                 return "agent group drain: kill errno " + std::to_string(errno);
             }
             const auto live = macos_detail::group_has_live_members(pid_);
-            if (!live) {
+            truncated = !live && live.error() == EOVERFLOW;
+            if (!live && !truncated) {
                 return "agent group drain: inspection errno " + std::to_string(live.error());
             }
-            if (!*live) {
+            if (live && !*live) {
                 return {};
             }
             ::usleep(drain_interval_us);
+        }
+        if (truncated) {
+            return std::string{
+                "agent group drain: listing truncated and descendants still live after SIGKILL"
+            };
         }
         return std::string{"agent group drain: descendants still live after SIGKILL"};
     }

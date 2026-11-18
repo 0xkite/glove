@@ -13,10 +13,13 @@
 
 #include <sys/proc.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -94,6 +97,66 @@ auto term_ignoring_group_escalates() -> int {
     REQUIRE(*code == -1);
     REQUIRE(elapsed < std::chrono::seconds{10});
     REQUIRE(!group_has_live_members(leader));
+    return 0;
+}
+
+// A group too large for one bounded listing is still killed and proven empty,
+// and the leader's exit code survives the truncated inspections.
+auto large_group_is_drained() -> int {
+    glove::container::profile prof;
+    auto spawner = glove::container::make_default_spawner();
+    REQUIRE(spawner != nullptr);
+    auto handle_or = spawner->spawn(
+        prof,
+        {"/bin/sh",
+         "-c",
+         "i=0; while [ $i -lt 300 ]; do sleep 30 >/dev/null 2>&1 & i=$((i+1)); done; echo $$; exit "
+         "7"}
+    );
+    REQUIRE(handle_or.has_value());
+    auto handle = std::move(*handle_or);
+    auto line = handle->transport().recv();
+    REQUIRE(line.has_value());
+    const auto leader = static_cast<::pid_t>(std::stol(*line));
+    REQUIRE(leader > 0);
+    auto code = handle->wait();
+    REQUIRE(code.has_value());
+    REQUIRE(*code == 7);
+    REQUIRE(!group_has_live_members(leader));
+    return 0;
+}
+
+// Once another waiter has consumed the leader, the PID and PGID are no longer
+// pinned: wait() must fail, keep failing identically, and signal nothing.
+auto lost_ownership_sends_no_signal() -> int {
+    glove::container::profile prof;
+    auto spawner = glove::container::make_default_spawner();
+    REQUIRE(spawner != nullptr);
+    auto handle_or =
+        spawner->spawn(prof, {"/bin/sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $$ $!; exit 0"});
+    REQUIRE(handle_or.has_value());
+    auto handle = std::move(*handle_or);
+    auto line = handle->transport().recv();
+    REQUIRE(line.has_value());
+    int leader_value = 0;
+    int sleeper_value = 0;
+    REQUIRE(std::sscanf(line->c_str(), "%d %d", &leader_value, &sleeper_value) == 2);
+    const auto leader = static_cast<::pid_t>(leader_value);
+    const auto sleeper = static_cast<::pid_t>(sleeper_value);
+    REQUIRE(leader > 0 && sleeper > 0);
+    int status = 0;
+    ::pid_t reaped = -1;
+    do {
+        reaped = ::waitpid(leader, &status, 0);
+    } while (reaped < 0 && errno == EINTR);
+    REQUIRE(reaped == leader);
+    auto code = handle->wait();
+    REQUIRE(!code.has_value());
+    auto again = handle->wait();
+    REQUIRE(!again.has_value());
+    REQUIRE(again.error() == code.error());
+    REQUIRE(::kill(sleeper, 0) == 0);
+    (void)::kill(sleeper, SIGKILL);
     return 0;
 }
 
@@ -187,5 +250,11 @@ auto main() -> int {
     if (const int failed = descendants_drained_before_reap(); failed != 0) {
         return failed;
     }
-    return term_ignoring_group_escalates();
+    if (const int failed = term_ignoring_group_escalates(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = large_group_is_drained(); failed != 0) {
+        return failed;
+    }
+    return lost_ownership_sends_no_signal();
 }

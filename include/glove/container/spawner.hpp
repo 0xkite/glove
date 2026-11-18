@@ -30,10 +30,12 @@ public:
     virtual auto transport() -> glove::mcp::transport& = 0;
 
     // Block until the agent exits, returning its exit code (or a negative
-    // value for abnormal termination). After the first call subsequent calls
-    // return the cached value. The destructor invokes this if it has not
-    // already been called, so an explicit wait() is optional unless the
-    // caller wants the code.
+    // value for abnormal termination). The first result, value or error, is
+    // cached and returned by later calls. wait() can return an error after the
+    // agent has exited, when its group cannot be proven empty or the leader
+    // was reaped elsewhere. The destructor invokes this if it has not already
+    // been called and does not retry a failed wait(), so an explicit wait() is
+    // optional unless the caller wants the code.
     virtual auto wait() -> std::expected<int, std::string> = 0;
 
     // Return the terminal resource-enforcement receipt. This is unavailable
