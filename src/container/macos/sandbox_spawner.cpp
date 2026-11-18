@@ -6,6 +6,7 @@
 #include "glove/mcp/transport.hpp"
 
 #include "darwin_process_group.hpp"
+#include "denial_tag.hpp"
 #include "launch_command.hpp"
 #include "runtime_filesystem.hpp"
 
@@ -429,13 +430,23 @@ auto regex_literal(std::string_view text, bool fold_case = false) -> std::string
     return out;
 }
 
-auto append_grant_root_guard(std::string& policy, std::string_view root) -> void {
+// Every deny rule ends with this modifier; the tag is hex, so it needs no
+// sbpl_escape.
+auto tag_modifier(std::string_view denial_tag) -> std::string {
+    return std::string{" (with message \""} + std::string{denial_tag} + "\")";
+}
+
+auto append_grant_root_guard(
+    std::string& policy, std::string_view root, std::string_view denial_tag
+) -> void {
     // Grant children write access without allowing the grant root's namespace
     // or security metadata to move out from under immutable/reserved paths.
     policy +=
         "(deny file-write-unlink file-write-mode file-write-owner file-write-flags (literal \"";
     policy += sbpl_escape(root);
-    policy += "\"))\n";
+    policy += "\")";
+    policy += tag_modifier(denial_tag);
+    policy += ")\n";
 }
 
 // system.sb provides the platform's dynamic-loader and Mach-service plumbing.
@@ -451,8 +462,14 @@ auto append_terminal_ioctl_rule(std::string& profile_text) -> void {
     profile_text += ")))\n";
 }
 
-auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::string {
-    std::string p = "(version 1)\n(deny default)\n(import \"system.sb\")\n";
+// Every deny rule must carry the launch's denial tag. A deny rule added
+// without it produces denials the session's telemetry cannot see, and a later
+// untagged rule overrides a tagged one for the operations it decides
+// (measured: the kernel appends the message only of the rule that decided).
+auto generate_sbpl(const profile& prof, std::string_view agent_program, std::string_view denial_tag)
+    -> std::string {
+    const auto tagged = tag_modifier(denial_tag);
+    std::string p = "(version 1)\n(deny default" + tagged + ")\n(import \"system.sb\")\n";
     p += "(allow process-exec*)\n(allow process-fork)\n(allow sysctl-read)\n";
     for (const auto* runtime : {"/bin", "/sbin", "/usr/bin", "/usr/sbin"}) {
         append_read_rule(p, runtime);
@@ -472,7 +489,7 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         append_read_rule(p, rule.path);
         append_parent_metadata_rules(p, rule.path);
     }
-    p += "(deny network*)\n";
+    p += "(deny network*" + tagged + ")\n";
     // The imported system profile grants exactly one network endpoint - the
     // host syslog datagram socket - and a filtered allow outranks the
     // unfiltered deny above. Close that path class explicitly so the import
@@ -481,7 +498,7 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
     // remote filters, so a path-filtered deny does not affect them.
     // /var/run is a symlink to /private/var/run and rule strings are matched
     // against the resolved path only, so a "/var/run" spelling matches nothing.
-    p += "(deny network-outbound (subpath \"/private/var/run\"))\n";
+    p += "(deny network-outbound (subpath \"/private/var/run\")" + tagged + ")\n";
     if (prof.bridge_endpoint) {
         // SBPL rejects numeric hosts. Its localhost filter plus AF_INET selects
         // 127.0.0.1 only; TCP excludes an unrelated UDP service on the same port.
@@ -508,7 +525,7 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         p += sbpl_escape(*prof.unix_socket_endpoint);
         p += "\"))\n";
     }
-    p += "(deny file-write*)\n";
+    p += "(deny file-write*" + tagged + ")\n";
     for (const auto& rule : prof.filesystem) {
         if (rule.writable) {
             p += "(allow file-write* (literal \"";
@@ -520,14 +537,14 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
             // replace it with a symlink. The next launch canonicalizes that
             // path and would silently grant the link target, so keep the root
             // node itself inside the grant. Children stay writable.
-            append_grant_root_guard(p, rule.path);
+            append_grant_root_guard(p, rule.path, denial_tag);
         }
     }
     for (const auto& file : prof.immutable_files) {
         p += "(deny file-write* (literal \"";
         p += sbpl_escape(file);
-        p += "\"))\n";
-        append_grant_root_guard(p, std::filesystem::path{file}.parent_path().string());
+        p += "\")" + tagged + ")\n";
+        append_grant_root_guard(p, std::filesystem::path{file}.parent_path().string(), denial_tag);
     }
     for (const auto& entry : prof.reserved_entries) {
         const auto pattern =
@@ -536,8 +553,8 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         // raw #"regex" syntax cannot safely encode an embedded quote.
         p += "(deny file-read* file-write* (regex \"";
         p += sbpl_escape(pattern);
-        p += "\"))\n";
-        append_grant_root_guard(p, entry.parent);
+        p += "\")" + tagged + ")\n";
+        append_grant_root_guard(p, entry.parent, denial_tag);
     }
     return p;
 }
@@ -547,17 +564,22 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
 // SBPL profile applied before its first instruction — not left to self-sandbox
 // the way the synthetic agent does. sandbox-exec compiles + applies the
 // profile, then exec()s the target.
+struct sandboxed_command {
+    std::vector<std::string> argv;
+    std::string denial_tag;
+};
+
 auto sandboxed_argv(
     const profile& prof, const std::vector<std::string>& argv, std::string resolved_program
-) -> std::vector<std::string> {
-    std::vector<std::string> out;
-    out.reserve(argv.size() + 3);
-    out.emplace_back("/usr/bin/sandbox-exec");
-    out.emplace_back("-p");
-    out.emplace_back(generate_sbpl(prof, resolved_program));
-    out.emplace_back(std::move(resolved_program));
+) -> sandboxed_command {
+    sandboxed_command out{.argv = {}, .denial_tag = macos_detail::make_denial_tag()};
+    out.argv.reserve(argv.size() + 3);
+    out.argv.emplace_back("/usr/bin/sandbox-exec");
+    out.argv.emplace_back("-p");
+    out.argv.emplace_back(generate_sbpl(prof, resolved_program, out.denial_tag));
+    out.argv.emplace_back(std::move(resolved_program));
     for (std::size_t i = 1; i < argv.size(); ++i) {
-        out.push_back(argv[i]);
+        out.argv.push_back(argv[i]);
     }
     return out;
 }
@@ -684,7 +706,10 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
     }
     ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
 
-    std::vector<std::string> argv_owned = sandboxed_argv(effective, argv, std::move(*resolved));
+    auto command = sandboxed_argv(effective, argv, std::move(*resolved));
+    std::vector<std::string> argv_owned = std::move(command.argv);
+    // read by denial telemetry once it is wired in
+    [[maybe_unused]] const std::string denial_tag = std::move(command.denial_tag);
     std::vector<std::string> env_owned = sandboxed_env(effective);
     if (auto compiled = profile_compiles(argv_owned[2]); !compiled) {
         ::posix_spawn_file_actions_destroy(&actions);
@@ -769,7 +794,10 @@ public:
         // Build and compile the profile before allocating pipes or spawn attributes,
         // so a profile that does not build fails the launch rather than surfacing
         // later as the agent's own exit code.
-        std::vector<std::string> argv_owned = sandboxed_argv(effective, argv, std::move(*resolved));
+        auto command = sandboxed_argv(effective, argv, std::move(*resolved));
+        std::vector<std::string> argv_owned = std::move(command.argv);
+        // read by denial telemetry once it is wired in
+        [[maybe_unused]] const std::string denial_tag = std::move(command.denial_tag);
         std::vector<std::string> env_owned = sandboxed_env(effective);
         if (auto compiled = profile_compiles(argv_owned[2]); !compiled) {
             return std::unexpected(compiled.error());
@@ -889,14 +917,15 @@ auto macos_detail::prepare_launch_command(
     if (!program) {
         return std::unexpected(program.error());
     }
-    auto arguments = sandboxed_argv(*checked, argv, std::move(*program));
+    auto command = sandboxed_argv(*checked, argv, std::move(*program));
     if (terminal_stdio) {
-        append_terminal_ioctl_rule(arguments[2]);
+        append_terminal_ioctl_rule(command.argv[2]);
     }
     return macos_detail::launch_command{
-        .arguments = std::move(arguments),
+        .arguments = std::move(command.argv),
         .environment = sandboxed_env(*checked),
         .start_directory = checked->work_dir ? checked->work_dir : checked->home_dir,
+        .denial_tag = std::move(command.denial_tag),
     };
 }
 
