@@ -145,7 +145,18 @@ public:
             // A destructor cannot report. wait() escalates SIGTERM to SIGKILL,
             // drains the group, and reaps; its remaining failures leave nothing
             // a destructor could safely retry.
-            [[maybe_unused]] const auto drained = wait();
+            try {
+                [[maybe_unused]] const auto drained = wait();
+            } catch (...) {
+                // wait() builds error strings, so it can throw. Leave no live
+                // group or zombie: the leader is still ours while owned_.
+                signal_group(SIGKILL);
+                if (owned_) {
+                    int status = 0;
+                    while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+                    owned_ = false;
+                }
+            }
         }
     }
 
