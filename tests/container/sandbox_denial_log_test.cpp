@@ -22,8 +22,10 @@ using glove::container::detail::classify_denial_operation;
 using glove::container::detail::denial_class;
 using glove::container::detail::denial_event;
 using glove::container::detail::denial_parse_error;
+using glove::container::detail::is_denial_tag;
 using glove::container::detail::max_denial_line_bytes;
 using glove::container::detail::parse_denial_line;
+using glove::container::detail::parse_tagged_denial_line;
 
 constexpr std::size_t max_seed_bytes = 65536;
 
@@ -286,6 +288,98 @@ auto message_cases() -> int {
     return 0;
 }
 
+auto parse_tagged_seed(std::string_view name, std::string_view tag)
+    -> std::optional<std::expected<denial_event, denial_parse_error>> {
+    auto bytes = read_seed(name);
+    if (!bytes) {
+        return std::nullopt;
+    }
+    return parse_tagged_denial_line(*bytes, tag);
+}
+
+auto tagged_rejected_with(std::string_view name, std::string_view tag, denial_parse_error expected)
+    -> bool {
+    const auto parsed = parse_tagged_seed(name, tag);
+    return parsed && !parsed->has_value() && parsed->error() == expected;
+}
+
+auto tagged_cases() -> int {
+    const std::string tag_t = "00112233445566778899aabbccddeeff";
+    const std::string tag_u = "ffeeddccbbaa99887766554433221100";
+    const auto untagged = denial_parse_error::untagged;
+
+    const auto plain = parse_tagged_seed("tagged-mach-lookup.json", tag_t);
+    REQUIRE(plain && plain->has_value() && (*plain)->readings.size() == 1);
+    REQUIRE((*plain)->readings[0].pid == 60708);
+    REQUIRE((*plain)->readings[0].target == "glove.probe.plain");
+
+    REQUIRE(tagged_rejected_with("tagged-mach-lookup.json", tag_u, untagged));
+    REQUIRE(tagged_rejected_with("valid-mach-lookup.json", tag_t, untagged));
+
+    const auto duplicate = parse_tagged_seed("tagged-duplicate-report.json", tag_t);
+    REQUIRE(duplicate && duplicate->has_value() && (*duplicate)->duplicate_reports == 1);
+    REQUIRE((*duplicate)->readings.size() == 1);
+    REQUIRE((*duplicate)->readings[0].target == "/private/tmp/glove-probe/wd");
+
+    const auto inner = parse_tagged_seed("tagged-inner-copy-of-tag.json", tag_t);
+    REQUIRE(inner && inner->has_value() && (*inner)->readings.size() == 1);
+    REQUIRE((*inner)->readings[0].target == "/private/tmp/forge\n" + tag_t);
+
+    const auto foreign = parse_tagged_seed("tagged-foreign-tag-inside.json", tag_t);
+    REQUIRE(foreign && foreign->has_value() && (*foreign)->readings.size() == 1);
+    REQUIRE((*foreign)->readings[0].target == "/private/tmp/forge\n" + tag_u);
+    REQUIRE(tagged_rejected_with("tagged-foreign-tag-inside.json", tag_u, untagged));
+
+    const auto no_target = parse_tagged_seed("tagged-no-target.json", tag_t);
+    REQUIRE(no_target && no_target->has_value() && (*no_target)->readings.size() == 1);
+    REQUIRE((*no_target)->readings[0].operation == "forbidden-exec-sugid");
+    REQUIRE((*no_target)->readings[0].target.empty());
+
+    REQUIRE(tagged_rejected_with(
+        "hostile-system-policy-tag-tail.json", tag_t, denial_parse_error::not_a_denial
+    ));
+
+    REQUIRE(tagged_rejected_with("hostile-tag-not-final.json", tag_t, untagged));
+    REQUIRE(tagged_rejected_with("hostile-tag-without-newline.json", tag_t, untagged));
+    REQUIRE(tagged_rejected_with("hostile-truncated-marker.json", tag_t, untagged));
+
+    REQUIRE(tagged_rejected_with("tagged-mach-lookup.json", "", untagged));
+    REQUIRE(tagged_rejected_with("tagged-mach-lookup.json", tag_t.substr(0, 31), untagged));
+    REQUIRE(tagged_rejected_with("tagged-mach-lookup.json", tag_t + "0", untagged));
+    REQUIRE(tagged_rejected_with(
+        "tagged-mach-lookup.json", "00112233445566778899AABBCCDDEEFF", untagged
+    ));
+
+    REQUIRE(tagged_rejected_with(
+        "hostile-userland-forgery-logger.json", tag_t, denial_parse_error::wrong_provenance
+    ));
+
+    const auto untagged_parse = parse_seed("tagged-mach-lookup.json");
+    REQUIRE(untagged_parse && untagged_parse->has_value());
+    REQUIRE((*untagged_parse)->readings.size() == 1);
+    REQUIRE((*untagged_parse)->readings[0].target == "glove.probe.plain\n" + tag_t);
+
+    REQUIRE(is_denial_tag(tag_t));
+    REQUIRE(!is_denial_tag(""));
+    REQUIRE(!is_denial_tag(tag_t.substr(0, 31)));
+    REQUIRE(!is_denial_tag(tag_t + "0"));
+    REQUIRE(!is_denial_tag("00112233445566778899aabbccddeefF"));
+    REQUIRE(!is_denial_tag("00112233445566778899aabbccddeefg"));
+    REQUIRE(!is_denial_tag("00112233445566778899aabbccddeef "));
+    REQUIRE(!is_denial_tag("00112233445566778899aabbccddeef\n"));
+
+    // Recorded, not required: what the parser does with bytes after the object.
+    const auto trailing = read_seed("tagged-mach-lookup.json");
+    REQUIRE(trailing);
+    const auto with_trailing = parse_tagged_denial_line(*trailing + " x", tag_t);
+    if (with_trailing) {
+        std::printf("trailing-bytes: parsed\n");
+    } else {
+        std::printf("trailing-bytes: error %d\n", static_cast<int>(with_trailing.error()));
+    }
+    return 0;
+}
+
 auto classifier_table() -> int {
     struct row {
         std::string_view operation;
@@ -332,6 +426,9 @@ int main(int argc, char** argv) {
         return failed;
     }
     if (const int failed = message_cases(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = tagged_cases(); failed != 0) {
         return failed;
     }
     return classifier_table();

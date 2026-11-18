@@ -243,6 +243,9 @@ struct denial_stream::implementation {
             case detail::denial_parse_error::bad_timestamp:
                 rejected_timestamp.fetch_add(1, std::memory_order_relaxed);
                 break;
+            case detail::denial_parse_error::untagged:
+                // parse_denial_line never checks a tag.
+                break;
             }
             return true;
         }

@@ -26,6 +26,7 @@ constexpr std::size_t max_denial_target_bytes = 4096;
 constexpr std::size_t max_denial_comm_bytes = 32;
 constexpr std::size_t max_denial_operation_bytes = 64;
 constexpr std::size_t max_denial_readings = 4;
+constexpr std::size_t denial_tag_bytes = 32;
 
 enum class denial_class : std::uint8_t {
     file_read,
@@ -50,6 +51,7 @@ enum class denial_parse_error : std::uint8_t {
     wrong_provenance,
     not_a_denial,
     bad_timestamp,
+    untagged,
 };
 
 struct denial_reading {
@@ -77,6 +79,21 @@ struct denial_event {
 // members, not emitted by the kernel's Sandbox extension, not a denial
 // message, or not carrying a well-formed timestamp, in that order.
 [[nodiscard]] auto parse_denial_line(std::string_view line)
+    -> std::expected<denial_event, denial_parse_error>;
+
+// True for exactly 32 characters, each in 0-9 or a-f.
+[[nodiscard]] auto is_denial_tag(std::string_view text) noexcept -> bool;
+
+// As parse_denial_line, but also returns untagged (after the provenance check)
+// unless the message ends with '\n' followed by TAG; that suffix is removed
+// before the message is read. The kernel appends "\n<tag>" to a denial decided
+// by a rule that carries `(with message "<tag>")`, so only that final line is
+// evidence the denied process ran under the session's profile. Everything
+// before it, the target included, can be chosen by the denied process, so a
+// copy of the tag earlier in the message proves nothing. The tag is not a
+// secret from processes inside the sandbox or from other processes of the same
+// user, who can therefore forge a tagged line.
+[[nodiscard]] auto parse_tagged_denial_line(std::string_view line, std::string_view tag)
     -> std::expected<denial_event, denial_parse_error>;
 
 } // namespace glove::container::detail

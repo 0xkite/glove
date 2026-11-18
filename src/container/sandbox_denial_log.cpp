@@ -258,7 +258,10 @@ auto classify_denial_operation(std::string_view operation) noexcept -> denial_cl
     return denial_class::other;
 }
 
-auto parse_denial_line(std::string_view line) -> std::expected<denial_event, denial_parse_error> {
+namespace {
+
+auto parse_line(std::string_view line, std::optional<std::string_view> tag)
+    -> std::expected<denial_event, denial_parse_error> {
     if (line.size() > max_denial_line_bytes) {
         return std::unexpected(denial_parse_error::oversized);
     }
@@ -271,7 +274,16 @@ auto parse_denial_line(std::string_view line) -> std::expected<denial_event, den
         return std::unexpected(denial_parse_error::wrong_provenance);
     }
 
-    const std::string_view message{record.event_message};
+    std::string_view message{record.event_message};
+    if (tag) {
+        // The kernel's "\n<tag>" is removed once, before anything else reads
+        // the message, so no reading's target carries it.
+        if (!is_denial_tag(*tag) || message.size() < denial_tag_bytes + 1 ||
+            !message.ends_with(*tag) || message[message.size() - denial_tag_bytes - 1] != '\n') {
+            return std::unexpected(denial_parse_error::untagged);
+        }
+        message.remove_suffix(denial_tag_bytes + 1);
+    }
     std::size_t pos = 0;
     denial_event event;
     event.duplicate_reports = take_duplicate_prefix(message, pos);
@@ -302,6 +314,23 @@ auto parse_denial_line(std::string_view line) -> std::expected<denial_event, den
     event.unix_micros = *micros;
     event.mach_timestamp = record.mach_timestamp;
     return event;
+}
+
+} // namespace
+
+auto parse_denial_line(std::string_view line) -> std::expected<denial_event, denial_parse_error> {
+    return parse_line(line, std::nullopt);
+}
+
+auto is_denial_tag(std::string_view text) noexcept -> bool {
+    return text.size() == denial_tag_bytes && std::ranges::all_of(text, [](char byte) {
+               return is_digit(byte) || (byte >= 'a' && byte <= 'f');
+           });
+}
+
+auto parse_tagged_denial_line(std::string_view line, std::string_view tag)
+    -> std::expected<denial_event, denial_parse_error> {
+    return parse_line(line, tag);
 }
 
 } // namespace glove::container::detail
