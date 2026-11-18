@@ -2,6 +2,7 @@
 
 #include <glaze/glaze.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -89,11 +90,15 @@ auto take_number(std::string_view text, std::size_t& pos) noexcept -> std::optio
 
 auto take_literal(std::string_view text, std::size_t& pos, std::string_view literal) noexcept
     -> bool {
-    if (text.substr(pos).starts_with(literal)) {
-        pos += literal.size();
-        return true;
+    // Bounds are checked before comparing so this cannot throw out_of_range.
+    if (pos > text.size() || text.size() - pos < literal.size() ||
+        !std::equal(
+            literal.begin(), literal.end(), text.begin() + static_cast<std::ptrdiff_t>(pos)
+        )) {
+        return false;
     }
-    return false;
+    pos += literal.size();
+    return true;
 }
 
 // "<N> duplicate report[s] for " in front of the denial; absent means 0.
