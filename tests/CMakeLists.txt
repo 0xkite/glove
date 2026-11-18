@@ -377,6 +377,14 @@ add_test(
 )
 set_tests_properties(container_sandbox_denial_log PROPERTIES TIMEOUT 10)
 
+add_executable(container_denial_telemetry_test container/denial_telemetry_test.cpp)
+target_link_libraries(container_denial_telemetry_test PRIVATE glove_container)
+target_include_directories(container_denial_telemetry_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+)
+add_test(NAME container_denial_telemetry COMMAND container_denial_telemetry_test)
+set_tests_properties(container_denial_telemetry PROPERTIES TIMEOUT 10)
+
 add_executable(container_receipt_chain_test container/receipt_chain_test.cpp)
 target_link_libraries(container_receipt_chain_test PRIVATE glove_container)
 add_test(NAME container_receipt_chain COMMAND container_receipt_chain_test)

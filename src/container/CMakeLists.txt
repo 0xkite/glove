@@ -8,6 +8,7 @@ add_library(glove_container STATIC
     refinement_protocol.cpp
     resource_monitor.cpp
     sandbox_denial_log.cpp
+    denial_telemetry.cpp
 )
 add_library(glove::container ALIAS glove_container)
 
