@@ -68,11 +68,13 @@ void denial_audit_writer::record_start(
     glove::container::denial_telemetry_state state, std::string_view reason
 ) {
     const std::lock_guard lock{mutex_};
-    if (finished_) {
+    if (finished_ || started_) {
         return;
     }
+    started_ = true;
     if (state == glove::container::denial_telemetry_state::unavailable) {
         started_unavailable_ = true;
+        pending_degraded_.reset();
         append(
             "telemetry",
             R"({"state":"unavailable"})",
@@ -82,6 +84,14 @@ void denial_audit_writer::record_start(
         return;
     }
     append("telemetry", R"({"state":"live"})", true, {});
+    if (state == glove::container::denial_telemetry_state::degraded && !pending_degraded_) {
+        pending_degraded_ = std::string{reason};
+    }
+    if (pending_degraded_) {
+        const std::string pending = std::move(*pending_degraded_);
+        pending_degraded_.reset();
+        append_degraded(pending);
+    }
 }
 
 void denial_audit_writer::on_denial(const glove::container::sandbox_denial& denial) {
@@ -129,7 +139,21 @@ void denial_audit_writer::on_denial(const glove::container::sandbox_denial& deni
 
 void denial_audit_writer::on_degraded(std::string_view reason) {
     const std::lock_guard lock{mutex_};
-    if (finished_ || degraded_written_) {
+    if (finished_) {
+        return;
+    }
+    if (!started_) {
+        if (!pending_degraded_) {
+            pending_degraded_ = std::string{reason};
+        }
+        return;
+    }
+    append_degraded(reason);
+}
+
+// Caller holds mutex_; at most one degraded record per writer.
+void denial_audit_writer::append_degraded(std::string_view reason) {
+    if (degraded_written_ || started_unavailable_) {
         return;
     }
     degraded_written_ = true;

@@ -230,6 +230,43 @@ auto unavailable() -> int {
     return 0;
 }
 
+// A degradation reported before the start record (the stream died between
+// its start proof and arming) is written after it, never before.
+auto early_degraded() -> int {
+    {
+        auto sink = glove::audit::make_memory_sink();
+        denial_audit_writer writer{sink};
+        writer.on_degraded("early");
+        writer.record_start(denial_telemetry_state::live, "");
+        const auto events = sink->take();
+        REQUIRE(events.size() == 2);
+        REQUIRE(events[0].arguments_json == R"({"state":"live"})");
+        REQUIRE(events[1].arguments_json == R"({"state":"degraded"})");
+        REQUIRE(events[1].error_message == "early");
+    }
+    {
+        auto sink = glove::audit::make_memory_sink();
+        denial_audit_writer writer{sink};
+        writer.record_start(denial_telemetry_state::degraded, "lost");
+        writer.on_degraded("again");
+        const auto events = sink->take();
+        REQUIRE(events.size() == 2);
+        REQUIRE(events[0].arguments_json == R"({"state":"live"})");
+        REQUIRE(events[1].arguments_json == R"({"state":"degraded"})");
+        REQUIRE(events[1].error_message == "lost");
+    }
+    {
+        auto sink = glove::audit::make_memory_sink();
+        denial_audit_writer writer{sink};
+        writer.on_degraded("early");
+        writer.record_start(denial_telemetry_state::unavailable, "none");
+        const auto events = sink->take();
+        REQUIRE(events.size() == 1);
+        REQUIRE(events[0].arguments_json == R"({"state":"unavailable"})");
+    }
+    return 0;
+}
+
 auto degraded() -> int {
     auto sink = glove::audit::make_memory_sink();
     denial_audit_writer writer{sink};
@@ -341,7 +378,9 @@ auto notices() -> int {
 } // namespace
 
 int main() {
-    for (auto* step : {shapes, rate, cap, unsafe, unavailable, degraded, sink_failure, notices}) {
+    for (auto* step : {
+             shapes, rate, cap, unsafe, unavailable, early_degraded, degraded, sink_failure, notices
+         }) {
         if (const int failed = step(); failed != 0) {
             return failed;
         }

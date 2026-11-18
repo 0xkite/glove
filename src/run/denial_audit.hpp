@@ -36,6 +36,7 @@ public:
     auto operator=(denial_audit_writer&&) -> denial_audit_writer& = delete;
     ~denial_audit_writer() = default;
 
+    // A degraded state writes the live start record, then the degraded one.
     void record_start(glove::container::denial_telemetry_state state, std::string_view reason);
     // Safe from any thread.
     void on_denial(const glove::container::sandbox_denial& denial);
@@ -54,8 +55,14 @@ private:
     std::mutex mutex_;
     std::shared_ptr<glove::audit::sink> sink_;
     clock now_;
+    void append_degraded(std::string_view reason);
+
+    bool started_ = false;
     bool started_unavailable_ = false;
     bool degraded_written_ = false;
+    // A degradation reported before record_start is written after the start
+    // record, so the trail never shows degraded before live.
+    std::optional<std::string> pending_degraded_;
     bool finished_ = false;
     std::optional<std::chrono::steady_clock::time_point> window_start_;
     std::size_t window_count_ = 0;
