@@ -322,12 +322,6 @@ auto parse_denial_line(std::string_view line) -> std::expected<denial_event, den
     return parse_line(line, std::nullopt);
 }
 
-auto is_denial_tag(std::string_view text) noexcept -> bool {
-    return text.size() == denial_tag_bytes && std::ranges::all_of(text, [](char byte) {
-               return is_digit(byte) || (byte >= 'a' && byte <= 'f');
-           });
-}
-
 auto parse_tagged_denial_line(std::string_view line, std::string_view tag)
     -> std::expected<denial_event, denial_parse_error> {
     return parse_line(line, tag);

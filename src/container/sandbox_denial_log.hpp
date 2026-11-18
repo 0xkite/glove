@@ -81,8 +81,19 @@ struct denial_event {
 [[nodiscard]] auto parse_denial_line(std::string_view line)
     -> std::expected<denial_event, denial_parse_error>;
 
-// True for exactly 32 characters, each in 0-9 or a-f.
-[[nodiscard]] auto is_denial_tag(std::string_view text) noexcept -> bool;
+// True for exactly 32 characters, each in 0-9 or a-f. Inline so profile
+// validation can use it without linking the parser.
+[[nodiscard]] inline auto is_denial_tag(std::string_view text) noexcept -> bool {
+    if (text.size() != denial_tag_bytes) {
+        return false;
+    }
+    for (const char byte : text) {
+        if ((byte < '0' || byte > '9') && (byte < 'a' || byte > 'f')) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // As parse_denial_line, but also returns untagged (after the provenance check)
 // unless the message ends with '\n' followed by TAG; that suffix is removed
