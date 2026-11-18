@@ -3,6 +3,7 @@
 // log exits, emits garbage, floods, ignores SIGTERM, or a callback throws.
 
 #include "macos/denial_stream.hpp"
+#include "macos/denial_tag.hpp"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -12,6 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -24,6 +26,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -42,10 +45,15 @@ using glove::container::detail::denial_event;
 using glove::container::macos_detail::denial_stream;
 using glove::container::macos_detail::denial_stream_options;
 using glove::container::macos_detail::denial_stream_state;
+using glove::container::macos_detail::make_denial_tag;
 using clock_type = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
 std::string corpus_dir;
+
+// The fixed tag of the tagged corpus seeds, and the foreign tag inside one.
+constexpr std::string_view seed_tag = "00112233445566778899aabbccddeeff";
+constexpr std::string_view foreign_tag = "ffeeddccbbaa99887766554433221100";
 
 auto group_has_live_members(::pid_t group) -> bool {
     std::array<struct kinfo_proc, 256> processes{};
@@ -74,11 +82,12 @@ auto make_nonce() -> std::string {
     return out;
 }
 
-// The same canary the class spawns, owned (unreaped) by the test.
-auto spawn_canary(const std::string& nonce) -> ::pid_t {
+// A denied touch of TARGET under a profile tagged TAG, owned (unreaped) by
+// the test.
+auto spawn_touch(std::string target, std::string_view tag) -> ::pid_t {
     const std::string profile =
-        R"((version 1)(deny default)(import "system.sb")(allow process-exec*)(allow file-read* (subpath "/usr") (subpath "/System")))";
-    std::string target = "/private/tmp/glove-denial-canary-" + nonce;
+        R"((version 1)(deny default (with message ")" + std::string{tag} +
+        R"("))(import "system.sb")(allow process-exec*)(allow file-read* (subpath "/usr") (subpath "/System")))";
     std::vector<std::string> argv{"/usr/bin/sandbox-exec", "-p", profile, "/usr/bin/touch", target};
     std::vector<char*> args;
     for (auto& arg : argv) {
@@ -102,6 +111,11 @@ auto spawn_canary(const std::string& nonce) -> ::pid_t {
     return rc == 0 ? pid : -1;
 }
 
+// The same canary the class spawns, but tagged TAG.
+auto spawn_canary(const std::string& nonce, std::string_view tag) -> ::pid_t {
+    return spawn_touch("/private/tmp/glove-denial-canary-" + nonce, tag);
+}
+
 void kill_and_reap(::pid_t pid) {
     if (pid <= 0) {
         return;
@@ -119,6 +133,7 @@ struct watcher {
     std::string want_nonce;
     bool hit = false;
     std::vector<std::int32_t> pids;
+    std::vector<std::string> targets;
     std::atomic<int> degraded_calls{0};
     std::string degraded_reason;
 
@@ -126,6 +141,9 @@ struct watcher {
         const std::lock_guard lock{mutex};
         if (!event.readings.empty() && pids.size() < 64) {
             pids.push_back(event.readings.front().pid);
+        }
+        if (event.readings.size() == 1 && targets.size() < 256) {
+            targets.push_back(event.readings.front().target);
         }
         if (event.readings.size() == 1 && event.readings[0].pid == want_pid &&
             !want_nonce.empty() && event.readings[0].target.ends_with(want_nonce)) {
@@ -142,8 +160,10 @@ struct watcher {
         degraded_calls.fetch_add(1);
     }
 
-    auto options(std::vector<std::string> argv = {}) -> denial_stream_options {
+    auto options(std::string_view tag, std::vector<std::string> argv = {})
+        -> denial_stream_options {
         return {
+            .tag = std::string{tag},
             .argv = std::move(argv),
             .on_event = [this](const denial_event& event) { on_event(event); },
             .on_degraded = [this](std::string_view reason) { on_degraded(reason); },
@@ -168,7 +188,8 @@ auto elapsed_ms(clock_type::time_point since) -> long long {
 
 auto live_and_latency() -> int {
     watcher watch;
-    auto started = denial_stream::start(watch.options());
+    const std::string tag = make_denial_tag();
+    auto started = denial_stream::start(watch.options(tag));
     REQUIRE(started.has_value());
     auto& stream = **started;
     // T0: a user who may not read the log gets a stream that degrades at once.
@@ -181,7 +202,7 @@ auto live_and_latency() -> int {
 
     REQUIRE(stream.prove_live(milliseconds{10000}).has_value());
     REQUIRE(stream.state() == denial_stream_state::live);
-    REQUIRE(stream.counters().events >= 1);
+    REQUIRE(stream.counters().canary_events >= 1);
     std::printf("T1 ok\n");
 
     int missed = 0;
@@ -193,7 +214,7 @@ auto live_and_latency() -> int {
             const std::lock_guard lock{watch.mutex};
             watch.hit = false;
             watch.want_nonce = nonce;
-            pid = spawn_canary(nonce);
+            pid = spawn_canary(nonce, tag);
             watch.want_pid = pid;
         }
         const auto spawned = clock_type::now();
@@ -228,7 +249,7 @@ auto live_and_latency() -> int {
 
 auto exited_child() -> int {
     watcher watch;
-    auto started = denial_stream::start(watch.options({"/usr/bin/false"}));
+    auto started = denial_stream::start(watch.options(seed_tag, {"/usr/bin/false"}));
     REQUIRE(started.has_value());
     auto stream = std::move(*started);
     REQUIRE(wait_for(
@@ -246,10 +267,10 @@ auto exited_child() -> int {
 
 auto spawn_failure() -> int {
     watcher watch;
-    auto missing = denial_stream::start(watch.options({"/nonexistent/glove-log"}));
+    auto missing = denial_stream::start(watch.options(seed_tag, {"/nonexistent/glove-log"}));
     REQUIRE(!missing.has_value());
     REQUIRE(missing.error().find("errno") != std::string::npos);
-    auto relative = denial_stream::start(watch.options({"log"}));
+    auto relative = denial_stream::start(watch.options(seed_tag, {"log"}));
     REQUIRE(!relative.has_value());
     std::printf("T4 ok\n");
     return 0;
@@ -258,8 +279,9 @@ auto spawn_failure() -> int {
 auto garbage_and_flood() -> int {
     watcher watch;
     const std::string script =
-        R"(i=0; while [ $i -lt 10000 ]; do echo garbage; i=$((i+1)); done; head -c 100000 /dev/zero | tr '\0' A; echo; cat "$1/valid-mach-lookup.json"; echo; exec sleep 30)";
-    auto started = denial_stream::start(watch.options({"/bin/sh", "-c", script, "sh", corpus_dir}));
+        R"(i=0; while [ $i -lt 10000 ]; do echo garbage; i=$((i+1)); done; head -c 100000 /dev/zero | tr '\0' A; echo; cat "$1/tagged-mach-lookup.json"; exec sleep 30)";
+    auto started =
+        denial_stream::start(watch.options(seed_tag, {"/bin/sh", "-c", script, "sh", corpus_dir}));
     REQUIRE(started.has_value());
     auto stream = std::move(*started);
     REQUIRE(wait_for([&] { return stream->counters().events == 1; }, milliseconds{10000}));
@@ -281,8 +303,9 @@ auto garbage_and_flood() -> int {
 
 auto term_ignoring_child() -> int {
     watcher watch;
-    auto started =
-        denial_stream::start(watch.options({"/bin/sh", "-c", "trap '' TERM; sleep 30 & wait"}));
+    auto started = denial_stream::start(
+        watch.options(seed_tag, {"/bin/sh", "-c", "trap '' TERM; sleep 30 & wait"})
+    );
     REQUIRE(started.has_value());
     auto stream = std::move(*started);
     const ::pid_t group = stream->child_pid_for_test();
@@ -300,12 +323,13 @@ auto term_ignoring_child() -> int {
 
 auto callback_throws() -> int {
     watcher watch;
-    auto options = watch.options();
+    const std::string tag = make_denial_tag();
+    auto options = watch.options(tag);
     options.on_event = [](const denial_event&) { throw std::runtime_error{"test callback"}; };
     auto started = denial_stream::start(std::move(options));
     REQUIRE(started.has_value());
     auto stream = std::move(*started);
-    const ::pid_t canary = spawn_canary(make_nonce());
+    const ::pid_t canary = spawn_canary(make_nonce(), tag);
     REQUIRE(canary > 0);
     const bool degraded = wait_for(
         [&] { return stream->state() == denial_stream_state::degraded; }, milliseconds{10000}
@@ -324,8 +348,9 @@ auto callback_throws() -> int {
 auto replayed_denial_is_not_a_canary() -> int {
     watcher watch;
     const std::string script =
-        R"(i=0; while [ $i -lt 60 ]; do cat "$1/valid-mach-lookup.json"; echo; sleep 0.05; i=$((i+1)); done; exec sleep 30)";
-    auto started = denial_stream::start(watch.options({"/bin/sh", "-c", script, "sh", corpus_dir}));
+        R"(i=0; while [ $i -lt 60 ]; do cat "$1/tagged-mach-lookup.json"; echo; sleep 0.05; i=$((i+1)); done; exec sleep 30)";
+    auto started =
+        denial_stream::start(watch.options(seed_tag, {"/bin/sh", "-c", script, "sh", corpus_dir}));
     REQUIRE(started.has_value());
     auto stream = std::move(*started);
     REQUIRE(!stream->prove_live(milliseconds{2000}).has_value());
@@ -338,7 +363,8 @@ auto replayed_denial_is_not_a_canary() -> int {
 // The orphaned sleep in its group must survive the destructor.
 auto lost_child_is_not_signalled() -> int {
     watcher watch;
-    auto started = denial_stream::start(watch.options({"/bin/sh", "-c", "sleep 30 & wait"}));
+    auto started =
+        denial_stream::start(watch.options(seed_tag, {"/bin/sh", "-c", "sleep 30 & wait"}));
     REQUIRE(started.has_value());
     auto stream = std::move(*started);
     const ::pid_t pid = stream->child_pid_for_test();
@@ -366,6 +392,94 @@ auto lost_child_is_not_signalled() -> int {
     return 0;
 }
 
+// T10: a denial under another tag never reaches this stream's callback.
+auto other_tag_is_not_delivered() -> int {
+    watcher watch;
+    const std::string tag = make_denial_tag();
+    auto started = denial_stream::start(watch.options(tag));
+    REQUIRE(started.has_value());
+    auto stream = std::move(*started);
+    REQUIRE(stream->prove_live(milliseconds{10000}).has_value());
+    const std::string other_nonce = make_nonce();
+    const std::string mine_nonce = make_nonce();
+    const ::pid_t other =
+        spawn_touch("/private/tmp/glove-denial-other-" + other_nonce, make_denial_tag());
+    const ::pid_t mine = spawn_touch("/private/tmp/glove-denial-mine-" + mine_nonce, tag);
+    const auto has_target = [&](std::string_view needle, bool suffix) {
+        const std::lock_guard lock{watch.mutex};
+        return std::ranges::any_of(watch.targets, [&](const std::string& target) {
+            return suffix ? target.ends_with(needle) : target.contains(needle);
+        });
+    };
+    const bool arrived =
+        wait_for([&] { return has_target(mine_nonce, true); }, milliseconds{10000});
+    const bool carries_tag = has_target(tag, false);
+    std::this_thread::sleep_for(milliseconds{500});
+    const bool foreign = has_target(other_nonce, false);
+    kill_and_reap(other);
+    kill_and_reap(mine);
+    REQUIRE(other > 0 && mine > 0);
+    REQUIRE(arrived);
+    REQUIRE(!carries_tag);
+    REQUIRE(!foreign);
+    std::printf("T10 ok\n");
+    return 0;
+}
+
+// T11: the stream's own canaries prove liveness but are never delivered.
+auto canary_is_not_delivered() -> int {
+    watcher watch;
+    auto started = denial_stream::start(watch.options(make_denial_tag()));
+    REQUIRE(started.has_value());
+    auto stream = std::move(*started);
+    REQUIRE(stream->prove_live(milliseconds{10000}).has_value());
+    std::this_thread::sleep_for(milliseconds{500});
+    {
+        const std::lock_guard lock{watch.mutex};
+        REQUIRE(std::ranges::none_of(watch.targets, [](const std::string& target) {
+            return target.contains("glove-denial-canary-");
+        }));
+    }
+    REQUIRE(stream->counters().canary_events >= 1);
+    std::printf("T11 ok\n");
+    return 0;
+}
+
+// T12: only lines ending with the session tag are delivered, in order.
+auto untagged_replay_is_dropped() -> int {
+    watcher watch;
+    const std::string script =
+        R"(cat "$1/valid-mach-lookup.json"; echo; cat "$1/hostile-system-policy-tag-tail.json"; echo; cat "$1/tagged-foreign-tag-inside.json"; echo; cat "$1/tagged-mach-lookup.json"; echo; exec sleep 30)";
+    auto started =
+        denial_stream::start(watch.options(seed_tag, {"/bin/sh", "-c", script, "sh", corpus_dir}));
+    REQUIRE(started.has_value());
+    auto stream = std::move(*started);
+    (void)wait_for([&] { return stream->counters().events == 2; }, milliseconds{5000});
+    const auto counted = stream->counters();
+    REQUIRE(counted.events == 2);
+    REQUIRE(counted.rejected_untagged >= 1);
+    REQUIRE(counted.rejected_not_a_denial >= 1);
+    REQUIRE(counted.canary_events == 0);
+    {
+        const std::lock_guard lock{watch.mutex};
+        REQUIRE(watch.targets.size() == 2);
+        REQUIRE(watch.targets[0] == "/private/tmp/forge\n" + std::string{foreign_tag});
+        REQUIRE(watch.targets[1] == "glove.probe.plain");
+    }
+    std::printf("T12 ok\n");
+    return 0;
+}
+
+// T13: a tag that is not 32 lowercase hex characters is refused.
+auto bad_tag_is_refused() -> int {
+    watcher watch;
+    REQUIRE(!denial_stream::start(watch.options("")).has_value());
+    REQUIRE(!denial_stream::start(watch.options(seed_tag.substr(0, 31))).has_value());
+    REQUIRE(!denial_stream::start(watch.options("00112233445566778899AABBCCDDEEFF")).has_value());
+    std::printf("T13 ok\n");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -385,7 +499,11 @@ int main(int argc, char** argv) {
           term_ignoring_child,
           callback_throws,
           replayed_denial_is_not_a_canary,
-          lost_child_is_not_signalled}) {
+          lost_child_is_not_signalled,
+          other_tag_is_not_delivered,
+          canary_is_not_delivered,
+          untagged_replay_is_dropped,
+          bad_tag_is_refused}) {
         if (const int failed = step(); failed != 0) {
             return failed;
         }

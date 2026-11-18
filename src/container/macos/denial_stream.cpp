@@ -1,6 +1,7 @@
 #include "denial_stream.hpp"
 
 #include "darwin_process_group.hpp"
+#include "denial_tag.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -33,24 +34,30 @@ namespace {
 constexpr std::size_t max_canaries_per_proof = 64;
 constexpr int stop_poll_interval_ms = 10;
 constexpr int drain_deadline_ms = 1000;
-constexpr std::size_t nonce_bytes = 16;
+
+constexpr int max_canary_tag_tries = 4;
 
 // The kernel provenance check is repeated in the parser; the predicate only
-// drops forged and unrelated records at the source.
-const std::vector<std::string>& default_argv() {
-    static const std::vector<std::string> argv{
-        "/usr/bin/log",
-        "stream",
-        "--style",
-        "ndjson",
-        "--predicate",
-        R"(processID == 0 AND senderImagePath ENDSWITH "/Sandbox" AND eventMessage CONTAINS "deny(")",
-    };
-    return argv;
+// drops forged and unrelated records at the source. "\n" is written as the
+// two characters backslash and n: `log` rejects a literal newline byte.
+auto default_argv(std::string_view tag, std::string_view canary_tag) -> std::vector<std::string> {
+    std::string predicate =
+        R"(processID == 0 AND senderImagePath ENDSWITH "/Sandbox" AND eventMessage CONTAINS "deny(" AND (eventMessage ENDSWITH "\n)";
+    predicate += tag;
+    predicate += R"(" OR eventMessage ENDSWITH "\n)";
+    predicate += canary_tag;
+    predicate += R"("))";
+    return {"/usr/bin/log", "stream", "--style", "ndjson", "--predicate", std::move(predicate)};
 }
 
-constexpr std::string_view canary_profile =
-    R"((version 1)(deny default)(import "system.sb")(allow process-exec*)(allow file-read* (subpath "/usr") (subpath "/System")))";
+auto canary_profile(std::string_view canary_tag) -> std::string {
+    std::string profile = R"((version 1)(deny default (with message ")";
+    profile += canary_tag;
+    profile +=
+        R"("))(import "system.sb")(allow process-exec*)(allow file-read* (subpath "/usr") (subpath "/System")))";
+    return profile;
+}
+
 constexpr std::string_view canary_path_prefix = "/private/tmp/glove-denial-canary-";
 
 auto errno_text(std::string_view what, int error) -> std::string {
@@ -141,19 +148,6 @@ void reap(::pid_t pid) noexcept {
     while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
 }
 
-auto make_nonce() -> std::string {
-    std::array<unsigned char, nonce_bytes> bytes{};
-    ::arc4random_buf(bytes.data(), bytes.size());
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::string out;
-    out.reserve(bytes.size() * 2);
-    for (const unsigned char byte : bytes) {
-        out.push_back(hex.at(byte >> 4U));
-        out.push_back(hex.at(byte & 0x0FU));
-    }
-    return out;
-}
-
 struct canary {
     ::pid_t pid = -1;
     std::string nonce;
@@ -163,6 +157,7 @@ struct canary {
 
 struct denial_stream::implementation {
     denial_stream_options options;
+    std::string canary_tag;
     ::pid_t child = -1;
     bool child_owned = false;
     int read_fd = -1;
@@ -175,6 +170,8 @@ struct denial_stream::implementation {
     std::atomic<std::uint64_t> rejected_provenance{0};
     std::atomic<std::uint64_t> rejected_not_a_denial{0};
     std::atomic<std::uint64_t> rejected_timestamp{0};
+    std::atomic<std::uint64_t> rejected_untagged{0};
+    std::atomic<std::uint64_t> canary_events{0};
 
     std::mutex canary_mutex;
     std::condition_variable canary_seen;
@@ -225,7 +222,17 @@ struct denial_stream::implementation {
     // False stops the reader: the callback failed and the stream degraded.
     auto handle_line(std::string_view line) -> bool {
         lines.fetch_add(1, std::memory_order_relaxed);
-        auto parsed = detail::parse_denial_line(line);
+        auto parsed = detail::parse_tagged_denial_line(line, options.tag);
+        if (!parsed && parsed.error() == detail::denial_parse_error::untagged) {
+            // A canary event proves liveness only; it is never an agent denial.
+            if (const auto probe = detail::parse_tagged_denial_line(line, canary_tag); probe) {
+                canary_events.fetch_add(1, std::memory_order_relaxed);
+                match_canary(*probe);
+            } else {
+                rejected_untagged.fetch_add(1, std::memory_order_relaxed);
+            }
+            return true;
+        }
         if (!parsed) {
             switch (parsed.error()) {
             case detail::denial_parse_error::oversized:
@@ -244,13 +251,11 @@ struct denial_stream::implementation {
                 rejected_timestamp.fetch_add(1, std::memory_order_relaxed);
                 break;
             case detail::denial_parse_error::untagged:
-                // parse_denial_line never checks a tag.
                 break;
             }
             return true;
         }
         events.fetch_add(1, std::memory_order_relaxed);
-        match_canary(*parsed);
         if (options.on_event) {
             try {
                 options.on_event(*parsed);
@@ -377,11 +382,11 @@ struct denial_stream::implementation {
     }
 
     auto spawn_canary() -> std::expected<canary, int> {
-        std::string nonce = make_nonce();
+        std::string nonce = make_denial_tag();
         const std::vector<std::string> argv{
             "/usr/bin/sandbox-exec",
             "-p",
-            std::string{canary_profile},
+            canary_profile(canary_tag),
             "/usr/bin/touch",
             std::string{canary_path_prefix} + nonce,
         };
@@ -414,8 +419,20 @@ denial_stream::~denial_stream() {
 
 auto denial_stream::start(denial_stream_options options)
     -> std::expected<std::unique_ptr<denial_stream>, std::string> {
+    if (!detail::is_denial_tag(options.tag)) {
+        return std::unexpected(
+            std::string{"denial stream: tag must be 32 lowercase hex characters"}
+        );
+    }
+    std::string canary_tag = make_denial_tag();
+    for (int tries = 1; canary_tag == options.tag; ++tries) {
+        if (tries == max_canary_tag_tries) {
+            return std::unexpected(std::string{"denial stream: canary tag collides"});
+        }
+        canary_tag = make_denial_tag();
+    }
     if (options.argv.empty()) {
-        options.argv = default_argv();
+        options.argv = default_argv(options.tag, canary_tag);
     }
     if (!options.argv.front().starts_with('/')) {
         return std::unexpected(std::string{"denial stream: argv[0] must be an absolute path"});
@@ -440,6 +457,7 @@ auto denial_stream::start(denial_stream_options options)
     }
     auto impl = std::make_unique<implementation>();
     impl->options = std::move(options);
+    impl->canary_tag = std::move(canary_tag);
     impl->child = *pid;
     impl->child_owned = true;
     impl->read_fd = pipe_fds[0];
@@ -469,6 +487,8 @@ auto denial_stream::counters() const noexcept -> denial_stream_counters {
         .rejected_provenance = impl_->rejected_provenance.load(),
         .rejected_not_a_denial = impl_->rejected_not_a_denial.load(),
         .rejected_timestamp = impl_->rejected_timestamp.load(),
+        .rejected_untagged = impl_->rejected_untagged.load(),
+        .canary_events = impl_->canary_events.load(),
     };
 }
 

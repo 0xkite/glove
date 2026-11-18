@@ -4,10 +4,12 @@
 //
 // Telemetry only. No containment decision may wait on this class: when the
 // log ends, floods, or emits garbage, the stream degrades to "no telemetry"
-// and the sandbox is unchanged. "live" means a canary denial from a process
-// this object holds unreaped was observed, not merely that the child runs.
-// Events are passed on unchanged; their names and targets are agent-chosen
-// bytes (possibly not UTF-8) and their pid is not an identity.
+// and the sandbox is unchanged. Only lines that end with the session tag
+// reach on_event. Canaries carry a second tag private to the stream and never
+// reach on_event. "live" means a canary denial from a process this object
+// holds unreaped was observed, not merely that the child runs. Events are
+// passed on unchanged; their names and targets are agent-chosen bytes
+// (possibly not UTF-8) and their pid is not an identity.
 
 #include "sandbox_denial_log.hpp"
 
@@ -39,11 +41,16 @@ struct denial_stream_counters {
     std::uint64_t rejected_provenance = 0;
     std::uint64_t rejected_not_a_denial = 0;
     std::uint64_t rejected_timestamp = 0;
+    std::uint64_t rejected_untagged = 0;
+    std::uint64_t canary_events = 0;
 };
 
 struct denial_stream_options {
-    // Empty selects `log stream --style ndjson` with the kernel-provenance
-    // predicate. argv[0] must be an absolute path.
+    // Required; the session tag whose lines are delivered.
+    std::string tag;
+    // Empty selects `log stream --style ndjson` with a kernel-provenance
+    // predicate narrowed to the session and canary tags. argv[0] must be an
+    // absolute path.
     std::vector<std::string> argv;
     // Both run on the reader thread. An exception from on_event degrades the
     // stream; on_degraded is called at most once.
