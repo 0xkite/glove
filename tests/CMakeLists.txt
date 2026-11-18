@@ -998,6 +998,21 @@ if(APPLE)
     add_test(NAME container_macos_sandbox COMMAND container_macos_sandbox_test)
     set_tests_properties(container_macos_sandbox PROPERTIES TIMEOUT 30)
 
+    # Supervised log-stream child for sandbox denial telemetry (not wired into
+    # any launch path). Skips (77) when this user cannot run `log stream`.
+    add_executable(container_macos_denial_stream_test container/macos_denial_stream_test.cpp)
+    target_link_libraries(container_macos_denial_stream_test PRIVATE glove_container)
+    target_include_directories(container_macos_denial_stream_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+    )
+    add_test(
+        NAME container_macos_denial_stream
+        COMMAND container_macos_denial_stream_test ${CMAKE_SOURCE_DIR}/fuzz/corpus/sandbox_denial_log
+    )
+    set_tests_properties(
+        container_macos_denial_stream PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+    )
+
     # Stage 3: `glove exec` stdio-passthrough contain path (HOME→workspace,
     # writes outside denied). macOS-only.
     add_executable(container_macos_exec_test container/macos_exec_test.cpp)
