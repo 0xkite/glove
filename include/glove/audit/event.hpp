@@ -18,6 +18,7 @@ enum class action : std::uint8_t {
     observation,
     local_service,
     control,
+    sandbox_denial,
 };
 
 // One observed agent interaction. Recorded after the inner call returns so

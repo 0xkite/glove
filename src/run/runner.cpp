@@ -17,6 +17,7 @@
 #include "glove/reflect/codegen.hpp"
 #include "glove/reflect/extension.hpp"
 
+#include "exit_audit.hpp"
 #include "provider_endpoint.hpp"
 
 #include <fcntl.h>
@@ -1608,20 +1609,7 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(std::string{"kernel: "} + ran.error());
     }
     auto exit_code = (*handle)->wait();
-    if (!exit_code) {
-        return std::unexpected(std::string{"wait: "} + exit_code.error());
-    }
-    if (auto audited = record(
-            *sink,
-            glove::audit::action::agent_exit,
-            std::to_string(*exit_code),
-            *exit_code == 0 ? glove::mcp::tool_call_status::ok
-                            : glove::mcp::tool_call_status::execution_error
-        );
-        !audited) {
-        return std::unexpected(std::string{"audit exit: "} + audited.error());
-    }
-    return *exit_code;
+    return detail::record_agent_exit(*sink, exit_code, (*handle)->reaped_exit_code());
 }
 
 auto exec(const options& opts) -> std::expected<int, std::string> {

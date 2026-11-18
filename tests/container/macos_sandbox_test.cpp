@@ -67,9 +67,11 @@ auto descendants_drained_before_reap() -> int {
     REQUIRE(line.has_value());
     const auto leader = static_cast<::pid_t>(std::stol(*line));
     REQUIRE(leader > 0);
+    REQUIRE(!handle->reaped_exit_code());
     auto code = handle->wait();
     REQUIRE(code.has_value());
     REQUIRE(*code == 7);
+    REQUIRE(handle->reaped_exit_code() == 7);
     REQUIRE(!group_has_live_members(leader));
     auto again = handle->wait();
     REQUIRE(again.has_value() && *again == 7);

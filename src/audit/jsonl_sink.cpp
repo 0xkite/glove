@@ -95,6 +95,8 @@ auto action_name(action a) -> std::string_view {
         return "local_service";
     case action::control:
         return "control";
+    case action::sandbox_denial:
+        return "sandbox_denial";
     }
     return "unknown";
 }

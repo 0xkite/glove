@@ -162,6 +162,10 @@ public:
 
     auto transport() -> glove::mcp::transport& override { return *transport_; }
 
+    [[nodiscard]] auto reaped_exit_code() const noexcept -> std::optional<int> override {
+        return reaped_code_;
+    }
+
     auto wait() -> std::expected<int, std::string> override {
         if (waited_) {
             if (!cached_error_.empty()) {
@@ -321,7 +325,8 @@ private:
         if (waited != pid_) {
             return std::unexpected("waitpid: errno " + std::to_string(waited < 0 ? errno : EIO));
         }
-        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        reaped_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        return *reaped_code_;
     }
 
     auto finish(std::expected<int, std::string> result) -> std::expected<int, std::string> {
@@ -340,6 +345,7 @@ private:
     bool waited_ = false;
     int cached_code_ = -1;
     std::string cached_error_;
+    std::optional<int> reaped_code_;
 };
 
 void close_pipe_pair(int (&fds)[2]) {

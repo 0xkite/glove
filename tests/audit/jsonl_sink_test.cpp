@@ -129,6 +129,17 @@ auto run() -> int {
     };
     REQUIRE(sink->record(local_service).has_value());
 
+    glove::audit::event denial{
+        .what = glove::audit::action::sandbox_denial,
+        .tool_name = "file_write",
+        .arguments_json = R"({"operation":"x"})",
+        .status = glove::mcp::tool_call_status::ok,
+        .error_message = "",
+        .at = std::chrono::system_clock::now(),
+        .latency = std::chrono::nanoseconds{0},
+    };
+    REQUIRE(sink->record(denial).has_value());
+
     std::ifstream in{path};
     REQUIRE(in);
     std::stringstream buf;
@@ -143,15 +154,16 @@ auto run() -> int {
     REQUIRE(contents.find("policy denied") != std::string::npos);
     REQUIRE(contents.find("\"action\":\"local_service\"") != std::string::npos);
     REQUIRE(contents.find("session-1:sage-observe") != std::string::npos);
+    REQUIRE(contents.find("\"action\":\"sandbox_denial\"") != std::string::npos);
 
-    // Three lines, three newlines.
+    // Four lines, four newlines.
     int newlines = 0;
     for (char c : contents) {
         if (c == '\n') {
             ++newlines;
         }
     }
-    REQUIRE(newlines == 3);
+    REQUIRE(newlines == 4);
 
     std::filesystem::remove(path);
 
