@@ -5,6 +5,7 @@
 #include "glove/container/spawner.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include "darwin_process_group.hpp"
 #include "launch_command.hpp"
 #include "runtime_filesystem.hpp"
 
@@ -20,6 +21,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
@@ -119,17 +121,29 @@ private:
     std::string buffer_;
 };
 
+// Process identity is the unreaped parent-child relation, not the PID. Until
+// this handle reaps the leader, its PID cannot be reused and its PGID cannot be
+// reallocated, so group signals reach only the agent's own group. Exit is
+// therefore observed with WNOWAIT, the group is killed and proven empty while
+// the zombie still pins it, and the leader is consumed last. After the reap,
+// or once another reaper has taken the child (ECHILD), no PID or PGID
+// operation is permitted.
 class macos_agent_handle final : public agent_handle {
 public:
     macos_agent_handle(::pid_t pid, std::unique_ptr<pipe_transport> t)
         : pid_{pid}, transport_{std::move(t)} {}
 
+    macos_agent_handle(const macos_agent_handle&) = delete;
+    macos_agent_handle& operator=(const macos_agent_handle&) = delete;
+    macos_agent_handle(macos_agent_handle&&) = delete;
+    macos_agent_handle& operator=(macos_agent_handle&&) = delete;
+
     ~macos_agent_handle() override {
         transport_.reset();
         if (!waited_) {
-            // A destructor cannot report. wait() already escalates SIGTERM to
-            // SIGKILL and blocks until the leader is reaped, so the only
-            // remaining failure is a waitpid() error such as ECHILD.
+            // A destructor cannot report. wait() escalates SIGTERM to SIGKILL,
+            // drains the group, and reaps; its remaining failures leave nothing
+            // a destructor could safely retry.
             [[maybe_unused]] const auto drained = wait();
         }
     }
@@ -138,49 +152,28 @@ public:
 
     auto wait() -> std::expected<int, std::string> override {
         if (waited_) {
+            if (!cached_error_.empty()) {
+                return std::unexpected(cached_error_);
+            }
             return cached_code_;
         }
-        int status = 0;
-        for (int spins = 0; spins < 50; ++spins) {
-            ::pid_t r = ::waitpid(pid_, &status, WNOHANG);
-            if (r == pid_) {
-                (void)::kill(-pid_, SIGKILL);
-                waited_ = true;
-                cached_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-                return cached_code_;
-            }
-            if (r < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return std::unexpected(std::string{"waitpid: "} + std::strerror(errno));
-            }
-            ::usleep(10 * 1000);
+        auto exited = observe_with_grace();
+        if (!exited) {
+            // An unexplained observation failure must not leave the agent
+            // running: while ownership holds, kill and consume the leader.
+            signal_group(SIGKILL);
+            [[maybe_unused]] const auto consumed = reap();
+            return finish(std::unexpected(std::move(exited.error())));
         }
-        (void)::kill(-pid_, SIGTERM);
-        for (int spins = 0; spins < 50; ++spins) {
-            ::pid_t r = ::waitpid(pid_, &status, WNOHANG);
-            if (r == pid_) {
-                (void)::kill(-pid_, SIGKILL);
-                waited_ = true;
-                cached_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-                return cached_code_;
-            }
-            if (r < 0 && errno != EINTR) {
-                return std::unexpected(std::string{"waitpid: "} + std::strerror(errno));
-            }
-            ::usleep(10 * 1000);
+        std::string drain_error = drain_group();
+        auto reaped = reap();
+        if (!reaped) {
+            return finish(std::unexpected(std::move(reaped.error())));
         }
-        (void)::kill(-pid_, SIGKILL);
-        while (::waitpid(pid_, &status, 0) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return std::unexpected(std::string{"waitpid: "} + std::strerror(errno));
+        if (!drain_error.empty()) {
+            return finish(std::unexpected(std::move(drain_error)));
         }
-        waited_ = true;
-        cached_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-        return cached_code_;
+        return finish(*reaped);
     }
 
     [[nodiscard]] auto resource_receipt() const
@@ -189,10 +182,143 @@ public:
     }
 
 private:
+    static constexpr int grace_polls = 50;
+    static constexpr ::useconds_t poll_interval_us = 10 * 1000;
+    static constexpr int drain_polls = 600; // ~3 s at 5 ms.
+    static constexpr ::useconds_t drain_interval_us = 5 * 1000;
+
+    enum class observation : std::uint8_t { running, exited };
+
+    // Observe without consuming: the zombie keeps pinning PID and PGID.
+    auto observe(bool nonblocking) -> std::expected<observation, std::string> {
+        siginfo_t information{};
+        int rc = -1;
+        do {
+            rc = ::waitid(
+                P_PID,
+                static_cast<id_t>(pid_),
+                &information,
+                WEXITED | WNOWAIT | (nonblocking ? WNOHANG : 0)
+            );
+        } while (rc < 0 && errno == EINTR);
+        if (rc != 0) {
+            const int error = errno;
+            if (error == ECHILD) {
+                // Ownership lost to a competing reaper: never signal again.
+                owned_ = false;
+            }
+            return std::unexpected("waitid WNOWAIT: errno " + std::to_string(error));
+        }
+        if (information.si_pid == 0 && nonblocking) {
+            return observation::running;
+        }
+        if (information.si_pid != pid_) {
+            return std::unexpected(std::string{"waitid WNOWAIT returned another process"});
+        }
+        return observation::exited;
+    }
+
+    // Signals are sent only while observe() has not lost ownership. The
+    // leader is unreaped here, so -pid_ is the agent's own group.
+    void signal_group(int number) const {
+        if (owned_) {
+            (void)::kill(-pid_, number);
+            // The leader may have left its group; KILL must still reach it.
+            if (number == SIGKILL) {
+                (void)::kill(pid_, SIGKILL);
+            }
+        }
+    }
+
+    auto poll_for_exit(int polls) -> std::expected<bool, std::string> {
+        for (int spin = 0; spin < polls; ++spin) {
+            auto seen = observe(true);
+            if (!seen) {
+                return std::unexpected(std::move(seen.error()));
+            }
+            if (*seen == observation::exited) {
+                return true;
+            }
+            ::usleep(poll_interval_us);
+        }
+        return false;
+    }
+
+    auto observe_with_grace() -> std::expected<void, std::string> {
+        auto exited = poll_for_exit(grace_polls);
+        if (exited && !*exited) {
+            signal_group(SIGTERM);
+            exited = poll_for_exit(grace_polls);
+        }
+        if (!exited) {
+            return std::unexpected(std::move(exited.error()));
+        }
+        if (!*exited) {
+            signal_group(SIGKILL);
+            auto seen = observe(false);
+            if (!seen) {
+                return std::unexpected(std::move(seen.error()));
+            }
+        }
+        return {};
+    }
+
+    // Descendants outliving the leader are killed and proven gone before the
+    // reap releases the PGID. Members that moved to another group are outside
+    // this mechanism; macOS has no containing equivalent of a cgroup.
+    auto drain_group() -> std::string {
+        for (int spin = 0; spin < drain_polls; ++spin) {
+            auto still_owned = observe(true);
+            if (!still_owned) {
+                return "agent group drain: " + still_owned.error();
+            }
+            if (::kill(-pid_, SIGKILL) != 0 && errno != ESRCH && errno != EPERM) {
+                return "agent group drain: kill errno " + std::to_string(errno);
+            }
+            const auto live = macos_detail::group_has_live_members(pid_);
+            if (!live) {
+                return "agent group drain: inspection errno " + std::to_string(live.error());
+            }
+            if (!*live) {
+                return {};
+            }
+            ::usleep(drain_interval_us);
+        }
+        return std::string{"agent group drain: descendants still live after SIGKILL"};
+    }
+
+    auto reap() -> std::expected<int, std::string> {
+        if (!owned_) {
+            return std::unexpected(std::string{"agent leader reaped by another waiter"});
+        }
+        int status = 0;
+        ::pid_t waited = -1;
+        do {
+            waited = ::waitpid(pid_, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        owned_ = false; // No PID or group operation is permitted beyond this point.
+        if (waited != pid_) {
+            return std::unexpected("waitpid: errno " + std::to_string(waited < 0 ? errno : EIO));
+        }
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+
+    auto finish(std::expected<int, std::string> result) -> std::expected<int, std::string> {
+        waited_ = true;
+        if (result) {
+            cached_code_ = *result;
+        } else {
+            cached_error_ = result.error();
+        }
+        return result;
+    }
+
     ::pid_t pid_;
     std::unique_ptr<pipe_transport> transport_;
+    bool owned_ = true;
     bool waited_ = false;
     int cached_code_ = -1;
+    std::string cached_error_;
 };
 
 void close_pipe_pair(int (&fds)[2]) {

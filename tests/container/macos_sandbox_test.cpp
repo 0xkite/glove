@@ -11,8 +11,12 @@
 #include "glove/container/spawner.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include <sys/proc.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
+#include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -28,6 +32,70 @@ namespace {
             return 1;                                                                              \
         }                                                                                          \
     } while (0)
+
+// True while any non-zombie process still belongs to group. Must be asked
+// only after wait(): the handle owes the caller an empty group on return.
+auto group_has_live_members(::pid_t group) -> bool {
+    std::array<struct kinfo_proc, 256> processes{};
+    std::size_t bytes = sizeof(processes);
+    std::array<int, 4> mib{CTL_KERN, KERN_PROC, KERN_PROC_PGRP, group};
+    if (::sysctl(mib.data(), mib.size(), processes.data(), &bytes, nullptr, 0) != 0) {
+        return true; // Unknown is never "empty".
+    }
+    for (std::size_t index = 0; index != bytes / sizeof(struct kinfo_proc); ++index) {
+        if (processes.at(index).kp_proc.p_stat != SZOMB) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Descendants that outlive the leader are killed and proven gone before
+// wait() releases the leader's PGID, and the leader's exit code survives.
+auto descendants_drained_before_reap() -> int {
+    glove::container::profile prof;
+    auto spawner = glove::container::make_default_spawner();
+    REQUIRE(spawner != nullptr);
+    auto handle_or =
+        spawner->spawn(prof, {"/bin/sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $$; exit 7"});
+    REQUIRE(handle_or.has_value());
+    auto handle = std::move(*handle_or);
+    auto line = handle->transport().recv();
+    REQUIRE(line.has_value());
+    const auto leader = static_cast<::pid_t>(std::stol(*line));
+    REQUIRE(leader > 0);
+    auto code = handle->wait();
+    REQUIRE(code.has_value());
+    REQUIRE(*code == 7);
+    REQUIRE(!group_has_live_members(leader));
+    auto again = handle->wait();
+    REQUIRE(again.has_value() && *again == 7);
+    return 0;
+}
+
+// A group that ignores SIGTERM is escalated to SIGKILL within the bounded
+// grace periods, and a signal death is reported as -1, not as an exit code.
+auto term_ignoring_group_escalates() -> int {
+    glove::container::profile prof;
+    auto spawner = glove::container::make_default_spawner();
+    REQUIRE(spawner != nullptr);
+    auto handle_or = spawner->spawn(
+        prof, {"/bin/sh", "-c", "trap '' TERM; echo $$; sleep 30 >/dev/null 2>&1; exit 0"}
+    );
+    REQUIRE(handle_or.has_value());
+    auto handle = std::move(*handle_or);
+    auto line = handle->transport().recv();
+    REQUIRE(line.has_value());
+    const auto leader = static_cast<::pid_t>(std::stol(*line));
+    const auto started = std::chrono::steady_clock::now();
+    auto code = handle->wait();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE(code.has_value());
+    REQUIRE(*code == -1);
+    REQUIRE(elapsed < std::chrono::seconds{10});
+    REQUIRE(!group_has_live_members(leader));
+    return 0;
+}
 
 auto run() -> int {
     const char* home = std::getenv("HOME");
@@ -113,5 +181,11 @@ auto run() -> int {
 } // namespace
 
 auto main() -> int {
-    return run();
+    if (const int failed = run(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = descendants_drained_before_reap(); failed != 0) {
+        return failed;
+    }
+    return term_ignoring_group_escalates();
 }
