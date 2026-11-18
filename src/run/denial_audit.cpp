@@ -1,0 +1,207 @@
+#include "denial_audit.hpp"
+
+#include "glove/audit/event.hpp"
+#include "glove/mcp/messages.hpp"
+
+#include <utility>
+
+namespace glove::run::detail {
+
+namespace {
+
+constexpr std::size_t max_kind_bytes = 32;
+constexpr auto window = std::chrono::milliseconds{1000};
+
+auto boolean(bool value) -> std::string_view {
+    return value ? "true" : "false";
+}
+
+auto state_name(glove::container::denial_telemetry_state state) -> std::string_view {
+    switch (state) {
+    case glove::container::denial_telemetry_state::unavailable:
+        return "unavailable";
+    case glove::container::denial_telemetry_state::live:
+        return "live";
+    case glove::container::denial_telemetry_state::degraded:
+        return "degraded";
+    }
+    return "unavailable";
+}
+
+} // namespace
+
+denial_audit_writer::denial_audit_writer(std::shared_ptr<glove::audit::sink> sink, clock now)
+    : sink_{std::move(sink)}, now_{std::move(now)} {
+    if (!now_) {
+        now_ = [] { return std::chrono::steady_clock::now(); };
+    }
+}
+
+auto denial_audit_writer::checked(std::string_view text, std::size_t max_bytes) -> std::string {
+    if (text.size() > max_bytes || !glove::container::is_encoded_text(text)) {
+        ++unsafe_fields_;
+        return {};
+    }
+    return std::string{text};
+}
+
+void denial_audit_writer::append(
+    std::string tool, std::string arguments, bool ok, std::string error
+) {
+    if (!sink_) {
+        return;
+    }
+    const glove::audit::event event{
+        .what = glove::audit::action::sandbox_denial,
+        .tool_name = std::move(tool),
+        .arguments_json = std::move(arguments),
+        .status =
+            ok ? glove::mcp::tool_call_status::ok : glove::mcp::tool_call_status::transport_error,
+        .error_message = std::move(error),
+    };
+    if (auto recorded = sink_->record(event); !recorded && !first_error_) {
+        first_error_ = recorded.error();
+    }
+}
+
+void denial_audit_writer::record_start(
+    glove::container::denial_telemetry_state state, std::string_view reason
+) {
+    const std::lock_guard lock{mutex_};
+    if (finished_) {
+        return;
+    }
+    if (state == glove::container::denial_telemetry_state::unavailable) {
+        started_unavailable_ = true;
+        append(
+            "telemetry",
+            R"({"state":"unavailable"})",
+            false,
+            checked(reason, glove::container::max_denial_reason_text_bytes)
+        );
+        return;
+    }
+    append("telemetry", R"({"state":"live"})", true, {});
+}
+
+void denial_audit_writer::on_denial(const glove::container::sandbox_denial& denial) {
+    const std::lock_guard lock{mutex_};
+    if (finished_) {
+        return;
+    }
+    duplicates_ += denial.duplicate_reports;
+    if (first_error_) {
+        ++suppressed_error_;
+        return;
+    }
+    if (recorded_ == denial_audit_per_session) {
+        ++suppressed_cap_;
+        return;
+    }
+    const auto now = now_();
+    if (!window_start_ || now - *window_start_ >= window) {
+        window_start_ = now;
+        window_count_ = 0;
+    }
+    if (window_count_ == denial_audit_per_second) {
+        ++suppressed_rate_;
+        return;
+    }
+    std::string arguments = R"({"operation":")";
+    arguments += checked(denial.operation, glove::container::max_denial_operation_text_bytes);
+    arguments += R"(","target":")";
+    arguments += checked(denial.target, glove::container::max_denial_target_text_bytes);
+    arguments += R"(","target_truncated":)";
+    arguments += boolean(denial.target_truncated);
+    arguments += R"(,"comm":")";
+    arguments += checked(denial.comm, glove::container::max_denial_comm_text_bytes);
+    arguments += R"(","pid":)";
+    arguments += std::to_string(denial.pid);
+    arguments += R"(,"duplicates":)";
+    arguments += std::to_string(denial.duplicate_reports);
+    arguments += R"(,"readings":)";
+    arguments += std::to_string(denial.readings);
+    arguments += "}";
+    append(checked(denial.kind, max_kind_bytes), std::move(arguments), true, {});
+    ++recorded_;
+    ++window_count_;
+}
+
+void denial_audit_writer::on_degraded(std::string_view reason) {
+    const std::lock_guard lock{mutex_};
+    if (finished_ || degraded_written_) {
+        return;
+    }
+    degraded_written_ = true;
+    append(
+        "telemetry",
+        R"({"state":"degraded"})",
+        false,
+        checked(reason, glove::container::max_denial_reason_text_bytes)
+    );
+}
+
+auto denial_audit_writer::finish(const glove::container::denial_monitor_report& report)
+    -> std::expected<void, std::string> {
+    const std::lock_guard lock{mutex_};
+    if (!finished_ && !started_unavailable_) {
+        const bool clean =
+            report.state == glove::container::denial_telemetry_state::live && report.end_proof;
+        std::string arguments = R"({"state":")";
+        arguments += state_name(report.state);
+        arguments += R"(","recorded":)";
+        arguments += std::to_string(recorded_);
+        arguments += R"(,"suppressed_rate":)";
+        arguments += std::to_string(suppressed_rate_);
+        arguments += R"(,"suppressed_cap":)";
+        arguments += std::to_string(suppressed_cap_);
+        arguments += R"(,"suppressed_error":)";
+        arguments += std::to_string(suppressed_error_);
+        // The reason is checked first so its own rejection is counted below.
+        std::string error =
+            clean ? std::string{}
+                  : checked(report.reason, glove::container::max_denial_reason_text_bytes);
+        arguments += R"(,"unsafe_fields":)";
+        arguments += std::to_string(unsafe_fields_);
+        arguments += R"(,"duplicates":)";
+        arguments += std::to_string(duplicates_);
+        arguments += R"(,"stream_events":)";
+        arguments += std::to_string(report.stream_events);
+        arguments += R"(,"stream_rejected":)";
+        arguments += std::to_string(report.stream_rejected);
+        arguments += R"(,"end_proof":)";
+        arguments += boolean(report.end_proof);
+        arguments += "}";
+        append("summary", std::move(arguments), clean, std::move(error));
+    }
+    finished_ = true;
+    if (first_error_) {
+        return std::unexpected("audit denial telemetry: " + *first_error_);
+    }
+    return {};
+}
+
+auto denial_notice_line(denial_notice what, std::string_view reason) -> std::string {
+    const std::string shown = reason.size() <= glove::container::max_denial_reason_text_bytes &&
+                                      glove::container::is_encoded_text(reason)
+                                  ? std::string{reason}
+                                  : std::string{"unknown"};
+    switch (what) {
+    case denial_notice::starting:
+        return "glove: starting sandbox denial telemetry (up to 2 s)\n";
+    case denial_notice::live:
+        return "glove: sandbox denial telemetry is live\n";
+    case denial_notice::unavailable:
+        return "glove: sandbox denial telemetry unavailable (" + shown +
+               "); the agent still runs sandboxed\n";
+    case denial_notice::stopping:
+        return "glove: stopping sandbox denial telemetry (up to 1 s)\n";
+    case denial_notice::degraded:
+        return "glove: sandbox denial telemetry was incomplete this session (" + shown +
+               "); the agent ran sandboxed\n";
+    }
+    return "glove: sandbox denial telemetry unavailable (unknown); the agent still runs "
+           "sandboxed\n";
+}
+
+} // namespace glove::run::detail

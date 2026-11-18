@@ -1121,6 +1121,16 @@ if(APPLE)
     add_dependencies(glove_exec_audit_test glove)
     add_test(NAME glove_exec_audit COMMAND glove_exec_audit_test)
     set_tests_properties(glove_exec_audit PROPERTIES TIMEOUT 30)
+
+    add_executable(glove_exec_denial_audit_test run/glove_exec_denial_audit_test.cpp)
+    target_link_libraries(glove_exec_denial_audit_test PRIVATE glove_kernel)
+    target_compile_definitions(glove_exec_denial_audit_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_exec_denial_audit_test glove)
+    add_test(NAME glove_exec_denial_audit COMMAND glove_exec_denial_audit_test)
+    set_tests_properties(
+        glove_exec_denial_audit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+    )
 endif()
 
 add_executable(run_exit_audit_test run/exit_audit_test.cpp)
@@ -1129,6 +1139,13 @@ target_include_directories(run_exit_audit_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run)
 add_test(NAME run_exit_audit COMMAND run_exit_audit_test)
 set_tests_properties(run_exit_audit PROPERTIES TIMEOUT 10)
+
+add_executable(run_denial_audit_test run/denial_audit_test.cpp)
+target_link_libraries(run_denial_audit_test PRIVATE glove_run)
+target_include_directories(run_denial_audit_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_denial_audit COMMAND run_denial_audit_test)
+set_tests_properties(run_denial_audit PROPERTIES TIMEOUT 10)
 
 # F1 regression: upstream pipe fds must be close-on-exec so they cannot leak
 # into a later-spawned (contained) process. Cross-platform: needs /bin/sh,

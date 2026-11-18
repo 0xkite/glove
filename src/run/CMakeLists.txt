@@ -1,6 +1,7 @@
 add_library(glove_run STATIC
     runner.cpp
     exit_audit.cpp
+    denial_audit.cpp
     provider_endpoint.cpp
     pi_selection.cpp
     pi_guest_config.cpp

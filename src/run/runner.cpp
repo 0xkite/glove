@@ -52,6 +52,10 @@
 #include <vector>
 
 #if defined(__APPLE__)
+#    include "glove/container/denial_telemetry.hpp"
+
+#    include "denial_audit.hpp"
+
 #    include <mach-o/dyld.h>
 #endif
 
@@ -1541,6 +1545,60 @@ void write_guest_mcp_configs(
 
 } // namespace
 
+#if defined(__APPLE__)
+namespace {
+
+// Sandbox denial telemetry is observation only: it never stops, delays past
+// its stated bounds, or fails a launch. A person at a terminal is told while
+// the CLI waits; anyone is told when telemetry is missing or incomplete.
+// Nothing is printed while the agent runs, since it may own the terminal.
+void print_denial_notice(detail::denial_notice what, std::string_view reason = {}) {
+    const auto line = detail::denial_notice_line(what, reason);
+    static_cast<void>(std::fputs(line.c_str(), stderr));
+    static_cast<void>(std::fflush(stderr));
+}
+
+auto start_denial_telemetry(
+    detail::denial_audit_writer& denial_writer, glove::container::profile& profile
+) -> std::unique_ptr<glove::container::denial_monitor> {
+    const bool terminal = ::isatty(STDERR_FILENO) == 1;
+    if (terminal) {
+        print_denial_notice(detail::denial_notice::starting);
+    }
+    auto denial_monitor = glove::container::denial_monitor::start({
+        .on_denial = [&denial_writer](const auto& denial) { denial_writer.on_denial(denial); },
+        .on_degraded =
+            [&denial_writer](std::string_view reason) { denial_writer.on_degraded(reason); },
+    });
+    denial_writer.record_start(denial_monitor->state(), denial_monitor->reason());
+    if (denial_monitor->state() == glove::container::denial_telemetry_state::unavailable) {
+        print_denial_notice(detail::denial_notice::unavailable, denial_monitor->reason());
+    } else if (terminal) {
+        print_denial_notice(detail::denial_notice::live);
+    }
+    if (!denial_monitor->tag().empty()) {
+        profile.denial_tag = denial_monitor->tag();
+    }
+    return denial_monitor;
+}
+
+auto finish_denial_telemetry(
+    detail::denial_audit_writer& denial_writer, glove::container::denial_monitor& denial_monitor
+) -> std::expected<void, std::string> {
+    if (::isatty(STDERR_FILENO) == 1 &&
+        denial_monitor.state() == glove::container::denial_telemetry_state::live) {
+        print_denial_notice(detail::denial_notice::stopping);
+    }
+    const auto report = denial_monitor.finish();
+    if (report.state == glove::container::denial_telemetry_state::degraded) {
+        print_denial_notice(detail::denial_notice::degraded, report.reason);
+    }
+    return denial_writer.finish(report);
+}
+
+} // namespace
+#endif
+
 auto execute(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
@@ -1591,6 +1649,10 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         }
     }
 
+#if defined(__APPLE__)
+    detail::denial_audit_writer denial_writer{*sink};
+    auto denial_monitor = start_denial_telemetry(denial_writer, *profile);
+#endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
@@ -1609,7 +1671,16 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(std::string{"kernel: "} + ran.error());
     }
     auto exit_code = (*handle)->wait();
-    return detail::record_agent_exit(*sink, exit_code, (*handle)->reaped_exit_code());
+#if defined(__APPLE__)
+    auto denial_audit = finish_denial_telemetry(denial_writer, *denial_monitor);
+#endif
+    auto recorded = detail::record_agent_exit(*sink, exit_code, (*handle)->reaped_exit_code());
+#if defined(__APPLE__)
+    if (recorded && !denial_audit) {
+        return std::unexpected(denial_audit.error());
+    }
+#endif
+    return recorded;
 }
 
 auto exec(const options& opts) -> std::expected<int, std::string> {
@@ -1753,6 +1824,10 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         }
     }
 
+#if defined(__APPLE__)
+    detail::denial_audit_writer denial_writer{*sink};
+    auto denial_monitor = start_denial_telemetry(denial_writer, *profile);
+#endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
@@ -1788,6 +1863,9 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
             ));
         }
     );
+#if defined(__APPLE__)
+    auto denial_audit = finish_denial_telemetry(denial_writer, *denial_monitor);
+#endif
     if (escape_audit_error) {
         return std::unexpected(std::string{"audit seccomp escape: "} + *escape_audit_error);
     }
@@ -1804,6 +1882,11 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         !audited) {
         return std::unexpected(std::string{"audit exit: "} + audited.error());
     }
+#if defined(__APPLE__)
+    if (!denial_audit) {
+        return std::unexpected(denial_audit.error());
+    }
+#endif
     return *exit_code;
 }
 
