@@ -55,6 +55,42 @@ Precedence is **specificity first, then source order**:
   outranks it. A later *unfiltered* deny cannot retract an earlier filtered
   allow; only an equal-or-more-specific deny can.
 
+## Denial telemetry
+
+A denial is written to the unified log by the kernel, not by the profile:
+
+```text
+Sandbox: <comm>(<pid>) deny(<n>) <operation> <target>
+```
+
+- **[verified]** A non-root reader can follow these events live with
+  `log stream --predicate 'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "deny"'`,
+  and sees the line while the denied process is still running. The workload
+  continues afterwards: the denial stays non-fatal.
+- **[verified]** `(with no-log)` is accepted on a deny and suppresses logging;
+  a profile that wants telemetry must not carry it.
+- **[verified, negative]** `(with report)` on an *allow* produced no observable
+  record in this test. Treat allow-side reporting as unavailable rather than
+  relying on it.
+
+This is what makes a middle response possible at all. The sandbox can only allow
+or deny, and `report` is rejected on deny, so "warn" cannot be expressed in
+SBPL. It can be expressed *outside* it: the profile denies as usual (the agent
+keeps running), and the trusted supervisor tails the log, attributes the event
+to a verified child identity, and decides what to do.
+
+Limits, which matter more than the capability:
+
+- Best effort, not enforcement. The log is asynchronous, host-wide, has no
+  session identifier, and can lose events under load. A signal that the agent
+  can flood is not a control.
+- Attribution needs identity, not a pid: the line carries a pid, and pids are
+  recycled. Correlate with the `(pid, start)` tuple or an audit token before
+  acting on an event.
+- Host-wide noise is real: a `bash` invocation in this probe also produced
+  `/dev/tty` denials from unrelated activity. Filter by verified pid, classify
+  by operation, and rate-limit.
+
 ## Response modifiers
 
 A rule can carry `(with ...)` modifiers that change what happens when it matches.
