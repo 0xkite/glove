@@ -59,7 +59,7 @@ using apply_receipt_wire::receipt_envelope;
 
 constexpr std::size_t max_receipt_bytes = 8U * 1024U;
 constexpr std::size_t max_identifier_bytes = 128U;
-constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
+constexpr glz::opts strict_read_options{.null_terminated = false, .error_on_unknown_keys = true};
 
 auto valid_identifier(std::string_view value) -> bool {
     return !value.empty() && value.size() <= max_identifier_bytes &&
