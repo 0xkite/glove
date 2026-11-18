@@ -43,7 +43,11 @@ struct denial_log_record {
     };
 };
 
-constexpr glz::opts record_options{.error_on_unknown_keys = false, .error_on_missing_keys = true};
+// The line is a view into a caller's buffer with no terminator past its end;
+// Glaze must not read beyond line.size().
+constexpr glz::opts record_options{
+    .null_terminated = false, .error_on_unknown_keys = false, .error_on_missing_keys = true
+};
 
 // Kernel provenance: userland (logger, os_log) can write the same message text
 // but cannot claim pid 0, the kernel image, and the Sandbox extension sender.
