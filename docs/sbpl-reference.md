@@ -91,6 +91,40 @@ Limits, which matter more than the capability:
   `/dev/tty` denials from unrelated activity. Filter by verified pid, classify
   by operation, and rate-limit.
 
+### Reading the denial log safely
+
+Measured on macOS 27.2.1 (arm64) with `log stream`, a deny-default profile, and probes that put hostile bytes in
+the process name and in the denied target.
+
+- **[verified]** The predicate above is not a provenance check. An unprivileged process, including one inside
+  the sandbox, can run `logger "Sandbox: x(4243) deny(1) file-read-data /y"` and the predicate matches it. Real
+  denials carry `processID` 0, `processImagePath` `/kernel`, and `senderImagePath`
+  `/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox`; the forged record carries the logger's own
+  pid and image path. A reader must check those three fields. The predicate
+  `processID == 0 AND senderImagePath ENDSWITH "/Sandbox" AND eventMessage CONTAINS "deny("` drops the forgery
+  at the source, and the reader checks the fields again.
+- **[verified]** The text styles (`default`, `compact`, `syslog`) are not line-safe. A denied target can contain a
+  newline (a Mach service name did in the probe), and the text styles print it raw, so one event can forge a
+  complete second `Sandbox: ...` line. `--style ndjson` prints one JSON object per line and escapes the newline.
+  Use `ndjson` only.
+- **[verified]** `ndjson` output starts with one non-JSON banner line (`Filtering the log data using ...`).
+  Forward slashes are escaped as `\/`, control bytes as `\u00XX`, and non-ASCII UTF-8 is passed through.
+- **[verified]** The message is `Sandbox: <name>(<pid>) deny(<n>) <operation> <target>`. The kernel may also emit
+  `<N> duplicate report(s) for Sandbox: ...` for repeats. Some operations append a second line to the message
+  (`syscall-unix 186\nsyscall-unix-denied`). The target is unquoted and unescaped.
+- **[verified]** `<name>` is the process name, truncated to 32 bytes, and is taken from the executed file's name.
+  A file named `x(1) deny(1) file-read-data y` produced
+  `Sandbox: x(1) deny(1) file-read-data y(65172) deny(1) mach-lookup ...`. The grammar cannot tell which
+  `(<pid>) deny(` is the real one, so a reader must keep every reading and must not attribute an ambiguous event
+  to one process on the text alone.
+- **[verified, negative]** A denial whose target is not valid UTF-8 did not appear in `log stream` at all, in
+  either `ndjson` or `compact` style, while the denials immediately before and after it from the same process
+  did. A sandboxed process can therefore hide a `mach-lookup` denial from this channel by choosing the service
+  name. Denial counts from the log are a lower bound.
+- **[verified]** `log stream` delivered a denial triggered about 0.3 s after the stream process was started, and
+  exits on SIGTERM. Host-wide volume during the probe was about 300 matching events per second from unrelated
+  system processes.
+
 ## Response modifiers
 
 A rule can carry `(with ...)` modifiers that change what happens when it matches.
