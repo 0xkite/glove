@@ -7,6 +7,7 @@ add_library(glove_container STATIC
     receipt_producer.cpp
     refinement_protocol.cpp
     resource_monitor.cpp
+    sandbox_denial_log.cpp
 )
 add_library(glove::container ALIAS glove_container)
 

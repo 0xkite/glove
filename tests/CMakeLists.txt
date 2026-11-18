@@ -366,6 +366,17 @@ target_include_directories(container_sha256_test PRIVATE
 )
 add_test(NAME container_sha256 COMMAND container_sha256_test)
 
+add_executable(container_sandbox_denial_log_test container/sandbox_denial_log_test.cpp)
+target_link_libraries(container_sandbox_denial_log_test PRIVATE glove_container)
+target_include_directories(container_sandbox_denial_log_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+)
+add_test(
+    NAME container_sandbox_denial_log
+    COMMAND container_sandbox_denial_log_test ${CMAKE_SOURCE_DIR}/fuzz/corpus/sandbox_denial_log
+)
+set_tests_properties(container_sandbox_denial_log PROPERTIES TIMEOUT 10)
+
 add_executable(container_receipt_chain_test container/receipt_chain_test.cpp)
 target_link_libraries(container_receipt_chain_test PRIVATE glove_container)
 add_test(NAME container_receipt_chain COMMAND container_receipt_chain_test)
