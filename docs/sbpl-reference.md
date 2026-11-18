@@ -81,12 +81,14 @@ to a verified child identity, and decides what to do.
 
 Limits, which matter more than the capability:
 
-- Best effort, not enforcement. The log is asynchronous, host-wide, has no
-  session identifier, and can lose events under load. A signal that the agent
-  can flood is not a control.
-- Attribution needs identity, not a pid: the line carries a pid, and pids are
-  recycled. Correlate with the `(pid, start)` tuple or an audit token before
-  acting on an event.
+- Best effort, not enforcement. The log is asynchronous and can lose events
+  under load. A signal that the agent can flood is not a control.
+- Attribution is by sandbox membership, not by pid. A deny rule can carry
+  `(with message "<text>")`, and the kernel appends a newline and that text to
+  every denial the rule decides. Glove gives every deny rule of a launch the
+  same random 128-bit tag, so a line that ends with the tag came from a process
+  under that launch's profile. The pid in the line is informative only: pids
+  are recycled, and it must never choose a signal target.
 - Host-wide noise is real: a `bash` invocation in this probe also produced
   `/dev/tty` denials from unrelated activity. Filter by verified pid, classify
   by operation, and rate-limit.
@@ -124,6 +126,36 @@ the process name and in the denied target.
 - **[verified]** `log stream` delivered a denial triggered about 0.3 s after the stream process was started, and
   exits on SIGTERM. Host-wide volume during the probe was about 300 matching events per second from unrelated
   system processes.
+
+### Session tag (`with message`)
+
+Measured on macOS 27.2.1 (arm64), Sandbox profiles version 1, with `sandbox-exec` and `log stream --style ndjson`.
+
+- **[verified]** `(deny default (with message "T"))` and a filtered deny such as
+  `(deny file-write* (literal "/p") (with message "T"))` compile, and the message of each denial they decide ends
+  with a newline and T. This holds for file, network-outbound, mach-lookup and user-preference denials, for the
+  `<N> duplicate report for` form, for children, and for a process that called `setsid`.
+- **[verified]** A deny rule without the modifier gives no suffix, including when a tagged `(deny default ...)` is
+  present and the untagged rule is the one that decides. Every deny rule must carry the tag.
+- **[verified]** `system.sb` and `dyld-support.sb` contain no deny rule on this release.
+- **[verified]** In a `log stream` predicate, `eventMessage ENDSWITH "\nT"` works when the newline is written as
+  backslash-n; a literal newline byte is rejected as a bad predicate. Two tags can be joined with `OR`.
+- **[verified]** Only the final line is evidence. A sandboxed process can put a newline and any text, including
+  another launch's tag, in a denied path; the kernel still appends its own profile's tag after it.
+- **[verified]** The tag is not secret. A process inside a profile that allows `sysctl-read` can read the
+  arguments of the `log` child with `KERN_PROCARGS2`, and `sandbox-exec` holds the profile in its arguments until
+  it executes the agent. A process outside the launch that knows the tag and can sandbox itself can produce a
+  line that ends with it, either with an untagged profile and a path ending in a newline and the tag, or with its
+  own profile carrying the same message. A process already inside a sandbox cannot apply a second profile
+  (`sandbox_apply: Operation not permitted`).
+- **[verified]** Some lines carry no tag, so counts stay a lower bound:
+  - A message longer than 1007 bytes is cut to 1008 bytes plus the three characters `<…>` and loses the tag.
+    That happens for a path of about 930 bytes or more.
+  - A denied `signal` produced no log line at all.
+  - `forbidden-exec-sugid` is logged without the tag and has no rule name to attach one to.
+  - Platform-policy denials are logged as `System Policy: ...` by the same kernel sender, without the tag and
+    with a target the process chooses. A reader must require the `Sandbox: ` prefix as well as the tag.
+  - A target that is not valid UTF-8 is still not logged.
 
 ## Response modifiers
 
