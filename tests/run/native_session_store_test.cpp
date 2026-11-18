@@ -266,6 +266,14 @@ auto journal_reconstruction(const fs::path& root) -> int {
         REQUIRE(!native_session_store::open(sessions, *id, "claude"));
         REQUIRE(write_file(journal, original.substr(0, original.size() / 2)));
         REQUIRE(!native_session_store::open(sessions, *id, "claude"));
+        // A record is one line: bytes after its object, or an object closed on
+        // the next line, are corruption rather than a valid record.
+        REQUIRE(original.ends_with("}\n"));
+        const auto body = original.substr(0, original.size() - 2);
+        REQUIRE(write_file(journal, body + "}x\n"));
+        REQUIRE(!native_session_store::open(sessions, *id, "claude"));
+        REQUIRE(write_file(journal, body + "}}\n"));
+        REQUIRE(!native_session_store::open(sessions, *id, "claude"));
         REQUIRE(write_file(journal, original));
         REQUIRE(native_session_store::open(sessions, *id, "claude"));
         REQUIRE(write_file(journal, original, 0644));
