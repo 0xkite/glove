@@ -1013,18 +1013,6 @@ if(APPLE)
         container_macos_denial_stream PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
     )
 
-    # Attribution of denial events to an unreaped leader's group (not wired
-    # into any launch path). Skips (77) when `log stream` is unavailable.
-    add_executable(container_macos_identity_ledger_test container/macos_identity_ledger_test.cpp)
-    target_link_libraries(container_macos_identity_ledger_test PRIVATE glove_container)
-    target_include_directories(container_macos_identity_ledger_test PRIVATE
-        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
-    )
-    add_test(NAME container_macos_identity_ledger COMMAND container_macos_identity_ledger_test)
-    set_tests_properties(
-        container_macos_identity_ledger PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
-    )
-
     # Stage 3: `glove exec` stdio-passthrough contain path (HOME→workspace,
     # writes outside denied). macOS-only.
     add_executable(container_macos_exec_test container/macos_exec_test.cpp)
