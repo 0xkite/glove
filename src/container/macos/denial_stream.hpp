@@ -59,6 +59,8 @@ public:
     auto operator=(denial_stream&&) -> denial_stream& = delete;
     // Stops the child within denial_stream_stop_grace_ms plus a bounded
     // drain, signalling it only while it is unreaped, and joins the reader.
+    // A callback that never returns blocks this destructor, and the object
+    // must not be destroyed from inside a callback.
     ~denial_stream();
 
     static auto start(denial_stream_options options)
@@ -69,7 +71,8 @@ public:
 
     // Spawns sandboxed canaries until one's denial is observed or timeout
     // passes. Canaries stay unreaped until return, so a pid match is an
-    // identity match. Success sets the state to live.
+    // identity match. Success sets the state to live. prove_live must not be
+    // called from two threads at once.
     auto prove_live(std::chrono::milliseconds timeout) -> std::expected<void, std::string>;
 
     [[nodiscard]] auto child_pid_for_test() const noexcept -> ::pid_t;

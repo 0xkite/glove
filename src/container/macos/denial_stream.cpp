@@ -32,7 +32,7 @@ namespace {
 
 constexpr std::size_t max_canaries_per_proof = 64;
 constexpr int stop_poll_interval_ms = 10;
-constexpr int drain_polls = 100; // ~1 s at stop_poll_interval_ms.
+constexpr int drain_deadline_ms = 1000;
 constexpr std::size_t nonce_bytes = 16;
 
 // The kernel provenance check is repeated in the parser; the predicate only
@@ -119,15 +119,21 @@ auto spawn_child(const std::vector<std::string>& argv, int stdout_fd, bool own_g
     return pid;
 }
 
+enum class child_status : std::uint8_t { running, exited, lost };
+
 // The child's exit, observed without consuming it: the zombie keeps pinning
-// the PID (and PGID) until the caller reaps.
-auto exited_unreaped(::pid_t pid) noexcept -> bool {
+// the PID (and PGID) until the caller reaps. Lost (ECHILD, or any other
+// waitid failure) means ownership is gone: never signal or reap it again.
+auto observe_child(::pid_t pid) noexcept -> child_status {
     siginfo_t information{};
     int rc = -1;
     do {
         rc = ::waitid(P_PID, static_cast<id_t>(pid), &information, WEXITED | WNOWAIT | WNOHANG);
     } while (rc < 0 && errno == EINTR);
-    return rc == 0 && information.si_pid == pid;
+    if (rc != 0) {
+        return child_status::lost;
+    }
+    return information.si_pid == pid ? child_status::exited : child_status::running;
 }
 
 void reap(::pid_t pid) noexcept {
@@ -315,38 +321,52 @@ struct denial_stream::implementation {
         }
     }
 
-    // Signals only while the child is unreaped; nothing after the reap.
+    // Signals only while the child is observed unreaped and still ours; a
+    // child reaped elsewhere is released without any signal or reap.
     void stop_child() noexcept {
         if (!child_owned) {
             return;
         }
-        (void)::kill(-child, SIGTERM);
-        (void)::kill(child, SIGTERM);
-        bool exited = false;
-        for (int waited = 0; waited < denial_stream_stop_grace_ms;
-             waited += stop_poll_interval_ms) {
-            if (exited_unreaped(child)) {
-                exited = true;
-                break;
-            }
-            sleep_ms(stop_poll_interval_ms);
+        auto status = observe_child(child);
+        if (status == child_status::lost) {
+            child_owned = false;
+            return;
         }
-        if (!exited) {
+        if (status == child_status::running) {
+            (void)::kill(-child, SIGTERM);
+            (void)::kill(child, SIGTERM);
+        }
+        const auto grace_end = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds{denial_stream_stop_grace_ms};
+        while (status == child_status::running && std::chrono::steady_clock::now() < grace_end) {
+            sleep_ms(stop_poll_interval_ms);
+            status = observe_child(child);
+        }
+        if (status == child_status::lost) {
+            child_owned = false;
+            return;
+        }
+        if (status == child_status::running) {
             (void)::kill(-child, SIGKILL);
             (void)::kill(child, SIGKILL);
         }
         // The leader's zombie pins the PGID: kill stragglers until the group
         // is proven empty or the bounded drain ends.
-        for (int poll = 0; poll < drain_polls; ++poll) {
-            if (!exited_unreaped(child)) {
-                sleep_ms(stop_poll_interval_ms);
-                continue;
+        const auto drain_end =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{drain_deadline_ms};
+        while (std::chrono::steady_clock::now() < drain_end) {
+            status = observe_child(child);
+            if (status == child_status::lost) {
+                child_owned = false;
+                return;
             }
-            const auto live = group_has_live_members(child);
-            if (live && !*live) {
-                break;
+            if (status == child_status::exited) {
+                const auto live = group_has_live_members(child);
+                if (live && !*live) {
+                    break;
+                }
+                (void)::kill(-child, SIGKILL);
             }
-            (void)::kill(-child, SIGKILL);
             sleep_ms(stop_poll_interval_ms);
         }
         reap(child);
@@ -502,8 +522,11 @@ auto denial_stream::prove_live(std::chrono::milliseconds timeout)
         const std::lock_guard lock{self.canary_mutex};
         self.pending.clear();
     }
-    // Every canary is still unreaped here, so these pids are still ours.
+    // A canary observed lost was reaped elsewhere and is no longer ours.
     for (const ::pid_t pid : spawned) {
+        if (observe_child(pid) == child_status::lost) {
+            continue;
+        }
         (void)::kill(pid, SIGKILL);
         reap(pid);
     }

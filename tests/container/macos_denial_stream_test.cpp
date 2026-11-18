@@ -334,6 +334,38 @@ auto replayed_denial_is_not_a_canary() -> int {
     return 0;
 }
 
+// T9: a child reaped by someone else is no longer this object's to signal.
+// The orphaned sleep in its group must survive the destructor.
+auto lost_child_is_not_signalled() -> int {
+    watcher watch;
+    auto started = denial_stream::start(watch.options({"/bin/sh", "-c", "sleep 30 & wait"}));
+    REQUIRE(started.has_value());
+    auto stream = std::move(*started);
+    const ::pid_t pid = stream->child_pid_for_test();
+    REQUIRE(pid > 0);
+    std::this_thread::sleep_for(milliseconds{300});
+    REQUIRE(group_has_live_members(pid));
+    (void)::kill(pid, SIGKILL);
+    int status = 0;
+    ::pid_t reaped = -1;
+    do {
+        reaped = ::waitpid(pid, &status, 0);
+    } while (reaped < 0 && errno == EINTR);
+    REQUIRE(reaped == pid);
+    REQUIRE(group_has_live_members(pid));
+    const auto destroying = clock_type::now();
+    stream.reset();
+    const auto took = elapsed_ms(destroying);
+    const bool survived = group_has_live_members(pid);
+    // The sleep keeps group pid alive, so the number cannot have been reused.
+    (void)::kill(-pid, SIGKILL);
+    (void)wait_for([&] { return !group_has_live_members(pid); }, milliseconds{2000});
+    REQUIRE(took < 1000);
+    REQUIRE(survived);
+    std::printf("T9 ok\n");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -352,7 +384,8 @@ int main(int argc, char** argv) {
           garbage_and_flood,
           term_ignoring_child,
           callback_throws,
-          replayed_denial_is_not_a_canary}) {
+          replayed_denial_is_not_a_canary,
+          lost_child_is_not_signalled}) {
         if (const int failed = step(); failed != 0) {
             return failed;
         }
