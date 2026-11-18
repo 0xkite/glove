@@ -89,9 +89,11 @@ Limits, which matter more than the capability:
   same random 128-bit tag, so a line that ends with the tag came from a process
   under that launch's profile. The pid in the line is informative only: pids
   are recycled, and it must never choose a signal target.
-- Host-wide noise is real: a `bash` invocation in this probe also produced
-  `/dev/tty` denials from unrelated activity. Filter by verified pid, classify
-  by operation, and rate-limit.
+- Host-wide noise is filtered at the source. The reader's predicate keeps only
+  kernel Sandbox messages that end with the launch's tag, so other processes'
+  denials never reach Glove. Lines of the launch's own processes that carry no
+  tag (see "Session tag" below) are lost with them. Classify by operation and
+  rate-limit what remains.
 
 ### Reading the denial log safely
 

@@ -470,3 +470,29 @@ same-user host process that can rewrite them.
 
 Detailed policy and file invariants are defined in
 [session-policy.md](session-policy.md).
+
+## macOS denial telemetry
+
+Observation only; no capability is advertised for it and nothing may depend on
+it.
+
+- The runner starts one `log stream` child per `glove run` or `glove exec`
+  session, filtered to kernel Sandbox messages that end with the session's
+  tag. Every deny rule of the session's profile carries that tag.
+- Liveness is proven with a canary before the agent starts (at most 2 s) and
+  once more at exit (at most 1 s). The log is ordered, so the closing canary is
+  the flush barrier for the session's own denials.
+- Each accepted denial becomes one `sandbox_denial` audit record with kind,
+  operation, target, process name and pid, percent-encoded and bounded (target
+  512 bytes, 16 records per second, 256 per session). One `telemetry` record is
+  written at start and one `summary` record at exit.
+- If the stream cannot be started or proven, one `telemetry` record says
+  `unavailable` and the session runs sandboxed without telemetry.
+- An audit append failure of a telemetry record is returned as an error after
+  the agent has exited.
+- On a terminal the CLI says on stderr when it starts and stops telemetry. It
+  always says when telemetry is unavailable, and at exit when it was
+  incomplete.
+
+Measurements are in [sbpl-reference.md](sbpl-reference.md); the limits are the
+two "macOS denial telemetry" rows of the [threat model](threat-model.md).
