@@ -2,6 +2,7 @@
 #include "glove/host/runtime_policy.hpp"
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/json_codec.hpp"
+#include "glove/run/pi_host_config.hpp"
 #include "glove/run/runner.hpp"
 #include "glove/term/terminal.hpp"
 #include "glove/version.hpp"
@@ -637,6 +638,38 @@ void add_verified_agent_read_dir(
     add_non_overlapping_read_dir(opts, canon);
 }
 
+// Expose the local packages named in host Pi settings read-only, so a package
+// kept outside the approved roots (for example a source checkout) still loads.
+// The runner drops any local package that ends up unreadable from the guest
+// settings.json, so a refused package degrades to "not loaded" with a warning.
+void add_pi_local_packages(
+    glove::run::options& opts,
+    const std::filesystem::path& home_dir,
+    const std::filesystem::path& pi_agent_dir
+) {
+    std::ifstream in(pi_agent_dir / "settings.json", std::ios::binary);
+    if (!in) {
+        return;
+    }
+    constexpr std::size_t limit = 4U * 1024U * 1024U;
+    std::string text(limit + 1, '\0');
+    in.read(text.data(), static_cast<std::streamsize>(text.size()));
+    text.resize(static_cast<std::size_t>(in.gcount()));
+    if (text.size() > limit) {
+        return;
+    }
+    auto packages = glove::run::pi_local_package_sources(text, pi_agent_dir, home_dir);
+    if (!packages) {
+        return;
+    }
+    for (const auto& package : *packages) {
+        if (auto canonical =
+                glove::run::pi_package_exposure(package.resolved, home_dir, pi_agent_dir)) {
+            add_non_overlapping_read_dir(opts, *canonical);
+        }
+    }
+}
+
 void add_unique_path_dir(glove::run::options& opts, const std::filesystem::path& dir) {
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec) || ec) {
@@ -767,6 +800,10 @@ auto attach_agent_harness_closure(
         add_verified_agent_read_dir(
             opts, dotfiles_dir / "pi" / ".pi" / "agent" / "packages", approved_pi_roots
         );
+        if (driver == "pi") {
+            add_pi_local_packages(opts, home_dir, pi_agent_dir);
+            opts.report_pi_packages = true;
+        }
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");
