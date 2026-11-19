@@ -496,3 +496,31 @@ it.
 
 Measurements are in [sbpl-reference.md](sbpl-reference.md); the limits are the
 two "macOS denial telemetry" rows of the [threat model](threat-model.md).
+
+### Denial decisions (interface only)
+
+`include/glove/container/denial_decision.hpp` defines how a session's denials
+become a verdict. It is not wired into any launch path yet: no verdict is
+recorded or acted on.
+
+- `denial_feature_builder` turns the denial stream into 34 features (schema
+  version 1): counts by kind and by target class (workspace, home credential
+  store, other home, system, temp, device, other, none), writes outside the
+  workspace, distinct targets and process names, rates over 1 s and 10 s, and
+  timing. Values are `log1p` scaled. Memory is bounded: the rate window holds
+  4096 entries and each distinct set 1024.
+- `denial_decider::decide` maps features to `proceed`, `flag` or `terminate`
+  with a score in [0, 1]. It is a pure function: no I/O, no blocking.
+- The product arm is a model trained offline and loaded with
+  `load_denial_model`: logistic regression or gradient-boosted trees in a
+  strict JSON file (at most 1 MiB, 512 trees, 255 nodes per tree, children
+  after their parent, feature names equal to the schema). A file that fails
+  any check does not load.
+- `make_heuristic_denial_decider` is a fixed-threshold arm kept only to
+  compare against the model.
+
+A decider can only escalate. The planned use records verdicts (shadow mode)
+until the operator enables termination, which goes through the
+identity-checked group teardown. A missing or invalid model leaves the session
+sandboxed with no reaction. Features come from agent-chosen bytes, so an
+agent can steer its own verdict, but not what the sandbox allows.

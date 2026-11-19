@@ -385,6 +385,11 @@ target_include_directories(container_denial_telemetry_test PRIVATE
 add_test(NAME container_denial_telemetry COMMAND container_denial_telemetry_test)
 set_tests_properties(container_denial_telemetry PROPERTIES TIMEOUT 10)
 
+add_executable(container_denial_decision_test container/denial_decision_test.cpp)
+target_link_libraries(container_denial_decision_test PRIVATE glove_container)
+add_test(NAME container_denial_decision COMMAND container_denial_decision_test)
+set_tests_properties(container_denial_decision PROPERTIES TIMEOUT 10)
+
 add_executable(container_receipt_chain_test container/receipt_chain_test.cpp)
 target_link_libraries(container_receipt_chain_test PRIVATE glove_container)
 add_test(NAME container_receipt_chain COMMAND container_receipt_chain_test)

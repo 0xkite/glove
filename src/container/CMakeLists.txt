@@ -9,6 +9,7 @@ add_library(glove_container STATIC
     resource_monitor.cpp
     sandbox_denial_log.cpp
     denial_telemetry.cpp
+    denial_decision.cpp
 )
 add_library(glove::container ALIAS glove_container)
 
