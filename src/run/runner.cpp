@@ -16,6 +16,7 @@
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/codegen.hpp"
 #include "glove/reflect/extension.hpp"
+#include "glove/run/launch_profile.hpp"
 
 #include "exit_audit.hpp"
 #include "provider_endpoint.hpp"
@@ -642,6 +643,16 @@ auto prepare_profile(const options& opts, const std::filesystem::path& runtime_r
     auto validated = glove::container::validate(*raw);
     if (!validated) {
         return std::unexpected(std::string{"profile: "} + validated.error());
+    }
+    // Glove's own configuration and state stay host-only, whatever the
+    // operator granted: an agent that could write a launch profile would
+    // choose its next sandbox.
+    std::vector<std::string> exposed;
+    for (const auto& rule : validated->filesystem) {
+        exposed.push_back(rule.path);
+    }
+    if (auto refused = refuse_glove_root_exposure(exposed, protected_glove_roots()); !refused) {
+        return std::unexpected(refused.error());
     }
     if (auto prepared = provision(*validated); !prepared) {
         return std::unexpected(prepared.error());
