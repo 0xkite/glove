@@ -15,8 +15,6 @@ namespace glove::run {
 struct pi_local_package {
     std::string declared;
     std::filesystem::path resolved;
-    // A glob pattern: rewritten to an absolute pattern but never exposed.
-    bool pattern = false;
 
     auto operator==(const pi_local_package&) const -> bool = default;
 };
@@ -26,8 +24,9 @@ struct pi_local_package {
 // included). They come from `packages` (string or object `source`) and from the
 // top-level `extensions`, `skills`, `prompts`, and `themes` arrays, whose
 // entries may carry a `!`/`-`/`+` prefix. Relative paths resolve from
-// `settings_dir`; `~` expands to `home`. Exclusions and globs are marked
-// `pattern`: rewritten, never exposed. Resolution is lexical only.
+// `settings_dir`; `~` expands to `home`. `!`/`-` exclusions and `*`/`?`
+// patterns are not returned: they match agent-relative paths and stay as
+// written. Resolution is lexical only.
 [[nodiscard]] auto pi_local_package_sources(
     std::string_view settings_json,
     const std::filesystem::path& settings_dir,
@@ -60,7 +59,8 @@ struct pi_local_package {
 // Rewrite the guest copy of `settings.json`. `exposed` maps a declared entry to
 // the absolute path that replaces it (a resource entry keeps its prefix). Local
 // package and resource entries that are not mapped are removed so Pi does not
-// abort on a path the sandbox cannot read; unmapped exclusions are kept.
+// abort on a path the sandbox cannot read; exclusions and patterns are kept
+// as written.
 // Non-local entries and all other settings are preserved.
 [[nodiscard]] auto rewrite_pi_settings_packages(
     std::string_view settings_json, const std::map<std::string, std::string>& exposed

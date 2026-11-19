@@ -87,7 +87,8 @@ auto run() -> int {
         std::ofstream(package / "package.json") << R"({"name":"local-pi-marker"})";
         std::ofstream(pi_agent / "settings.json")
             << R"({"defaultProvider":"deepseek","packages":["npm:pi-lens",)"
-               R"("../../pkgs/local-pi","../../pkgs/missing"]})";
+               R"("../../pkgs/local-pi","../../pkgs/missing"],)"
+               R"("extensions":["!*.test.ts","./extensions/inpi.ts"]})";
         std::ofstream(pi_agent / "models.json")
             << R"({"providers":{"local":{"baseUrl":"http://127.0.0.1:8081/v1","apiKey":"dummy"},)"
                R"("remote":{"baseUrl":"https://api.example.com/v1","apiKey":"sk-remote-secret"}}})";
@@ -128,6 +129,8 @@ auto run() -> int {
     REQUIRE(settings.find(package.string()) != std::string::npos);
     REQUIRE(settings.find("npm:pi-lens") != std::string::npos);
     REQUIRE(settings.find("missing") == std::string::npos);
+    REQUIRE(settings.find("\"!*.test.ts\"") != std::string::npos);
+    REQUIRE(settings.find("\"./extensions/inpi.ts\"") != std::string::npos);
     REQUIRE(slurp(out / "package.txt").find("local-pi-marker") != std::string::npos);
 
     const auto models = slurp(out / "models.json");

@@ -484,8 +484,14 @@ void stage_guest_pi_settings(
     }
     std::map<std::string, std::string> exposed;
     for (const auto& package : *packages) {
-        if (package.pattern) {
-            exposed.emplace(package.declared, package.resolved.string());
+        // Entries under the agent directory resolve through the guest's
+        // mirrored layout (npm, skills, ...), so they keep their original form.
+        if (path_within(package.resolved, host_pi_dir)) {
+            const std::string_view declared{package.declared};
+            exposed.emplace(
+                package.declared,
+                std::string{declared.starts_with('+') ? declared.substr(1) : declared}
+            );
             continue;
         }
         auto canonical = glove::run::pi_package_exposure(package.resolved, host_home, host_pi_dir);
@@ -503,12 +509,12 @@ void stage_guest_pi_settings(
         if (canonical && std::ranges::any_of(profile.filesystem, [&](const auto& rule) {
                 return path_within(std::filesystem::path{rule.path}, *canonical);
             })) {
-            reason = "it contains the workspace or another mounted path";
+            reason = "it contains the workspace or another mounted path; use a workspace "
+                     "outside it";
         }
         std::fprintf(
             stderr,
-            "glove: Pi resource '%s' is not loaded in the sandbox (%s); pass --read <path> to "
-            "expose it\n",
+            "glove: Pi resource '%s' is not loaded in the sandbox (%s)\n",
             package.declared.c_str(),
             reason.c_str()
         );

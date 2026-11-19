@@ -659,14 +659,33 @@ void add_pi_local_packages(
     if (!packages) {
         return;
     }
+    const std::array<std::filesystem::path, 2> dotfiles_roots{
+        home_dir / "Documents" / "depend" / "dotfiles", home_dir / ".dotfiles"
+    };
     for (const auto& package : *packages) {
-        if (package.pattern) {
+        if (is_subpath_of(package.resolved, pi_agent_dir)) {
             continue;
         }
-        if (auto canonical =
-                glove::run::pi_package_exposure(package.resolved, home_dir, pi_agent_dir)) {
-            add_non_overlapping_read_dir(opts, *canonical);
+        auto canonical = glove::run::pi_package_exposure(package.resolved, home_dir, pi_agent_dir);
+        if (!canonical) {
+            continue;
         }
+        const bool approved = std::ranges::any_of(dotfiles_roots, [&](const auto& root) {
+            std::error_code ec;
+            const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+            return !ec && is_subpath_of(*canonical, canonical_root);
+        });
+        if (!approved) {
+            // A package outside the approved roots is visible on every launch,
+            // so name it: settings.json is the only thing that put it there.
+            std::fprintf(
+                stderr,
+                "glove: exposing Pi package '%s' read-only (from %s)\n",
+                canonical->c_str(),
+                (pi_agent_dir / "settings.json").c_str()
+            );
+        }
+        add_non_overlapping_read_dir(opts, *canonical);
     }
 }
 
@@ -800,8 +819,10 @@ auto attach_agent_harness_closure(
         add_verified_agent_read_dir(
             opts, dotfiles_dir / "pi" / ".pi" / "agent" / "packages", approved_pi_roots
         );
-        add_pi_local_packages(opts, home_dir, pi_agent_dir);
-        opts.report_pi_packages = driver == "pi";
+        if (driver == "pi") {
+            add_pi_local_packages(opts, home_dir, pi_agent_dir);
+            opts.report_pi_packages = true;
+        }
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");

@@ -139,8 +139,15 @@ auto resolve_source(std::string_view source, const fs::path& settings_dir, const
     return resolved;
 }
 
+// Pi's `isPattern`: only `*` and `?` make an entry a pattern.
 auto is_glob(std::string_view path) -> bool {
-    return path.find_first_of("*?[]{}") != std::string_view::npos;
+    return path.find_first_of("*?") != std::string_view::npos;
+}
+
+// Exclusions and patterns match against agent-relative paths and basenames, and
+// the guest agent directory mirrors the host layout, so they stay as written.
+auto verbatim_resource(std::string_view prefix, std::string_view path) -> bool {
+    return prefix == "!" || prefix == "-" || is_glob(path);
 }
 
 // Top-level resource arrays take path patterns with an optional `!`/`-`
@@ -440,9 +447,7 @@ auto pi_local_package_sources(
                 continue;
             }
             found.push_back(
-                {.declared = *source,
-                 .resolved = resolve_source(*path, settings_dir, home),
-                 .pattern = false}
+                {.declared = *source, .resolved = resolve_source(*path, settings_dir, home)}
             );
         }
     }
@@ -461,13 +466,12 @@ auto pi_local_package_sources(
             }
             const auto [prefix, raw] = split_resource(entry.get_string());
             const auto path = local_path(raw);
-            if (!path) {
+            if (!path || verbatim_resource(prefix, *path)) {
                 continue;
             }
             found.push_back(
                 {.declared = entry.get_string(),
-                 .resolved = resolve_source(*path, settings_dir, home),
-                 .pattern = prefix == "!" || prefix == "-" || is_glob(*path)}
+                 .resolved = resolve_source(*path, settings_dir, home)}
             );
         }
     }
@@ -636,16 +640,13 @@ auto rewrite_pi_settings_packages(
             }
             const auto text = entry.get_string();
             const auto [prefix, raw] = split_resource(text);
-            if (!local_path(raw)) {
+            const auto path = local_path(raw);
+            if (!path || verbatim_resource(prefix, *path)) {
                 kept.push_back(std::move(entry));
                 continue;
             }
             if (const auto mapped = exposed.find(text); mapped != exposed.end()) {
                 kept.emplace_back(std::string{prefix} + mapped->second);
-            } else if (prefix == "!" || prefix == "-") {
-                // An unmapped exclusion is harmless and dropping it would widen
-                // what a pattern includes, so it is kept as written.
-                kept.push_back(std::move(entry));
             }
         }
         it->second = std::move(kept);

@@ -70,7 +70,8 @@ auto local_sources() -> int {
                      "github:example/repo", "ssh://git@example.com/r.git",
                      "git@github.com:example/repo.git", "builtin:mcp"],
         "extensions": ["../../ext/one.ts", "-builtin:mcp", "!../../ext/skip.ts",
-                       "+../../ext/glob/*.ts"],
+                       "+../../ext/glob/*.ts", "!*.test.ts", "-../../ext/off.ts",
+                       "../../ext/foo[1].ts"],
         "skills": ["~/skills/local"],
         "prompts": ["npm:prompt-pack"],
         "themes": ["./themes/dark.json"]
@@ -82,8 +83,7 @@ auto local_sources() -> int {
         {.declared = "  ./spaced  ", .resolved = "/home/u/.pi/agent/spaced"},
         {.declared = "file:///opt/pi/from-url", .resolved = "/opt/pi/from-url"},
         {.declared = "../../ext/one.ts", .resolved = "/home/u/ext/one.ts"},
-        {.declared = "!../../ext/skip.ts", .resolved = "/home/u/ext/skip.ts", .pattern = true},
-        {.declared = "+../../ext/glob/*.ts", .resolved = "/home/u/ext/glob/*.ts", .pattern = true},
+        {.declared = "../../ext/foo[1].ts", .resolved = "/home/u/ext/foo[1].ts"},
         {.declared = "~/skills/local", .resolved = "/home/u/skills/local"},
         {.declared = "./themes/dark.json", .resolved = "/home/u/.pi/agent/themes/dark.json"},
     };
@@ -135,24 +135,26 @@ auto rewrite_packages() -> int {
 
     constexpr std::string_view resources = R"({
         "extensions": ["../../ext/one.ts", "-builtin:mcp", "!../../ext/gone.ts",
-                       "+../../ext/glob/*.ts"],
+                       "+../../ext/glob/*.ts", "!*.test.ts", "+skills/x", "../../ext/unmapped.ts"],
         "skills": ["~/skills/local"]
     })";
     auto resource_rewrite = rewrite_pi_settings_packages(
         resources,
         {{"../../ext/one.ts", "/real/ext/one.ts"},
-         {"+../../ext/glob/*.ts", "/real/ext/glob/*.ts"},
+         {"+skills/x", "skills/x"},
          {"~/skills/local", "/real/skills/local"}}
     );
     REQUIRE(resource_rewrite.has_value());
     glz::generic resource_json{};
     REQUIRE(!glz::read_json(resource_json, *resource_rewrite));
     auto& extensions = resource_json["extensions"].get<glz::generic::array_t>();
-    REQUIRE(extensions.size() == 4);
+    REQUIRE(extensions.size() == 6);
     REQUIRE(extensions[0].get<std::string>() == "/real/ext/one.ts");
     REQUIRE(extensions[1].get<std::string>() == "-builtin:mcp");
     REQUIRE(extensions[2].get<std::string>() == "!../../ext/gone.ts");
-    REQUIRE(extensions[3].get<std::string>() == "+/real/ext/glob/*.ts");
+    REQUIRE(extensions[3].get<std::string>() == "+../../ext/glob/*.ts");
+    REQUIRE(extensions[4].get<std::string>() == "!*.test.ts");
+    REQUIRE(extensions[5].get<std::string>() == "+skills/x");
     REQUIRE(
         resource_json["skills"].get<glz::generic::array_t>()[0].get<std::string>() ==
         "/real/skills/local"
