@@ -20,6 +20,7 @@
 
 #include "exit_audit.hpp"
 #include "provider_endpoint.hpp"
+#include "secret_resolve.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -1037,10 +1038,18 @@ struct preset_startup {
 // Start the mediated reverse endpoint for `--agent <preset>` and compute the
 // environment that steers the client at it. The real provider secret is read
 // only here, on the host, and is never placed in the child environment.
-auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
-    -> std::expected<preset_startup, std::string> {
+auto start_agent_preset(
+    const options& opts,
+    const glove::container::profile& profile,
+    const std::shared_ptr<glove::audit::sink>& sink
+) -> std::expected<preset_startup, std::string> {
     preset_startup startup;
     if (!opts.agent_preset) {
+        if (opts.provider_secret) {
+            return std::unexpected(
+                std::string{"a provider secret needs an agent preset (--agent or profile agent)"}
+            );
+        }
         return startup;
     }
     auto definition = preset_definition_for(*opts.agent_preset);
@@ -1087,12 +1096,30 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
             }
         }
     }
-    const char* secret = std::getenv(api_key_env.c_str());
-    if (secret == nullptr || *secret == '\0') {
-        return std::unexpected(
-            std::string{"--agent "} + std::string{definition->label} +
-            " requires the host environment variable " + api_key_env
-        );
+    std::string secret;
+    if (opts.provider_secret) {
+        // A file secret must stay outside every grant, or the agent could
+        // read the credential the endpoint is keeping from it.
+        std::vector<std::string> exposed;
+        for (const auto& rule : profile.filesystem) {
+            exposed.push_back(rule.path);
+        }
+        auto resolved =
+            detail::resolve_secret(*opts.provider_secret, invoking_user_home(), exposed);
+        if (!resolved) {
+            return std::unexpected(resolved.error());
+        }
+        secret = std::move(*resolved);
+    } else {
+        const char* value = std::getenv(api_key_env.c_str());
+        if (value == nullptr || *value == '\0') {
+            return std::unexpected(
+                std::string{"--agent "} + std::string{definition->label} +
+                " requires the host environment variable " + api_key_env +
+                " or a profile secrets.provider"
+            );
+        }
+        secret = value;
     }
     auto nonce = random_session_nonce();
     if (!nonce) {
@@ -1100,7 +1127,7 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     }
 
     auto endpoint_options =
-        detail::make_provider_endpoint_options(definition->surface, std::string{secret}, *nonce);
+        detail::make_provider_endpoint_options(definition->surface, std::move(secret), *nonce);
     if (!endpoint_options) {
         return std::unexpected(endpoint_options.error());
     }
@@ -1704,6 +1731,11 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
     }
+    if (opts.provider_secret) {
+        return std::unexpected(
+            std::string{"a provider secret applies to glove exec or shell with an agent preset"}
+        );
+    }
 #if !defined(__APPLE__)
     if (opts.denial_trace) {
         return std::unexpected(std::string{"denial traces are recorded on macOS only"});
@@ -1825,7 +1857,7 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(proxy.error());
     }
 
-    auto preset = start_agent_preset(opts, *sink);
+    auto preset = start_agent_preset(opts, *profile, *sink);
     if (!preset) {
         return std::unexpected(preset.error());
     }

@@ -1167,6 +1167,14 @@ target_include_directories(run_denial_audit_test PRIVATE
 add_test(NAME run_denial_audit COMMAND run_denial_audit_test)
 set_tests_properties(run_denial_audit PROPERTIES TIMEOUT 10)
 
+add_executable(run_secret_resolve_test run/secret_resolve_test.cpp)
+target_link_libraries(run_secret_resolve_test PRIVATE glove_run)
+target_include_directories(run_secret_resolve_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/run>
+)
+add_test(NAME run_secret_resolve COMMAND run_secret_resolve_test)
+set_tests_properties(run_secret_resolve PROPERTIES TIMEOUT 30)
+
 add_executable(run_launch_profile_test run/launch_profile_test.cpp)
 target_link_libraries(run_launch_profile_test PRIVATE glove_run)
 target_include_directories(run_launch_profile_test PRIVATE

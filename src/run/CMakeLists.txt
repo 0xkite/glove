@@ -6,6 +6,8 @@ add_library(glove_run STATIC
     launch_profile.cpp
     launch_profile_text.cpp
     profile_cli.cpp
+    secret_reference.cpp
+    secret_resolve.cpp
     yaml_subset.cpp
     provider_endpoint.cpp
     pi_selection.cpp
@@ -50,6 +52,10 @@ target_link_libraries(glove_run
         glaze::glaze
         glove_host
 )
+if(APPLE)
+    # keychain:// secrets (secret_resolve.cpp).
+    target_link_libraries(glove_run PRIVATE "-framework Security" "-framework CoreFoundation")
+endif()
 target_include_directories(glove_run
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>

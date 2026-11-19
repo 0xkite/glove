@@ -1546,14 +1546,14 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         opts.agent_preset.reset();
     } else if (driver == "pi" || driver == "claude" || driver == "claude-code") {
         const char* key = std::getenv("ANTHROPIC_API_KEY");
-        if (key != nullptr && *key != '\0') {
+        if (opts.provider_secret || (key != nullptr && *key != '\0')) {
             opts.agent_preset = driver;
         } else {
             opts.agent_preset.reset();
         }
     } else if (driver == "codex") {
         const char* key = std::getenv("OPENAI_API_KEY");
-        if (key != nullptr && *key != '\0') {
+        if (opts.provider_secret || (key != nullptr && *key != '\0')) {
             opts.agent_preset = driver;
         } else {
             opts.agent_preset.reset();

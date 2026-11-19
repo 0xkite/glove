@@ -2,6 +2,7 @@
 
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/engine.hpp"
+#include "glove/run/secret_reference.hpp"
 
 #include <expected>
 #include <filesystem>
@@ -65,6 +66,9 @@ struct options {
     // Preset agent profile (e.g. "claude-code", "codex", "pi") that selects a
     // credentialed reverse endpoint and generates the matching environment.
     std::optional<std::string> agent_preset;
+    // Where the preset's provider credential comes from. Unset: the preset's
+    // host environment variable (e.g. ANTHROPIC_API_KEY).
+    std::optional<secret_reference> provider_secret;
     // Permit private-loopback socket binding/listening inside the sandbox's
     // isolated network namespace (required by runtimes like agy).
     bool allow_loopback_listen = false;
