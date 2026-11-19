@@ -664,4 +664,23 @@ auto scrub_pi_models_credentials(std::string_view models_json)
     return write_object(*models, "models.json");
 }
 
+auto printable(std::string_view text) -> std::string {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(text.size());
+    for (const char ch : text) {
+        const auto byte = static_cast<unsigned char>(ch);
+        if (ch == '\\') {
+            out += "\\\\";
+        } else if (byte < 0x20U || byte >= 0x7FU) {
+            out += "\\x";
+            out.push_back(hex[byte >> 4U]);
+            out.push_back(hex[byte & 0x0FU]);
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
 } // namespace glove::run

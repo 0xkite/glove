@@ -675,17 +675,18 @@ void add_pi_local_packages(
             const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
             return !ec && is_subpath_of(*canonical, canonical_root);
         });
-        if (!approved) {
+        const auto before = opts.readable.size();
+        add_non_overlapping_read_dir(opts, *canonical);
+        if (!approved && opts.readable.size() > before) {
             // A package outside the approved roots is visible on every launch,
             // so name it: settings.json is the only thing that put it there.
             std::fprintf(
                 stderr,
                 "glove: exposing Pi package '%s' read-only (from %s)\n",
-                canonical->c_str(),
-                (pi_agent_dir / "settings.json").c_str()
+                glove::run::printable(canonical->string()).c_str(),
+                glove::run::printable((pi_agent_dir / "settings.json").string()).c_str()
             );
         }
-        add_non_overlapping_read_dir(opts, *canonical);
     }
 }
 

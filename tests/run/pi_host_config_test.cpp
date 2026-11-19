@@ -29,6 +29,7 @@ namespace fs = std::filesystem;
 using glove::run::pi_local_package;
 using glove::run::pi_local_package_sources;
 using glove::run::pi_package_exposure;
+using glove::run::printable;
 using glove::run::rewrite_pi_settings_packages;
 using glove::run::scrub_pi_models_credentials;
 
@@ -319,7 +320,20 @@ auto exposure() -> int {
 
 } // namespace
 
+auto escapes() -> int {
+    REQUIRE(printable("/home/u/pkgs/a b") == "/home/u/pkgs/a b");
+    REQUIRE(printable("x\r\x1b[2Ky") == "x\\x0d\\x1b[2Ky");
+    REQUIRE(printable("bell\x07") == "bell\\x07");
+    REQUIRE(printable("del\x7f") == "del\\x7f");
+    REQUIRE(printable("caf\xc3\xa9") == "caf\\xc3\\xa9");
+    REQUIRE(printable("back\\slash") == "back\\\\slash");
+    return 0;
+}
+
 auto main() -> int {
+    if (const int rc = escapes(); rc != 0) {
+        return rc;
+    }
     if (const int rc = local_sources(); rc != 0) {
         return rc;
     }

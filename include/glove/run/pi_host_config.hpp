@@ -77,4 +77,9 @@ struct pi_local_package {
 [[nodiscard]] auto scrub_pi_models_credentials(std::string_view models_json)
     -> std::expected<std::string, std::string>;
 
+// Text from host configuration made safe for a terminal: control bytes, DEL,
+// and bytes >= 0x80 are written as `\xNN`, so a crafted path cannot move the
+// cursor or erase the line that reports it.
+[[nodiscard]] auto printable(std::string_view text) -> std::string;
+
 } // namespace glove::run

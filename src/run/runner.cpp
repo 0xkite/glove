@@ -484,8 +484,9 @@ void stage_guest_pi_settings(
     }
     std::map<std::string, std::string> exposed;
     for (const auto& package : *packages) {
-        // Entries under the agent directory resolve through the guest's
-        // mirrored layout (npm, skills, ...), so they keep their original form.
+        // Entries under the agent directory keep their original form: the
+        // guest mirrors npm, skills, pi-subagents, pi-web-access, and missions
+        // there, and anything else under it was not loadable before either.
         if (path_within(package.resolved, host_pi_dir)) {
             const std::string_view declared{package.declared};
             exposed.emplace(
@@ -515,8 +516,8 @@ void stage_guest_pi_settings(
         std::fprintf(
             stderr,
             "glove: Pi resource '%s' is not loaded in the sandbox (%s)\n",
-            package.declared.c_str(),
-            reason.c_str()
+            glove::run::printable(package.declared).c_str(),
+            glove::run::printable(reason).c_str()
         );
     }
     auto rewritten = glove::run::rewrite_pi_settings_packages(*text, exposed);
