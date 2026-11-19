@@ -5,6 +5,7 @@ add_library(glove_run STATIC
     denial_trace_writer.cpp
     launch_profile.cpp
     launch_profile_text.cpp
+    profile_cli.cpp
     yaml_subset.cpp
     provider_endpoint.cpp
     pi_selection.cpp

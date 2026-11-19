@@ -2,12 +2,14 @@
 #include "glove/host/runtime_policy.hpp"
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/json_codec.hpp"
+#include "glove/run/launch_profile.hpp"
 #include "glove/run/runner.hpp"
 #include "glove/term/terminal.hpp"
 #include "glove/version.hpp"
 
 #include "host/cli.hpp"
 #include "run/pi_cli.hpp"
+#include "run/profile_cli.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -53,6 +55,8 @@ void print_run_usage() {
         "usage: glove run [options] -- <agent argv>...\n"
         "\n"
         "options:\n"
+        "  --profile <name>                     start from launch profile <name>\n"
+        "                                       (see `glove profile`); flags add to it\n"
         "  --upstream <name>=<cmd>[,<arg>...]   register one upstream MCP server\n"
         "                                       (may be repeated)\n"
         "  --allow <qualified.tool>             permit one tool name through policy\n"
@@ -183,6 +187,8 @@ void print_exec_usage() {
         "kernel is wired (use `glove run` for an MCP-client agent).\n"
         "\n"
         "options:\n"
+        "  --profile <name>        start from launch profile <name> (see `glove profile`);\n"
+        "                          the flags below add to it\n"
         "  --workspace <path>      read-write workspace for the agent\n"
         "                          (omitted: private empty working directory)\n"
         "  --read <path>           expose one additional path read-only\n"
@@ -232,6 +238,7 @@ void print_shell_usage() {
         "  --list                  list saved and currently running environments\n"
         "\n"
         "options:\n"
+        "  --profile <name>        start from launch profile <name> (see `glove profile`)\n"
         "  --workspace <path>      read-write workspace (auto-created if missing;\n"
         "                          omitted: ephemeral private workspace)\n"
         "  --agent <name>          agent harness to launch: pi, agy, claude, or codex\n"
@@ -488,8 +495,69 @@ auto parse_sandbox_flag(
     return std::nullopt;
 }
 
+// Loads launch profile NAME and layers the command-line options OPTS on top.
+auto apply_profile_flag(
+    const std::optional<std::string>& name, glove::run::options& opts, std::string_view cmd_name
+) -> bool {
+    if (!name) {
+        return true;
+    }
+    auto profile = glove::run::load_launch_profile(*name);
+    if (!profile) {
+        std::fprintf(
+            stderr,
+            "glove %.*s: %s\n",
+            static_cast<int>(cmd_name.size()),
+            cmd_name.data(),
+            profile.error().c_str()
+        );
+        return false;
+    }
+    auto applied =
+        glove::run::apply_launch_profile(*profile, opts, glove::run::invoking_user_home());
+    if (!applied) {
+        std::fprintf(
+            stderr,
+            "glove %.*s: profile %s: %s\n",
+            static_cast<int>(cmd_name.size()),
+            cmd_name.data(),
+            name->c_str(),
+            applied.error().c_str()
+        );
+        return false;
+    }
+    opts = std::move(*applied);
+    return true;
+}
+
+// `--profile <name>`: returns 0 when consumed, 2 on a missing argument, or
+// nullopt when ARGS[I] is another flag.
+auto parse_profile_flag(
+    std::span<char* const> args,
+    std::size_t& i,
+    std::optional<std::string>& name,
+    std::string_view cmd_name
+) -> std::optional<int> {
+    if (std::string_view{args[i]} != "--profile") {
+        return std::nullopt;
+    }
+    if (i + 1 >= args.size() || name) {
+        std::fprintf(
+            stderr,
+            "glove %.*s: --profile needs one argument and may be given once\n",
+            static_cast<int>(cmd_name.size()),
+            cmd_name.data()
+        );
+        return 2;
+    }
+    name = std::string{args[i + 1]};
+    i += 2;
+    return 0;
+}
+
 auto exec_subcommand(std::span<char* const> args) -> int {
     glove::run::options opts;
+    std::optional<std::string> profile_name;
     std::size_t i = 0;
     bool dashdash_seen = false;
     while (i < args.size()) {
@@ -510,6 +578,12 @@ auto exec_subcommand(std::span<char* const> args) -> int {
             }
             opts.denial_trace = std::filesystem::path{args[i + 1]};
             i += 2;
+            continue;
+        }
+        if (const auto handled = parse_profile_flag(args, i, profile_name, "exec")) {
+            if (*handled != 0) {
+                return *handled;
+            }
             continue;
         }
         if (const auto handled = parse_sandbox_flag(args, i, opts, "exec")) {
@@ -536,6 +610,9 @@ auto exec_subcommand(std::span<char* const> args) -> int {
     if (opts.agent_argv.empty()) {
         std::fprintf(stderr, "glove exec: agent argv is empty after `--`\n");
         return 2;
+    }
+    if (!apply_profile_flag(profile_name, opts, "exec")) {
+        return 1;
     }
 
     auto code = glove::run::exec(opts);
@@ -1330,6 +1407,7 @@ auto shell_subcommand(std::span<char* const> args) -> int {
     opts.allow_loopback_listen = true;
     std::optional<std::string> save_name;
     std::optional<std::string> load_name;
+    std::optional<std::string> profile_name;
     std::size_t i = 0;
     while (i < args.size()) {
         std::string_view a{args[i]};
@@ -1373,6 +1451,12 @@ auto shell_subcommand(std::span<char* const> args) -> int {
             i += 2;
             continue;
         }
+        if (const auto handled = parse_profile_flag(args, i, profile_name, "shell")) {
+            if (*handled != 0) {
+                return *handled;
+            }
+            continue;
+        }
         if (const auto handled = parse_sandbox_flag(args, i, opts, "shell")) {
             if (*handled != 0) {
                 return *handled;
@@ -1391,6 +1475,15 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         return 2;
     }
 
+    if (load_name && profile_name) {
+        std::fprintf(
+            stderr, "glove shell: use either a saved environment or --profile, not both\n"
+        );
+        return 2;
+    }
+    if (!apply_profile_flag(profile_name, opts, "shell")) {
+        return 1;
+    }
     if (load_name) {
         glove::run::options loaded;
         loaded.allow_loopback_listen = true;
@@ -1823,6 +1916,7 @@ auto loop_subcommand(std::span<char* const> args) -> int {
 
 auto run_subcommand(std::span<char* const> args) -> int {
     glove::run::options opts;
+    std::optional<std::string> profile_name;
     std::size_t i = 0;
     bool dashdash_seen = false;
     while (i < args.size()) {
@@ -1880,6 +1974,12 @@ auto run_subcommand(std::span<char* const> args) -> int {
             }
             opts.audit_log = std::filesystem::path{args[i + 1]};
             i += 2;
+            continue;
+        }
+        if (const auto handled = parse_profile_flag(args, i, profile_name, "run")) {
+            if (*handled != 0) {
+                return *handled;
+            }
             continue;
         }
         if (a == "--denial-trace") {
@@ -1954,6 +2054,9 @@ auto run_subcommand(std::span<char* const> args) -> int {
         std::fprintf(stderr, "glove run: agent argv is empty after `--`\n");
         return 2;
     }
+    if (!apply_profile_flag(profile_name, opts, "run")) {
+        return 1;
+    }
 
     auto code = glove::run::execute(opts);
     if (!code) {
@@ -1975,6 +2078,7 @@ void print_usage() {
         "  loop            run a seeded agent feedback loop (--prompt, --verify)\n"
         "  exec            contain a self-driving agent (-- <argv>...)\n"
         "  run             spawn an MCP-client agent inside the container\n"
+        "  profile         create, edit, and check launch profiles (--profile <name>)\n"
         "\nsetup, policy & sessions:\n"
         "  setup           initialize machine-local config, keys, and optional policies\n"
         "  policy          detect harnesses and generate or validate runtime policy\n"
@@ -2111,6 +2215,11 @@ auto main(int argc, char** argv) -> int {
     }
     if (sub == "loop") {
         return loop_subcommand(
+            std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
+        );
+    }
+    if (sub == "profile") {
+        return glove::run::profile_command(
             std::span<char* const>{argv + 2, static_cast<std::size_t>(argc - 2)}
         );
     }

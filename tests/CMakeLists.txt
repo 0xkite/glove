@@ -1273,6 +1273,12 @@ if(Python3_Interpreter_FOUND)
             denial_model_collect PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
         )
     endif()
+    # Launch profiles: CLI lifecycle, edit validation, and --profile launches.
+    add_test(NAME profile_cli
+        COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_profile_cli.py
+            $<TARGET_FILE:glove>)
+    set_tests_properties(profile_cli PROPERTIES TIMEOUT 120)
     add_test(NAME workerd_supply_chain
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_workerd.py)
     set_tests_properties(workerd_supply_chain PROPERTIES TIMEOUT 120)

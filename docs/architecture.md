@@ -471,6 +471,40 @@ same-user host process that can rewrite them.
 Detailed policy and file invariants are defined in
 [session-policy.md](session-policy.md).
 
+## Launch profiles
+
+`glove exec`, `glove run`, and `glove shell` accept `--profile <name>`, read
+from `<XDG_CONFIG_HOME>/glove/profiles/<name>.yaml`. A profile names the
+workspace, agent preset, read and write grants, environment (a literal
+`value` or `from: host`), egress rules, MCP upstreams, tool allow rules, and
+bridge port. Command-line flags layer on top: a flag workspace, agent, or
+bridge port replaces the profile's; list flags append.
+
+- Glove reads profiles on the host before any sandbox exists. The profile
+  directory must be owner-only (`0700`) with no group- or other-writable
+  ancestor; a profile must be a regular, single-link, owner-owned `0600`
+  file of at most 64 KiB, opened without following symlinks.
+- The text is a strict YAML subset (`src/run/yaml_subset.cpp`), translated
+  to JSON and decoded by Glaze's strict JSON reader with unknown and
+  missing keys refused. Duplicate keys, anchors, aliases, tags, block
+  scalars, multiple documents, directives, tabs, control and invisible
+  characters, multi-line scalars, and plain nulls are refused with a line
+  number, so the file a reviewer reads is the policy glove applies.
+  Glaze's own YAML reader is not used.
+- `glove profile show` prints a canonical encoding that parses back to the
+  same profile; the profile fuzzer checks that property.
+- Every launch refuses a filesystem grant that lies inside, or contains,
+  glove's configuration or state directory (XDG and the account's default
+  locations, lexical and symlink-resolved). An agent that could read them
+  would learn policy and decoy layout; one that could write them would
+  choose its next sandbox.
+- `glove profile edit` saves only text that validates, restores mode `0600`
+  after editors that replace the file, and keeps a rejected edit aside.
+
+The JSON environments `glove shell --save/--load` writes under
+`<XDG_CONFIG_HOME>/glove/envs` remain as session state; profiles are the
+operator-authored policy.
+
 ## macOS denial telemetry
 
 Observation only; no capability is advertised for it and nothing may depend on
