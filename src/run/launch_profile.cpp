@@ -233,6 +233,9 @@ auto apply_launch_profile(
     if (!cli.bridge_port && profile.bridge_port) {
         out.bridge_port = profile.bridge_port;
     }
+    if (!cli.provider_secret && profile.provider_secret) {
+        out.provider_secret = profile.provider_secret;
+    }
     const auto paths = [&expand](
                            const std::vector<std::string>& from,
                            const std::vector<std::string>& extra,

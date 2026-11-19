@@ -2,6 +2,8 @@
 
 #include "glove/run/launch_profile.hpp"
 
+#include "secret_resolve.hpp"
+
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/stat.h>
@@ -279,6 +281,18 @@ auto command_check(std::string_view reference) -> int {
         if (!std::filesystem::exists(path, ec) &&
             (!applied->workspace || path != applied->workspace->string())) {
             return fail("path does not exist: " + path);
+        }
+    }
+    if (applied->provider_secret) {
+        if (!applied->agent_preset) {
+            return fail("secrets.provider needs an agent");
+        }
+        // Resolve now so a wrong reference fails here, not at launch. The
+        // value is discarded and never printed.
+        if (auto secret =
+                detail::resolve_secret(*applied->provider_secret, invoking_user_home(), exposed);
+            !secret) {
+            return fail(secret.error());
         }
     }
     std::printf("ok\n");

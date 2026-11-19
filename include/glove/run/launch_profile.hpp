@@ -15,6 +15,7 @@
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/engine.hpp"
 #include "glove/run/runner.hpp"
+#include "glove/run/secret_reference.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +57,8 @@ struct launch_profile {
     std::vector<std::string> allow;
     std::vector<glove::policy::argument_prefix_rule> allow_arg;
     std::optional<std::uint16_t> bridge_port;
+    // secrets.provider: the agent preset's provider credential.
+    std::optional<secret_reference> provider_secret;
 };
 
 [[nodiscard]] auto operator==(const launch_profile& a, const launch_profile& b) -> bool;

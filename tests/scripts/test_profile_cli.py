@@ -147,6 +147,52 @@ def main():
         expect(result, 1, "would expose glove's own configuration")
         if marker.exists():
             fail("the agent ran although the launch was refused")
+        # A profile secret reaches only the host side of the credentialed
+        # endpoint; the sandbox sees a session nonce, never the value.
+        keys = root / "keys"
+        keys.mkdir(mode=0o700)
+        key = keys / "provider"
+        key.write_text("sk-ant-profile-secret-must-not-leak\n", encoding="ascii")
+        key.chmod(0o600)
+        secret_env = {k: v for k, v in env.items()
+                      if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
+
+        def profile(name, body):
+            path = directory / f"{name}.yaml"
+            path.write_text(body, encoding="ascii")
+            path.chmod(0o600)
+
+        profile("secret", f"version: 1\nworkspace: {workspace}\nagent: claude-code\n"
+                          f"secrets:\n  provider: \"file://{key}\"\n")
+        expect(glove(binary, env, "profile", "check", "secret"), 0, "ok", where="stdout")
+        observed = workspace / "observed.txt"
+        script = 'printf "key=%s\\nbase=%s\\n" "$ANTHROPIC_API_KEY" "$ANTHROPIC_BASE_URL" > observed.txt'
+        expect(glove(binary, secret_env, "exec", "--profile", "secret", "--audit-log", audit,
+                     "--", "/bin/sh", "-c", script), 0)
+        seen = observed.read_text(encoding="ascii")
+        if "sk-ant-profile-secret" in seen or "key=glove-session-" not in seen \
+                or "base=http://127.0.0.1:" not in seen:
+            fail(f"profile secret handling is wrong:\n{seen}")
+
+        # A secret file the sandbox could read is refused before launch.
+        inner = workspace / "key"
+        inner.write_text("sk-ant-inner\n", encoding="ascii")
+        inner.chmod(0o600)
+        profile("inner", f"version: 1\nworkspace: {workspace}\nagent: claude-code\n"
+                         f"secrets:\n  provider: \"file://{inner}\"\n")
+        result = expect(glove(binary, secret_env, "exec", "--profile", "inner", "--audit-log",
+                              audit, "--", "/usr/bin/true"), 1, "sandbox can reach")
+        if "sk-ant-inner" in result.stderr:
+            fail("an error message carried the secret value")
+        profile("unset", "version: 1\nagent: claude-code\n"
+                         "secrets:\n  provider: env://GLOVE_TEST_UNSET_KEY\n")
+        expect(glove(binary, secret_env, "profile", "check", "unset"), 1, "unset or empty")
+        expect(glove(binary, secret_env, "profile", "check", "inner"), 1, "sandbox can reach")
+        expect(glove(binary, secret_env, "exec", "--profile", "unset", "--audit-log", audit,
+                     "--", "/usr/bin/true"), 1, "unset or empty")
+        profile("noagent", f"version: 1\nsecrets:\n  provider: \"file://{key}\"\n")
+        expect(glove(binary, secret_env, "exec", "--profile", "noagent", "--audit-log", audit,
+                     "--", "/usr/bin/true"), 1, "needs an agent preset")
     print("profile cli ok")
 
 

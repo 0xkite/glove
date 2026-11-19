@@ -500,6 +500,17 @@ bridge port replaces the profile's; list flags append.
   choose its next sandbox.
 - `glove profile edit` saves only text that validates, restores mode `0600`
   after editors that replace the file, and keeps a rejected edit aside.
+- `secrets.provider` names where the agent preset's provider credential
+  lives: `env://NAME`, `file:///path` or `file://~/path`, or
+  `keychain://service/account` (macOS Keychain generic password). Glove
+  resolves it on the host when the credentialed endpoint starts; the value
+  goes only to the endpoint, and the sandbox sees the session nonce. A file
+  secret must be a regular, single-link, owner-only file holding one token
+  and outside every filesystem grant of the launch. Errors name the
+  reference, never the value. `glove profile check` resolves it too.
+  Without the field, the preset's host environment variable is used as
+  before. Password-manager CLIs (`op://` and similar) are not supported:
+  they would run a program named by the profile.
 
 The JSON environments `glove shell --save/--load` writes under
 `<XDG_CONFIG_HOME>/glove/envs` remain as session state; profiles are the

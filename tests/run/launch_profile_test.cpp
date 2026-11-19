@@ -58,6 +58,8 @@ allow: [yams.search]
 allow_arg:
   - { tool: yams.search, field: path, prefix: /src }
 bridge_port: 8080
+secrets:
+  provider: keychain://glove/anthropic
 )";
 
 auto parses_full_profile() -> int {
@@ -85,12 +87,40 @@ auto parses_full_profile() -> int {
     REQUIRE(parsed->allow == std::vector<std::string>{"yams.search"});
     REQUIRE(parsed->allow_arg.size() == 1 && parsed->allow_arg[0].required_prefix == "/src");
     REQUIRE(parsed->bridge_port == 8080);
+    REQUIRE(parsed->provider_secret.has_value());
+    REQUIRE(parsed->provider_secret->source == glove::run::secret_source::keychain);
 
     const auto encoded = glove::run::encode_launch_profile(*parsed);
     const auto reparsed = parse_launch_profile(encoded);
     REQUIRE(reparsed.has_value());
     REQUIRE(*reparsed == *parsed);
     REQUIRE(glove::run::encode_launch_profile(*reparsed) == encoded);
+    REQUIRE(encoded.contains("provider: \"keychain://glove/anthropic\""));
+    // Equality is the fuzzer's oracle, so it must see every field.
+    auto other_secret = *parsed;
+    other_secret.provider_secret = *glove::run::parse_secret_reference("env://OTHER");
+    REQUIRE(!(other_secret == *parsed));
+    auto no_secret = *parsed;
+    no_secret.provider_secret.reset();
+    REQUIRE(!(no_secret == *parsed));
+    using edit = void (*)(launch_profile&);
+    for (const edit change : std::array<edit, 11>{
+             [](launch_profile& p) { p.workspace = "/other"; },
+             [](launch_profile& p) { p.agent = "pi"; },
+             [](launch_profile& p) { p.read.pop_back(); },
+             [](launch_profile& p) { p.write.pop_back(); },
+             [](launch_profile& p) { p.env.front().value = "x"; },
+             [](launch_profile& p) { p.egress.front().port = 1; },
+             [](launch_profile& p) { p.egress.front().allow_private = true; },
+             [](launch_profile& p) { p.mcp.front().argv.pop_back(); },
+             [](launch_profile& p) { p.allow.clear(); },
+             [](launch_profile& p) { p.allow_arg.front().required_prefix = "/x"; },
+             [](launch_profile& p) { p.bridge_port = 1; },
+         }) {
+        auto changed = *parsed;
+        change(changed);
+        REQUIRE(!(changed == *parsed));
+    }
 
     const auto starter = parse_launch_profile(glove::run::launch_profile_template());
     REQUIRE(starter.has_value());
@@ -105,7 +135,7 @@ struct refusal {
 
 auto refuses_ambiguous_yaml() -> int {
     const std::string nul_text = std::string{"version: 1\nworkspace: /a"} + '\0' + "b\n";
-    const std::array<refusal, 40> cases{{
+    const std::array<refusal, 43> cases{{
         {"version: 1\nread: [/a]\nread: [/b]\n", "line 3: duplicate key 'read'"},
         {"version: 1\nenv:\n  A: { value: x }\n  A: { value: y }\n", "line 4: duplicate key 'A'"},
         {"version: 1\nenv:\n  A: { value: x, value: y }\n", "duplicate key 'value'"},
@@ -145,6 +175,9 @@ auto refuses_ambiguous_yaml() -> int {
         {"version: 1\nenv:\n  A: { from: shell }\n", "from must be host"},
         {"version: 1\nenv:\n  1A: { value: x }\n", "not a variable name"},
         {"version: 1\nbridge_port: 70000\n", "schema"},
+        {"version: 1\nsecrets:\n  provider: ANTHROPIC_API_KEY\n", "secrets.provider"},
+        {"version: 1\nsecrets:\n  provider: op://vault/item\n", "unsupported secret reference"},
+        {"version: 1\nsecrets:\n  token: env://A\n", "unknown_key"},
         {"version: 1\nmcp:\n  - { name: a, argv: [/x] }\n  - { name: a, argv: [/y] }\n",
          "unique server name"},
     }};
@@ -217,6 +250,7 @@ auto layers_command_line() -> int {
     cli.environment_names = {"C"};
     cli.egress.push_back({.host = "c.example"});
     cli.agent_argv = {"/bin/true"};
+    parsed->provider_secret = *glove::run::parse_secret_reference("env://PROFILE_KEY");
     auto applied = glove::run::apply_launch_profile(*parsed, cli, "/home/u");
     REQUIRE(applied.has_value());
     REQUIRE(applied->workspace == std::filesystem::path{"/home/u/w"});
@@ -230,6 +264,7 @@ auto layers_command_line() -> int {
     REQUIRE(applied->environment_values[0].value == "one");
     REQUIRE(applied->egress.size() == 2 && applied->egress[1].host == "c.example");
     REQUIRE(applied->agent_argv == cli.agent_argv);
+    REQUIRE(applied->provider_secret->locator == "PROFILE_KEY");
 
     cli.workspace = std::filesystem::path{"/cli-ws"};
     cli.agent_preset = "codex";
