@@ -117,49 +117,63 @@ auto resolve_absolute(std::filesystem::path path) -> std::expected<std::string, 
     return result.lexically_normal().string();
 }
 
-auto append_selected_environment(
-    glove::container::profile& profile,
-    const std::vector<std::string>& names,
-    const std::vector<std::string>& extra_path_dirs
-) -> std::expected<void, std::string> {
+// Glove-managed variables, plus the outer-harness control variables. The
+// documented invariant is that the sandboxed child never receives Herdr's
+// socket path or binary path; allowing them through `--env` or a profile
+// would hand an agent the supervisor's control channel.
+auto reserved_environment_name(std::string_view name) -> bool {
+    for (const std::string_view reserved : {
+             "HOME",
+             "TMPDIR",
+             "GLOVE_SANDBOXED",
+             "HTTPS_PROXY",
+             "HTTP_PROXY",
+             "ALL_PROXY",
+             "HERDR_ENV",
+             "HERDR_PANE_ID",
+             "HERDR_BIN_PATH",
+             "HERDR_SOCKET_PATH",
+             "HERDR_AGENT",
+         }) {
+        if (name == reserved) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto append_selected_environment(glove::container::profile& profile, const options& opts)
+    -> std::expected<void, std::string> {
     std::string path_entry = "PATH=";
-    for (const auto& dir : extra_path_dirs) {
+    for (const auto& dir : opts.extra_path_dirs) {
         if (!dir.empty()) {
             path_entry += dir + ":";
         }
     }
     path_entry += "/usr/bin:/bin:/usr/sbin:/sbin";
     profile.environment = {std::move(path_entry), "TERM=xterm-256color"};
-    for (const auto& name : names) {
+    for (const auto& name : opts.environment_names) {
         if (name.empty() || name.find('=') != std::string::npos) {
             return std::unexpected(std::string{"--env requires a variable name, not NAME=VALUE"});
         }
-        // Glove-managed variables, plus the outer-harness control variables.
-        // The documented invariant is that the sandboxed child never receives
-        // Herdr's socket path or binary path; allowing them through `--env`
-        // would hand an agent the supervisor's control channel.
-        for (const auto* reserved : {
-                 "HOME",
-                 "TMPDIR",
-                 "GLOVE_SANDBOXED",
-                 "HTTPS_PROXY",
-                 "HTTP_PROXY",
-                 "ALL_PROXY",
-                 "HERDR_ENV",
-                 "HERDR_PANE_ID",
-                 "HERDR_BIN_PATH",
-                 "HERDR_SOCKET_PATH",
-                 "HERDR_AGENT",
-             }) {
-            if (name == reserved) {
-                return std::unexpected(
-                    std::string{"--env cannot override glove-managed variable "} + name
-                );
-            }
+        if (reserved_environment_name(name)) {
+            return std::unexpected(
+                std::string{"--env cannot override glove-managed variable "} + name
+            );
         }
         const char* value = std::getenv(name.c_str());
         if (value == nullptr) {
             return std::unexpected(std::string{"selected environment variable is unset: "} + name);
+        }
+        profile.environment.push_back(name + "=" + value);
+    }
+    for (const auto& [name, value] : opts.environment_values) {
+        if (name.empty() || name.find('=') != std::string::npos ||
+            value.find('\0') != std::string::npos) {
+            return std::unexpected("invalid profile environment entry '" + name + "'");
+        }
+        if (reserved_environment_name(name)) {
+            return std::unexpected("a profile cannot set glove-managed variable " + name);
         }
         profile.environment.push_back(name + "=" + value);
     }
@@ -170,9 +184,7 @@ auto build_profile(const options& opts, const std::filesystem::path& runtime_roo
     -> std::expected<glove::container::profile, std::string> {
     glove::container::profile profile;
     profile.allow_loopback_listen = opts.allow_loopback_listen;
-    if (auto environment =
-            append_selected_environment(profile, opts.environment_names, opts.extra_path_dirs);
-        !environment) {
+    if (auto environment = append_selected_environment(profile, opts); !environment) {
         return std::unexpected(environment.error());
     }
 
@@ -1041,7 +1053,13 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     const std::string api_key_env{definition->api_key_env};
     // Reject host-credential-shaped selections. `--env` cannot smuggle a real
     // provider secret or a base-URL override past the mediated endpoint.
-    for (const std::string_view name : opts.environment_names) {
+    std::vector<std::string_view> selected{
+        opts.environment_names.begin(), opts.environment_names.end()
+    };
+    for (const auto& entry : opts.environment_values) {
+        selected.emplace_back(entry.name);
+    }
+    for (const std::string_view name : selected) {
         for (const std::string_view reserved : {
                  std::string_view{"ANTHROPIC_API_KEY"},
                  std::string_view{"ANTHROPIC_AUTH_TOKEN"},

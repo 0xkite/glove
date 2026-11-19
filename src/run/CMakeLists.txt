@@ -3,6 +3,9 @@ add_library(glove_run STATIC
     exit_audit.cpp
     denial_audit.cpp
     denial_trace_writer.cpp
+    launch_profile.cpp
+    launch_profile_text.cpp
+    yaml_subset.cpp
     provider_endpoint.cpp
     pi_selection.cpp
     pi_guest_config.cpp

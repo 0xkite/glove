@@ -18,6 +18,12 @@ struct upstream_spec {
     std::vector<std::string> argv;
 };
 
+// One literal environment variable set in the sandbox.
+struct environment_value {
+    std::string name;
+    std::string value;
+};
+
 // Top-level options for the `glove run` subcommand. Built from CLI flags
 // (today) or config (Phase 6).
 struct options {
@@ -48,6 +54,9 @@ struct options {
     // Names copied from the host environment. Values are looked up only after
     // explicit selection; no host variable is inherited by default.
     std::vector<std::string> environment_names;
+    // Literal variables from a launch profile. The same names are reserved
+    // as for environment_names.
+    std::vector<environment_value> environment_values;
     // Exact host+port grants through the authenticated egress proxy.
     std::vector<glove::net::egress_rule> egress;
     // Report lifecycle (working/done) to host Herdr supervisor when running
