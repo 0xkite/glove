@@ -1028,6 +1028,9 @@ struct preset_definition {
     detail::provider_surface surface;
     std::string_view base_url_env;
     std::string_view api_key_env;
+    // When set, the client is steered through this provider entry of the guest
+    // Pi models.json instead of environment variables.
+    std::string_view pi_models_provider{};
 };
 
 auto preset_definition_for(std::string_view name) -> std::optional<preset_definition> {
@@ -1047,6 +1050,16 @@ auto preset_definition_for(std::string_view name) -> std::optional<preset_defini
             .surface = detail::provider_surface::legacy_openai,
             .base_url_env = "OPENAI_BASE_URL",
             .api_key_env = "OPENAI_API_KEY",
+        };
+    }
+    if (name == "pi-deepseek") {
+        return preset_definition{
+            .provider = glove::net::endpoint_provider::deepseek,
+            .label = "pi (--share-credential deepseek)",
+            .surface = detail::provider_surface::pi_deepseek,
+            .base_url_env = {},
+            .api_key_env = "DEEPSEEK_API_KEY",
+            .pi_models_provider = "deepseek",
         };
     }
     if (name == "pi") {
@@ -1082,6 +1095,10 @@ struct preset_startup {
     std::unique_ptr<glove::net::credentialed_endpoint> endpoint;
     std::optional<glove::container::bridge_endpoint_settings> bridge;
     std::vector<std::string> environment;
+    // Guest Pi models.json override: provider name, endpoint base URL, nonce.
+    std::string pi_models_provider;
+    std::string pi_base_url;
+    std::string pi_nonce;
 };
 
 // Start the mediated reverse endpoint for `--agent <preset>` and compute the
@@ -1090,6 +1107,11 @@ struct preset_startup {
 auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
     -> std::expected<preset_startup, std::string> {
     preset_startup startup;
+    if (opts.share_credential && opts.agent_preset != "pi-deepseek") {
+        return std::unexpected(
+            std::string{"--share-credential is supported only by glove shell --agent pi"}
+        );
+    }
     if (!opts.agent_preset) {
         return startup;
     }
@@ -1121,6 +1143,7 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
                  std::string_view{"ANTHROPIC_BASE_URL"},
                  std::string_view{"OPENAI_API_KEY"},
                  std::string_view{"OPENAI_BASE_URL"},
+                 std::string_view{"DEEPSEEK_API_KEY"},
              }) {
             if (name == reserved) {
                 return std::unexpected(
@@ -1174,8 +1197,14 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     startup.bridge = glove::container::bridge_endpoint_settings{
         .port = (*endpoint)->port(),
     };
-    startup.environment.push_back(std::string{definition->base_url_env} + "=" + *base_url);
-    startup.environment.push_back(api_key_env + "=" + *nonce);
+    if (definition->pi_models_provider.empty()) {
+        startup.environment.push_back(std::string{definition->base_url_env} + "=" + *base_url);
+        startup.environment.push_back(api_key_env + "=" + *nonce);
+    } else {
+        startup.pi_models_provider = std::string{definition->pi_models_provider};
+        startup.pi_base_url = *base_url;
+        startup.pi_nonce = *nonce;
+    }
     startup.endpoint = std::move(*endpoint);
     // Drop the real credential from this process's environment now that the
     // endpoint owns it. Otherwise it lingers and is inherited by every child
@@ -1183,6 +1212,41 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     // spawned with ::environ.
     ::unsetenv(api_key_env.c_str());
     return startup;
+}
+
+// Point the guest Pi provider at the credentialed endpoint. Fails closed: a
+// launch whose shared provider cannot be routed through the endpoint is refused.
+auto stage_mediated_pi_provider(
+    const glove::container::profile& profile, const preset_startup& preset
+) -> std::expected<void, std::string> {
+    if (!profile.home_dir) {
+        return std::unexpected(std::string{"--share-credential needs a private sandbox HOME"});
+    }
+    const auto guest_pi_dir = std::filesystem::path{*profile.home_dir} / ".pi" / "agent";
+    std::error_code ec;
+    std::filesystem::create_directories(guest_pi_dir, ec);
+    if (ec) {
+        return std::unexpected("cannot create the guest Pi directory: " + ec.message());
+    }
+    const auto models_path = guest_pi_dir / "models.json";
+    std::string current;
+    if (std::filesystem::exists(std::filesystem::symlink_status(models_path, ec))) {
+        auto text = read_small_file(models_path);
+        if (!text) {
+            return std::unexpected(std::string{"cannot read the guest Pi models.json"});
+        }
+        current = std::move(*text);
+    }
+    auto mediated = mediate_pi_provider(
+        current, preset.pi_models_provider, preset.pi_base_url, preset.pi_nonce
+    );
+    if (!mediated) {
+        return std::unexpected("cannot route the shared provider: " + mediated.error());
+    }
+    if (!replace_file_0600(models_path, *mediated)) {
+        return std::unexpected(std::string{"cannot write the guest Pi models.json"});
+    }
+    return {};
 }
 
 class herdr_reporter final {
@@ -1624,6 +1688,11 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
     }
+    if (opts.share_credential) {
+        return std::unexpected(
+            std::string{"--share-credential is supported only by glove shell --agent pi"}
+        );
+    }
     auto runtime = private_runtime::create();
     if (!runtime) {
         return std::unexpected(runtime.error());
@@ -1733,6 +1802,11 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     auto preset = start_agent_preset(opts, *sink);
     if (!preset) {
         return std::unexpected(preset.error());
+    }
+    if (!preset->pi_models_provider.empty()) {
+        if (auto staged = stage_mediated_pi_provider(*profile, *preset); !staged) {
+            return std::unexpected(staged.error());
+        }
     }
     if (preset->bridge) {
         profile->bridge_endpoint = *preset->bridge;

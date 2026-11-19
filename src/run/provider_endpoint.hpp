@@ -15,6 +15,9 @@ enum class provider_surface {
     legacy_openai,
     pi_anthropic,
     pi_openai,
+    // DeepSeek's OpenAI-compatible chat completions, used by Pi's deepseek
+    // provider when a host key is shared through `--share-credential deepseek`.
+    pi_deepseek,
     native_anthropic = pi_anthropic,
     native_openai = pi_openai
 };

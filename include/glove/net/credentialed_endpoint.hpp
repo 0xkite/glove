@@ -16,6 +16,7 @@ enum class endpoint_provider : std::uint8_t {
     openai,
     github,
     custom,
+    deepseek,
 };
 
 struct credentialed_endpoint_rule {

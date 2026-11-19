@@ -326,6 +326,20 @@ auto parse_sandbox_flag(
         ++i;
         return 0;
     }
+    if (a == "--share-credential") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --share-credential needs a provider\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        opts.share_credential = std::string{args[i + 1]};
+        i += 2;
+        return 0;
+    }
     if (a == "--agent") {
         if (i + 1 >= args.size()) {
             std::fprintf(
@@ -1491,9 +1505,29 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         }
     }
 
-    // Only activate the host credentialed reverse endpoint when the required
-    // provider API key is present on the host and raw egress is not requested.
-    if (driver == "agy" || !opts.egress.empty()) {
+    // An explicitly shared credential is opt-in and fails closed: it never
+    // falls back to raw provider egress or to another preset.
+    if (opts.share_credential) {
+        const char* refusal = nullptr;
+        if (*opts.share_credential != "deepseek") {
+            refusal = "--share-credential supports only 'deepseek'";
+        } else if (driver != "pi") {
+            refusal = "--share-credential requires --agent pi";
+        } else if (!opts.egress.empty()) {
+            refusal = "--share-credential cannot be combined with --egress-allow: the provider "
+                      "is reached only through the credentialed endpoint";
+        } else if (
+            const char* key = std::getenv("DEEPSEEK_API_KEY"); key == nullptr || *key == '\0'
+        ) {
+            refusal = "--share-credential deepseek requires the host environment variable "
+                      "DEEPSEEK_API_KEY";
+        }
+        if (refusal != nullptr) {
+            std::fprintf(stderr, "glove shell: %s\n", refusal);
+            return 2;
+        }
+        opts.agent_preset = "pi-deepseek";
+    } else if (driver == "agy" || !opts.egress.empty()) {
         opts.agent_preset.reset();
     } else if (driver == "pi" || driver == "claude" || driver == "claude-code") {
         const char* key = std::getenv("ANTHROPIC_API_KEY");

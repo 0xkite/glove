@@ -20,6 +20,7 @@ auto scheme_for(endpoint_provider provider) -> std::optional<http::credential_sc
         return http::credential_scheme::x_api_key;
     case endpoint_provider::openai:
     case endpoint_provider::github:
+    case endpoint_provider::deepseek:
         return http::credential_scheme::bearer;
     case endpoint_provider::custom:
         // No defined credential field, so nothing safe to inject.

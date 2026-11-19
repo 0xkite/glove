@@ -35,6 +35,12 @@ auto make_provider_endpoint_options(
                 ? std::vector<std::string>{"/v1/chat/completions", "/v1/responses", "/v1/models"}
                 : std::vector<std::string>{"/v1/responses"};
         break;
+    case provider_surface::pi_deepseek:
+        rule.provider = net::endpoint_provider::deepseek;
+        rule.path_prefix = "/deepseek";
+        rule.upstream_host = "api.deepseek.com";
+        rule.allowed_paths = {"/chat/completions"};
+        break;
     default:
         return std::unexpected(std::string{"unsupported provider endpoint surface"});
     }

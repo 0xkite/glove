@@ -166,7 +166,9 @@ auto run() -> int {
     REQUIRE(refused(
         "egress", {"--share-credential", "deepseek", "--egress-allow", "api.deepseek.com"}, true
     ));
-    REQUIRE(refused("envfwd", {"--share-credential", "deepseek", "--env", "DEEPSEEK_API_KEY"}, true));
+    REQUIRE(
+        refused("envfwd", {"--share-credential", "deepseek", "--env", "DEEPSEEK_API_KEY"}, true)
+    );
     REQUIRE(refused("codex", share, true, "codex"));
     REQUIRE(refused("unknown", {"--share-credential", "example"}, true));
 

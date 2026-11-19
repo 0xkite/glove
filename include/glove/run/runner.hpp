@@ -52,6 +52,10 @@ struct options {
     // Preset agent profile (e.g. "claude-code", "codex", "pi") that selects a
     // credentialed reverse endpoint and generates the matching environment.
     std::optional<std::string> agent_preset;
+    // `--share-credential <provider>` (shell, Pi only): mediate one host
+    // provider key through the credentialed endpoint. The sandbox receives a
+    // session nonce and a loopback base URL, never the key itself.
+    std::optional<std::string> share_credential;
     // Permit private-loopback socket binding/listening inside the sandbox's
     // isolated network namespace (required by runtimes like agy).
     bool allow_loopback_listen = false;

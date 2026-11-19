@@ -77,6 +77,18 @@ struct pi_local_package {
 [[nodiscard]] auto scrub_pi_models_credentials(std::string_view models_json)
     -> std::expected<std::string, std::string>;
 
+// Point one provider in the guest copy of `models.json` at the host
+// credentialed endpoint: `baseUrl` becomes `base_url` and `apiKey` the session
+// nonce. Provider and per-model `headers`, and per-model `baseUrl`/`apiKey`,
+// are removed so no request for that provider can bypass the endpoint or carry
+// a second credential. An empty input is treated as `{}`.
+[[nodiscard]] auto mediate_pi_provider(
+    std::string_view models_json,
+    std::string_view provider,
+    std::string_view base_url,
+    std::string_view nonce
+) -> std::expected<std::string, std::string>;
+
 // Text from host configuration made safe for a terminal: control bytes, DEL,
 // and bytes >= 0x80 are written as `\xNN`, so a crafted path cannot move the
 // cursor or erase the line that reports it.
