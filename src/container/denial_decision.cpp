@@ -153,15 +153,21 @@ auto within(std::string_view path, std::string_view root) -> bool {
     return rest.empty() || rest.starts_with('/');
 }
 
-auto normalized_root(std::string_view path) -> std::string {
-    auto encoded = encode_untrusted(path, max_denial_target_text_bytes);
-    if (encoded.truncated || !encoded.text.starts_with('/')) {
+// An encoded absolute directory without trailing '/', or empty if unusable.
+auto normalized_root(std::string_view encoded) -> std::string {
+    if (!encoded.starts_with('/') || !is_encoded_text(encoded) ||
+        encoded.size() > max_denial_target_text_bytes) {
         return {};
     }
-    while (encoded.text.size() > 1 && encoded.text.ends_with('/')) {
-        encoded.text.pop_back();
+    while (encoded.size() > 1 && encoded.ends_with('/')) {
+        encoded.remove_suffix(1);
     }
-    return encoded.text == "/" ? std::string{} : std::move(encoded.text);
+    return encoded == "/" ? std::string{} : std::string{encoded};
+}
+
+auto encoded_root(std::string_view raw) -> std::string {
+    const auto encoded = encode_untrusted(raw, max_denial_target_text_bytes);
+    return encoded.truncated ? std::string{} : normalized_root(encoded.text);
 }
 
 auto log_scale(double value) noexcept -> float {
@@ -204,6 +210,21 @@ auto denial_verdict_name(denial_verdict verdict) noexcept -> std::string_view {
         return "terminate";
     }
     return "proceed";
+}
+
+auto make_denial_context(
+    std::span<const std::string> raw_workspace_roots, std::string_view raw_home
+) -> denial_context {
+    denial_context out{.workspace_roots = {}, .home = encoded_root(raw_home)};
+    for (const auto& raw : raw_workspace_roots) {
+        if (out.workspace_roots.size() == max_denial_context_roots) {
+            break;
+        }
+        if (auto root = encoded_root(raw); !root.empty()) {
+            out.workspace_roots.push_back(std::move(root));
+        }
+    }
+    return out;
 }
 
 denial_feature_builder::denial_feature_builder(const denial_context& context)

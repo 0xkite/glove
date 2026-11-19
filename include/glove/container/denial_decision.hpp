@@ -44,14 +44,23 @@ using denial_features = std::array<float, denial_feature_count>;
 [[nodiscard]] auto denial_feature_names() noexcept
     -> std::span<const std::string_view, denial_feature_count>;
 
-// Paths in the form the kernel reports them (for example /private/var/...,
-// not /var/...). Each root names a directory; a target inside it matches.
+// Where a launch's targets are classified from. Paths are in the form the
+// kernel reports them (for example /private/var/..., not /var/...) and in the
+// encoding of sandbox_denial::target, so a recorded trace replays exactly.
+// Each root names a directory; a target inside it matches.
 struct denial_context {
     std::vector<std::string> workspace_roots;
     std::string home;
 };
 
 constexpr std::size_t max_denial_context_roots = 64;
+
+// Encodes raw host paths with encode_untrusted. Drops a path that is not
+// absolute, is "/", or does not fit max_denial_target_text_bytes, and keeps at
+// most max_denial_context_roots roots.
+[[nodiscard]] auto
+make_denial_context(std::span<const std::string> raw_workspace_roots, std::string_view raw_home)
+    -> denial_context;
 constexpr std::size_t denial_rate_window_capacity = 4096;
 constexpr std::size_t denial_distinct_capacity = 1024;
 

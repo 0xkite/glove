@@ -33,6 +33,7 @@ using glove::container::denial_feature_names;
 using glove::container::denial_features;
 using glove::container::denial_verdict;
 using glove::container::load_denial_model;
+using glove::container::make_denial_context;
 using glove::container::make_heuristic_denial_decider;
 using glove::container::sandbox_denial;
 using std::chrono::milliseconds;
@@ -108,6 +109,27 @@ auto target_classes() -> int {
     REQUIRE(counted(features, "ambiguous", 1));
     REQUIRE(counted(features, "kind_other", 1));
     REQUIRE(counted(features, "target_none", 1));
+    return 0;
+}
+
+auto encoded_context() -> int {
+    const std::vector<std::string> roots{
+        "/w/a%b/", "relative", "/", std::string(600, '/'), "/w/q\"x"
+    };
+    const auto made = make_denial_context(roots, "/h/\n");
+    REQUIRE(made.home == "/h/%0A");
+    REQUIRE(made.workspace_roots == std::vector<std::string>({"/w/a%25b", "/w/q%22x"}));
+    // A target is matched in its encoded form, without encoding the roots twice.
+    denial_feature_builder builder{made};
+    builder.observe(denial("file_read", "/w/a%25b/f"), milliseconds{0});
+    builder.observe(denial("file_read", "/h/%0A/.kube/config"), milliseconds{0});
+    const auto features = builder.features(milliseconds{0});
+    REQUIRE(counted(features, "target_workspace", 1));
+    REQUIRE(counted(features, "target_home_secret", 1));
+    // A context that is not encoded text is ignored, not re-encoded.
+    denial_feature_builder raw{{.workspace_roots = {"/w/a b\"c"}, .home = "/h"}};
+    raw.observe(denial("file_read", "/w/a b%22c/f"), milliseconds{0});
+    REQUIRE(counted(raw.features(milliseconds{0}), "target_other_path", 1));
     return 0;
 }
 
@@ -354,6 +376,7 @@ int main() {
     for (auto* step :
          {schema,
           target_classes,
+          encoded_context,
           writes,
           rates_and_time,
           bounds,
