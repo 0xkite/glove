@@ -80,6 +80,13 @@ auto main() -> int {
             "/openai",
             "api.openai.com",
             {"/v1/responses"}
+        ) ||
+        !check_surface(
+            provider_surface::pi_deepseek,
+            endpoint_provider::deepseek,
+            "/deepseek",
+            "api.deepseek.com",
+            {"/chat/completions"}
         )) {
         std::fprintf(stderr, "fixed provider surface mismatch\n");
         return 1;

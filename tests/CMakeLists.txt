@@ -666,6 +666,13 @@ if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_dependencies(glove_shell_pi_config_test glove)
     add_test(NAME glove_shell_pi_config COMMAND glove_shell_pi_config_test)
     set_tests_properties(glove_shell_pi_config PROPERTIES TIMEOUT 30)
+
+    add_executable(glove_shell_pi_share_credential_test run/glove_shell_pi_share_credential_test.cpp)
+    target_compile_definitions(glove_shell_pi_share_credential_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_shell_pi_share_credential_test glove)
+    add_test(NAME glove_shell_pi_share_credential COMMAND glove_shell_pi_share_credential_test)
+    set_tests_properties(glove_shell_pi_share_credential PROPERTIES TIMEOUT 60)
 endif()
 
 if(APPLE)
