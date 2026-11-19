@@ -62,6 +62,11 @@ target_link_libraries(glove PRIVATE glove_kernel)
 add_executable(glove-remote-exec remote_exec_main.cpp)
 target_link_libraries(glove-remote-exec PRIVATE glove_control)
 
+# Offline tooling for denial deciders (replay, rows for training, ablation).
+# Not installed.
+add_executable(glove-denial-replay tools/denial_replay_main.cpp)
+target_link_libraries(glove-denial-replay PRIVATE glove_container glaze::glaze)
+
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(gloved gloved_main.cpp)
     target_link_libraries(gloved PRIVATE glove_control glove_host glove_sage_adapter)

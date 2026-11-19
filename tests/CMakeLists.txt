@@ -1246,6 +1246,25 @@ endif()
 # Pinned-supply-chain tool tests (network-free; exercises tools/fetch_workerd.py).
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    # Denial model tooling: replay rows, stdlib trainer, C++ loader agree.
+    add_test(NAME denial_model_pipeline
+        COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_denial_model_pipeline.py
+            $<TARGET_FILE:glove-denial-replay>
+            ${CMAKE_SOURCE_DIR}/tools/denial_model/train.py)
+    set_tests_properties(denial_model_pipeline PROPERTIES TIMEOUT 120)
+    if(APPLE)
+        # Scenario collection under glove exec, including the leak check.
+        add_test(NAME denial_model_collect
+            COMMAND ${Python3_EXECUTABLE} -I
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_denial_collect.py
+                $<TARGET_FILE:glove>
+                $<TARGET_FILE:glove-denial-replay>
+                ${CMAKE_SOURCE_DIR}/tools/denial_model/collect.py)
+        set_tests_properties(
+            denial_model_collect PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
+        )
+    endif()
     add_test(NAME workerd_supply_chain
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_workerd.py)
     set_tests_properties(workerd_supply_chain PROPERTIES TIMEOUT 120)
