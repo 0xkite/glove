@@ -63,6 +63,8 @@ void print_run_usage() {
         "                                       rules for the same tool ALL must pass)\n"
         "  --audit-log <path>                   JSONL audit destination\n"
         "                                       (default: in-memory)\n"
+        "  --denial-trace <path>                record this launch's sandbox denials to a\n"
+        "                                       new file (macOS; for training deciders)\n"
         "  --workspace <path>                   read-write workspace bound for the agent\n"
         "                                       (default: none)\n"
         "  --read <path>                        expose one additional path read-only\n"
@@ -195,6 +197,8 @@ void print_exec_usage() {
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
+        "  --denial-trace <path>   record this launch's sandbox denials to a new file\n"
+        "                          (macOS; for training denial deciders)\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
@@ -498,6 +502,15 @@ auto exec_subcommand(std::span<char* const> args) -> int {
         if (a == "-h" || a == "--help") {
             print_exec_usage();
             return 0;
+        }
+        if (a == "--denial-trace") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "glove exec: --denial-trace needs an argument\n");
+                return 2;
+            }
+            opts.denial_trace = std::filesystem::path{args[i + 1]};
+            i += 2;
+            continue;
         }
         if (const auto handled = parse_sandbox_flag(args, i, opts, "exec")) {
             if (*handled != 0) {
@@ -1866,6 +1879,15 @@ auto run_subcommand(std::span<char* const> args) -> int {
                 return 2;
             }
             opts.audit_log = std::filesystem::path{args[i + 1]};
+            i += 2;
+            continue;
+        }
+        if (a == "--denial-trace") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "glove run: --denial-trace needs an argument\n");
+                return 2;
+            }
+            opts.denial_trace = std::filesystem::path{args[i + 1]};
             i += 2;
             continue;
         }

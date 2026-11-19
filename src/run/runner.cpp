@@ -55,8 +55,10 @@
 #    include "glove/container/denial_telemetry.hpp"
 
 #    include "denial_audit.hpp"
+#    include "denial_trace_writer.hpp"
 
 #    include <mach-o/dyld.h>
+#    include <pwd.h>
 #endif
 
 extern "C" char** environ;
@@ -1558,15 +1560,78 @@ void print_denial_notice(detail::denial_notice what, std::string_view reason = {
     static_cast<void>(std::fflush(stderr));
 }
 
+// The invoking user's home directory as the kernel names it, or empty.
+auto host_home() -> std::string {
+    std::vector<char> buffer(16384);
+    struct ::passwd account{};
+    struct ::passwd* found = nullptr;
+    if (::getpwuid_r(::geteuid(), &account, buffer.data(), buffer.size(), &found) != 0 ||
+        found == nullptr || found->pw_dir == nullptr) {
+        return {};
+    }
+    std::error_code ec;
+    const auto home = std::filesystem::weakly_canonical(found->pw_dir, ec);
+    return ec ? std::string{} : home.string();
+}
+
+// Opens the operator's --denial-trace file, or returns null when none was
+// asked for. The file must not be reachable through any mount of the final
+// profile, or the agent could read or rewrite its own training record.
+auto open_denial_trace(const options& opts, const glove::container::profile& profile)
+    -> std::expected<std::unique_ptr<detail::denial_trace_writer>, std::string> {
+    if (!opts.denial_trace) {
+        return nullptr;
+    }
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(*opts.denial_trace, ec);
+    if (ec || !absolute.has_filename()) {
+        return std::unexpected(std::string{"denial trace path is not a file path"});
+    }
+    const auto parent = std::filesystem::weakly_canonical(absolute.parent_path(), ec);
+    if (ec) {
+        return std::unexpected(std::string{"denial trace directory cannot be resolved"});
+    }
+    const auto resolved = parent / absolute.filename();
+    std::vector<std::string> roots;
+    for (const auto& rule : profile.filesystem) {
+        const std::filesystem::path root{rule.path};
+        auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+        if (ec) {
+            canonical_root = root;
+        }
+        if (path_within(resolved, root) || path_within(resolved, canonical_root) ||
+            path_within(absolute, root)) {
+            return std::unexpected(
+                std::string{"denial trace destination is exposed by launch profile mount: '"} +
+                rule.path + "'"
+            );
+        }
+        if (rule.writable) {
+            roots.push_back(canonical_root.string());
+        }
+    }
+    return detail::denial_trace_writer::create(
+        resolved, glove::container::make_denial_context(roots, host_home())
+    );
+}
+
 auto start_denial_telemetry(
-    detail::denial_audit_writer& denial_writer, glove::container::profile& profile
+    detail::denial_audit_writer& denial_writer,
+    detail::denial_trace_writer* trace,
+    glove::container::profile& profile
 ) -> std::unique_ptr<glove::container::denial_monitor> {
     const bool terminal = ::isatty(STDERR_FILENO) == 1;
     if (terminal) {
         print_denial_notice(detail::denial_notice::starting);
     }
     auto denial_monitor = glove::container::denial_monitor::start({
-        .on_denial = [&denial_writer](const auto& denial) { denial_writer.on_denial(denial); },
+        .on_denial =
+            [&denial_writer, trace](const auto& denial) {
+                denial_writer.on_denial(denial);
+                if (trace != nullptr) {
+                    trace->on_denial(denial);
+                }
+            },
         .on_degraded =
             [&denial_writer](std::string_view reason) { denial_writer.on_degraded(reason); },
     });
@@ -1583,7 +1648,9 @@ auto start_denial_telemetry(
 }
 
 auto finish_denial_telemetry(
-    detail::denial_audit_writer& denial_writer, glove::container::denial_monitor& denial_monitor
+    detail::denial_audit_writer& denial_writer,
+    detail::denial_trace_writer* trace,
+    glove::container::denial_monitor& denial_monitor
 ) -> std::expected<void, std::string> {
     if (::isatty(STDERR_FILENO) == 1 &&
         denial_monitor.state() == glove::container::denial_telemetry_state::live) {
@@ -1593,7 +1660,12 @@ auto finish_denial_telemetry(
     if (report.state == glove::container::denial_telemetry_state::degraded) {
         print_denial_notice(detail::denial_notice::degraded, report.reason);
     }
-    return denial_writer.finish(report);
+    auto audited = denial_writer.finish(report);
+    auto traced = trace != nullptr ? trace->finish(report) : std::expected<void, std::string>{};
+    if (!audited) {
+        return audited;
+    }
+    return traced;
 }
 
 } // namespace
@@ -1603,6 +1675,11 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
     }
+#if !defined(__APPLE__)
+    if (opts.denial_trace) {
+        return std::unexpected(std::string{"denial traces are recorded on macOS only"});
+    }
+#endif
     auto runtime = private_runtime::create();
     if (!runtime) {
         return std::unexpected(runtime.error());
@@ -1650,8 +1727,12 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     }
 
 #if defined(__APPLE__)
+    auto denial_trace = open_denial_trace(opts, *profile);
+    if (!denial_trace) {
+        return std::unexpected(denial_trace.error());
+    }
     detail::denial_audit_writer denial_writer{*sink};
-    auto denial_monitor = start_denial_telemetry(denial_writer, *profile);
+    auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
 #endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
@@ -1672,7 +1753,8 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     }
     auto exit_code = (*handle)->wait();
 #if defined(__APPLE__)
-    auto denial_audit = finish_denial_telemetry(denial_writer, *denial_monitor);
+    auto denial_audit =
+        finish_denial_telemetry(denial_writer, denial_trace->get(), *denial_monitor);
 #endif
     auto recorded = detail::record_agent_exit(*sink, exit_code, (*handle)->reaped_exit_code());
 #if defined(__APPLE__)
@@ -1687,6 +1769,11 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
     }
+#if !defined(__APPLE__)
+    if (opts.denial_trace) {
+        return std::unexpected(std::string{"denial traces are recorded on macOS only"});
+    }
+#endif
     auto runtime = private_runtime::create();
     if (!runtime) {
         return std::unexpected(runtime.error());
@@ -1825,8 +1912,12 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     }
 
 #if defined(__APPLE__)
+    auto denial_trace = open_denial_trace(opts, *profile);
+    if (!denial_trace) {
+        return std::unexpected(denial_trace.error());
+    }
     detail::denial_audit_writer denial_writer{*sink};
-    auto denial_monitor = start_denial_telemetry(denial_writer, *profile);
+    auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
 #endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
@@ -1864,7 +1955,8 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         }
     );
 #if defined(__APPLE__)
-    auto denial_audit = finish_denial_telemetry(denial_writer, *denial_monitor);
+    auto denial_audit =
+        finish_denial_telemetry(denial_writer, denial_trace->get(), *denial_monitor);
 #endif
     if (escape_audit_error) {
         return std::unexpected(std::string{"audit seccomp escape: "} + *escape_audit_error);

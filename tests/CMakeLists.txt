@@ -390,6 +390,11 @@ target_link_libraries(container_denial_decision_test PRIVATE glove_container)
 add_test(NAME container_denial_decision COMMAND container_denial_decision_test)
 set_tests_properties(container_denial_decision PROPERTIES TIMEOUT 10)
 
+add_executable(container_denial_trace_test container/denial_trace_test.cpp)
+target_link_libraries(container_denial_trace_test PRIVATE glove_container)
+add_test(NAME container_denial_trace COMMAND container_denial_trace_test)
+set_tests_properties(container_denial_trace PROPERTIES TIMEOUT 10)
+
 add_executable(container_receipt_chain_test container/receipt_chain_test.cpp)
 target_link_libraries(container_receipt_chain_test PRIVATE glove_container)
 add_test(NAME container_receipt_chain COMMAND container_receipt_chain_test)
@@ -1136,6 +1141,16 @@ if(APPLE)
     set_tests_properties(
         glove_exec_denial_audit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
     )
+
+    add_executable(glove_exec_denial_trace_test run/glove_exec_denial_trace_test.cpp)
+    target_link_libraries(glove_exec_denial_trace_test PRIVATE glove_container)
+    target_compile_definitions(glove_exec_denial_trace_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_exec_denial_trace_test glove)
+    add_test(NAME glove_exec_denial_trace COMMAND glove_exec_denial_trace_test)
+    set_tests_properties(
+        glove_exec_denial_trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    )
 endif()
 
 add_executable(run_exit_audit_test run/exit_audit_test.cpp)
@@ -1151,6 +1166,14 @@ target_include_directories(run_denial_audit_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run)
 add_test(NAME run_denial_audit COMMAND run_denial_audit_test)
 set_tests_properties(run_denial_audit PROPERTIES TIMEOUT 10)
+
+add_executable(run_denial_trace_writer_test run/denial_trace_writer_test.cpp)
+target_link_libraries(run_denial_trace_writer_test PRIVATE glove_run)
+target_include_directories(run_denial_trace_writer_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/run>
+)
+add_test(NAME run_denial_trace_writer COMMAND run_denial_trace_writer_test)
+set_tests_properties(run_denial_trace_writer PROPERTIES TIMEOUT 30)
 
 # F1 regression: upstream pipe fds must be close-on-exec so they cannot leak
 # into a later-spawned (contained) process. Cross-platform: needs /bin/sh,

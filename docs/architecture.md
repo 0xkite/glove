@@ -518,6 +518,16 @@ recorded or acted on.
   any check does not load.
 - `make_heuristic_denial_decider` is a fixed-threshold arm kept only to
   compare against the model.
+- `glove run|exec --denial-trace <path>` records the launch's raw denials to
+  a new file (JSON lines: a header with the classification context, one line
+  per denial with its time since launch, an end line with the monitor's
+  report). It holds at most 16384 events; the rest are counted as dropped.
+  The file is created with `O_EXCL|O_NOFOLLOW` and mode 0600, and a path that
+  any profile mount exposes is refused before the agent starts. A trace holds
+  host paths the agent tried to reach, so it is opt-in. Write failures are
+  reported after the agent exits. `parse_denial_trace` reads a trace back as
+  untrusted input; traces store events, not features, so a corpus survives a
+  feature schema change.
 
 A decider can only escalate. The planned use records verdicts (shadow mode)
 until the operator enables termination, which goes through the

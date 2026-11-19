@@ -35,6 +35,10 @@ struct options {
     // Optional JSONL audit destination. When unset, an in-memory sink is
     // used (events drop on exit; only useful in tests).
     std::optional<std::filesystem::path> audit_log;
+    // Optional new file for this launch's raw sandbox denials (macOS only),
+    // collected to train and evaluate denial deciders. Never inside a path
+    // the agent can reach.
+    std::optional<std::filesystem::path> denial_trace;
     // Optional read-write workspace path exposed to the agent. When unset,
     // both modes use only a per-run private empty working directory.
     std::optional<std::filesystem::path> workspace;
