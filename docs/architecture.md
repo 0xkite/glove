@@ -528,6 +528,9 @@ recorded or acted on.
   reported after the agent exits. `parse_denial_trace` reads a trace back as
   untrusted input; traces store events, not features, so a corpus survives a
   feature schema change.
+- `glove-denial-replay` (built, not installed) replays traces into feature
+  rows and evaluates arms; `tools/denial_model/` holds the scenario
+  collector, the trainer and the cross-validated ablation. See its README.
 
 A decider can only escalate. The planned use records verdicts (shadow mode)
 until the operator enables termination, which goes through the
