@@ -6,6 +6,8 @@
 //    settings.json instead of making Pi abort on an unreadable path.
 // 3. The guest models.json keeps loopback dummy keys and drops remote secrets.
 // 4. The guest auth.json stays empty.
+// 5. A host settings.json that resolves into an agent-writable path does not
+//    choose which host paths are exposed.
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -135,6 +137,47 @@ auto run() -> int {
 
     const auto auth = slurp(out / "auth.json");
     REQUIRE(auth.find("sk-host-auth-secret") == std::string::npos);
+
+    // 5. settings.json symlinked into the writable workspace: the package it
+    //    names must not become readable.
+    const auto home2 = base / "home2";
+    const auto pi_agent2 = home2 / ".pi" / "agent";
+    const auto workspace2 = base / "workspace2";
+    const auto planted = home2 / "pkgs" / "planted";
+    fs::create_directories(pi_agent2, ec);
+    fs::create_directories(planted, ec);
+    fs::create_directories(workspace2, ec);
+    REQUIRE(!ec);
+    {
+        std::ofstream(planted / "package.json") << R"({"name":"planted-marker"})";
+        std::ofstream(workspace2 / "settings.json") << R"({"packages":["../../pkgs/planted"]})";
+    }
+    fs::create_symlink(workspace2 / "settings.json", pi_agent2 / "settings.json", ec);
+    REQUIRE(!ec);
+    const auto planted_out = out / "planted.txt";
+    const int rc2 = run_glove(
+        {GLOVE_BIN,
+         "shell",
+         "--agent",
+         "pi",
+         "--workspace",
+         workspace2.string(),
+         "--write",
+         out.string(),
+         "--audit-log",
+         (base / "audit2.jsonl").string(),
+         "--",
+         "/bin/sh",
+         "-c",
+         "cat '" + (planted / "package.json").string() + "' > '" + planted_out.string() +
+             "' 2>/dev/null; true"},
+        {"HOME=" + home2.string(),
+         "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+         "XDG_STATE_HOME=" + (base / "state").string(),
+         "XDG_CONFIG_HOME=" + (base / "config").string()}
+    );
+    REQUIRE(rc2 == 0);
+    REQUIRE(slurp(planted_out).find("planted-marker") == std::string::npos);
 
     fs::remove_all(base, ec);
     return 0;

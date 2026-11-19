@@ -638,31 +638,31 @@ void add_verified_agent_read_dir(
     add_non_overlapping_read_dir(opts, canon);
 }
 
-// Expose the local packages named in host Pi settings read-only, so a package
-// kept outside the approved roots (for example a source checkout) still loads.
-// The runner drops any local package that ends up unreadable from the guest
-// settings.json, so a refused package degrades to "not loaded" with a warning.
+// Expose the local packages and resources named in host Pi settings read-only,
+// so one kept outside the approved roots (for example a source checkout) still
+// loads. The runner drops any that end up unreadable from the guest settings,
+// so a refused package degrades to "not loaded" with a warning.
 void add_pi_local_packages(
     glove::run::options& opts,
     const std::filesystem::path& home_dir,
     const std::filesystem::path& pi_agent_dir
 ) {
-    std::ifstream in(pi_agent_dir / "settings.json", std::ios::binary);
-    if (!in) {
+    std::vector<std::filesystem::path> agent_writable{opts.writable.begin(), opts.writable.end()};
+    if (opts.workspace) {
+        agent_writable.push_back(*opts.workspace);
+    }
+    auto text = glove::run::read_host_pi_settings(pi_agent_dir, home_dir, agent_writable);
+    if (!text) {
         return;
     }
-    constexpr std::size_t limit = 4U * 1024U * 1024U;
-    std::string text(limit + 1, '\0');
-    in.read(text.data(), static_cast<std::streamsize>(text.size()));
-    text.resize(static_cast<std::size_t>(in.gcount()));
-    if (text.size() > limit) {
-        return;
-    }
-    auto packages = glove::run::pi_local_package_sources(text, pi_agent_dir, home_dir);
+    auto packages = glove::run::pi_local_package_sources(*text, pi_agent_dir, home_dir);
     if (!packages) {
         return;
     }
     for (const auto& package : *packages) {
+        if (package.pattern) {
+            continue;
+        }
         if (auto canonical =
                 glove::run::pi_package_exposure(package.resolved, home_dir, pi_agent_dir)) {
             add_non_overlapping_read_dir(opts, *canonical);
@@ -800,10 +800,8 @@ auto attach_agent_harness_closure(
         add_verified_agent_read_dir(
             opts, dotfiles_dir / "pi" / ".pi" / "agent" / "packages", approved_pi_roots
         );
-        if (driver == "pi") {
-            add_pi_local_packages(opts, home_dir, pi_agent_dir);
-            opts.report_pi_packages = true;
-        }
+        add_pi_local_packages(opts, home_dir, pi_agent_dir);
+        opts.report_pi_packages = driver == "pi";
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");

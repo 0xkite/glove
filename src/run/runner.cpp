@@ -463,36 +463,54 @@ void stage_guest_pi_settings(
     bool report
 ) {
     const auto guest_settings = guest_pi_dir / "settings.json";
+    if (!std::filesystem::exists(std::filesystem::symlink_status(guest_settings))) {
+        return;
+    }
     const auto text = read_small_file(guest_settings);
     if (!text) {
+        (void)::unlink(guest_settings.c_str());
         return;
     }
     auto packages = glove::run::pi_local_package_sources(*text, host_pi_dir, host_home);
     if (!packages) {
-        std::fprintf(stderr, "glove: Pi settings.json not staged: %s\n", packages.error().c_str());
-        (void)::unlink(guest_settings.c_str());
+        // Keep the copy as staged: losing defaultProvider/defaultModel is worse
+        // than a local package path that may not resolve in the sandbox.
+        std::fprintf(
+            stderr,
+            "glove: Pi settings.json staged unchanged; local package paths not rewritten: %s\n",
+            packages.error().c_str()
+        );
         return;
     }
     std::map<std::string, std::string> exposed;
     for (const auto& package : *packages) {
+        if (package.pattern) {
+            exposed.emplace(package.declared, package.resolved.string());
+            continue;
+        }
         auto canonical = glove::run::pi_package_exposure(package.resolved, host_home, host_pi_dir);
-        const bool visible =
-            canonical && std::ranges::any_of(profile.filesystem, [&](const auto& rule) {
-                return path_within(*canonical, std::filesystem::path{rule.path});
-            });
-        if (visible) {
+        const auto covers = [&](const auto& rule) {
+            return path_within(*canonical, std::filesystem::path{rule.path});
+        };
+        if (canonical && std::ranges::any_of(profile.filesystem, covers)) {
             exposed.emplace(package.declared, canonical->string());
             continue;
         }
         if (!report) {
             continue;
         }
+        std::string reason = canonical ? "path is not exposed" : canonical.error();
+        if (canonical && std::ranges::any_of(profile.filesystem, [&](const auto& rule) {
+                return path_within(std::filesystem::path{rule.path}, *canonical);
+            })) {
+            reason = "it contains the workspace or another mounted path";
+        }
         std::fprintf(
             stderr,
-            "glove: Pi package '%s' is not loaded in the sandbox (%s); pass --read <path> to "
+            "glove: Pi resource '%s' is not loaded in the sandbox (%s); pass --read <path> to "
             "expose it\n",
             package.declared.c_str(),
-            canonical ? "path is not exposed" : canonical.error().c_str()
+            reason.c_str()
         );
     }
     auto rewritten = glove::run::rewrite_pi_settings_packages(*text, exposed);
@@ -502,15 +520,16 @@ void stage_guest_pi_settings(
     }
 }
 
-// Remove remote provider credentials from the staged models.json; on any
-// failure the guest gets no models.json rather than an unscrubbed one.
+// Remove credentials from the staged models.json; on any failure the guest
+// gets no models.json rather than an unscrubbed one.
 void stage_guest_pi_models(const std::filesystem::path& guest_pi_dir) {
     const auto guest_models = guest_pi_dir / "models.json";
-    const auto text = read_small_file(guest_models);
-    if (!text) {
+    if (!std::filesystem::exists(std::filesystem::symlink_status(guest_models))) {
         return;
     }
-    auto scrubbed = glove::run::scrub_pi_models_credentials(*text);
+    const auto text = read_small_file(guest_models);
+    auto scrubbed = text ? glove::run::scrub_pi_models_credentials(*text)
+                         : std::expected<std::string, std::string>{std::unexpected("unreadable")};
     if (!scrubbed || !replace_file_0600(guest_models, *scrubbed)) {
         std::fprintf(stderr, "glove: Pi models.json not staged: cannot remove credentials\n");
         (void)::unlink(guest_models.c_str());
