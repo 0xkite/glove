@@ -10,6 +10,7 @@ add_library(glove_container STATIC
     sandbox_denial_log.cpp
     denial_telemetry.cpp
     denial_decision.cpp
+    denial_trace.cpp
 )
 add_library(glove::container ALIAS glove_container)
 

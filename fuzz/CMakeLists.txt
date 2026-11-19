@@ -248,6 +248,7 @@ glove_configure_fuzzer(glove_sandbox_denial_log_fuzzer)
 
 add_library(glove_denial_model_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/container/denial_decision.cpp
+    ${CMAKE_SOURCE_DIR}/src/container/denial_trace.cpp
     ${CMAKE_SOURCE_DIR}/src/container/denial_telemetry.cpp
 )
 target_link_libraries(glove_denial_model_fuzz_support PUBLIC glove_options)
@@ -261,6 +262,10 @@ target_compile_options(glove_denial_model_fuzz_support PRIVATE -fsanitize=fuzzer
 add_executable(glove_denial_model_fuzzer denial_model_fuzzer.cpp)
 target_link_libraries(glove_denial_model_fuzzer PRIVATE glove_denial_model_fuzz_support)
 glove_configure_fuzzer(glove_denial_model_fuzzer)
+
+add_executable(glove_denial_trace_fuzzer denial_trace_fuzzer.cpp)
+target_link_libraries(glove_denial_trace_fuzzer PRIVATE glove_denial_model_fuzz_support)
+glove_configure_fuzzer(glove_denial_trace_fuzzer)
 
 # The Apple Container stats parser is compiled only on Apple platforms
 # (src/control/CMakeLists.txt), so this fuzzer only links there.

@@ -423,6 +423,7 @@ container_profile_fuzz_corpus="${fuzz_workspace}/container_profile"
 kernel_server_fuzz_corpus="${fuzz_workspace}/kernel_server"
 sandbox_denial_log_fuzz_corpus="${fuzz_workspace}/sandbox_denial_log"
 denial_model_fuzz_corpus="${fuzz_workspace}/denial_model"
+denial_trace_fuzz_corpus="${fuzz_workspace}/denial_trace"
 cp -R fuzz/corpus/mcp_codec "${mcp_fuzz_corpus}"
 cp -R fuzz/corpus/policy_jsonpath "${policy_fuzz_corpus}"
 cp -R fuzz/corpus/change_manifest "${manifest_fuzz_corpus}"
@@ -435,6 +436,7 @@ cp -R fuzz/corpus/container_profile "${container_profile_fuzz_corpus}"
 cp -R fuzz/corpus/kernel_server "${kernel_server_fuzz_corpus}"
 cp -R fuzz/corpus/sandbox_denial_log "${sandbox_denial_log_fuzz_corpus}"
 cp -R fuzz/corpus/denial_model "${denial_model_fuzz_corpus}"
+cp -R fuzz/corpus/denial_trace "${denial_trace_fuzz_corpus}"
 apple_stats_fuzz_corpus="${fuzz_workspace}/apple_container_stats"
 cp -R fuzz/corpus/apple_container_stats "${apple_stats_fuzz_corpus}"
 ASAN_OPTIONS="${asan_opts}" \
@@ -509,6 +511,12 @@ ASAN_OPTIONS="${asan_opts}" \
     -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
     -artifact_prefix="${denial_model_fuzz_corpus}/" \
     "${denial_model_fuzz_corpus}"
+ASAN_OPTIONS="${asan_opts}" \
+    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+    "${BUILD_ROOT}/fuzz/fuzz/glove_denial_trace_fuzzer" \
+    -runs=10000 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -verbosity=0 \
+    -artifact_prefix="${denial_trace_fuzz_corpus}/" \
+    "${denial_trace_fuzz_corpus}"
 # The Apple container-stats parser fuzzer is only built on platforms with that
 # runtime (macOS); run it when present so the target stops being built-but-idle.
 if [[ -x "${BUILD_ROOT}/fuzz/fuzz/glove_apple_container_stats_fuzzer" ]]; then
