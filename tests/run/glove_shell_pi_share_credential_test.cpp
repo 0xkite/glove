@@ -237,6 +237,57 @@ auto run() -> int {
         REQUIRE(!fs::exists(fx.out / "env.txt"));
     }
 
+    // A launch profile's secrets.provider is the key source when present, and
+    // profile env values may not carry the shared secret into the sandbox.
+    {
+        const auto profiles = fx.base / "config" / "glove" / "profiles";
+        fs::create_directories(profiles, ec);
+        REQUIRE(!ec);
+        fs::permissions(fx.base / "config" / "glove", fs::perms::owner_all, ec);
+        fs::permissions(profiles, fs::perms::owner_all, ec);
+        const auto write_profile = [&](const std::string& name, const std::string& body) {
+            const auto path = profiles / (name + ".yaml");
+            std::ofstream(path) << body;
+            fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write, ec);
+        };
+        write_profile(
+            "share-unset", "version: 1\nagent: pi\nsecrets:\n  provider: env://GLOVE_SHARE_UNSET\n"
+        );
+        write_profile(
+            "share-key-leak",
+            "version: 1\nagent: pi\nsecrets:\n  provider: env://GLOVE_SHARE_KEY\n"
+            "env:\n  LEAKED: { value: \"profile-secret-fixture\" }\n"
+        );
+        write_profile(
+            "share-auth-leak",
+            "version: 1\nagent: pi\nenv:\n  LEAKED: { value: \"sk-deepseek-host-fixture\" }\n"
+        );
+        write_profile(
+            "share-key", "version: 1\nagent: pi\nsecrets:\n  provider: env://GLOVE_SHARE_KEY\n"
+        );
+        auto env = fx.env();
+        env.emplace_back("GLOVE_SHARE_KEY=profile-secret-fixture");
+        const auto profiled = [&](const std::string& tag, const std::string& profile) {
+            fs::remove(fx.out / "env.txt", ec);
+            fs::remove(fx.out / "models.json", ec);
+            return run_glove(
+                fx.argv(tag, {"--profile", profile, "--share-credential", "deepseek"}), env
+            );
+        };
+        // An unresolvable profile secret refuses instead of falling back to auth.json.
+        REQUIRE(profiled("p-unset", "share-unset") != 0);
+        REQUIRE(!fs::exists(fx.out / "env.txt"));
+        // The profile secret is the one shared: a profile env value equal to it,
+        // or to the auth.json key without a profile secret, is refused.
+        REQUIRE(profiled("p-key-leak", "share-key-leak") != 0);
+        REQUIRE(!fs::exists(fx.out / "env.txt"));
+        REQUIRE(profiled("p-auth-leak", "share-auth-leak") != 0);
+        REQUIRE(!fs::exists(fx.out / "env.txt"));
+        REQUIRE(profiled("p-key", "share-key") == 0);
+        REQUIRE(slurp(fx.out / "models.json").find("/p/deepseek\"") != std::string::npos);
+        REQUIRE(slurp(fx.out / "env.txt").find("profile-secret-fixture") == std::string::npos);
+    }
+
     // A saved environment keeps a --share-credential given at load time.
     REQUIRE(run_glove(fx.argv("save", {"--save", "sharedenv"}), fx.env()) == 0);
     {
