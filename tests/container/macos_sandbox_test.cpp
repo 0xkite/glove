@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace {
@@ -243,10 +244,61 @@ auto run() -> int {
     return 0;
 }
 
+// An agent must be able to stop its own children (timeouts, harnesses), but
+// a process outside the sandbox must stay unsignalable.
+auto sandboxed_process_signals_own_child_not_host() -> int {
+    const ::pid_t host_pid = ::fork();
+    REQUIRE(host_pid >= 0);
+    if (host_pid == 0) {
+        ::execl("/bin/sleep", "sleep", "30", static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+
+    glove::container::profile prof;
+    auto spawner = glove::container::make_default_spawner();
+    std::string script =
+        "sleep 30 & c=$!; if kill -TERM $c 2>/dev/null; then k=OK; else k=DENY; fi; ";
+    script +=
+        "if kill -0 " + std::to_string(host_pid) + " 2>/dev/null; then h=OK; else h=DENY; fi; ";
+    script += "echo kill=$k host_kill=$h";
+
+    std::optional<std::string> line;
+    bool spawned = false;
+    if (spawner != nullptr) {
+        auto handle_or = spawner->spawn(prof, {"/bin/sh", "-c", script});
+        spawned = handle_or.has_value();
+        if (spawned) {
+            auto handle = std::move(*handle_or);
+            auto received = handle->transport().recv();
+            if (received.has_value()) {
+                line = *received;
+                std::fprintf(stderr, "probe: %s\n", line->c_str());
+            }
+        }
+    }
+
+    (void)::kill(host_pid, SIGKILL);
+    int status = 0;
+    ::pid_t reaped = -1;
+    do {
+        reaped = ::waitpid(host_pid, &status, 0);
+    } while (reaped < 0 && errno == EINTR);
+
+    REQUIRE(spawner != nullptr);
+    REQUIRE(spawned);
+    REQUIRE(line.has_value());
+    REQUIRE(line->rfind("kill=OK ", 0) == 0); // not the "kill=OK" inside "host_kill=OK"
+    REQUIRE(line->find("host_kill=DENY") != std::string::npos);
+    return 0;
+}
+
 } // namespace
 
 auto main() -> int {
     if (const int failed = run(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = sandboxed_process_signals_own_child_not_host(); failed != 0) {
         return failed;
     }
     if (const int failed = descendants_drained_before_reap(); failed != 0) {
