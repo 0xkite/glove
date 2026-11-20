@@ -168,6 +168,12 @@ auto allowlist_cases() -> int {
     auto no_scheme = forward(custom, {}, soon(2000));
     REQUIRE(!no_scheme);
     REQUIRE(no_scheme.error().find("credential scheme") != std::string::npos);
+    auto unplaced = request_for("API.Anthropic.COM", 443);
+    unplaced.provider = glove::net::endpoint_provider::client_placed;
+    unplaced.credential_field = "cookie";
+    auto no_field = forward(unplaced, {}, soon(2000));
+    REQUIRE(!no_field);
+    REQUIRE(no_field.error().find("credential scheme") != std::string::npos);
 
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
     REQUIRE(server.accepted() == 0);

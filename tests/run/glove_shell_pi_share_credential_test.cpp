@@ -1,14 +1,18 @@
-// End-to-end: `glove shell --agent pi --share-credential deepseek` mediates the
-// host DeepSeek key instead of copying it into the sandbox.
-// 1. The guest models.json points the deepseek provider at the host loopback
-//    endpoint and carries a session nonce, never the host key.
-// 2. The host key appears nowhere in the guest Pi directory or environment.
-// 3. A missing host key, raw egress, a forwarded DEEPSEEK_API_KEY, a driver
-//    other than pi, and an unknown provider are refused before launch.
+// End-to-end: `glove shell --agent pi --share-credential <provider>` mediates a
+// host Pi provider credential instead of copying it into the sandbox. One code
+// path serves every provider; the data comes from Pi's own catalog and host
+// auth.json. Three credential shapes are exercised (Bearer, x-api-key,
+// x-goog-api-key), plus the refusals.
+// 1. The guest models.json points the provider at the host loopback endpoint
+//    (`/p/<provider>` plus the upstream base path) with a session nonce.
+// 2. No host key appears in the guest Pi directory, environment, or audit log.
+// 3. Subscription logins, unknown providers, raw egress, forwarded key
+//    variables, and a driver other than pi are refused before launch.
 
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -32,7 +36,22 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr const char* host_key = "sk-deepseek-host-secret-fixture";
+struct provider_case {
+    const char* name;
+    const char* api;
+    const char* base_url;
+    const char* guest_suffix; // expected guest baseUrl after the loopback port
+    const char* host_key;
+};
+
+constexpr std::array<provider_case, 3> providers{{
+    {"deepseek", "openai-completions", "https://api.deepseek.com", "/p/deepseek\"",
+     "sk-deepseek-host-fixture"},
+    {"anthropic", "anthropic-messages", "https://api.anthropic.com", "/p/anthropic\"",
+     "sk-ant-host-fixture"},
+    {"google", "google-generative-ai", "https://generativelanguage.googleapis.com/v1beta",
+     "/p/google/v1beta\"", "google-host-fixture"},
+}};
 
 auto run_glove(std::vector<std::string> argv_owned, std::vector<std::string> env_owned) -> int {
     std::vector<char*> argv;
@@ -67,22 +86,24 @@ auto slurp(const fs::path& path) -> std::string {
     return buffer.str();
 }
 
+auto catalog_json(const provider_case& p) -> std::string {
+    return std::string{R"({")"} + p.api + R"(":{"chat:m1":{"id":"m1","provider":")" + p.name +
+           R"(","api":")" + p.api + R"(","baseUrl":")" + p.base_url + R"("}}})";
+}
+
 struct fixture {
     fs::path base;
     fs::path home;
     fs::path out;
 
-    [[nodiscard]] auto env(bool with_key) const -> std::vector<std::string> {
-        std::vector<std::string> env{
+    [[nodiscard]] auto env() const -> std::vector<std::string> {
+        return {
             "HOME=" + home.string(),
             "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
             "XDG_STATE_HOME=" + (base / "state").string(),
             "XDG_CONFIG_HOME=" + (base / "config").string(),
+            "EXAMPLE_API_KEY=forward-me-not",
         };
-        if (with_key) {
-            env.push_back(std::string{"DEEPSEEK_API_KEY="} + host_key);
-        }
-        return env;
     }
 
     [[nodiscard]] auto argv(
@@ -124,53 +145,75 @@ auto run() -> int {
     fx.home = fx.base / "home";
     fx.out = fx.base / "out";
     const auto pi_agent = fx.home / ".pi" / "agent";
-    fs::create_directories(pi_agent, ec);
+    // Pi's managed install layout: install/current-version names the release.
+    const auto catalog_dir = pi_agent / "install" / "releases" / "9.9.9" / "node_modules" /
+                             "@earendil-works" / "pi-ai" / "dist" / "providers" / "data";
+    fs::create_directories(catalog_dir, ec);
     fs::create_directories(fx.out, ec);
     fs::create_directories(fx.base / "state", ec);
     fs::create_directories(fx.base / "config", ec);
     REQUIRE(!ec);
+    std::string auth = "{";
+    for (const auto& p : providers) {
+        std::ofstream(catalog_dir / (std::string{p.name} + ".json")) << catalog_json(p);
+        auth += std::string{"\""} + p.name + R"(":{"type":"api_key","key":")" + p.host_key +
+                "\"},";
+    }
+    auth += R"("openai-codex":{"type":"oauth","access":"codex-access-fixture","refresh":"r",)"
+            R"("expires":1}})";
     {
+        std::ofstream(catalog_dir / "openai-codex.json")
+            << R"({"openai-codex-responses":{"chat:c":{"id":"c","provider":"openai-codex",)"
+               R"("api":"openai-codex-responses","baseUrl":"https://chatgpt.com/backend-api"}}})";
+        std::ofstream(pi_agent / "install" / "current-version") << "9.9.9\n";
         std::ofstream(pi_agent / "settings.json") << R"({"defaultProvider":"deepseek"})";
         std::ofstream(pi_agent / "models.json")
             << R"({"providers":{"local":{"baseUrl":"http://127.0.0.1:8081/v1","apiKey":"dummy"}}})";
+        std::ofstream(pi_agent / "auth.json") << auth;
     }
+    fs::permissions(pi_agent / "auth.json", fs::perms::owner_read | fs::perms::owner_write);
 
-    // 1-2. Mediated: nonce and loopback base URL, no host key anywhere.
-    const std::vector<std::string> share{"--share-credential", "deepseek"};
-    REQUIRE(run_glove(fx.argv("ok", share), fx.env(true)) == 0);
-    const auto models = slurp(fx.out / "models.json");
-    REQUIRE(models.find("\"deepseek\"") != std::string::npos);
-    REQUIRE(models.find("http://127.0.0.1:") != std::string::npos);
-    REQUIRE(models.find("/deepseek\"") != std::string::npos);
-    REQUIRE(models.find("glove-session-") != std::string::npos);
-    REQUIRE(models.find("\"dummy\"") != std::string::npos);
-    REQUIRE(models.find(host_key) == std::string::npos);
-    REQUIRE(slurp(fx.out / "agent-dir.txt").find(host_key) == std::string::npos);
-    const auto env = slurp(fx.out / "env.txt");
-    REQUIRE(!env.empty());
-    REQUIRE(env.find(host_key) == std::string::npos);
-    REQUIRE(env.find("DEEPSEEK_API_KEY") == std::string::npos);
-    const auto audit = slurp(fx.base / "audit-ok.jsonl");
-    REQUIRE(audit.find(host_key) == std::string::npos);
+    // 1-2. Each credential shape goes through the same mediated path.
+    for (const auto& p : providers) {
+        fs::remove(fx.out / "models.json", ec);
+        const std::string tag = std::string{"ok-"} + p.name;
+        REQUIRE(run_glove(fx.argv(tag, {"--share-credential", p.name}), fx.env()) == 0);
+        const auto models = slurp(fx.out / "models.json");
+        REQUIRE(models.find(std::string{"\""} + p.name + "\"") != std::string::npos);
+        REQUIRE(models.find("http://127.0.0.1:") != std::string::npos);
+        REQUIRE(models.find(p.guest_suffix) != std::string::npos);
+        REQUIRE(models.find("glove-session-") != std::string::npos);
+        REQUIRE(models.find("\"dummy\"") != std::string::npos);
+        const auto agent_dir = slurp(fx.out / "agent-dir.txt");
+        const auto env = slurp(fx.out / "env.txt");
+        const auto audit = slurp(fx.base / ("audit-" + tag + ".jsonl"));
+        REQUIRE(!env.empty());
+        for (const auto& other : providers) {
+            REQUIRE(models.find(other.host_key) == std::string::npos);
+            REQUIRE(agent_dir.find(other.host_key) == std::string::npos);
+            REQUIRE(env.find(other.host_key) == std::string::npos);
+            REQUIRE(audit.find(other.host_key) == std::string::npos);
+        }
+        REQUIRE(agent_dir.find("codex-access-fixture") == std::string::npos);
+        REQUIRE(env.find("forward-me-not") == std::string::npos);
+    }
 
     // 3. Refusals happen before launch: the probe script never runs.
     const auto refused = [&](const std::string& tag,
                              const std::vector<std::string>& extra,
-                             bool with_key,
                              const std::string& agent = "pi") -> bool {
         fs::remove(fx.out / "env.txt", ec);
-        const int rc = run_glove(fx.argv(tag, extra, agent), fx.env(with_key));
+        const int rc = run_glove(fx.argv(tag, extra, agent), fx.env());
         return rc != 0 && !fs::exists(fx.out / "env.txt");
     };
-    REQUIRE(refused("nokey", share, false));
+    REQUIRE(refused("oauth", {"--share-credential", "openai-codex"}));
+    REQUIRE(refused("unknown", {"--share-credential", "nowhere"}));
+    REQUIRE(refused("badname", {"--share-credential", "../deepseek"}));
     REQUIRE(refused(
-        "egress", {"--share-credential", "deepseek", "--egress-allow", "api.deepseek.com"}, true
+        "egress", {"--share-credential", "deepseek", "--egress-allow", "api.deepseek.com"}
     ));
-    REQUIRE(
-        refused("envfwd", {"--share-credential", "deepseek", "--env", "DEEPSEEK_API_KEY"}, true)
-    );
-    REQUIRE(refused("codex", share, true, "codex"));
-    REQUIRE(refused("unknown", {"--share-credential", "example"}, true));
+    REQUIRE(refused("envfwd", {"--share-credential", "deepseek", "--env", "EXAMPLE_API_KEY"}));
+    REQUIRE(refused("codex", {"--share-credential", "deepseek"}, "codex"));
 
     fs::remove_all(fx.base, ec);
     return 0;

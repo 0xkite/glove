@@ -168,6 +168,11 @@ target_link_libraries(run_pi_host_config_test PRIVATE glove_run glaze::glaze)
 add_test(NAME run_pi_host_config COMMAND run_pi_host_config_test)
 set_tests_properties(run_pi_host_config PROPERTIES TIMEOUT 10)
 
+add_executable(run_pi_provider_share_test run/pi_provider_share_test.cpp)
+target_link_libraries(run_pi_provider_share_test PRIVATE glove_run)
+add_test(NAME run_pi_provider_share COMMAND run_pi_provider_share_test)
+set_tests_properties(run_pi_provider_share PROPERTIES TIMEOUT 10)
+
 add_executable(run_provider_endpoint_test run/provider_endpoint_test.cpp)
 target_link_libraries(run_provider_endpoint_test PRIVATE glove_run)
 target_include_directories(run_provider_endpoint_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
