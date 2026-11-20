@@ -290,6 +290,10 @@ auto run() -> int {
         fs::remove(fx.out / "env.txt", ec);
         return run_glove(fx2.argv(tag, extra), env) != 0 && !fs::exists(fx.out / "env.txt");
     };
+    // The folder behind a symlinked models.json decides where keys go too.
+    REQUIRE(refused2(
+        "write-dotfiles", {"--share-credential", "custom1", "--write", dotfiles.string()}, env2
+    ));
     // The exact variable being shared cannot also be forwarded.
     REQUIRE(
         refused2("envfwd2", {"--share-credential", "custom1", "--env", "CUSTOM1_SECRET"}, env2)

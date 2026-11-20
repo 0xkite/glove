@@ -95,6 +95,8 @@ auto main() -> int {
             .port = 443,
             .base_path = "/v1beta",
             .allowed_paths = {"/v1beta/models/*"},
+            .origin_from_models_json = false,
+            .catalog_hosts = {},
         };
         auto shared_options = glove::run::detail::make_shared_provider_endpoint_options(
             shared, "host-secret-sentinel", "glove-session-fixture"
