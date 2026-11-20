@@ -27,11 +27,16 @@ struct api_route {
     std::string_view path;
 };
 
-constexpr std::array<api_route, 4> api_routes{{
+// `/*:suffix` admits one model segment ending in that method, so a shared
+// Google key reaches generation and token counting only, not batch, embedding,
+// or media endpoints under the same collection.
+constexpr std::array<api_route, 6> api_routes{{
     {"openai-completions", "/chat/completions"},
     {"openai-responses", "/responses"},
     {"anthropic-messages", "/v1/messages"},
-    {"google-generative-ai", "/models/*"},
+    {"google-generative-ai", "/models/*:generateContent"},
+    {"google-generative-ai", "/models/*:streamGenerateContent"},
+    {"google-generative-ai", "/models/*:countTokens"},
 }};
 
 auto parse_object(std::string_view json, std::string_view what)
@@ -106,7 +111,12 @@ auto parse_base_url(std::string_view url) -> std::expected<upstream, std::string
     std::ranges::transform(host, host.begin(), [](char c) {
         return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
     });
-    if (host.empty() || host.find('.') == std::string::npos ||
+    // A DNS name: dotted, no trailing dot, and a top-level label with a
+    // letter, which excludes dotted-decimal, hex, and octal IPv4 forms.
+    const auto top_label = host.substr(host.rfind('.') + 1);
+    if (host.empty() || host.find('.') == std::string::npos || host.ends_with('.') ||
+        host.starts_with('.') || host.find("..") != std::string::npos ||
+        !std::ranges::any_of(top_label, [](char c) { return c >= 'a' && c <= 'z'; }) ||
         !std::ranges::all_of(host, [](char c) {
             return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-';
         })) {
@@ -166,8 +176,9 @@ auto is_env_reference(std::string_view value) -> std::optional<std::string_view>
     return name;
 }
 
-auto checked_secret(std::string value, std::string_view name)
-    -> std::expected<std::string, std::string> {
+auto checked_secret(
+    std::string value, std::string_view name, std::optional<std::string> variable = std::nullopt
+) -> std::expected<pi_shared_secret, std::string> {
     if (value.empty() || value.size() > max_secret_bytes || !std::ranges::all_of(value, [](char c) {
             const auto byte = static_cast<unsigned char>(c);
             return byte > 0x20U && byte < 0x7FU;
@@ -177,7 +188,20 @@ auto checked_secret(std::string value, std::string_view name)
             "' is empty, too long, or contains whitespace or control bytes"
         );
     }
-    return value;
+    return pi_shared_secret{.value = std::move(value), .environment_variable = std::move(variable)};
+}
+
+// Pi's default variable for most providers: `deepseek` -> `DEEPSEEK_API_KEY`.
+auto conventional_key_variable(std::string_view name) -> std::string {
+    std::string variable;
+    for (const char c : name) {
+        variable.push_back(
+            (c >= 'a' && c <= 'z')   ? static_cast<char>(c - 'a' + 'A')
+            : (c == '-' || c == '.') ? '_'
+                                     : c
+        );
+    }
+    return variable + "_API_KEY";
 }
 
 } // namespace
@@ -212,6 +236,7 @@ auto resolve_pi_shared_provider(
     std::set<std::string> base_urls;
     std::set<std::string> apis;
     bool known = false;
+    bool from_models_json = false;
     std::vector<std::string> catalog_urls;
     for (const auto& [group, rows] : catalog->get_object()) {
         if (!rows.is_object()) {
@@ -242,6 +267,7 @@ auto resolve_pi_shared_provider(
         known = true;
         if (auto url = string_field(*custom, "baseUrl")) {
             base_urls.insert(std::move(*url));
+            from_models_json = true;
         } else {
             base_urls.insert(catalog_urls.begin(), catalog_urls.end());
         }
@@ -259,6 +285,7 @@ auto resolve_pi_shared_provider(
                 }
                 if (auto url = string_field(model.get_object(), "baseUrl")) {
                     base_urls.insert(std::move(*url));
+                    from_models_json = true;
                 }
             }
         }
@@ -293,6 +320,14 @@ auto resolve_pi_shared_provider(
     out.host = upstreams.begin()->host;
     out.port = upstreams.begin()->port;
     out.base_path = upstreams.begin()->path;
+    out.origin_from_models_json = from_models_json;
+    std::set<std::string> catalog_host_set;
+    for (const auto& url : catalog_urls) {
+        if (auto parsed = parse_base_url(url)) {
+            catalog_host_set.insert(parsed->host);
+        }
+    }
+    out.catalog_hosts.assign(catalog_host_set.begin(), catalog_host_set.end());
     for (const auto& route : api_routes) {
         if (apis.contains(std::string{route.api})) {
             out.allowed_paths.push_back(out.base_path + std::string{route.path});
@@ -316,7 +351,7 @@ auto pi_shared_provider_secret(
     std::string_view auth_json,
     std::string_view models_json,
     const pi_environment_lookup& environment
-) -> std::expected<std::string, std::string> {
+) -> std::expected<pi_shared_secret, std::string> {
     const std::string label = "Pi provider '" + printable(name) + "'";
     auto auth = parse_object(auth_json, "auth.json");
     if (!auth) {
@@ -355,7 +390,11 @@ auto pi_shared_provider_secret(
     }
     const auto api_key = custom != nullptr ? string_field(*custom, "apiKey") : std::nullopt;
     if (!api_key) {
-        return std::unexpected(label + " has no API key in auth.json or models.json");
+        const auto variable = conventional_key_variable(name);
+        if (auto value = environment ? environment(variable) : std::nullopt) {
+            return checked_secret(std::move(*value), name, variable);
+        }
+        return std::unexpected(label + " has no API key in auth.json, models.json, or " + variable);
     }
     if (api_key->starts_with('!')) {
         return std::unexpected(label + " uses a command-provided API key, which is not shared");
@@ -368,7 +407,7 @@ auto pi_shared_provider_secret(
                 ", which is not set on the host"
             );
         }
-        return checked_secret(std::move(*value), name);
+        return checked_secret(std::move(*value), name, std::string{*variable});
     }
     if (api_key->starts_with('$')) {
         return std::unexpected(label + " has an API key template that is not a plain variable");

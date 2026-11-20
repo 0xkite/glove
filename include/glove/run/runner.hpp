@@ -56,6 +56,9 @@ struct options {
     // provider key through the credentialed endpoint. The sandbox receives a
     // session nonce and a loopback base URL, never the key itself.
     std::optional<std::string> share_credential;
+    // `--share-credential-origin <host>`: required when the host models.json
+    // sends a catalog provider to a host Pi's catalog does not name.
+    std::optional<std::string> share_credential_origin;
     // Permit private-loopback socket binding/listening inside the sandbox's
     // isolated network namespace (required by runtimes like agy).
     bool allow_loopback_listen = false;

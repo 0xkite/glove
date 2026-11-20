@@ -246,36 +246,47 @@ auto path_within(const std::filesystem::path& candidate, const std::filesystem::
     return mr == nr.end();
 }
 
-void copy_regular_file_0600(
-    const std::filesystem::path& src,
-    const std::filesystem::path& dst,
-    bool allow_owner_symlink = false
-) noexcept {
+// Read a host Pi configuration file under the staging rules: owned by the
+// effective user, a regular file of at most 4 MiB, and, when it is a symlink and
+// `allow_owner_symlink` is set, resolving to a same-named owned file inside an
+// approved tree. Absent is `std::nullopt`; present but refused is an error, so a
+// caller can fail closed instead of treating the file as empty.
+auto read_host_owned_config(const std::filesystem::path& src, bool allow_owner_symlink)
+    -> std::expected<std::optional<std::string>, std::string> {
+    const auto refused = [&](std::string_view why) {
+        return std::unexpected(src.filename().string() + " " + std::string{why});
+    };
     struct ::stat link_st{};
-    if (::lstat(src.c_str(), &link_st) != 0 || link_st.st_uid != ::geteuid()) {
-        return;
+    if (::lstat(src.c_str(), &link_st) != 0) {
+        if (errno == ENOENT) {
+            return std::optional<std::string>{};
+        }
+        return refused("cannot be inspected");
+    }
+    if (link_st.st_uid != ::geteuid()) {
+        return refused("is not owned by the current user");
     }
     std::filesystem::path open_path = src;
     struct ::stat expected_st = link_st;
     if (S_ISLNK(link_st.st_mode)) {
         if (!allow_owner_symlink) {
-            return;
+            return refused("is a symlink");
         }
         std::error_code ec;
         const auto target = std::filesystem::canonical(src, ec);
         if (ec || target.empty()) {
-            return;
+            return refused("is not a readable owned regular file in an approved location");
         }
         // Validate target constraints:
         // 1. Target filename must match src filename (prevent settings.json -> id_rsa/auth.json)
         if (target.filename() != src.filename()) {
-            return;
+            return refused("is not a readable owned regular file in an approved location");
         }
         // 2. Target must be a regular file owned by the user
         struct ::stat target_st{};
         if (::stat(target.c_str(), &target_st) != 0 || target_st.st_uid != ::geteuid() ||
             !S_ISREG(target_st.st_mode)) {
-            return;
+            return refused("is not a readable owned regular file in an approved location");
         }
         // 3. Target must not contain sensitive path components
         const std::string target_str = target.string();
@@ -290,7 +301,7 @@ void copy_regular_file_0600(
               "id_ed25519",
               "token"}) {
             if (target_str.find(sensitive) != std::string::npos) {
-                return;
+                return refused("is not a readable owned regular file in an approved location");
             }
         }
         // 4. Target must be within approved trees
@@ -300,7 +311,7 @@ void copy_regular_file_0600(
             std::error_code home_ec;
             const auto canon_home = std::filesystem::canonical(home_path, home_ec);
             if (home_ec || canon_home.empty()) {
-                return;
+                return refused("is not a readable owned regular file in an approved location");
             }
             const bool in_approved =
                 path_within(target, canon_home / ".pi") ||
@@ -308,7 +319,7 @@ void copy_regular_file_0600(
                 path_within(target, canon_home / ".dotfiles") ||
                 path_within(target, src.parent_path());
             if (!in_approved) {
-                return;
+                return refused("is not a readable owned regular file in an approved location");
             }
         }
         open_path = target;
@@ -316,7 +327,7 @@ void copy_regular_file_0600(
     }
     const int in_fd = ::open(open_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (in_fd < 0) {
-        return;
+        return refused("is not a readable owned regular file in an approved location");
     }
     struct ::stat before{};
     constexpr std::uint64_t kMaxGuestConfigBytes = 4U * 1024U * 1024U;
@@ -324,7 +335,7 @@ void copy_regular_file_0600(
         before.st_dev != expected_st.st_dev || before.st_ino != expected_st.st_ino ||
         before.st_size < 0 || static_cast<std::uint64_t>(before.st_size) > kMaxGuestConfigBytes) {
         (void)::close(in_fd);
-        return;
+        return refused("is not a readable owned regular file in an approved location");
     }
     std::string contents(static_cast<std::size_t>(before.st_size), '\0');
     std::size_t offset = 0;
@@ -335,7 +346,7 @@ void copy_regular_file_0600(
         }
         if (n <= 0) {
             (void)::close(in_fd);
-            return;
+            return refused("could not be read");
         }
         offset += static_cast<std::size_t>(n);
     }
@@ -344,9 +355,22 @@ void copy_regular_file_0600(
         after.st_ino != before.st_ino || after.st_size != before.st_size ||
         after.st_mtime != before.st_mtime) {
         (void)::close(in_fd);
-        return;
+        return refused("is not a readable owned regular file in an approved location");
     }
     (void)::close(in_fd);
+    return std::optional<std::string>{std::move(contents)};
+}
+
+void copy_regular_file_0600(
+    const std::filesystem::path& src,
+    const std::filesystem::path& dst,
+    bool allow_owner_symlink = false
+) noexcept {
+    auto read = read_host_owned_config(src, allow_owner_symlink);
+    if (!read || !*read) {
+        return;
+    }
+    const std::string contents = std::move(**read);
 
     const int out_fd =
         ::open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -1119,9 +1143,9 @@ auto host_pi_provider_catalog(const std::filesystem::path& pi_agent_dir, std::st
 // Resolve the provider from host Pi data, read its secret on the host, and
 // start one client-placed endpoint for it. The guest receives only the
 // endpoint base URL and a session nonce (staged into its models.json later).
-auto start_shared_pi_provider(
-    std::string_view name, const std::shared_ptr<glove::audit::sink>& sink
-) -> std::expected<preset_startup, std::string> {
+auto start_shared_pi_provider(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
+    -> std::expected<preset_startup, std::string> {
+    const std::string name = opts.share_credential.value_or(std::string{});
     const char* home = std::getenv("HOME");
     if (home == nullptr || *home == '\0') {
         return std::unexpected(std::string{"--share-credential needs HOME to find host Pi data"});
@@ -1129,14 +1153,69 @@ auto start_shared_pi_provider(
     if (!valid_pi_provider_name(name)) {
         return std::unexpected("invalid Pi provider name '" + printable(name) + "'");
     }
-    const auto pi_agent_dir = std::filesystem::path{home} / ".pi" / "agent";
-    const auto models = read_small_file(pi_agent_dir / "models.json").value_or(std::string{});
-    auto provider =
-        resolve_pi_shared_provider(name, host_pi_provider_catalog(pi_agent_dir, name), models);
+    const std::filesystem::path home_dir{home};
+    std::error_code ec;
+    const auto pi_root = std::filesystem::weakly_canonical(home_dir / ".pi", ec);
+    if (ec) {
+        return std::unexpected(std::string{"--share-credential cannot resolve ~/.pi"});
+    }
+    // Host Pi data decides where the key is sent. A session that can write it
+    // could redirect the key in a later launch, so no writable mount may
+    // overlap it.
+    std::vector<std::string> writable = opts.writable;
+    if (opts.workspace) {
+        writable.push_back(opts.workspace->string());
+    }
+    for (const auto& raw : writable) {
+        const auto path = std::filesystem::weakly_canonical(std::filesystem::path{raw}, ec);
+        if (ec || path_within(path, pi_root) || path_within(pi_root, path)) {
+            return std::unexpected(
+                "--share-credential refuses a writable workspace or --write path that overlaps "
+                "~/.pi: " +
+                printable(raw)
+            );
+        }
+    }
+    const auto pi_agent_dir = home_dir / ".pi" / "agent";
+    auto models_read = read_host_owned_config(pi_agent_dir / "models.json", true);
+    if (!models_read) {
+        return std::unexpected("cannot use the host Pi " + models_read.error());
+    }
+    const std::string models = models_read->value_or(std::string{});
+    const auto catalog = host_pi_provider_catalog(pi_agent_dir, name);
+    auto provider = resolve_pi_shared_provider(name, catalog, models);
     if (!provider) {
+        if (catalog.empty()) {
+            return std::unexpected(
+                provider.error() +
+                " (Pi's catalog is read from its managed install under ~/.pi/agent/install; "
+                "otherwise define the provider's baseUrl and api in ~/.pi/agent/models.json)"
+            );
+        }
         return std::unexpected(provider.error());
     }
-    const auto auth = read_small_file(pi_agent_dir / "auth.json").value_or(std::string{});
+    // A catalog provider redirected by models.json is sent only to a host the
+    // operator names for this launch.
+    const bool redirected =
+        provider->origin_from_models_json && !provider->catalog_hosts.empty() &&
+        std::ranges::find(provider->catalog_hosts, provider->host) == provider->catalog_hosts.end();
+    if (opts.share_credential_origin && *opts.share_credential_origin != provider->host) {
+        return std::unexpected(
+            "--share-credential-origin " + printable(*opts.share_credential_origin) +
+            " does not match the resolved host " + provider->host
+        );
+    }
+    if (redirected && !opts.share_credential_origin) {
+        return std::unexpected(
+            "Pi provider '" + name + "' is redirected by ~/.pi/agent/models.json to " +
+            provider->host + "; confirm with --share-credential-origin " + provider->host
+        );
+    }
+    auto auth_read = read_host_owned_config(pi_agent_dir / "auth.json", false);
+    if (!auth_read) {
+        return std::unexpected("cannot use the host Pi " + auth_read.error());
+    }
+    const std::string auth = auth_read->value_or(std::string{});
     auto secret = pi_shared_provider_secret(name, auth, models, [](std::string_view variable) {
         const std::string key{variable};
         const char* value = std::getenv(key.c_str());
@@ -1146,12 +1225,32 @@ auto start_shared_pi_provider(
     if (!secret) {
         return std::unexpected(secret.error());
     }
+    // A forwarded variable would hand the sandbox the real secret beside the
+    // mediated one: refuse the variable it came from and any equal value.
+    for (const auto& forwarded : opts.environment_names) {
+        const char* value = std::getenv(forwarded.c_str());
+        if (forwarded == secret->environment_variable ||
+            (value != nullptr && secret->value == value)) {
+            return std::unexpected(
+                "--share-credential cannot be combined with --env " + printable(forwarded) +
+                ", which carries the shared secret"
+            );
+        }
+    }
+    std::fprintf(
+        stderr,
+        "glove: sharing the host credential for Pi provider '%s' with https://%s:%u%s only\n",
+        name.c_str(),
+        provider->host.c_str(),
+        static_cast<unsigned>(provider->port),
+        printable(provider->base_path).c_str()
+    );
     auto nonce = random_session_nonce();
     if (!nonce) {
         return std::unexpected(nonce.error());
     }
     auto endpoint_options =
-        detail::make_shared_provider_endpoint_options(*provider, std::move(*secret), *nonce);
+        detail::make_shared_provider_endpoint_options(*provider, std::move(secret->value), *nonce);
     if (!endpoint_options) {
         return std::unexpected(endpoint_options.error());
     }
@@ -1181,6 +1280,11 @@ auto start_shared_pi_provider(
     startup.pi_base_url = *base_url + provider->base_path;
     startup.pi_nonce = std::move(*nonce);
     startup.endpoint = std::move(*endpoint);
+    // The endpoint owns the secret now. Children this process starts later
+    // (the optional herdr reporter uses ::environ) must not inherit it.
+    if (secret->environment_variable) {
+        ::unsetenv(secret->environment_variable->c_str());
+    }
     return startup;
 }
 
@@ -1196,7 +1300,7 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
                 std::string{"--share-credential is supported only by glove shell --agent pi"}
             );
         }
-        return start_shared_pi_provider(*opts.share_credential, sink);
+        return start_shared_pi_provider(opts, sink);
     }
     if (!opts.agent_preset) {
         return startup;

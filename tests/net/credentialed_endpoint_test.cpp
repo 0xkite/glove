@@ -679,7 +679,9 @@ auto run() -> int {
                     "Content-Length: 0\r\n\r\n"
             );
         };
-        REQUIRE(post("/v1beta/models/gemini-2.5-flash:generateContent").starts_with("HTTP/1.1 200"));
+        REQUIRE(
+            post("/v1beta/models/gemini-2.5-flash:generateContent").starts_with("HTTP/1.1 200")
+        );
         for (const std::string path : {
                  "/v1beta/models/m:predict",
                  "/v1beta/models/a/b:generateContent",

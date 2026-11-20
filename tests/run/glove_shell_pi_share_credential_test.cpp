@@ -258,7 +258,9 @@ auto run() -> int {
     fs::create_directories(pi_agent2 / "install", ec);
     fs::create_directories(dotfiles, ec);
     REQUIRE(!ec);
-    fs::create_directory_symlink(pi_agent / "install" / "releases", pi_agent2 / "install" / "releases", ec);
+    fs::create_directory_symlink(
+        pi_agent / "install" / "releases", pi_agent2 / "install" / "releases", ec
+    );
     REQUIRE(!ec);
     {
         std::ofstream(pi_agent2 / "install" / "current-version") << "9.9.9\n";
@@ -282,13 +284,16 @@ auto run() -> int {
         REQUIRE(custom_models.find("CUSTOM1_SECRET") == std::string::npos);
         REQUIRE(slurp(fx.out / "env.txt").find("custom1-host-fixture") == std::string::npos);
     }
-    const auto refused2 = [&](const std::string& tag, const std::vector<std::string>& extra,
+    const auto refused2 = [&](const std::string& tag,
+                              const std::vector<std::string>& extra,
                               const std::vector<std::string>& env) -> bool {
         fs::remove(fx.out / "env.txt", ec);
         return run_glove(fx2.argv(tag, extra), env) != 0 && !fs::exists(fx.out / "env.txt");
     };
     // The exact variable being shared cannot also be forwarded.
-    REQUIRE(refused2("envfwd2", {"--share-credential", "custom1", "--env", "CUSTOM1_SECRET"}, env2));
+    REQUIRE(
+        refused2("envfwd2", {"--share-credential", "custom1", "--env", "CUSTOM1_SECRET"}, env2)
+    );
     // A catalog provider redirected by models.json needs the origin confirmed.
     REQUIRE(refused2("redirect", {"--share-credential", "deepseek"}, env2));
     REQUIRE(refused2(
@@ -302,7 +307,10 @@ auto run() -> int {
             run_glove(
                 fx2.argv(
                     "redirect-ok",
-                    {"--share-credential", "deepseek", "--share-credential-origin", "gw.example.com"}
+                    {"--share-credential",
+                     "deepseek",
+                     "--share-credential-origin",
+                     "gw.example.com"}
                 ),
                 env2
             ) == 0

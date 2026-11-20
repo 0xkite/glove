@@ -68,13 +68,12 @@ auto resolves_three_credential_shapes() -> int {
     REQUIRE(google.has_value());
     REQUIRE(google->host == "generativelanguage.googleapis.com");
     REQUIRE(google->base_path == "/v1beta");
-    REQUIRE(
-        google->allowed_paths == std::vector<std::string>{
-                                     "/v1beta/models/*:generateContent",
-                                     "/v1beta/models/*:streamGenerateContent",
-                                     "/v1beta/models/*:countTokens",
-                                 }
-    );
+    const std::vector<std::string> google_paths{
+        "/v1beta/models/*:generateContent",
+        "/v1beta/models/*:streamGenerateContent",
+        "/v1beta/models/*:countTokens",
+    };
+    REQUIRE(google->allowed_paths == google_paths);
     REQUIRE(!google->origin_from_models_json);
     return 0;
 }

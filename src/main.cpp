@@ -197,6 +197,12 @@ void print_exec_usage() {
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
+        "  --share-credential <pi-provider>\n"
+        "                          with --agent pi: mediate the host API key for one Pi\n"
+        "                          provider; the sandbox gets a session nonce, never the key\n"
+        "  --share-credential-origin <host>\n"
+        "                          confirm the host when ~/.pi/agent/models.json redirects\n"
+        "                          a catalog provider\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
@@ -327,17 +333,32 @@ auto parse_sandbox_flag(
         ++i;
         return 0;
     }
-    if (a == "--share-credential") {
-        if (i + 1 >= args.size()) {
+    if (a == "--share-credential" || a == "--share-credential-origin") {
+        if (cmd_name != "shell") {
             std::fprintf(
                 stderr,
-                "glove %.*s: --share-credential needs a provider\n",
+                "glove %.*s: %.*s is supported only by glove shell --agent pi\n",
                 static_cast<int>(cmd_name.size()),
-                cmd_name.data()
+                cmd_name.data(),
+                static_cast<int>(a.size()),
+                a.data()
             );
             return 2;
         }
-        opts.share_credential = std::string{args[i + 1]};
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: %.*s needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data(),
+                static_cast<int>(a.size()),
+                a.data()
+            );
+            return 2;
+        }
+        auto& target =
+            a == "--share-credential" ? opts.share_credential : opts.share_credential_origin;
+        target = std::string{args[i + 1]};
         i += 2;
         return 0;
     }
@@ -1466,8 +1487,23 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         if (opts.bridge_port) {
             loaded.bridge_port = opts.bridge_port;
         }
-        loaded.readable.insert(loaded.readable.end(), opts.readable.begin(), opts.readable.end());
-        loaded.writable.insert(loaded.writable.end(), opts.writable.begin(), opts.writable.end());
+        if (opts.audit_log) {
+            loaded.audit_log = opts.audit_log;
+        }
+        // Not stored in saved environments; a flag given at load time applies.
+        loaded.share_credential = opts.share_credential;
+        loaded.share_credential_origin = opts.share_credential_origin;
+        // A path given both in the profile and on the command line is one rule.
+        const auto merge_paths = [](std::vector<std::string>& into,
+                                    const std::vector<std::string>& extra) {
+            for (const auto& path : extra) {
+                if (std::ranges::find(into, path) == into.end()) {
+                    into.push_back(path);
+                }
+            }
+        };
+        merge_paths(loaded.readable, opts.readable);
+        merge_paths(loaded.writable, opts.writable);
         loaded.environment_names.insert(
             loaded.environment_names.end(),
             opts.environment_names.begin(),
@@ -1508,6 +1544,12 @@ auto shell_subcommand(std::span<char* const> args) -> int {
 
     // An explicitly shared credential is opt-in and fails closed: it never
     // falls back to raw provider egress or to another preset.
+    if (opts.share_credential_origin && !opts.share_credential) {
+        std::fprintf(
+            stderr, "glove shell: --share-credential-origin requires --share-credential\n"
+        );
+        return 2;
+    }
     if (opts.share_credential) {
         const char* refusal = nullptr;
         if (!glove::run::valid_pi_provider_name(*opts.share_credential)) {
@@ -1555,6 +1597,8 @@ auto shell_subcommand(std::span<char* const> args) -> int {
     }
 
     const auto user_readable = opts.readable;
+    // Default provider egress is recomputed at launch; only explicit grants are saved.
+    const auto user_egress = opts.egress;
     const bool explicit_cmd = !trailing_args.empty() && !trailing_args.front().starts_with('-');
     const std::string resolved_bin = (driver.empty() || (explicit_cmd && !had_explicit_agent))
                                          ? std::string{}
@@ -1578,6 +1622,7 @@ auto shell_subcommand(std::span<char* const> args) -> int {
 
     glove::run::options saved_snapshot = opts;
     saved_snapshot.readable = user_readable;
+    saved_snapshot.egress = user_egress;
     const long my_pid = static_cast<long>(::getpid());
     if (save_name) {
         save_env_profile(*save_name, saved_snapshot, driver, my_pid);

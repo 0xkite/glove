@@ -693,6 +693,17 @@ auto mediate_pi_provider(
     }
     auto& fields = entry->second.get_object();
     fields.erase("headers");
+    fields.erase("authHeader");
+    if (auto overrides = fields.find("modelOverrides");
+        overrides != fields.end() && overrides->second.is_object()) {
+        for (auto& [model_id, model] : overrides->second.get_object()) {
+            if (model.is_object()) {
+                for (const char* key : {"baseUrl", "apiKey", "headers"}) {
+                    model.get_object().erase(key);
+                }
+            }
+        }
+    }
     fields["baseUrl"] = std::string{base_url};
     fields["apiKey"] = std::string{nonce};
     if (auto list = fields.find("models"); list != fields.end() && list->second.is_array()) {

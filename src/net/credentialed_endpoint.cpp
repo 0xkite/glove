@@ -723,6 +723,21 @@ private:
         if (!matched_rule->allowed_paths.empty()) {
             bool path_allowed = false;
             for (const auto& ap : matched_rule->allowed_paths) {
+                // "stem/*:suffix" admits exactly one non-empty segment under
+                // stem whose name ends with ":suffix".
+                if (const auto star = ap.find("/*:"); star != std::string::npos) {
+                    const auto stem = ap.substr(0, star + 1);
+                    const auto suffix = ap.substr(star + 2);
+                    if (rewritten_path.starts_with(stem)) {
+                        const auto segment = std::string_view{rewritten_path}.substr(stem.size());
+                        if (segment.size() > suffix.size() && segment.ends_with(suffix) &&
+                            segment.find('/') == std::string_view::npos) {
+                            path_allowed = true;
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if (ap.ends_with("/*")) {
                     const auto stem = ap.substr(0, ap.size() - 1);
                     if (rewritten_path.starts_with(stem)) {

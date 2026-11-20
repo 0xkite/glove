@@ -31,7 +31,9 @@ struct credentialed_endpoint_rule {
     std::string secret_token;  // Maintained in host memory only
     std::string session_nonce; // Ephemeral token required from sandbox
     std::vector<std::string> allowed_methods = {"POST"};
-    std::vector<std::string> allowed_paths; // Empty means allow all under prefix
+    // Empty means allow all under prefix. An entry is an exact path, a subtree
+    // ("/v1/*"), or one segment ending in a suffix ("/v1/models/*:generate").
+    std::vector<std::string> allowed_paths;
 };
 
 struct endpoint_event {
