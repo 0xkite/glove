@@ -1,3 +1,5 @@
+#include "glove/detail/descriptor_limit.hpp"
+
 #include "../support/descriptor_acl_fixture.hpp"
 #include "pi_catalog.hpp"
 
@@ -402,6 +404,8 @@ auto unsafe_closure_cases(const std::filesystem::path& root) -> int {
 } // namespace
 
 auto main() -> int {
+    // The deep cases run at the depth bound, as glove itself does.
+    glove::detail::raise_descriptor_soft_limit();
     temporary_directory temporary;
     REQUIRE(!temporary.root().empty());
     REQUIRE(basic_cases(temporary.root()) == 0);

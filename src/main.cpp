@@ -1,3 +1,4 @@
+#include "glove/detail/descriptor_limit.hpp"
 #include "glove/host/config.hpp"
 #include "glove/host/runtime_policy.hpp"
 #include "glove/policy/engine.hpp"
@@ -2325,6 +2326,7 @@ auto mcp_bridge_subcommand(std::span<char* const> args) -> int {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    glove::detail::raise_descriptor_soft_limit();
     if (argc < 2) {
         print_usage();
         return 0;
