@@ -642,6 +642,55 @@ auto run() -> int {
         REQUIRE(!both.starts_with("HTTP/1.1 200 OK"));
         REQUIRE(seen.size() == before);
     }
+
+    // `stem/*:suffix` admits one non-empty segment that ends in the suffix.
+    {
+        glove::net::credentialed_endpoint_options methods;
+        methods.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::client_placed,
+            .path_prefix = "/p/google",
+            .upstream_host = "generativelanguage.googleapis.com",
+            .upstream_port = 443,
+            .secret_token = "google-host-secret",
+            .session_nonce = "glove-nonce-methods",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1beta/models/*:generateContent"},
+        });
+        std::size_t forwarded = 0;
+        methods.forward = [&](
+                              const glove::net::upstream_request&,
+                              std::stop_token,
+                              std::chrono::steady_clock::time_point
+                          ) -> std::expected<glove::net::upstream_response, std::string> {
+            ++forwarded;
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.body = "{}";
+            return response;
+        };
+        auto methods_endpoint = glove::net::start_credentialed_endpoint(std::move(methods));
+        REQUIRE(methods_endpoint.has_value());
+        const auto methods_port = (*methods_endpoint)->port();
+        const auto post = [&](const std::string& path) {
+            return send_and_receive(
+                methods_port,
+                "POST /p/google" + path +
+                    " HTTP/1.1\r\nHost: 127.0.0.1\r\nx-goog-api-key: glove-nonce-methods\r\n"
+                    "Content-Length: 0\r\n\r\n"
+            );
+        };
+        REQUIRE(post("/v1beta/models/gemini-2.5-flash:generateContent").starts_with("HTTP/1.1 200"));
+        for (const std::string path : {
+                 "/v1beta/models/m:predict",
+                 "/v1beta/models/a/b:generateContent",
+                 "/v1beta/models/:generateContent",
+                 "/v1beta/models/m:generateContentX",
+                 "/v1beta/models/m",
+             }) {
+            REQUIRE(!post(path).starts_with("HTTP/1.1 200"));
+        }
+        REQUIRE(forwarded == 1);
+    }
     return 0;
 }
 

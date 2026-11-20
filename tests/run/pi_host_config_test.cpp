@@ -361,6 +361,22 @@ auto mediate_models() -> int {
     REQUIRE(!contains(*merged, "DEEPSEEK_API_KEY"));
     REQUIRE(!contains(*merged, "headers"));
     REQUIRE(!contains(*merged, "$K"));
+    // Pi adds its own Authorization header when authHeader is set, and model
+    // overrides may carry headers: both would put a second credential beside
+    // the nonce.
+    auto overrides = mediate_pi_provider(
+        R"({"providers":{"google":{"authHeader":true,"modelOverrides":{"m":{"headers":)"
+        R"({"Authorization":"Bearer ${T}"},"name":"kept"}}},"other":{"authHeader":true}}})",
+        "google",
+        url,
+        nonce
+    );
+    REQUIRE(overrides.has_value());
+    REQUIRE(!contains(*overrides, R"("headers")"));
+    REQUIRE(contains(*overrides, R"("name":"kept")"));
+    REQUIRE(contains(*overrides, R"("other":{"authHeader":true})"));
+    REQUIRE(!contains(*overrides, R"("google":{"authHeader")"));
+    REQUIRE(overrides->find("authHeader") == overrides->rfind("authHeader"));
     // Malformed input and missing parameters are refused, never guessed.
     REQUIRE(!mediate_pi_provider(R"({"providers":[]})", "deepseek", url, nonce).has_value());
     REQUIRE(!mediate_pi_provider(R"({"providers":)", "deepseek", url, nonce).has_value());

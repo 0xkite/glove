@@ -222,6 +222,102 @@ auto run() -> int {
     );
     REQUIRE(refused("envfwd", {"--share-credential", "deepseek", "--env", "EXAMPLE_API_KEY"}));
     REQUIRE(refused("codex", {"--share-credential", "deepseek"}, "codex"));
+    // A writable mount of host Pi data could redirect a later shared key.
+    REQUIRE(refused("write-pi", {"--share-credential", "deepseek", "--write", pi_agent.string()}));
+    REQUIRE(refused(
+        "write-pi-parent", {"--share-credential", "deepseek", "--write", (fx.home / ".pi").string()}
+    ));
+    // Only `glove shell` accepts the flag.
+    {
+        fs::remove(fx.out / "env.txt", ec);
+        auto exec_argv = fx.argv("exec", {"--share-credential", "deepseek"});
+        exec_argv[1] = "exec";
+        exec_argv.erase(exec_argv.begin() + 2, exec_argv.begin() + 4); // drop --agent pi
+        REQUIRE(run_glove(exec_argv, fx.env()) != 0);
+        REQUIRE(!fs::exists(fx.out / "env.txt"));
+    }
+
+    // A saved environment keeps a --share-credential given at load time.
+    REQUIRE(run_glove(fx.argv("save", {"--save", "sharedenv"}), fx.env()) == 0);
+    {
+        fs::remove(fx.out / "models.json", ec);
+        auto load_argv = fx.argv("load", {"--share-credential", "deepseek"});
+        load_argv.insert(load_argv.begin() + 2, "sharedenv");
+        REQUIRE(run_glove(load_argv, fx.env()) == 0);
+        const auto loaded_models = slurp(fx.out / "models.json");
+        REQUIRE(loaded_models.find("/p/deepseek\"") != std::string::npos);
+        REQUIRE(loaded_models.find("glove-session-") != std::string::npos);
+    }
+
+    // Second HOME: a dotfiles-symlinked models.json that defines a custom
+    // provider (key from a named host variable) and redirects a catalog one.
+    fixture fx2 = fx;
+    fx2.home = fx.base / "home2";
+    const auto pi_agent2 = fx2.home / ".pi" / "agent";
+    const auto dotfiles = fx2.home / ".dotfiles" / "pi";
+    fs::create_directories(pi_agent2 / "install", ec);
+    fs::create_directories(dotfiles, ec);
+    REQUIRE(!ec);
+    fs::create_directory_symlink(pi_agent / "install" / "releases", pi_agent2 / "install" / "releases", ec);
+    REQUIRE(!ec);
+    {
+        std::ofstream(pi_agent2 / "install" / "current-version") << "9.9.9\n";
+        std::ofstream(dotfiles / "models.json")
+            << R"({"providers":{"custom1":{"baseUrl":"https://api.custom1.example/v1",)"
+               R"("api":"openai-completions","apiKey":"$CUSTOM1_SECRET"},)"
+               R"("deepseek":{"baseUrl":"https://gw.example.com/v1"}}})";
+        std::ofstream(pi_agent2 / "auth.json")
+            << R"({"deepseek":{"type":"api_key","key":"sk-deepseek-host-fixture"}})";
+    }
+    fs::create_symlink(dotfiles / "models.json", pi_agent2 / "models.json", ec);
+    REQUIRE(!ec);
+    auto env2 = fx2.env();
+    env2.emplace_back("CUSTOM1_SECRET=custom1-host-fixture");
+    {
+        fs::remove(fx.out / "models.json", ec);
+        REQUIRE(run_glove(fx2.argv("custom", {"--share-credential", "custom1"}), env2) == 0);
+        const auto custom_models = slurp(fx.out / "models.json");
+        REQUIRE(custom_models.find("/p/custom1/v1\"") != std::string::npos);
+        REQUIRE(custom_models.find("custom1-host-fixture") == std::string::npos);
+        REQUIRE(custom_models.find("CUSTOM1_SECRET") == std::string::npos);
+        REQUIRE(slurp(fx.out / "env.txt").find("custom1-host-fixture") == std::string::npos);
+    }
+    const auto refused2 = [&](const std::string& tag, const std::vector<std::string>& extra,
+                              const std::vector<std::string>& env) -> bool {
+        fs::remove(fx.out / "env.txt", ec);
+        return run_glove(fx2.argv(tag, extra), env) != 0 && !fs::exists(fx.out / "env.txt");
+    };
+    // The exact variable being shared cannot also be forwarded.
+    REQUIRE(refused2("envfwd2", {"--share-credential", "custom1", "--env", "CUSTOM1_SECRET"}, env2));
+    // A catalog provider redirected by models.json needs the origin confirmed.
+    REQUIRE(refused2("redirect", {"--share-credential", "deepseek"}, env2));
+    REQUIRE(refused2(
+        "redirect-wrong",
+        {"--share-credential", "deepseek", "--share-credential-origin", "api.deepseek.com"},
+        env2
+    ));
+    {
+        fs::remove(fx.out / "models.json", ec);
+        REQUIRE(
+            run_glove(
+                fx2.argv(
+                    "redirect-ok",
+                    {"--share-credential", "deepseek", "--share-credential-origin", "gw.example.com"}
+                ),
+                env2
+            ) == 0
+        );
+        REQUIRE(slurp(fx.out / "models.json").find("/p/deepseek/v1\"") != std::string::npos);
+    }
+    // A host credential file that exists but cannot be read refuses the launch.
+    fs::permissions(pi_agent2 / "auth.json", fs::perms::none, ec);
+    REQUIRE(!ec);
+    REQUIRE(refused2(
+        "unreadable",
+        {"--share-credential", "deepseek", "--share-credential-origin", "gw.example.com"},
+        env2
+    ));
+    fs::permissions(pi_agent2 / "auth.json", fs::perms::owner_read | fs::perms::owner_write, ec);
 
     fs::remove_all(fx.base, ec);
     return 0;

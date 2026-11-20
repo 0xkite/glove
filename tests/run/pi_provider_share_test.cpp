@@ -68,7 +68,14 @@ auto resolves_three_credential_shapes() -> int {
     REQUIRE(google.has_value());
     REQUIRE(google->host == "generativelanguage.googleapis.com");
     REQUIRE(google->base_path == "/v1beta");
-    REQUIRE(google->allowed_paths == std::vector<std::string>{"/v1beta/models/*"});
+    REQUIRE(
+        google->allowed_paths == std::vector<std::string>{
+                                     "/v1beta/models/*:generateContent",
+                                     "/v1beta/models/*:streamGenerateContent",
+                                     "/v1beta/models/*:countTokens",
+                                 }
+    );
+    REQUIRE(!google->origin_from_models_json);
     return 0;
 }
 
@@ -83,6 +90,8 @@ auto models_json_overrides_and_custom_providers() -> int {
     REQUIRE(proxied->host == "gw.example.com");
     REQUIRE(proxied->base_path == "/deepseek/v1");
     REQUIRE(proxied->allowed_paths == std::vector<std::string>{"/deepseek/v1/chat/completions"});
+    REQUIRE(proxied->origin_from_models_json);
+    REQUIRE(proxied->catalog_hosts == std::vector<std::string>{"api.deepseek.com"});
 
     // A provider defined only in models.json needs no catalog.
     auto custom = resolve_pi_shared_provider(
@@ -96,6 +105,8 @@ auto models_json_overrides_and_custom_providers() -> int {
     REQUIRE(contains(custom->allowed_paths, "/v1/chat/completions"));
     REQUIRE(contains(custom->allowed_paths, "/v1/responses"));
     REQUIRE(custom->allowed_paths.size() == 2);
+    REQUIRE(custom->origin_from_models_json);
+    REQUIRE(custom->catalog_hosts.empty());
     return 0;
 }
 
@@ -123,6 +134,12 @@ auto refusals() -> int {
              "https://api.example.com/v1?key=x",
              "https://api.example.com/v1/../admin",
              "https://api.example.com:99999/v1",
+             "https://0x7f.0.0.1/v1",
+             "https://0177.0.0.1/v1",
+             "https://10.0.0.1/v1",
+             "https://169.254.169.254/latest",
+             "https://api.example.com./v1",
+             "https://localhost./v1",
          }) {
         REQUIRE(refused("p", catalog("p", "openai-completions", url), ""));
     }
@@ -168,7 +185,8 @@ auto secrets() -> int {
     auto api_key = pi_shared_provider_secret(
         "deepseek", R"({"deepseek":{"type":"api_key","key":"sk-auth"}})", "", no_env
     );
-    REQUIRE(api_key.has_value() && *api_key == "sk-auth");
+    REQUIRE(api_key.has_value() && api_key->value == "sk-auth");
+    REQUIRE(!api_key->environment_variable);
 
     // Subscription logins cannot be substituted by a nonce yet.
     auto oauth = pi_shared_provider_secret(
@@ -188,12 +206,13 @@ auto secrets() -> int {
             std::string{R"({"providers":{"runinfra":{"apiKey":")"} + std::string{ref} + R"("}}})",
             env
         );
-        REQUIRE(from_env.has_value() && *from_env == "env-secret");
+        REQUIRE(from_env.has_value() && from_env->value == "env-secret");
+        REQUIRE(from_env->environment_variable == std::optional<std::string>{"RUNINFRA_KEY"});
     }
     auto literal = pi_shared_provider_secret(
         "runinfra", "", R"({"providers":{"runinfra":{"apiKey":"sk-literal"}}})", no_env
     );
-    REQUIRE(literal.has_value() && *literal == "sk-literal");
+    REQUIRE(literal.has_value() && literal->value == "sk-literal");
 
     // Commands, unset variables, framing bytes, and absence are refused.
     REQUIRE(!pi_shared_provider_secret(
@@ -209,6 +228,22 @@ auto secrets() -> int {
     )
                  .has_value());
     REQUIRE(!pi_shared_provider_secret("deepseek", "{}", "{}", no_env).has_value());
+
+    // Pi's conventional `<PROVIDER>_API_KEY` host variable is the last source.
+    const auto conventional = [](std::string_view name) -> std::optional<std::string> {
+        if (name == "DEEPSEEK_API_KEY" || name == "OPENCODE_GO_API_KEY") {
+            return std::string{"conventional-secret"};
+        }
+        return std::nullopt;
+    };
+    for (const std::string_view provider : {"deepseek", "opencode-go"}) {
+        auto fallback = pi_shared_provider_secret(provider, "{}", "{}", conventional);
+        REQUIRE(fallback.has_value() && fallback->value == "conventional-secret");
+        REQUIRE(fallback->environment_variable.has_value());
+    }
+    auto missing = pi_shared_provider_secret("deepseek", "{}", "{}", no_env);
+    REQUIRE(!missing.has_value());
+    REQUIRE(missing.error().find("DEEPSEEK_API_KEY") != std::string::npos);
     return 0;
 }
 

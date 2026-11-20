@@ -317,9 +317,9 @@ auto serialization_cases() -> int {
     agent_goog.headers.emplace_back("x-goog-api-key", "agent-supplied");
     // A credential field the transport owns is refused, never forwarded beside
     // the injected one.
-    auto owned = serialize_request(agent_goog, credential_scheme::bearer);
-    REQUIRE(!owned);
-    REQUIRE(owned.error().find("owned by the transport") != std::string::npos);
+    auto refused_owned = serialize_request(agent_goog, credential_scheme::bearer);
+    REQUIRE(!refused_owned);
+    REQUIRE(refused_owned.error().find("owned by the transport") != std::string::npos);
 
     request.upstream_port = 8443;
     auto ported = serialize_request(request, credential_scheme::x_api_key);
