@@ -16,7 +16,11 @@ enum class endpoint_provider : std::uint8_t {
     openai,
     github,
     custom,
-    deepseek,
+    // The credential is injected into the field where the client presented
+    // the session nonce (`Authorization: Bearer`, `x-api-key`, or
+    // `x-goog-api-key`), so one rule serves any provider whose client formats
+    // its own authentication header.
+    client_placed,
 };
 
 struct credentialed_endpoint_rule {
@@ -56,6 +60,9 @@ struct upstream_request {
     // are already removed: the transport sets Host and the credential itself.
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    // Lowercase name of the header that carried the session nonce. Used to
+    // place the secret for `endpoint_provider::client_placed`.
+    std::string credential_field;
     // The provider credential to present. Host memory only; never leaves it as
     // plain agent-visible state.
     std::string secret_token;

@@ -17,6 +17,7 @@ namespace glove::net::http {
 enum class credential_scheme : std::uint8_t {
     x_api_key,
     bearer,
+    x_goog_api_key,
 };
 
 // Serialise one HTTP/1.1 request in origin form with exactly one Host, an

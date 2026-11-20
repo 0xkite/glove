@@ -110,7 +110,9 @@ auto refusals() -> int {
     REQUIRE(!valid_pi_provider_name(""));
     REQUIRE(!valid_pi_provider_name("Upper"));
     REQUIRE(valid_pi_provider_name("opencode-go"));
-    REQUIRE(refused("../anthropic", catalog("../anthropic", "anthropic-messages", "https://a.b"), ""));
+    REQUIRE(
+        refused("../anthropic", catalog("../anthropic", "anthropic-messages", "https://a.b"), "")
+    );
     // Templated, plaintext, loopback, userinfo, query, and dot-segment upstreams.
     for (const std::string_view url : {
              "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/x",
@@ -214,7 +216,9 @@ auto secrets() -> int {
 
 auto main() -> int {
     for (const auto step :
-         {resolves_three_credential_shapes, models_json_overrides_and_custom_providers, refusals,
+         {resolves_three_credential_shapes,
+          models_json_overrides_and_custom_providers,
+          refusals,
           secrets}) {
         if (const int rc = step(); rc != 0) {
             return rc;

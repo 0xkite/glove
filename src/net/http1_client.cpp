@@ -327,6 +327,7 @@ constexpr auto serializer_owned_fields = std::to_array<std::string_view>({
     "proxy-connection",
     "proxy-authorization",
     "x-api-key",
+    "x-goog-api-key",
     "authorization",
 });
 
@@ -341,6 +342,8 @@ auto credential_field(credential_scheme scheme, std::string_view secret) -> std:
         return "x-api-key: " + std::string{secret};
     case credential_scheme::bearer:
         return "Authorization: Bearer " + std::string{secret};
+    case credential_scheme::x_goog_api_key:
+        return "x-goog-api-key: " + std::string{secret};
     }
     return {};
 }

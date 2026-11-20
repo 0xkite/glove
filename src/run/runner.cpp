@@ -17,6 +17,7 @@
 #include "glove/reflect/codegen.hpp"
 #include "glove/reflect/extension.hpp"
 #include "glove/run/pi_host_config.hpp"
+#include "glove/run/pi_provider_share.hpp"
 
 #include "provider_endpoint.hpp"
 
@@ -1028,9 +1029,6 @@ struct preset_definition {
     detail::provider_surface surface;
     std::string_view base_url_env;
     std::string_view api_key_env;
-    // When set, the client is steered through this provider entry of the guest
-    // Pi models.json instead of environment variables.
-    std::string_view pi_models_provider{};
 };
 
 auto preset_definition_for(std::string_view name) -> std::optional<preset_definition> {
@@ -1050,16 +1048,6 @@ auto preset_definition_for(std::string_view name) -> std::optional<preset_defini
             .surface = detail::provider_surface::legacy_openai,
             .base_url_env = "OPENAI_BASE_URL",
             .api_key_env = "OPENAI_API_KEY",
-        };
-    }
-    if (name == "pi-deepseek") {
-        return preset_definition{
-            .provider = glove::net::endpoint_provider::deepseek,
-            .label = "pi (--share-credential deepseek)",
-            .surface = detail::provider_surface::pi_deepseek,
-            .base_url_env = {},
-            .api_key_env = "DEEPSEEK_API_KEY",
-            .pi_models_provider = "deepseek",
         };
     }
     if (name == "pi") {
@@ -1101,16 +1089,114 @@ struct preset_startup {
     std::string pi_nonce;
 };
 
+// Pi's managed install keeps one provider catalog file per provider under the
+// current release. A missing install or file yields an empty catalog, so a
+// provider defined only in the host models.json can still be shared.
+auto host_pi_provider_catalog(const std::filesystem::path& pi_agent_dir, std::string_view name)
+    -> std::string {
+    auto version = read_small_file(pi_agent_dir / "install" / "current-version");
+    if (!version) {
+        return {};
+    }
+    while (!version->empty() && (version->back() == '\n' || version->back() == '\r')) {
+        version->pop_back();
+    }
+    const bool safe_version = !version->empty() && *version != "." && *version != ".." &&
+                              std::ranges::all_of(*version, [](char c) {
+                                  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                                         (c >= 'A' && c <= 'Z') || c == '.' || c == '_' ||
+                                         c == '+' || c == '-';
+                              });
+    if (!safe_version) {
+        return {};
+    }
+    const auto file = pi_agent_dir / "install" / "releases" / *version / "node_modules" /
+                      "@earendil-works" / "pi-ai" / "dist" / "providers" / "data" /
+                      (std::string{name} + ".json");
+    return read_small_file(file).value_or(std::string{});
+}
+
+// Resolve the provider from host Pi data, read its secret on the host, and
+// start one client-placed endpoint for it. The guest receives only the
+// endpoint base URL and a session nonce (staged into its models.json later).
+auto start_shared_pi_provider(
+    std::string_view name, const std::shared_ptr<glove::audit::sink>& sink
+) -> std::expected<preset_startup, std::string> {
+    const char* home = std::getenv("HOME");
+    if (home == nullptr || *home == '\0') {
+        return std::unexpected(std::string{"--share-credential needs HOME to find host Pi data"});
+    }
+    if (!valid_pi_provider_name(name)) {
+        return std::unexpected("invalid Pi provider name '" + printable(name) + "'");
+    }
+    const auto pi_agent_dir = std::filesystem::path{home} / ".pi" / "agent";
+    const auto models = read_small_file(pi_agent_dir / "models.json").value_or(std::string{});
+    auto provider =
+        resolve_pi_shared_provider(name, host_pi_provider_catalog(pi_agent_dir, name), models);
+    if (!provider) {
+        return std::unexpected(provider.error());
+    }
+    const auto auth = read_small_file(pi_agent_dir / "auth.json").value_or(std::string{});
+    auto secret = pi_shared_provider_secret(name, auth, models, [](std::string_view variable) {
+        const std::string key{variable};
+        const char* value = std::getenv(key.c_str());
+        return value != nullptr && *value != '\0' ? std::optional<std::string>{value}
+                                                  : std::nullopt;
+    });
+    if (!secret) {
+        return std::unexpected(secret.error());
+    }
+    auto nonce = random_session_nonce();
+    if (!nonce) {
+        return std::unexpected(nonce.error());
+    }
+    auto endpoint_options =
+        detail::make_shared_provider_endpoint_options(*provider, std::move(*secret), *nonce);
+    if (!endpoint_options) {
+        return std::unexpected(endpoint_options.error());
+    }
+    endpoint_options->on_event =
+        [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
+        const std::string subject = event.method + " " + event.path;
+        const auto status = event.allowed ? glove::mcp::tool_call_status::ok
+                                          : glove::mcp::tool_call_status::invalid_arguments;
+        if (auto audited =
+                record(sink, glove::audit::action::egress, subject, status, event.detail);
+            !audited) {
+            return std::unexpected(audited.error());
+        }
+        return {};
+    };
+    auto endpoint = glove::net::start_credentialed_endpoint(std::move(*endpoint_options));
+    if (!endpoint) {
+        return std::unexpected(std::string{"credentialed endpoint: "} + endpoint.error());
+    }
+    auto base_url = (*endpoint)->base_url(glove::net::endpoint_provider::client_placed);
+    if (!base_url) {
+        return std::unexpected(base_url.error());
+    }
+    preset_startup startup;
+    startup.bridge = glove::container::bridge_endpoint_settings{.port = (*endpoint)->port()};
+    startup.pi_models_provider = provider->name;
+    startup.pi_base_url = *base_url + provider->base_path;
+    startup.pi_nonce = std::move(*nonce);
+    startup.endpoint = std::move(*endpoint);
+    return startup;
+}
+
 // Start the mediated reverse endpoint for `--agent <preset>` and compute the
 // environment that steers the client at it. The real provider secret is read
 // only here, on the host, and is never placed in the child environment.
 auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
     -> std::expected<preset_startup, std::string> {
     preset_startup startup;
-    if (opts.share_credential && opts.agent_preset != "pi-deepseek") {
-        return std::unexpected(
-            std::string{"--share-credential is supported only by glove shell --agent pi"}
-        );
+    if (opts.share_credential) {
+        if (opts.agent_preset != "pi-shared") {
+            return std::unexpected(
+                std::string{"--share-credential is supported only by glove shell --agent pi"}
+            );
+        }
+        return start_shared_pi_provider(*opts.share_credential, sink);
     }
     if (!opts.agent_preset) {
         return startup;
@@ -1143,7 +1229,6 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
                  std::string_view{"ANTHROPIC_BASE_URL"},
                  std::string_view{"OPENAI_API_KEY"},
                  std::string_view{"OPENAI_BASE_URL"},
-                 std::string_view{"DEEPSEEK_API_KEY"},
              }) {
             if (name == reserved) {
                 return std::unexpected(
@@ -1197,14 +1282,8 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     startup.bridge = glove::container::bridge_endpoint_settings{
         .port = (*endpoint)->port(),
     };
-    if (definition->pi_models_provider.empty()) {
-        startup.environment.push_back(std::string{definition->base_url_env} + "=" + *base_url);
-        startup.environment.push_back(api_key_env + "=" + *nonce);
-    } else {
-        startup.pi_models_provider = std::string{definition->pi_models_provider};
-        startup.pi_base_url = *base_url;
-        startup.pi_nonce = *nonce;
-    }
+    startup.environment.push_back(std::string{definition->base_url_env} + "=" + *base_url);
+    startup.environment.push_back(api_key_env + "=" + *nonce);
     startup.endpoint = std::move(*endpoint);
     // Drop the real credential from this process's environment now that the
     // endpoint owns it. Otherwise it lingers and is inherited by every child

@@ -45,12 +45,21 @@ struct provider_case {
 };
 
 constexpr std::array<provider_case, 3> providers{{
-    {"deepseek", "openai-completions", "https://api.deepseek.com", "/p/deepseek\"",
+    {"deepseek",
+     "openai-completions",
+     "https://api.deepseek.com",
+     "/p/deepseek\"",
      "sk-deepseek-host-fixture"},
-    {"anthropic", "anthropic-messages", "https://api.anthropic.com", "/p/anthropic\"",
+    {"anthropic",
+     "anthropic-messages",
+     "https://api.anthropic.com",
+     "/p/anthropic\"",
      "sk-ant-host-fixture"},
-    {"google", "google-generative-ai", "https://generativelanguage.googleapis.com/v1beta",
-     "/p/google/v1beta\"", "google-host-fixture"},
+    {"google",
+     "google-generative-ai",
+     "https://generativelanguage.googleapis.com/v1beta",
+     "/p/google/v1beta\"",
+     "google-host-fixture"},
 }};
 
 auto run_glove(std::vector<std::string> argv_owned, std::vector<std::string> env_owned) -> int {
@@ -156,8 +165,7 @@ auto run() -> int {
     std::string auth = "{";
     for (const auto& p : providers) {
         std::ofstream(catalog_dir / (std::string{p.name} + ".json")) << catalog_json(p);
-        auth += std::string{"\""} + p.name + R"(":{"type":"api_key","key":")" + p.host_key +
-                "\"},";
+        auth += std::string{"\""} + p.name + R"(":{"type":"api_key","key":")" + p.host_key + "\"},";
     }
     auth += R"("openai-codex":{"type":"oauth","access":"codex-access-fixture","refresh":"r",)"
             R"("expires":1}})";
@@ -209,9 +217,9 @@ auto run() -> int {
     REQUIRE(refused("oauth", {"--share-credential", "openai-codex"}));
     REQUIRE(refused("unknown", {"--share-credential", "nowhere"}));
     REQUIRE(refused("badname", {"--share-credential", "../deepseek"}));
-    REQUIRE(refused(
-        "egress", {"--share-credential", "deepseek", "--egress-allow", "api.deepseek.com"}
-    ));
+    REQUIRE(
+        refused("egress", {"--share-credential", "deepseek", "--egress-allow", "api.deepseek.com"})
+    );
     REQUIRE(refused("envfwd", {"--share-credential", "deepseek", "--env", "EXAMPLE_API_KEY"}));
     REQUIRE(refused("codex", {"--share-credential", "deepseek"}, "codex"));
 

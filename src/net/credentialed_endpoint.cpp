@@ -193,6 +193,7 @@ constexpr auto request_header_denylist = std::to_array<std::string_view>({
     "content-length",
     "expect",
     "x-api-key",
+    "x-goog-api-key",
     "authorization",
     "forwarded",
     "x-forwarded-for",
@@ -269,6 +270,7 @@ struct parsed_request_head {
     std::string http_version;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string provided_nonce;
+    std::string credential_field;
     std::size_t content_length = 0;
     bool has_content_length = false;
 };
@@ -413,7 +415,7 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
             }
             parsed.content_length = *length;
             parsed.has_content_length = true;
-        } else if (name == "x-api-key") {
+        } else if (name == "x-api-key" || name == "x-goog-api-key") {
             // Exactly one credential source may name the nonce. A second one is
             // ambiguous, and a request carrying both would forward two
             // credentials once injection is implemented.
@@ -422,6 +424,7 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
             }
             has_api_key = true;
             parsed.provided_nonce = std::string{val};
+            parsed.credential_field = name;
         } else if (name == "authorization") {
             if (has_api_key || has_authorization) {
                 return std::unexpected(std::string{"duplicate credential header"});
@@ -432,6 +435,7 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
             }
             has_authorization = true;
             parsed.provided_nonce = std::string{val.substr(bearer_prefix.size())};
+            parsed.credential_field = "authorization";
         } else if (name == "host") {
             if (has_host) {
                 return std::unexpected(std::string{"duplicate host header"});
@@ -831,6 +835,7 @@ private:
         }
         request.body = std::move(body);
         request.secret_token = matched_rule->secret_token;
+        request.credential_field = head->credential_field;
         const auto request_connection_named = connection_named_fields(head->headers);
         for (const auto& [name, value] : head->headers) {
             if (is_forwardable_request_header(name) &&

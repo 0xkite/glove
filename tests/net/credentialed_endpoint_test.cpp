@@ -636,9 +636,8 @@ auto run() -> int {
         REQUIRE(wrong.starts_with("HTTP/1.1 401 Unauthorized"));
         const auto both = send_and_receive(
             placed_port,
-            target +
-                "x-goog-api-key: glove-nonce-placed\r\nx-api-key: glove-nonce-placed\r\n"
-                "Content-Length: 0\r\n\r\n"
+            target + "x-goog-api-key: glove-nonce-placed\r\nx-api-key: glove-nonce-placed\r\n"
+                     "Content-Length: 0\r\n\r\n"
         );
         REQUIRE(!both.starts_with("HTTP/1.1 200 OK"));
         REQUIRE(seen.size() == before);

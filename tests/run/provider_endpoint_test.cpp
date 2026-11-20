@@ -1,6 +1,6 @@
-#include "provider_endpoint.hpp"
-
 #include "glove/run/pi_provider_share.hpp"
+
+#include "provider_endpoint.hpp"
 
 #include <cstdio>
 #include <string>

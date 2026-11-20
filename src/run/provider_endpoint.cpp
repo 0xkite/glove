@@ -35,12 +35,6 @@ auto make_provider_endpoint_options(
                 ? std::vector<std::string>{"/v1/chat/completions", "/v1/responses", "/v1/models"}
                 : std::vector<std::string>{"/v1/responses"};
         break;
-    case provider_surface::pi_deepseek:
-        rule.provider = net::endpoint_provider::deepseek;
-        rule.path_prefix = "/deepseek";
-        rule.upstream_host = "api.deepseek.com";
-        rule.allowed_paths = {"/chat/completions"};
-        break;
     default:
         return std::unexpected(std::string{"unsupported provider endpoint surface"});
     }
@@ -55,6 +49,39 @@ auto make_provider_endpoint_options(
     options.endpoints.push_back(std::move(rule));
     // The response is buffered through the existing transport. Cover one full
     // bounded generation rather than mistaking a slow stream for a dead peer.
+    options.upstream_deadline_ms = 10 * 60 * 1000;
+    options.on_event = std::move(on_event);
+    return options;
+}
+
+auto make_shared_provider_endpoint_options(
+    const pi_shared_provider& provider,
+    std::string secret,
+    std::string nonce,
+    provider_event_handler on_event
+) -> std::expected<net::credentialed_endpoint_options, std::string> {
+    if (secret.empty() || nonce.empty() || secret.find('\0') != std::string::npos ||
+        nonce.find('\0') != std::string::npos) {
+        return std::unexpected(std::string{"provider endpoint requires host secret and nonce"});
+    }
+    if (!valid_pi_provider_name(provider.name) || provider.host.empty() ||
+        provider.allowed_paths.empty()) {
+        return std::unexpected(std::string{"shared provider is incomplete"});
+    }
+    net::credentialed_endpoint_rule rule;
+    rule.provider = net::endpoint_provider::client_placed;
+    rule.path_prefix = "/p/" + provider.name;
+    rule.upstream_host = provider.host;
+    rule.upstream_port = provider.port;
+    rule.allowed_paths = provider.allowed_paths;
+    rule.allowed_methods = {"POST"};
+    rule.secret_token = std::move(secret);
+    rule.session_nonce = std::move(nonce);
+    net::credentialed_endpoint_options options;
+    options.forward = net::make_tls_forwarder({
+        .allowed_upstreams = {{rule.upstream_host, rule.upstream_port}},
+    });
+    options.endpoints.push_back(std::move(rule));
     options.upstream_deadline_ms = 10 * 60 * 1000;
     options.on_event = std::move(on_event);
     return options;

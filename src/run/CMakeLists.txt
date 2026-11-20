@@ -4,6 +4,7 @@ add_library(glove_run STATIC
     pi_selection.cpp
     pi_guest_config.cpp
     pi_host_config.cpp
+    pi_provider_share.cpp
     pi_catalog.cpp
     pi_private_state.cpp
     native_private_state.cpp

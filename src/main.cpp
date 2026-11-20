@@ -3,6 +3,7 @@
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/json_codec.hpp"
 #include "glove/run/pi_host_config.hpp"
+#include "glove/run/pi_provider_share.hpp"
 #include "glove/run/runner.hpp"
 #include "glove/term/terminal.hpp"
 #include "glove/version.hpp"
@@ -1509,24 +1510,30 @@ auto shell_subcommand(std::span<char* const> args) -> int {
     // falls back to raw provider egress or to another preset.
     if (opts.share_credential) {
         const char* refusal = nullptr;
-        if (*opts.share_credential != "deepseek") {
-            refusal = "--share-credential supports only 'deepseek'";
+        if (!glove::run::valid_pi_provider_name(*opts.share_credential)) {
+            refusal = "--share-credential needs a Pi provider name (for example deepseek)";
         } else if (driver != "pi") {
             refusal = "--share-credential requires --agent pi";
         } else if (!opts.egress.empty()) {
             refusal = "--share-credential cannot be combined with --egress-allow: the provider "
                       "is reached only through the credentialed endpoint";
-        } else if (
-            const char* key = std::getenv("DEEPSEEK_API_KEY"); key == nullptr || *key == '\0'
-        ) {
-            refusal = "--share-credential deepseek requires the host environment variable "
-                      "DEEPSEEK_API_KEY";
+        } else {
+            // A forwarded key variable would hand the sandbox a real secret
+            // beside the mediated one.
+            for (const auto& name : opts.environment_names) {
+                if (name.find("API_KEY") != std::string::npos || name.ends_with("_TOKEN") ||
+                    name.ends_with("_SECRET")) {
+                    refusal = "--share-credential cannot be combined with --env of a key, token, "
+                              "or secret variable";
+                    break;
+                }
+            }
         }
         if (refusal != nullptr) {
             std::fprintf(stderr, "glove shell: %s\n", refusal);
             return 2;
         }
-        opts.agent_preset = "pi-deepseek";
+        opts.agent_preset = "pi-shared";
     } else if (driver == "agy" || !opts.egress.empty()) {
         opts.agent_preset.reset();
     } else if (driver == "pi" || driver == "claude" || driver == "claude-code") {
