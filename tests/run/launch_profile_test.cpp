@@ -242,6 +242,45 @@ auto accepts_plain_subtleties() -> int {
     return 0;
 }
 
+// system_services names come from the vetted catalog: the profile accepts
+// them, an unknown or raw name fails at load, and the CLI list is appended.
+auto parses_system_services() -> int {
+    auto parsed = parse_launch_profile(
+        "version: 1\n"
+        "system_services: [network-config, tls-config]\n"
+    );
+    REQUIRE(parsed.has_value());
+    REQUIRE((parsed->system_services == std::vector<std::string>{"network-config", "tls-config"}));
+
+    auto round_trip = parse_launch_profile(glove::run::encode_launch_profile(*parsed));
+    REQUIRE(round_trip.has_value());
+    REQUIRE(*round_trip == *parsed);
+
+    auto unknown = parse_launch_profile("version: 1\nsystem_services: [no-such-service]\n");
+    REQUIRE(!unknown.has_value());
+    REQUIRE(unknown.error().contains("unknown system service 'no-such-service'"));
+
+    auto raw = parse_launch_profile(
+        "version: 1\nsystem_services: [com.apple.SystemConfiguration.configd]\n"
+    );
+    REQUIRE(!raw.has_value());
+    REQUIRE(raw.error().contains("raw mach service names are not accepted"));
+
+    auto absent = parse_launch_profile("version: 1\n");
+    REQUIRE(absent.has_value() && absent->system_services.empty());
+
+    glove::run::options cli;
+    cli.system_services = {"tls-config"};
+    cli.agent_argv = {"/bin/true"};
+    auto applied = glove::run::apply_launch_profile(*parsed, cli, "/home/u");
+    REQUIRE(applied.has_value());
+    REQUIRE(
+        (applied->system_services ==
+         std::vector<std::string>{"network-config", "tls-config", "tls-config"})
+    );
+    return 0;
+}
+
 auto layers_command_line() -> int {
     auto parsed = parse_launch_profile(
         "version: 1\n"
@@ -401,6 +440,7 @@ int main() {
          {parses_full_profile,
           refuses_ambiguous_yaml,
           accepts_plain_subtleties,
+          parses_system_services,
           layers_command_line}) {
         if (const int failed = step(); failed != 0) {
             return failed;
