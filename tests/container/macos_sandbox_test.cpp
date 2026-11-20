@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -292,6 +293,54 @@ auto sandboxed_process_signals_own_child_not_host() -> int {
     return 0;
 }
 
+// A grant spelled through a symlink must let path resolution traverse the link
+// (metadata only) without making any other symlink readable.
+auto grant_spelled_through_symlink_resolves() -> int {
+    const char* home = std::getenv("HOME");
+    REQUIRE(home != nullptr && *home != '\0');
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path base = fs::path{home} / (".glove_t003_" + std::to_string(::getpid()));
+    fs::create_directories(base / "real", ec);
+    REQUIRE(!ec);
+    { std::ofstream{base / "real" / "file"} << "x"; }
+    fs::create_directory_symlink("real", base / "link", ec);
+    REQUIRE(!ec);
+    fs::create_directory_symlink("real", base / "other_link", ec);
+    REQUIRE(!ec);
+
+    glove::container::profile prof;
+    prof.filesystem.push_back({.path = (base / "link").string()});
+    std::string script = "if cat '" + (base / "link").string() +
+                         "/file' >/dev/null 2>&1; then a=OK; else a=DENY; fi; ";
+    script += "if ls '" + (base / "other_link").string() +
+              "' >/dev/null 2>&1; then b=OK; else b=DENY; fi; ";
+    script += "echo via_link=$a unnamed_link=$b";
+
+    auto spawner = glove::container::make_default_spawner();
+    std::optional<std::string> line;
+    bool spawned = false;
+    if (spawner != nullptr) {
+        auto handle_or = spawner->spawn(prof, {"/bin/sh", "-c", script});
+        spawned = handle_or.has_value();
+        if (spawned) {
+            auto handle = std::move(*handle_or);
+            auto received = handle->transport().recv();
+            if (received.has_value()) {
+                line = *received;
+                std::fprintf(stderr, "probe: %s\n", line->c_str());
+            }
+        }
+    }
+    fs::remove_all(base, ec);
+    REQUIRE(spawner != nullptr);
+    REQUIRE(spawned);
+    REQUIRE(line.has_value());
+    REQUIRE(line->find("via_link=OK") != std::string::npos);
+    REQUIRE(line->find("unnamed_link=DENY") != std::string::npos);
+    return 0;
+}
+
 } // namespace
 
 auto main() -> int {
@@ -299,6 +348,9 @@ auto main() -> int {
         return failed;
     }
     if (const int failed = sandboxed_process_signals_own_child_not_host(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = grant_spelled_through_symlink_resolves(); failed != 0) {
         return failed;
     }
     if (const int failed = descendants_drained_before_reap(); failed != 0) {
