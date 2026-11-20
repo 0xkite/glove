@@ -1,6 +1,7 @@
 #include "glove/audit/sink.hpp"
 #include "glove/control/receipt_audit_unix_server.hpp"
 #include "glove/control/session_registry.hpp"
+#include "glove/detail/descriptor_limit.hpp"
 #include "glove/host/config.hpp"
 #include "glove/host/remote_backend.hpp"
 #include "glove/supervisor/library_bundle.hpp"
@@ -830,6 +831,7 @@ void print_usage() {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    glove::detail::raise_descriptor_soft_limit();
     try {
         if (argc == 2 &&
             (std::string_view{argv[1]} == "-V" || std::string_view{argv[1]} == "--version")) {

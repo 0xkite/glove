@@ -1,3 +1,4 @@
+#include "glove/detail/descriptor_limit.hpp"
 #include "glove/host/runtime_policy.hpp"
 #include "glove/supervisor/native_skill_runtime_adapter.hpp"
 
@@ -643,5 +644,7 @@ auto run() -> int {
 } // namespace
 
 auto main() -> int {
+    // The deep cases run at the depth bound, as glove itself does.
+    glove::detail::raise_descriptor_soft_limit();
     return run();
 }

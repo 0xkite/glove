@@ -1,5 +1,6 @@
 #include "glove/container/profile.hpp"
 #include "glove/container/spawner.hpp"
+#include "glove/detail/descriptor_limit.hpp"
 #include "glove/mcp/transport.hpp"
 #include "glove/net/credentialed_endpoint.hpp"
 
@@ -790,6 +791,8 @@ auto test_configuration(const std::string& probe) -> int {
 } // namespace
 
 auto main(int argc, char** argv) -> int {
+    // The deep cases run at the depth bound, as glove itself does.
+    glove::detail::raise_descriptor_soft_limit();
     if (argc != 3) {
         return 2;
     }
