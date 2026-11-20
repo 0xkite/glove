@@ -7,6 +7,10 @@ add_library(glove_container STATIC
     receipt_producer.cpp
     refinement_protocol.cpp
     resource_monitor.cpp
+    sandbox_denial_log.cpp
+    denial_telemetry.cpp
+    denial_decision.cpp
+    denial_trace.cpp
 )
 add_library(glove::container ALIAS glove_container)
 
@@ -22,6 +26,8 @@ if(APPLE)
     target_sources(glove_container PRIVATE
         macos/sandbox_spawner.cpp
         macos/runtime_filesystem.cpp
+        macos/denial_stream.cpp
+        macos/denial_monitor.cpp
         linux/pty_session_channel.cpp
     )
     target_include_directories(glove_container PRIVATE

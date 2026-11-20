@@ -13,6 +13,9 @@ struct launch_command {
     std::vector<std::string> arguments;
     std::vector<std::string> environment;
     std::optional<std::string> start_directory;
+    // The tag every deny rule of arguments[2] carries; not a secret from the
+    // launched process.
+    std::string denial_tag;
 };
 
 // Owns no process or descriptors. Reuses the backend's policy and program

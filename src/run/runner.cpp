@@ -16,9 +16,13 @@
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/codegen.hpp"
 #include "glove/reflect/extension.hpp"
+#include "glove/run/launch_profile.hpp"
 #include "glove/run/pi_host_config.hpp"
 
+#include "decoys.hpp"
+#include "exit_audit.hpp"
 #include "provider_endpoint.hpp"
+#include "secret_resolve.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -54,7 +58,13 @@
 #include <vector>
 
 #if defined(__APPLE__)
+#    include "glove/container/denial_telemetry.hpp"
+
+#    include "denial_audit.hpp"
+#    include "denial_trace_writer.hpp"
+
 #    include <mach-o/dyld.h>
+#    include <pwd.h>
 #endif
 
 extern "C" char** environ;
@@ -113,49 +123,63 @@ auto resolve_absolute(std::filesystem::path path) -> std::expected<std::string, 
     return result.lexically_normal().string();
 }
 
-auto append_selected_environment(
-    glove::container::profile& profile,
-    const std::vector<std::string>& names,
-    const std::vector<std::string>& extra_path_dirs
-) -> std::expected<void, std::string> {
+// Glove-managed variables, plus the outer-harness control variables. The
+// documented invariant is that the sandboxed child never receives Herdr's
+// socket path or binary path; allowing them through `--env` or a profile
+// would hand an agent the supervisor's control channel.
+auto reserved_environment_name(std::string_view name) -> bool {
+    for (const std::string_view reserved : {
+             "HOME",
+             "TMPDIR",
+             "GLOVE_SANDBOXED",
+             "HTTPS_PROXY",
+             "HTTP_PROXY",
+             "ALL_PROXY",
+             "HERDR_ENV",
+             "HERDR_PANE_ID",
+             "HERDR_BIN_PATH",
+             "HERDR_SOCKET_PATH",
+             "HERDR_AGENT",
+         }) {
+        if (name == reserved) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto append_selected_environment(glove::container::profile& profile, const options& opts)
+    -> std::expected<void, std::string> {
     std::string path_entry = "PATH=";
-    for (const auto& dir : extra_path_dirs) {
+    for (const auto& dir : opts.extra_path_dirs) {
         if (!dir.empty()) {
             path_entry += dir + ":";
         }
     }
     path_entry += "/usr/bin:/bin:/usr/sbin:/sbin";
     profile.environment = {std::move(path_entry), "TERM=xterm-256color"};
-    for (const auto& name : names) {
+    for (const auto& name : opts.environment_names) {
         if (name.empty() || name.find('=') != std::string::npos) {
             return std::unexpected(std::string{"--env requires a variable name, not NAME=VALUE"});
         }
-        // Glove-managed variables, plus the outer-harness control variables.
-        // The documented invariant is that the sandboxed child never receives
-        // Herdr's socket path or binary path; allowing them through `--env`
-        // would hand an agent the supervisor's control channel.
-        for (const auto* reserved : {
-                 "HOME",
-                 "TMPDIR",
-                 "GLOVE_SANDBOXED",
-                 "HTTPS_PROXY",
-                 "HTTP_PROXY",
-                 "ALL_PROXY",
-                 "HERDR_ENV",
-                 "HERDR_PANE_ID",
-                 "HERDR_BIN_PATH",
-                 "HERDR_SOCKET_PATH",
-                 "HERDR_AGENT",
-             }) {
-            if (name == reserved) {
-                return std::unexpected(
-                    std::string{"--env cannot override glove-managed variable "} + name
-                );
-            }
+        if (reserved_environment_name(name)) {
+            return std::unexpected(
+                std::string{"--env cannot override glove-managed variable "} + name
+            );
         }
         const char* value = std::getenv(name.c_str());
         if (value == nullptr) {
             return std::unexpected(std::string{"selected environment variable is unset: "} + name);
+        }
+        profile.environment.push_back(name + "=" + value);
+    }
+    for (const auto& [name, value] : opts.environment_values) {
+        if (name.empty() || name.find('=') != std::string::npos ||
+            value.find('\0') != std::string::npos) {
+            return std::unexpected("invalid profile environment entry '" + name + "'");
+        }
+        if (reserved_environment_name(name)) {
+            return std::unexpected("a profile cannot set glove-managed variable " + name);
         }
         profile.environment.push_back(name + "=" + value);
     }
@@ -166,9 +190,7 @@ auto build_profile(const options& opts, const std::filesystem::path& runtime_roo
     -> std::expected<glove::container::profile, std::string> {
     glove::container::profile profile;
     profile.allow_loopback_listen = opts.allow_loopback_listen;
-    if (auto environment =
-            append_selected_environment(profile, opts.environment_names, opts.extra_path_dirs);
-        !environment) {
+    if (auto environment = append_selected_environment(profile, opts); !environment) {
         return std::unexpected(environment.error());
     }
 
@@ -704,6 +726,16 @@ auto prepare_profile(const options& opts, const std::filesystem::path& runtime_r
     if (!validated) {
         return std::unexpected(std::string{"profile: "} + validated.error());
     }
+    // Glove's own configuration and state stay host-only, whatever the
+    // operator granted: an agent that could write a launch profile would
+    // choose its next sandbox.
+    std::vector<std::string> exposed;
+    for (const auto& rule : validated->filesystem) {
+        exposed.push_back(rule.path);
+    }
+    if (auto refused = refuse_glove_root_exposure(exposed, protected_glove_roots()); !refused) {
+        return std::unexpected(refused.error());
+    }
     if (auto prepared = provision(*validated); !prepared) {
         return std::unexpected(prepared.error());
     }
@@ -1087,10 +1119,18 @@ struct preset_startup {
 // Start the mediated reverse endpoint for `--agent <preset>` and compute the
 // environment that steers the client at it. The real provider secret is read
 // only here, on the host, and is never placed in the child environment.
-auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
-    -> std::expected<preset_startup, std::string> {
+auto start_agent_preset(
+    const options& opts,
+    const glove::container::profile& profile,
+    const std::shared_ptr<glove::audit::sink>& sink
+) -> std::expected<preset_startup, std::string> {
     preset_startup startup;
     if (!opts.agent_preset) {
+        if (opts.provider_secret) {
+            return std::unexpected(
+                std::string{"a provider secret needs an agent preset (--agent or profile agent)"}
+            );
+        }
         return startup;
     }
     auto definition = preset_definition_for(*opts.agent_preset);
@@ -1114,7 +1154,13 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     const std::string api_key_env{definition->api_key_env};
     // Reject host-credential-shaped selections. `--env` cannot smuggle a real
     // provider secret or a base-URL override past the mediated endpoint.
-    for (const std::string_view name : opts.environment_names) {
+    std::vector<std::string_view> selected{
+        opts.environment_names.begin(), opts.environment_names.end()
+    };
+    for (const auto& entry : opts.environment_values) {
+        selected.emplace_back(entry.name);
+    }
+    for (const std::string_view name : selected) {
         for (const std::string_view reserved : {
                  std::string_view{"ANTHROPIC_API_KEY"},
                  std::string_view{"ANTHROPIC_AUTH_TOKEN"},
@@ -1131,12 +1177,30 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
             }
         }
     }
-    const char* secret = std::getenv(api_key_env.c_str());
-    if (secret == nullptr || *secret == '\0') {
-        return std::unexpected(
-            std::string{"--agent "} + std::string{definition->label} +
-            " requires the host environment variable " + api_key_env
-        );
+    std::string secret;
+    if (opts.provider_secret) {
+        // A file secret must stay outside every grant, or the agent could
+        // read the credential the endpoint is keeping from it.
+        std::vector<std::string> exposed;
+        for (const auto& rule : profile.filesystem) {
+            exposed.push_back(rule.path);
+        }
+        auto resolved =
+            detail::resolve_secret(*opts.provider_secret, invoking_user_home(), exposed);
+        if (!resolved) {
+            return std::unexpected(resolved.error());
+        }
+        secret = std::move(*resolved);
+    } else {
+        const char* value = std::getenv(api_key_env.c_str());
+        if (value == nullptr || *value == '\0') {
+            return std::unexpected(
+                std::string{"--agent "} + std::string{definition->label} +
+                " requires the host environment variable " + api_key_env +
+                " or a profile secrets.provider"
+            );
+        }
+        secret = value;
     }
     auto nonce = random_session_nonce();
     if (!nonce) {
@@ -1144,7 +1208,7 @@ auto start_agent_preset(const options& opts, const std::shared_ptr<glove::audit:
     }
 
     auto endpoint_options =
-        detail::make_provider_endpoint_options(definition->surface, std::string{secret}, *nonce);
+        detail::make_provider_endpoint_options(definition->surface, std::move(secret), *nonce);
     if (!endpoint_options) {
         return std::unexpected(endpoint_options.error());
     }
@@ -1620,10 +1684,179 @@ void write_guest_mcp_configs(
 
 } // namespace
 
+#if defined(__APPLE__)
+namespace {
+
+// Sandbox denial telemetry is observation only: it never stops, delays past
+// its stated bounds, or fails a launch. A person at a terminal is told while
+// the CLI waits; anyone is told when telemetry is missing or incomplete.
+// Nothing is printed while the agent runs, since it may own the terminal.
+void print_denial_notice(detail::denial_notice what, std::string_view reason = {}) {
+    const auto line = detail::denial_notice_line(what, reason);
+    static_cast<void>(std::fputs(line.c_str(), stderr));
+    static_cast<void>(std::fflush(stderr));
+}
+
+// The invoking user's home directory as the kernel names it, or empty.
+auto host_home() -> std::string {
+    std::vector<char> buffer(16384);
+    struct ::passwd account{};
+    struct ::passwd* found = nullptr;
+    if (::getpwuid_r(::geteuid(), &account, buffer.data(), buffer.size(), &found) != 0 ||
+        found == nullptr || found->pw_dir == nullptr) {
+        return {};
+    }
+    std::error_code ec;
+    const auto home = std::filesystem::weakly_canonical(found->pw_dir, ec);
+    return ec ? std::string{} : home.string();
+}
+
+// Opens the operator's --denial-trace file, or returns null when none was
+// asked for. The file must not be reachable through any mount of the final
+// profile, or the agent could read or rewrite its own training record.
+auto open_denial_trace(const options& opts, const glove::container::profile& profile)
+    -> std::expected<std::unique_ptr<detail::denial_trace_writer>, std::string> {
+    if (!opts.denial_trace) {
+        return nullptr;
+    }
+    std::error_code ec;
+    const auto absolute = std::filesystem::absolute(*opts.denial_trace, ec);
+    if (ec || !absolute.has_filename()) {
+        return std::unexpected(std::string{"denial trace path is not a file path"});
+    }
+    const auto parent = std::filesystem::weakly_canonical(absolute.parent_path(), ec);
+    if (ec) {
+        return std::unexpected(std::string{"denial trace directory cannot be resolved"});
+    }
+    const auto resolved = parent / absolute.filename();
+    std::vector<std::string> roots;
+    for (const auto& rule : profile.filesystem) {
+        const std::filesystem::path root{rule.path};
+        auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+        if (ec) {
+            canonical_root = root;
+        }
+        if (path_within(resolved, root) || path_within(resolved, canonical_root) ||
+            path_within(absolute, root)) {
+            return std::unexpected(
+                std::string{"denial trace destination is exposed by launch profile mount: '"} +
+                rule.path + "'"
+            );
+        }
+        if (rule.writable) {
+            roots.push_back(canonical_root.string());
+        }
+    }
+    return detail::denial_trace_writer::create(
+        resolved, glove::container::make_denial_context(roots, host_home())
+    );
+}
+
+auto start_denial_telemetry(
+    detail::denial_audit_writer& denial_writer,
+    detail::denial_trace_writer* trace,
+    glove::container::profile& profile
+) -> std::unique_ptr<glove::container::denial_monitor> {
+    const bool terminal = ::isatty(STDERR_FILENO) == 1;
+    if (terminal) {
+        print_denial_notice(detail::denial_notice::starting);
+    }
+    auto denial_monitor = glove::container::denial_monitor::start({
+        .on_denial =
+            [&denial_writer, trace](const auto& denial) {
+                denial_writer.on_denial(denial);
+                if (trace != nullptr) {
+                    trace->on_denial(denial);
+                }
+            },
+        .on_degraded =
+            [&denial_writer](std::string_view reason) { denial_writer.on_degraded(reason); },
+    });
+    denial_writer.record_start(denial_monitor->state(), denial_monitor->reason());
+    if (denial_monitor->state() == glove::container::denial_telemetry_state::unavailable) {
+        print_denial_notice(detail::denial_notice::unavailable, denial_monitor->reason());
+    } else if (terminal) {
+        print_denial_notice(detail::denial_notice::live);
+    }
+    if (!denial_monitor->tag().empty()) {
+        profile.denial_tag = denial_monitor->tag();
+    }
+    return denial_monitor;
+}
+
+auto finish_denial_telemetry(
+    detail::denial_audit_writer& denial_writer,
+    detail::denial_trace_writer* trace,
+    glove::container::denial_monitor& denial_monitor
+) -> std::expected<void, std::string> {
+    if (::isatty(STDERR_FILENO) == 1 &&
+        denial_monitor.state() == glove::container::denial_telemetry_state::live) {
+        print_denial_notice(detail::denial_notice::stopping);
+    }
+    const auto report = denial_monitor.finish();
+    if (report.state == glove::container::denial_telemetry_state::degraded) {
+        print_denial_notice(detail::denial_notice::degraded, report.reason);
+    }
+    auto audited = denial_writer.finish(report);
+    auto traced = trace != nullptr ? trace->finish(report) : std::expected<void, std::string>{};
+    if (!audited) {
+        return audited;
+    }
+    return traced;
+}
+
+} // namespace
+#endif
+
+// Plants this launch's decoys outside every grant of the final profile,
+// after removing what crashed launches left behind. They are removed when
+// the returned set goes out of scope.
+auto plant_launch_decoys(
+    const options& opts,
+    const glove::container::profile& profile,
+    const std::shared_ptr<glove::audit::sink>& sink
+) -> std::expected<detail::decoy_set, std::string> {
+    if (opts.decoys.empty()) {
+        return detail::decoy_set{};
+    }
+    auto directory = detail::decoy_journal_directory();
+    if (!directory) {
+        return std::unexpected("decoys: " + directory.error());
+    }
+    static_cast<void>(detail::sweep_stale_decoys(*directory));
+    std::vector<std::string> exposed;
+    for (const auto& rule : profile.filesystem) {
+        exposed.push_back(rule.path);
+    }
+    auto planted = detail::decoy_set::plant(opts.decoys, exposed, *directory);
+    if (!planted) {
+        return std::unexpected(planted.error());
+    }
+    if (auto audited = record(
+            sink,
+            glove::audit::action::control,
+            "decoys_planted:" + std::to_string(planted->paths().size())
+        );
+        !audited) {
+        return std::unexpected("audit decoys: " + audited.error());
+    }
+    return planted;
+}
+
 auto execute(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
     }
+    if (opts.provider_secret) {
+        return std::unexpected(
+            std::string{"a provider secret applies to glove exec or shell with an agent preset"}
+        );
+    }
+#if !defined(__APPLE__)
+    if (opts.denial_trace) {
+        return std::unexpected(std::string{"denial traces are recorded on macOS only"});
+    }
+#endif
     auto runtime = private_runtime::create();
     if (!runtime) {
         return std::unexpected(runtime.error());
@@ -1670,6 +1903,19 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         }
     }
 
+    auto decoys = plant_launch_decoys(opts, *profile, *sink);
+    if (!decoys) {
+        return std::unexpected(decoys.error());
+    }
+#if defined(__APPLE__)
+    auto denial_trace = open_denial_trace(opts, *profile);
+    if (!denial_trace) {
+        return std::unexpected(denial_trace.error());
+    }
+    detail::denial_audit_writer denial_writer{*sink};
+    denial_writer.watch_decoys(decoys->paths());
+    auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
+#endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
@@ -1688,26 +1934,28 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(std::string{"kernel: "} + ran.error());
     }
     auto exit_code = (*handle)->wait();
-    if (!exit_code) {
-        return std::unexpected(std::string{"wait: "} + exit_code.error());
+#if defined(__APPLE__)
+    auto denial_audit =
+        finish_denial_telemetry(denial_writer, denial_trace->get(), *denial_monitor);
+#endif
+    auto recorded = detail::record_agent_exit(*sink, exit_code, (*handle)->reaped_exit_code());
+#if defined(__APPLE__)
+    if (recorded && !denial_audit) {
+        return std::unexpected(denial_audit.error());
     }
-    if (auto audited = record(
-            *sink,
-            glove::audit::action::agent_exit,
-            std::to_string(*exit_code),
-            *exit_code == 0 ? glove::mcp::tool_call_status::ok
-                            : glove::mcp::tool_call_status::execution_error
-        );
-        !audited) {
-        return std::unexpected(std::string{"audit exit: "} + audited.error());
-    }
-    return *exit_code;
+#endif
+    return recorded;
 }
 
 auto exec(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
     }
+#if !defined(__APPLE__)
+    if (opts.denial_trace) {
+        return std::unexpected(std::string{"denial traces are recorded on macOS only"});
+    }
+#endif
     auto runtime = private_runtime::create();
     if (!runtime) {
         return std::unexpected(runtime.error());
@@ -1730,7 +1978,7 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(proxy.error());
     }
 
-    auto preset = start_agent_preset(opts, *sink);
+    auto preset = start_agent_preset(opts, *profile, *sink);
     if (!preset) {
         return std::unexpected(preset.error());
     }
@@ -1809,6 +2057,9 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         mcp_bridge = std::move(*started_bridge);
         profile->allow_loopback_listen = true;
         profile->filesystem.push_back({.path = mcp_runtime->root().string(), .writable = false});
+        // connect() to the bridge socket is network-outbound; validate() stores
+        // the canonical form because SBPL matches the resolved path.
+        profile->unix_socket_endpoint = sock_path.string();
         profile->environment.push_back("GLOVE_MCP_SOCKET=" + sock_path.string());
         if (auto self_exe = resolve_self_executable(); self_exe && self_exe->has_parent_path()) {
             const std::string self_dir = self_exe->parent_path().string();
@@ -1842,6 +2093,19 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         }
     }
 
+    auto decoys = plant_launch_decoys(opts, *profile, *sink);
+    if (!decoys) {
+        return std::unexpected(decoys.error());
+    }
+#if defined(__APPLE__)
+    auto denial_trace = open_denial_trace(opts, *profile);
+    if (!denial_trace) {
+        return std::unexpected(denial_trace.error());
+    }
+    detail::denial_audit_writer denial_writer{*sink};
+    denial_writer.watch_decoys(decoys->paths());
+    auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
+#endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
         !audited) {
         return std::unexpected(std::string{"audit launch: "} + audited.error());
@@ -1877,6 +2141,10 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
             ));
         }
     );
+#if defined(__APPLE__)
+    auto denial_audit =
+        finish_denial_telemetry(denial_writer, denial_trace->get(), *denial_monitor);
+#endif
     if (escape_audit_error) {
         return std::unexpected(std::string{"audit seccomp escape: "} + *escape_audit_error);
     }
@@ -1893,6 +2161,11 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         !audited) {
         return std::unexpected(std::string{"audit exit: "} + audited.error());
     }
+#if defined(__APPLE__)
+    if (!denial_audit) {
+        return std::unexpected(denial_audit.error());
+    }
+#endif
     return *exit_code;
 }
 

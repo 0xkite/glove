@@ -1,0 +1,1 @@
+Filtering the log data using "processIdentifier == 0 AND senderImagePath ENDSWITH "/Sandbox" AND composedMessage CONTAINS "deny(""

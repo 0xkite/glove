@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <expected>
 #include <mutex>
@@ -34,6 +35,11 @@ namespace {
 constexpr std::size_t max_request_bytes = 8192;
 constexpr int poll_tick_ms = 200;
 constexpr std::size_t relay_chunk = 16384;
+// accept() and poll() can fail for reasons that belong to a single connection or
+// to transient resource pressure rather than to the listener. Those are retried
+// with a bounded backoff instead of ending the only accept thread.
+constexpr int accept_backoff_initial_ms = 20;
+constexpr int accept_backoff_max_ms = poll_tick_ms;
 
 using detail::authenticated;
 using detail::host_matches;
@@ -78,11 +84,28 @@ auto random_token() -> std::expected<std::string, std::string> {
     return token;
 }
 
+auto set_no_sigpipe(int fd) -> void {
+#if defined(SO_NOSIGPIPE)
+    // Darwin has no MSG_NOSIGNAL. Without this, a peer that resets or closes its
+    // tunnel turns the relay's write() into SIGPIPE, whose default action ends
+    // the whole Glove host. The agent owns the client end of this socket, so it
+    // must not be able to stop the mediator. Mirrors credentialed_endpoint.
+    const int enabled = 1;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#else
+    (void)fd;
+#endif
+}
+
 auto write_all(int fd, std::string_view data) -> bool {
     const char* cursor = data.data();
     std::size_t remaining = data.size();
     while (remaining > 0) {
+#if defined(MSG_NOSIGNAL)
+        const ::ssize_t n = ::send(fd, cursor, remaining, MSG_NOSIGNAL);
+#else
         const ::ssize_t n = ::write(fd, cursor, remaining);
+#endif
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -186,6 +209,7 @@ auto dial(const std::string& host, std::uint16_t port, bool allow_private)
             continue;
         }
         if (::connect(fd, item->ai_addr, item->ai_addrlen) == 0) {
+            set_no_sigpipe(fd);
             connected = fd;
             break;
         }
@@ -234,6 +258,21 @@ void relay(int first, int second, const std::atomic<bool>& stop) {
             }
         }
     }
+}
+
+// Failures that must not end the mediator's accept loop. The agent owns the
+// client end of every accepted socket and shares this process's descriptor
+// table, so an aborted handshake (ECONNABORTED) or descriptor pressure
+// (EMFILE/ENFILE/ENOBUFS/ENOMEM) is reachable by the untrusted side on BSD,
+// macOS, and Linux.
+auto transient_listener_error(int error) -> bool {
+    return error == EINTR || error == ECONNABORTED || error == EAGAIN || error == EWOULDBLOCK ||
+           error == EMFILE || error == ENFILE || error == ENOBUFS || error == ENOMEM;
+}
+
+auto back_off(int& delay_ms) -> void {
+    std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
+    delay_ms = std::min(delay_ms * 2, accept_backoff_max_ms);
 }
 
 class proxy_impl final : public egress_proxy {
@@ -299,13 +338,37 @@ private:
         return {};
     }
 
+    // A listener defect is not a policy decision, but it must not be silent:
+    // the session keeps exporting this proxy's URL and would otherwise lose
+    // mediated egress with no audit record and no error surfaced. Report it
+    // through the same sink, then stop accepting. The event carries port 0,
+    // which every rule validates against (a rule with port 0 is rejected), so
+    // an operator cannot mistake this for a denied destination, and the Unix
+    // socket path cannot confuse it with the advertised guest relay port. The
+    // detail names the errno numerically because strerror() is not thread-safe
+    // and this runs on the accept thread.
+    void report_listener_failure(const char* operation, int error) {
+        egress_event event{
+            .host = "egress-listener",
+            .port = 0,
+            .allowed = false,
+            .detail = std::string{operation} + " failed with errno " + std::to_string(error),
+        };
+        [[maybe_unused]] const auto recorded = emit(event);
+    }
+
     void accept_loop() {
+        int delay_ms = accept_backoff_initial_ms;
         while (!stopping_.load()) {
             ::pollfd descriptor{.fd = listen_fd_, .events = POLLIN, .revents = 0};
             const int result = ::poll(&descriptor, 1, poll_tick_ms);
             if (result <= 0) {
                 if (result < 0 && errno != EINTR) {
-                    return;
+                    if (!transient_listener_error(errno)) {
+                        report_listener_failure("poll", errno);
+                        return;
+                    }
+                    back_off(delay_ms);
                 }
                 continue;
             }
@@ -314,8 +377,15 @@ private:
                 if (errno == EINTR) {
                     continue;
                 }
-                return;
+                if (!transient_listener_error(errno)) {
+                    report_listener_failure("accept", errno);
+                    return;
+                }
+                back_off(delay_ms);
+                continue;
             }
+            delay_ms = accept_backoff_initial_ms;
+            set_no_sigpipe(connection);
             std::scoped_lock lock{connections_mutex_};
             connections_.emplace_back([this, connection] { handle(connection); });
         }
@@ -323,7 +393,10 @@ private:
 
     void deny(int client, egress_event& event, std::string detail, std::string_view response) {
         event.detail = std::move(detail);
-        (void)emit(event);
+        // The request is already refused, so a failed append here loses denial
+        // evidence rather than enforcement. The allow path fails closed above;
+        // this path still answers the client and lets the sink report the gap.
+        [[maybe_unused]] const auto recorded = emit(event);
         (void)write_all(client, response);
         ::close(client);
     }

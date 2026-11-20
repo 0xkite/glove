@@ -168,6 +168,18 @@ inline constexpr glz::opts strict_options{
     .error_on_unknown_keys = true, .error_on_missing_keys = true
 };
 
+// A journal line is a slice whose next byte is '\n', not NUL. Default opts
+// assume a terminator and let a truncated object borrow bytes from the next
+// line; Glaze also accepts bytes after a complete object unless asked to
+// check them. Glaze reads this extra field only from a type derived from opts.
+struct journal_line_opts : glz::opts {
+    bool validate_trailing_whitespace = true;
+};
+
+inline constexpr journal_line_opts journal_line_options{
+    {.null_terminated = false, .error_on_unknown_keys = true, .error_on_missing_keys = true}
+};
+
 inline auto encode_record(const checkpoint_record& record) -> result<std::string> {
     const record_wire wire{
         .schema_id = std::string{record_schema},
@@ -410,7 +422,7 @@ struct native_session_store::implementation {
                 return std::unexpected("native session journal record exceeds bounds");
             }
             journal_event event;
-            if (glz::read<strict_options>(event, line) || !valid_event(event) ||
+            if (glz::read<journal_line_options>(event, line) || !valid_event(event) ||
                 event.seq != expected_seq) {
                 return std::unexpected("native session journal is corrupt or reordered");
             }
