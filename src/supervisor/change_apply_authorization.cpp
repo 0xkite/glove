@@ -83,7 +83,7 @@ using authorization_wire::wire_signed_envelope;
 constexpr std::size_t max_authorization_bytes = std::size_t{16} * 1024U;
 constexpr std::size_t max_identifier_bytes = 128U;
 constexpr std::size_t max_signature_bytes = 1'024U;
-constexpr glz::opts strict_read_options{.error_on_unknown_keys = true};
+constexpr glz::opts strict_read_options{.null_terminated = false, .error_on_unknown_keys = true};
 
 auto valid_identifier(std::string_view value) -> bool {
     return !value.empty() && value.size() <= max_identifier_bytes &&

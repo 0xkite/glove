@@ -2,6 +2,7 @@
 
 #include "glove/net/egress_proxy.hpp"
 #include "glove/policy/engine.hpp"
+#include "glove/run/secret_reference.hpp"
 
 #include <expected>
 #include <filesystem>
@@ -16,6 +17,12 @@ namespace glove::run {
 struct upstream_spec {
     std::string name;
     std::vector<std::string> argv;
+};
+
+// One literal environment variable set in the sandbox.
+struct environment_value {
+    std::string name;
+    std::string value;
 };
 
 // Top-level options for the `glove run` subcommand. Built from CLI flags
@@ -35,6 +42,10 @@ struct options {
     // Optional JSONL audit destination. When unset, an in-memory sink is
     // used (events drop on exit; only useful in tests).
     std::optional<std::filesystem::path> audit_log;
+    // Optional new file for this launch's raw sandbox denials (macOS only),
+    // collected to train and evaluate denial deciders. Never inside a path
+    // the agent can reach.
+    std::optional<std::filesystem::path> denial_trace;
     // Optional read-write workspace path exposed to the agent. When unset,
     // both modes use only a per-run private empty working directory.
     std::optional<std::filesystem::path> workspace;
@@ -44,6 +55,9 @@ struct options {
     // Names copied from the host environment. Values are looked up only after
     // explicit selection; no host variable is inherited by default.
     std::vector<std::string> environment_names;
+    // Literal variables from a launch profile. The same names are reserved
+    // as for environment_names.
+    std::vector<environment_value> environment_values;
     // Exact host+port grants through the authenticated egress proxy.
     std::vector<glove::net::egress_rule> egress;
     // Report lifecycle (working/done) to host Herdr supervisor when running
@@ -52,6 +66,12 @@ struct options {
     // Preset agent profile (e.g. "claude-code", "codex", "pi") that selects a
     // credentialed reverse endpoint and generates the matching environment.
     std::optional<std::string> agent_preset;
+    // Where the preset's provider credential comes from. Unset: the preset's
+    // host environment variable (e.g. ANTHROPIC_API_KEY).
+    std::optional<secret_reference> provider_secret;
+    // Absolute host paths for canary decoys planted for this launch only;
+    // "{nonce}" becomes a per-launch value. See src/run/decoys.hpp.
+    std::vector<std::string> decoys;
     // Permit private-loopback socket binding/listening inside the sandbox's
     // isolated network namespace (required by runtimes like agy).
     bool allow_loopback_listen = false;

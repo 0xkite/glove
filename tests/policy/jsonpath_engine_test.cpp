@@ -5,9 +5,12 @@
 #include "glove/policy/decision.hpp"
 #include "glove/policy/engine.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -185,6 +188,59 @@ auto test_other_tool_unaffected() -> int {
     return 0;
 }
 
+auto test_prefix_rule_rejects_symlink_escapes() -> int {
+    // weakly_canonical() resolves only existing components, so an in-grant
+    // dangling symlink used to compare as an in-grant name while the host-side
+    // open() that the rule authorizes would follow it outside the grant.
+    std::error_code ec;
+    auto root = std::filesystem::temp_directory_path(ec) /
+                ("glove-policy-symlink-" + std::to_string(::getpid()));
+    const auto granted = root / "ws";
+    const auto outside = root / "outside";
+    std::filesystem::create_directories(granted, ec);
+    REQUIRE(!ec);
+    std::filesystem::create_directories(outside, ec);
+    REQUIRE(!ec);
+    {
+        std::FILE* file = std::fopen((outside / "existing").c_str(), "w");
+        REQUIRE(file != nullptr);
+        std::fputs("outside\n", file);
+        std::fclose(file);
+    }
+    std::filesystem::create_symlink(outside / "newfile", granted / "dangling", ec);
+    REQUIRE(!ec);
+    std::filesystem::create_symlink(outside / "existing", granted / "existing", ec);
+    REQUIRE(!ec);
+    std::filesystem::create_symlink(granted / "loop", granted / "loop", ec);
+    REQUIRE(!ec);
+
+    glove::policy::jsonpath_options opts;
+    opts.allow = {"fs.write_file"};
+    opts.prefix_rules = {
+        {.tool_name = "fs.write_file", .field = "path", .required_prefix = granted.string()},
+    };
+    auto eng = glove::policy::make_jsonpath_engine(std::move(opts));
+
+    const auto verdict = [&eng](const std::filesystem::path& path) {
+        return eng->check("fs.write_file", R"({"path":")" + path.string() + R"("})").verdict;
+    };
+    const auto allow = glove::policy::decision::allow;
+    const auto deny = glove::policy::decision::deny;
+
+    // A new file directly under the grant stays allowed.
+    REQUIRE(verdict(granted / "new-file") == allow);
+    REQUIRE(verdict(granted / "nested" / "new-file") == allow);
+    // A dangling link, a self-loop, and an existing link leaving the grant deny.
+    REQUIRE(verdict(granted / "dangling") == deny);
+    REQUIRE(verdict(granted / "loop") == deny);
+    REQUIRE(verdict(granted / "existing") == deny);
+    // The target itself is still outside the grant.
+    REQUIRE(verdict(outside / "newfile") == deny);
+
+    std::filesystem::remove_all(root, ec);
+    return 0;
+}
+
 } // namespace
 
 auto main() -> int {
@@ -197,6 +253,8 @@ auto main() -> int {
     if (test_prefix_rule_fails() != 0)
         return 1;
     if (test_prefix_rule_rejects_parent_traversal() != 0)
+        return 1;
+    if (test_prefix_rule_rejects_symlink_escapes() != 0)
         return 1;
     if (test_missing_field_denies() != 0)
         return 1;

@@ -17,7 +17,7 @@ auto parse_json_object(std::string_view json) -> std::expected<json_object, std:
     }
 
     glz::generic root{};
-    if (const auto err = glz::read_json(root, json); err) {
+    if (const auto err = glz::read<glz::opts{.null_terminated = false}>(root, json); err) {
         return std::unexpected(glz::format_error(err, json));
     }
     if (!root.is_object()) {

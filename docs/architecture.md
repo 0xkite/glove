@@ -470,3 +470,140 @@ same-user host process that can rewrite them.
 
 Detailed policy and file invariants are defined in
 [session-policy.md](session-policy.md).
+
+## Launch profiles
+
+`glove exec`, `glove run`, and `glove shell` accept `--profile <name>`, read
+from `<XDG_CONFIG_HOME>/glove/profiles/<name>.yaml`. A profile names the
+workspace, agent preset, read and write grants, environment (a literal
+`value` or `from: host`), egress rules, MCP upstreams, tool allow rules, and
+bridge port. Command-line flags layer on top: a flag workspace, agent, or
+bridge port replaces the profile's; list flags append.
+
+- Glove reads profiles on the host before any sandbox exists. The profile
+  directory must be owner-only (`0700`) with no group- or other-writable
+  ancestor; a profile must be a regular, single-link, owner-owned `0600`
+  file of at most 64 KiB, opened without following symlinks.
+- The text is a strict YAML subset (`src/run/yaml_subset.cpp`), translated
+  to JSON and decoded by Glaze's strict JSON reader with unknown and
+  missing keys refused. Duplicate keys, anchors, aliases, tags, block
+  scalars, multiple documents, directives, tabs, control and invisible
+  characters, multi-line scalars, and plain nulls are refused with a line
+  number, so the file a reviewer reads is the policy glove applies.
+  Glaze's own YAML reader is not used.
+- `glove profile show` prints a canonical encoding that parses back to the
+  same profile; the profile fuzzer checks that property.
+- Every launch refuses a filesystem grant that lies inside, or contains,
+  glove's configuration or state directory (XDG and the account's default
+  locations, lexical and symlink-resolved). An agent that could read them
+  would learn policy and decoy layout; one that could write them would
+  choose its next sandbox.
+- `glove profile edit` saves only text that validates, restores mode `0600`
+  after editors that replace the file, and keeps a rejected edit aside.
+- `secrets.provider` names where the agent preset's provider credential
+  lives: `env://NAME`, `file:///path` or `file://~/path`, or
+  `keychain://service/account` (macOS Keychain generic password). Glove
+  resolves it on the host when the credentialed endpoint starts; the value
+  goes only to the endpoint, and the sandbox sees the session nonce. A file
+  secret must be a regular, single-link, owner-only file holding one token
+  and outside every filesystem grant of the launch. Errors name the
+  reference, never the value. `glove profile check` resolves it too.
+  Without the field, the preset's host environment variable is used as
+  before. Password-manager CLIs (`op://` and similar) are not supported:
+  they would run a program named by the profile.
+
+### Decoys
+
+`decoys:` in a profile lists host paths where glove plants a canary file for
+each `exec` or `run` launch (`src/run/decoys.cpp`). Each file is new
+(`O_EXCL`, mode `0600`) and holds one random `glvc_` token. Glove refuses a
+decoy inside or containing a filesystem grant, one whose directory is
+missing, not owned by the user, a symlink, or group- or other-writable (it
+never creates the directory), and one where a non-decoy file exists. On
+macOS a sandbox denial whose target is a decoy is written as a separate
+`decoy` audit record with its own cap of 32, and the denial summary counts
+`decoy_hits`; elsewhere decoys are content canaries only.
+
+The sandbox cannot list a decoy's directory, so a probe is seen only when it
+opens a decoy by its exact name: realistic fixed names (a credential file
+the user does not have) catch real probing, while a `{nonce}` name is seen
+only by a process told it (scripted scenarios). A fixed name already planted
+by another live launch is shared, not refused.
+
+Removal uses content, not process identity: glove unlinks a decoy only if it
+is still a regular single-link file of the user's holding exactly its
+canary. Each launch journals its decoys under
+`<XDG_STATE_HOME>/glove/decoys` before creating them and holds an exclusive
+lock on the journal while it runs; the next launch removes what a launch
+that no longer holds its lock left behind.
+
+The JSON environments `glove shell --save/--load` writes under
+`<XDG_CONFIG_HOME>/glove/envs` remain as session state; profiles are the
+operator-authored policy.
+
+## macOS denial telemetry
+
+Observation only; no capability is advertised for it and nothing may depend on
+it.
+
+- The runner starts one `log stream` child per `glove run` or `glove exec`
+  session, filtered to kernel Sandbox messages that end with the session's
+  tag. Every deny rule of the session's profile carries that tag.
+- Liveness is proven with a canary before the agent starts (at most 2 s) and
+  once more at exit (at most 1 s). The log is ordered, so the closing canary is
+  the flush barrier for the session's own denials.
+- Each accepted denial becomes one `sandbox_denial` audit record with kind,
+  operation, target, process name and pid, percent-encoded and bounded (target
+  512 bytes, 16 records per second, 256 per session). One `telemetry` record is
+  written at start and one `summary` record at exit.
+- If the stream cannot be started or proven, one `telemetry` record says
+  `unavailable` and the session runs sandboxed without telemetry.
+- An audit append failure of a telemetry record is returned as an error after
+  the agent has exited.
+- On a terminal the CLI says on stderr when it starts and stops telemetry. It
+  always says when telemetry is unavailable, and at exit when it was
+  incomplete.
+
+Measurements are in [sbpl-reference.md](sbpl-reference.md); the limits are the
+two "macOS denial telemetry" rows of the [threat model](threat-model.md).
+
+### Denial decisions (interface only)
+
+`include/glove/container/denial_decision.hpp` defines how a session's denials
+become a verdict. It is not wired into any launch path yet: no verdict is
+recorded or acted on.
+
+- `denial_feature_builder` turns the denial stream into 34 features (schema
+  version 1): counts by kind and by target class (workspace, home credential
+  store, other home, system, temp, device, other, none), writes outside the
+  workspace, distinct targets and process names, rates over 1 s and 10 s, and
+  timing. Values are `log1p` scaled. Memory is bounded: the rate window holds
+  4096 entries and each distinct set 1024.
+- `denial_decider::decide` maps features to `proceed`, `flag` or `terminate`
+  with a score in [0, 1]. It is a pure function: no I/O, no blocking.
+- The product arm is a model trained offline and loaded with
+  `load_denial_model`: logistic regression or gradient-boosted trees in a
+  strict JSON file (at most 1 MiB, 512 trees, 255 nodes per tree, children
+  after their parent, feature names equal to the schema). A file that fails
+  any check does not load.
+- `make_heuristic_denial_decider` is a fixed-threshold arm kept only to
+  compare against the model.
+- `glove run|exec --denial-trace <path>` records the launch's raw denials to
+  a new file (JSON lines: a header with the classification context, one line
+  per denial with its time since launch, an end line with the monitor's
+  report). It holds at most 16384 events; the rest are counted as dropped.
+  The file is created with `O_EXCL|O_NOFOLLOW` and mode 0600, and a path that
+  any profile mount exposes is refused before the agent starts. A trace holds
+  host paths the agent tried to reach, so it is opt-in. Write failures are
+  reported after the agent exits. `parse_denial_trace` reads a trace back as
+  untrusted input; traces store events, not features, so a corpus survives a
+  feature schema change.
+- `glove-denial-replay` (built, not installed) replays traces into feature
+  rows and evaluates arms; `tools/denial_model/` holds the scenario
+  collector, the trainer and the cross-validated ablation. See its README.
+
+A decider can only escalate. The planned use records verdicts (shadow mode)
+until the operator enables termination, which goes through the
+identity-checked group teardown. A missing or invalid model leaves the session
+sandboxed with no reaction. Features come from agent-chosen bytes, so an
+agent can steer its own verdict, but not what the sandbox allows.

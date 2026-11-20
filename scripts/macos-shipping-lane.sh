@@ -30,32 +30,35 @@ EOF
 run_tests=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --image)
-            [[ $# -ge 2 ]] || { printf '%s\n' "--image requires a value" >&2; exit 2; }
-            image="$2"
-            shift 2
-            ;;
-        --skip-build)
-            build_image=0
-            shift
-            ;;
-        --build-only)
-            run_tests=0
-            shift
-            ;;
-        --start-system)
-            start_system=1
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            printf 'unknown option: %s\n' "$1" >&2
-            usage >&2
+    --image)
+        [[ $# -ge 2 ]] || {
+            printf '%s\n' "--image requires a value" >&2
             exit 2
-            ;;
+        }
+        image="$2"
+        shift 2
+        ;;
+    --skip-build)
+        build_image=0
+        shift
+        ;;
+    --build-only)
+        run_tests=0
+        shift
+        ;;
+    --start-system)
+        start_system=1
+        shift
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        printf 'unknown option: %s\n' "$1" >&2
+        usage >&2
+        exit 2
+        ;;
     esac
 done
 
@@ -64,7 +67,7 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
     exit 1
 fi
 macos_major="$(sw_vers -productVersion | cut -d. -f1)"
-if [[ ! "${macos_major}" =~ ^[0-9]+$ ]] || (( macos_major < 26 )); then
+if [[ ! "${macos_major}" =~ ^[0-9]+$ ]] || ((macos_major < 26)); then
     printf 'The macOS shipping lane requires macOS 26 or newer; found %s\n' \
         "$(sw_vers -productVersion)" >&2
     exit 1
@@ -74,7 +77,7 @@ if ! command -v container >/dev/null; then
     exit 1
 fi
 if ! container system status >/dev/null 2>&1; then
-    if (( start_system == 0 )); then
+    if ((start_system == 0)); then
         printf '%s\n' \
             "Apple container services are stopped; run 'container system start' or pass --start-system" \
             >&2
@@ -86,7 +89,7 @@ fi
 printf 'Apple container: %s\n' "$(container --version)"
 printf 'macOS: %s (%s)\n' "$(sw_vers -productVersion)" "$(uname -m)"
 
-if (( build_image == 1 )); then
+if ((build_image == 1)); then
     container build \
         --progress plain \
         --cpus "${cpus}" \
@@ -95,14 +98,17 @@ if (( build_image == 1 )); then
         --tag "${image}" \
         "${root}"
 fi
-if (( run_tests == 0 )); then
+if ((run_tests == 0)); then
     exit 0
 fi
 
 # These tests require an inner user namespace with mountable procfs, delegated
 # cgroup controllers, or both. Apple container 1.2.0's default guest permits
 # the outer root mount but rejects procfs mounts from a child user namespace.
-nested_tests='^(container_spawner|glove_exec_perimeter|container_linux_cgroup_v2|container_linux_resource_lifecycle|container_linux_managed_session|control_linux_session_preparation|control_linux_session_executor|container_linux_exec)$'
+# The portable first pass excludes the whole set; the probe below decides
+# whether the same set runs. Keep one definition so a newly added
+# namespace-dependent test cannot silently fail the portable pass first.
+nested_tests='^(container_spawner|glove_exec_perimeter|container_linux_cgroup_v2|container_linux_resource_lifecycle|container_linux_managed_session|control_linux_session_preparation|control_linux_session_executor|container_linux_exec|container_linux_seccomp_denial|container_linux_escape_monitor|container_linux_loopback_listen|glove_shell_loop_cli)$'
 
 container run \
     --rm \
@@ -121,8 +127,7 @@ if container run \
     --memory 512M \
     "${image}" \
     /bin/sh -c \
-        'mkdir -p /tmp/glove-nested-proc && unshare --user --map-root-user --mount /bin/sh -c "mount -t proc proc /tmp/glove-nested-proc"'
-then
+    'mkdir -p /tmp/glove-nested-proc && unshare --user --map-root-user --mount /bin/sh -c "mount -t proc proc /tmp/glove-nested-proc"'; then
     printf '%s\n' "nested_userns_procfs=available"
     container run \
         --rm \
@@ -132,7 +137,7 @@ then
         --memory "${memory}" \
         "${image}" \
         /bin/bash -lc \
-        "ctest --preset asan --output-on-failure -R '^(container_spawner|glove_exec_perimeter|container_linux_exec)$'"
+        "ctest --preset asan --output-on-failure -R '${nested_tests}'"
 else
     printf '%s\n' \
         "nested_userns_procfs=unavailable (portable Linux tests passed; inner Glove sandbox not claimed)"

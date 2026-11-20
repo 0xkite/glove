@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build pkg-config \
         libc++-18-dev libc++abi-18-dev \
         libseccomp-dev libssl-dev \
+        openssh-client \
         git curl \
     && rm -rf /var/lib/apt/lists/*
 

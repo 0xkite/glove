@@ -5,9 +5,12 @@
 #include "glove/container/spawner.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include "darwin_process_group.hpp"
+#include "denial_tag.hpp"
 #include "launch_command.hpp"
 #include "runtime_filesystem.hpp"
 
+#include <crt_externs.h>
 #include <spawn.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -19,6 +22,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
@@ -118,65 +122,74 @@ private:
     std::string buffer_;
 };
 
+// Process identity is the unreaped parent-child relation, not the PID. Until
+// this handle reaps the leader, its PID cannot be reused and its PGID cannot be
+// reallocated, so group signals reach only the agent's own group. Exit is
+// therefore observed with WNOWAIT, the group is killed and proven empty while
+// the zombie still pins it, and the leader is consumed last. After the reap,
+// or once another reaper has taken the child (ECHILD), no PID or PGID
+// operation is permitted.
 class macos_agent_handle final : public agent_handle {
 public:
     macos_agent_handle(::pid_t pid, std::unique_ptr<pipe_transport> t)
         : pid_{pid}, transport_{std::move(t)} {}
 
+    macos_agent_handle(const macos_agent_handle&) = delete;
+    macos_agent_handle& operator=(const macos_agent_handle&) = delete;
+    macos_agent_handle(macos_agent_handle&&) = delete;
+    macos_agent_handle& operator=(macos_agent_handle&&) = delete;
+
     ~macos_agent_handle() override {
         transport_.reset();
         if (!waited_) {
-            (void)wait();
+            // A destructor cannot report. wait() escalates SIGTERM to SIGKILL,
+            // drains the group, and reaps; its remaining failures leave nothing
+            // a destructor could safely retry.
+            try {
+                [[maybe_unused]] const auto drained = wait();
+            } catch (...) {
+                // wait() builds error strings, so it can throw. Leave no live
+                // group or zombie: the leader is still ours while owned_.
+                signal_group(SIGKILL);
+                if (owned_) {
+                    int status = 0;
+                    while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+                    owned_ = false;
+                }
+            }
         }
     }
 
     auto transport() -> glove::mcp::transport& override { return *transport_; }
 
+    [[nodiscard]] auto reaped_exit_code() const noexcept -> std::optional<int> override {
+        return reaped_code_;
+    }
+
     auto wait() -> std::expected<int, std::string> override {
         if (waited_) {
+            if (!cached_error_.empty()) {
+                return std::unexpected(cached_error_);
+            }
             return cached_code_;
         }
-        int status = 0;
-        for (int spins = 0; spins < 50; ++spins) {
-            ::pid_t r = ::waitpid(pid_, &status, WNOHANG);
-            if (r == pid_) {
-                (void)::kill(-pid_, SIGKILL);
-                waited_ = true;
-                cached_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-                return cached_code_;
-            }
-            if (r < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return std::unexpected(std::string{"waitpid: "} + std::strerror(errno));
-            }
-            ::usleep(10 * 1000);
+        auto exited = observe_with_grace();
+        if (!exited) {
+            // An unexplained observation failure must not leave the agent
+            // running: while ownership holds, kill and consume the leader.
+            signal_group(SIGKILL);
+            [[maybe_unused]] const auto consumed = reap();
+            return finish(std::unexpected(std::move(exited.error())));
         }
-        (void)::kill(-pid_, SIGTERM);
-        for (int spins = 0; spins < 50; ++spins) {
-            ::pid_t r = ::waitpid(pid_, &status, WNOHANG);
-            if (r == pid_) {
-                (void)::kill(-pid_, SIGKILL);
-                waited_ = true;
-                cached_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-                return cached_code_;
-            }
-            if (r < 0 && errno != EINTR) {
-                return std::unexpected(std::string{"waitpid: "} + std::strerror(errno));
-            }
-            ::usleep(10 * 1000);
+        std::string drain_error = drain_group();
+        auto reaped = reap();
+        if (!reaped) {
+            return finish(std::unexpected(std::move(reaped.error())));
         }
-        (void)::kill(-pid_, SIGKILL);
-        while (::waitpid(pid_, &status, 0) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return std::unexpected(std::string{"waitpid: "} + std::strerror(errno));
+        if (!drain_error.empty()) {
+            return finish(std::unexpected(std::move(drain_error)));
         }
-        waited_ = true;
-        cached_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-        return cached_code_;
+        return finish(*reaped);
     }
 
     [[nodiscard]] auto resource_receipt() const
@@ -185,10 +198,154 @@ public:
     }
 
 private:
+    static constexpr int grace_polls = 50;
+    static constexpr ::useconds_t poll_interval_us = 10 * 1000;
+    static constexpr int drain_polls = 600; // ~3 s at 5 ms.
+    static constexpr ::useconds_t drain_interval_us = 5 * 1000;
+
+    enum class observation : std::uint8_t { running, exited };
+
+    // Observe without consuming: the zombie keeps pinning PID and PGID.
+    auto observe(bool nonblocking) -> std::expected<observation, std::string> {
+        siginfo_t information{};
+        int rc = -1;
+        do {
+            rc = ::waitid(
+                P_PID,
+                static_cast<id_t>(pid_),
+                &information,
+                WEXITED | WNOWAIT | (nonblocking ? WNOHANG : 0)
+            );
+        } while (rc < 0 && errno == EINTR);
+        if (rc != 0) {
+            const int error = errno;
+            if (error == ECHILD) {
+                // Ownership lost to a competing reaper: never signal again.
+                owned_ = false;
+            }
+            return std::unexpected("waitid WNOWAIT: errno " + std::to_string(error));
+        }
+        if (information.si_pid == 0 && nonblocking) {
+            return observation::running;
+        }
+        if (information.si_pid != pid_) {
+            return std::unexpected(std::string{"waitid WNOWAIT returned another process"});
+        }
+        return observation::exited;
+    }
+
+    // Signals are sent only while observe() has not lost ownership. The
+    // leader is unreaped here, so -pid_ is the agent's own group.
+    void signal_group(int number) const {
+        if (owned_) {
+            (void)::kill(-pid_, number);
+            // The leader may have left its group; KILL must still reach it.
+            if (number == SIGKILL) {
+                (void)::kill(pid_, SIGKILL);
+            }
+        }
+    }
+
+    auto poll_for_exit(int polls) -> std::expected<bool, std::string> {
+        for (int spin = 0; spin < polls; ++spin) {
+            auto seen = observe(true);
+            if (!seen) {
+                return std::unexpected(std::move(seen.error()));
+            }
+            if (*seen == observation::exited) {
+                return true;
+            }
+            ::usleep(poll_interval_us);
+        }
+        return false;
+    }
+
+    auto observe_with_grace() -> std::expected<void, std::string> {
+        auto exited = poll_for_exit(grace_polls);
+        if (exited && !*exited) {
+            signal_group(SIGTERM);
+            exited = poll_for_exit(grace_polls);
+        }
+        if (!exited) {
+            return std::unexpected(std::move(exited.error()));
+        }
+        if (!*exited) {
+            signal_group(SIGKILL);
+            auto seen = observe(false);
+            if (!seen) {
+                return std::unexpected(std::move(seen.error()));
+            }
+        }
+        return {};
+    }
+
+    // Descendants outliving the leader are killed and proven gone before the
+    // reap releases the PGID. Members that moved to another group are outside
+    // this mechanism; macOS has no containing equivalent of a cgroup.
+    // A listing truncated by the fixed bound counts as live members, so a
+    // large group is still killed until it fits or the deadline passes.
+    auto drain_group() -> std::string {
+        bool truncated = false;
+        for (int spin = 0; spin < drain_polls; ++spin) {
+            auto still_owned = observe(true);
+            if (!still_owned) {
+                return "agent group drain: " + still_owned.error();
+            }
+            if (::kill(-pid_, SIGKILL) != 0 && errno != ESRCH && errno != EPERM) {
+                return "agent group drain: kill errno " + std::to_string(errno);
+            }
+            const auto live = macos_detail::group_has_live_members(pid_);
+            truncated = !live && live.error() == EOVERFLOW;
+            if (!live && !truncated) {
+                return "agent group drain: inspection errno " + std::to_string(live.error());
+            }
+            if (live && !*live) {
+                return {};
+            }
+            ::usleep(drain_interval_us);
+        }
+        if (truncated) {
+            return std::string{
+                "agent group drain: listing truncated and descendants still live after SIGKILL"
+            };
+        }
+        return std::string{"agent group drain: descendants still live after SIGKILL"};
+    }
+
+    auto reap() -> std::expected<int, std::string> {
+        if (!owned_) {
+            return std::unexpected(std::string{"agent leader reaped by another waiter"});
+        }
+        int status = 0;
+        ::pid_t waited = -1;
+        do {
+            waited = ::waitpid(pid_, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        owned_ = false; // No PID or group operation is permitted beyond this point.
+        if (waited != pid_) {
+            return std::unexpected("waitpid: errno " + std::to_string(waited < 0 ? errno : EIO));
+        }
+        reaped_code_ = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        return *reaped_code_;
+    }
+
+    auto finish(std::expected<int, std::string> result) -> std::expected<int, std::string> {
+        waited_ = true;
+        if (result) {
+            cached_code_ = *result;
+        } else {
+            cached_error_ = result.error();
+        }
+        return result;
+    }
+
     ::pid_t pid_;
     std::unique_ptr<pipe_transport> transport_;
+    bool owned_ = true;
     bool waited_ = false;
     int cached_code_ = -1;
+    std::string cached_error_;
+    std::optional<int> reaped_code_;
 };
 
 void close_pipe_pair(int (&fds)[2]) {
@@ -290,18 +447,46 @@ auto regex_literal(std::string_view text, bool fold_case = false) -> std::string
     return out;
 }
 
-auto append_grant_root_guard(std::string& policy, std::string_view root) -> void {
+// Every deny rule ends with this modifier; the tag is hex, so it needs no
+// sbpl_escape.
+auto tag_modifier(std::string_view denial_tag) -> std::string {
+    return std::string{" (with message \""} + std::string{denial_tag} + "\")";
+}
+
+auto append_grant_root_guard(
+    std::string& policy, std::string_view root, std::string_view denial_tag
+) -> void {
     // Grant children write access without allowing the grant root's namespace
     // or security metadata to move out from under immutable/reserved paths.
     policy +=
         "(deny file-write-unlink file-write-mode file-write-owner file-write-flags (literal \"";
     policy += sbpl_escape(root);
-    policy += "\"))\n";
+    policy += "\")";
+    policy += tag_modifier(denial_tag);
+    policy += ")\n";
 }
 
 // system.sb provides the platform's dynamic-loader and Mach-service plumbing.
-auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::string {
-    std::string p = "(version 1)\n(deny default)\n(import \"system.sb\")\n";
+// Opening terminal paths stays denied; CLOEXEC_DEFAULT leaves only inherited
+// stdio, whose terminal inspection and raw-mode commands an interactive agent
+// needs. Both the session path and exec_passthrough require it, and the grant is
+// scoped to TTY vnodes the process already holds.
+auto append_terminal_ioctl_rule(std::string& profile_text) -> void {
+    profile_text += "(allow file-ioctl (require-all (vnode-type TTY) (require-any";
+    for (const auto command : {TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF, TIOCGPGRP, TIOCGWINSZ}) {
+        profile_text += " (ioctl-command " + std::to_string(command) + ")";
+    }
+    profile_text += ")))\n";
+}
+
+// Every deny rule must carry the launch's denial tag. A deny rule added
+// without it produces denials the session's telemetry cannot see, and a later
+// untagged rule overrides a tagged one for the operations it decides
+// (measured: the kernel appends the message only of the rule that decided).
+auto generate_sbpl(const profile& prof, std::string_view agent_program, std::string_view denial_tag)
+    -> std::string {
+    const auto tagged = tag_modifier(denial_tag);
+    std::string p = "(version 1)\n(deny default" + tagged + ")\n(import \"system.sb\")\n";
     p += "(allow process-exec*)\n(allow process-fork)\n(allow sysctl-read)\n";
     for (const auto* runtime : {"/bin", "/sbin", "/usr/bin", "/usr/sbin"}) {
         append_read_rule(p, runtime);
@@ -321,7 +506,16 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         append_read_rule(p, rule.path);
         append_parent_metadata_rules(p, rule.path);
     }
-    p += "(deny network*)\n";
+    p += "(deny network*" + tagged + ")\n";
+    // The imported system profile grants exactly one network endpoint - the
+    // host syslog datagram socket - and a filtered allow outranks the
+    // unfiltered deny above. Close that path class explicitly so the import
+    // cannot silently widen the documented deny-default network boundary as
+    // Apple regenerates system.sb. The bridge and proxy allows below carry
+    // remote filters, so a path-filtered deny does not affect them.
+    // /var/run is a symlink to /private/var/run and rule strings are matched
+    // against the resolved path only, so a "/var/run" spelling matches nothing.
+    p += "(deny network-outbound (subpath \"/private/var/run\")" + tagged + ")\n";
     if (prof.bridge_endpoint) {
         // SBPL rejects numeric hosts. Its localhost filter plus AF_INET selects
         // 127.0.0.1 only; TCP excludes an unrelated UDP service on the same port.
@@ -330,11 +524,25 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         p += "\") (socket-domain AF_INET)))\n";
     }
     if (prof.proxy) {
-        p += "(allow network-outbound (remote ip \"localhost:";
+        // The egress proxy always advertises a numeric 127.0.0.1 URL, so the
+        // AF_INET socket-domain filter costs nothing and keeps this rule from
+        // also admitting IPv6 ::1. Without it, `remote ip "localhost:PORT"`
+        // matches both loopback families, which contradicts the documented
+        // "no IPv6 egress" boundary and the bridged-endpoint rule below.
+        p += "(allow network-outbound (require-all (remote tcp \"localhost:";
         p += std::to_string(prof.proxy->port);
+        p += "\") (socket-domain AF_INET)))\n";
+    }
+    if (prof.unix_socket_endpoint) {
+        // connect() on a Unix socket is network-outbound, not a file read, so the
+        // unfiltered deny above would kill a mediated broker such as the MCP
+        // bridge. validate() stored the canonical path, which is the form the
+        // kernel matches; the caller's $TMPDIR spelling would never match.
+        p += "(allow network-outbound (literal \"";
+        p += sbpl_escape(*prof.unix_socket_endpoint);
         p += "\"))\n";
     }
-    p += "(deny file-write*)\n";
+    p += "(deny file-write*" + tagged + ")\n";
     for (const auto& rule : prof.filesystem) {
         if (rule.writable) {
             p += "(allow file-write* (literal \"";
@@ -342,13 +550,18 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
             p += "\") (subpath \"";
             p += sbpl_escape(rule.path);
             p += "\"))\n";
+            // A writable grant lets its own holder unlink an empty root and
+            // replace it with a symlink. The next launch canonicalizes that
+            // path and would silently grant the link target, so keep the root
+            // node itself inside the grant. Children stay writable.
+            append_grant_root_guard(p, rule.path, denial_tag);
         }
     }
     for (const auto& file : prof.immutable_files) {
         p += "(deny file-write* (literal \"";
         p += sbpl_escape(file);
-        p += "\"))\n";
-        append_grant_root_guard(p, std::filesystem::path{file}.parent_path().string());
+        p += "\")" + tagged + ")\n";
+        append_grant_root_guard(p, std::filesystem::path{file}.parent_path().string(), denial_tag);
     }
     for (const auto& entry : prof.reserved_entries) {
         const auto pattern =
@@ -357,8 +570,8 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
         // raw #"regex" syntax cannot safely encode an embedded quote.
         p += "(deny file-read* file-write* (regex \"";
         p += sbpl_escape(pattern);
-        p += "\"))\n";
-        append_grant_root_guard(p, entry.parent);
+        p += "\")" + tagged + ")\n";
+        append_grant_root_guard(p, entry.parent, denial_tag);
     }
     return p;
 }
@@ -368,19 +581,69 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program) -> std::
 // SBPL profile applied before its first instruction — not left to self-sandbox
 // the way the synthetic agent does. sandbox-exec compiles + applies the
 // profile, then exec()s the target.
+struct sandboxed_command {
+    std::vector<std::string> argv;
+    std::string denial_tag;
+};
+
 auto sandboxed_argv(
     const profile& prof, const std::vector<std::string>& argv, std::string resolved_program
-) -> std::vector<std::string> {
-    std::vector<std::string> out;
-    out.reserve(argv.size() + 3);
-    out.emplace_back("/usr/bin/sandbox-exec");
-    out.emplace_back("-p");
-    out.emplace_back(generate_sbpl(prof, resolved_program));
-    out.emplace_back(std::move(resolved_program));
+) -> sandboxed_command {
+    sandboxed_command out{
+        .argv = {},
+        .denial_tag = prof.denial_tag ? *prof.denial_tag : macos_detail::make_denial_tag(),
+    };
+    out.argv.reserve(argv.size() + 3);
+    out.argv.emplace_back("/usr/bin/sandbox-exec");
+    out.argv.emplace_back("-p");
+    out.argv.emplace_back(generate_sbpl(prof, resolved_program, out.denial_tag));
+    out.argv.emplace_back(std::move(resolved_program));
     for (std::size_t i = 1; i < argv.size(); ++i) {
-        out.push_back(argv[i]);
+        out.argv.push_back(argv[i]);
     }
     return out;
+}
+
+// A profile that does not compile is a construction failure, not an agent
+// exit. sandbox-exec reports a bad profile only on its own stderr with exit 65,
+// and only after posix_spawn has already succeeded, so the parent would record
+// it as the agent's own exit code and never learn that containment was absent.
+// Compile the exact text first by running it against /usr/bin/true: the probe
+// also proves the profile admits the dynamic loader and /usr/bin, which every
+// launch needs.
+auto profile_compiles(const std::string& profile_text) -> std::expected<void, std::string> {
+    std::vector<std::string> argv{"/usr/bin/sandbox-exec", "-p", profile_text, "/usr/bin/true"};
+    std::vector<char*> argv_ptrs;
+    argv_ptrs.reserve(argv.size() + 1);
+    for (auto& argument : argv) {
+        argv_ptrs.push_back(argument.data());
+    }
+    argv_ptrs.push_back(nullptr);
+    ::pid_t pid = -1;
+    char** environment = *_NSGetEnviron();
+    if (const int rc =
+            ::posix_spawn(&pid, argv[0].c_str(), nullptr, nullptr, argv_ptrs.data(), environment);
+        rc != 0) {
+        return std::unexpected(std::string{"profile probe: "} + std::strerror(rc));
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return std::unexpected(std::string{"profile probe: "} + std::strerror(errno));
+    }
+    if (!WIFEXITED(status)) {
+        return std::unexpected(std::string{"profile probe: terminated by signal"});
+    }
+    const int code = WEXITSTATUS(status);
+    if (code != 0) {
+        return std::unexpected(
+            "generated sandbox profile does not compile (sandbox-exec exit " +
+            std::to_string(code) + ")"
+        );
+    }
+    return {};
 }
 
 auto has_environment_name(const std::vector<std::string>& environment, std::string_view name)
@@ -463,8 +726,21 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
     }
     ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
 
-    std::vector<std::string> argv_owned = sandboxed_argv(effective, argv, std::move(*resolved));
+    auto command = sandboxed_argv(effective, argv, std::move(*resolved));
+    std::vector<std::string> argv_owned = std::move(command.argv);
+    // read by denial telemetry once it is wired in
+    [[maybe_unused]] const std::string denial_tag = std::move(command.denial_tag);
     std::vector<std::string> env_owned = sandboxed_env(effective);
+    if (auto compiled = profile_compiles(argv_owned[2]); !compiled) {
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::posix_spawnattr_destroy(&attr);
+        return std::unexpected(compiled.error());
+    }
+    // An interactive agent owns its terminal but not the right to open other
+    // terminal paths; mirror the session path's scoped ioctl grant.
+    if (::isatty(STDIN_FILENO) != 0) {
+        append_terminal_ioctl_rule(argv_owned[2]);
+    }
     std::vector<char*> argv_ptrs;
     std::vector<char*> envp;
     argv_ptrs.reserve(argv_owned.size() + 1);
@@ -535,6 +811,17 @@ public:
         if (!resolved) {
             return std::unexpected(resolved.error());
         }
+        // Build and compile the profile before allocating pipes or spawn attributes,
+        // so a profile that does not build fails the launch rather than surfacing
+        // later as the agent's own exit code.
+        auto command = sandboxed_argv(effective, argv, std::move(*resolved));
+        std::vector<std::string> argv_owned = std::move(command.argv);
+        // read by denial telemetry once it is wired in
+        [[maybe_unused]] const std::string denial_tag = std::move(command.denial_tag);
+        std::vector<std::string> env_owned = sandboxed_env(effective);
+        if (auto compiled = profile_compiles(argv_owned[2]); !compiled) {
+            return std::unexpected(compiled.error());
+        }
 
         // Two pipes: pipe_in carries parent→child (child stdin); pipe_out
         // carries child→parent (child stdout). Child stderr is inherited so
@@ -590,8 +877,6 @@ public:
             return std::unexpected(std::string{"spawnattr_setflags: "} + std::strerror(rc));
         }
 
-        std::vector<std::string> argv_owned = sandboxed_argv(effective, argv, std::move(*resolved));
-        std::vector<std::string> env_owned = sandboxed_env(effective);
         std::vector<char*> argv_ptrs;
         argv_ptrs.reserve(argv_owned.size() + 1);
         for (auto& a : argv_owned) {
@@ -652,21 +937,15 @@ auto macos_detail::prepare_launch_command(
     if (!program) {
         return std::unexpected(program.error());
     }
-    auto arguments = sandboxed_argv(*checked, argv, std::move(*program));
+    auto command = sandboxed_argv(*checked, argv, std::move(*program));
     if (terminal_stdio) {
-        // Opening terminal paths stays denied. CLOEXEC_DEFAULT leaves only
-        // inherited stdio, whose terminal inspection/raw-mode commands are needed.
-        arguments[2] += "(allow file-ioctl (require-all (vnode-type TTY) (require-any";
-        for (const auto command :
-             {TIOCGETA, TIOCSETA, TIOCSETAW, TIOCSETAF, TIOCGPGRP, TIOCGWINSZ}) {
-            arguments[2] += " (ioctl-command " + std::to_string(command) + ")";
-        }
-        arguments[2] += ")))\n";
+        append_terminal_ioctl_rule(command.argv[2]);
     }
     return macos_detail::launch_command{
-        .arguments = std::move(arguments),
+        .arguments = std::move(command.argv),
         .environment = sandboxed_env(*checked),
         .start_directory = checked->work_dir ? checked->work_dir : checked->home_dir,
+        .denial_tag = std::move(command.denial_tag),
     };
 }
 

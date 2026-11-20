@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -16,6 +17,24 @@ namespace {
     } while (0)
 
 auto run() -> int {
+    {
+        constexpr std::string_view tag = "00112233445566778899aabbccddeeff";
+        glove::container::profile p;
+        p.denial_tag = std::string{tag};
+        auto out = glove::container::validate(p);
+        REQUIRE(out.has_value());
+        REQUIRE(out->denial_tag == std::string{tag});
+        for (const std::string& bad :
+             {std::string{},
+              std::string{tag.substr(0, 31)},
+              std::string{"00112233445566778899AABBCCDDEEFF"}}) {
+            p.denial_tag = bad;
+            auto rejected = glove::container::validate(p);
+            REQUIRE(!rejected.has_value());
+            REQUIRE(rejected.error() == "denial tag must be 32 lowercase hex characters");
+        }
+    }
+
     {
         glove::container::profile p;
         p.filesystem.push_back({.path = "/agent/workspace", .writable = true});

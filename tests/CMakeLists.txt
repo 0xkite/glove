@@ -371,6 +371,35 @@ target_include_directories(container_sha256_test PRIVATE
 )
 add_test(NAME container_sha256 COMMAND container_sha256_test)
 
+add_executable(container_sandbox_denial_log_test container/sandbox_denial_log_test.cpp)
+target_link_libraries(container_sandbox_denial_log_test PRIVATE glove_container)
+target_include_directories(container_sandbox_denial_log_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+)
+add_test(
+    NAME container_sandbox_denial_log
+    COMMAND container_sandbox_denial_log_test ${CMAKE_SOURCE_DIR}/fuzz/corpus/sandbox_denial_log
+)
+set_tests_properties(container_sandbox_denial_log PROPERTIES TIMEOUT 10)
+
+add_executable(container_denial_telemetry_test container/denial_telemetry_test.cpp)
+target_link_libraries(container_denial_telemetry_test PRIVATE glove_container)
+target_include_directories(container_denial_telemetry_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+)
+add_test(NAME container_denial_telemetry COMMAND container_denial_telemetry_test)
+set_tests_properties(container_denial_telemetry PROPERTIES TIMEOUT 10)
+
+add_executable(container_denial_decision_test container/denial_decision_test.cpp)
+target_link_libraries(container_denial_decision_test PRIVATE glove_container)
+add_test(NAME container_denial_decision COMMAND container_denial_decision_test)
+set_tests_properties(container_denial_decision PROPERTIES TIMEOUT 10)
+
+add_executable(container_denial_trace_test container/denial_trace_test.cpp)
+target_link_libraries(container_denial_trace_test PRIVATE glove_container)
+add_test(NAME container_denial_trace COMMAND container_denial_trace_test)
+set_tests_properties(container_denial_trace PROPERTIES TIMEOUT 10)
+
 add_executable(container_receipt_chain_test container/receipt_chain_test.cpp)
 target_link_libraries(container_receipt_chain_test PRIVATE glove_container)
 add_test(NAME container_receipt_chain COMMAND container_receipt_chain_test)
@@ -999,6 +1028,45 @@ if(APPLE)
     add_test(NAME container_macos_sandbox COMMAND container_macos_sandbox_test)
     set_tests_properties(container_macos_sandbox PROPERTIES TIMEOUT 30)
 
+    # Supervised log-stream child for sandbox denial telemetry (not wired into
+    # any launch path). Skips (77) when this user cannot run `log stream`.
+    add_executable(container_macos_denial_stream_test container/macos_denial_stream_test.cpp)
+    target_link_libraries(container_macos_denial_stream_test PRIVATE glove_container)
+    target_include_directories(container_macos_denial_stream_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+    )
+    add_test(
+        NAME container_macos_denial_stream
+        COMMAND container_macos_denial_stream_test ${CMAKE_SOURCE_DIR}/fuzz/corpus/sandbox_denial_log
+    )
+    set_tests_properties(
+        container_macos_denial_stream PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+    )
+
+    # Per-launch denial tag on every generated deny rule (telemetry is not
+    # wired into any launch path).
+    add_executable(container_macos_denial_tag_test container/macos_denial_tag_test.cpp)
+    target_link_libraries(container_macos_denial_tag_test PRIVATE glove_container)
+    target_include_directories(container_macos_denial_tag_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+    )
+    add_test(NAME container_macos_denial_tag COMMAND container_macos_denial_tag_test)
+    set_tests_properties(
+        container_macos_denial_tag PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77
+    )
+
+    # Per-launch denial monitor: delivery at finish, unavailable and degraded
+    # streams, and two concurrent sessions.
+    add_executable(container_macos_denial_monitor_test container/macos_denial_monitor_test.cpp)
+    target_link_libraries(container_macos_denial_monitor_test PRIVATE glove_container)
+    target_include_directories(container_macos_denial_monitor_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+    )
+    add_test(NAME container_macos_denial_monitor COMMAND container_macos_denial_monitor_test)
+    set_tests_properties(
+        container_macos_denial_monitor PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77
+    )
+
     # Stage 3: `glove exec` stdio-passthrough contain path (HOME→workspace,
     # writes outside denied). macOS-only.
     add_executable(container_macos_exec_test container/macos_exec_test.cpp)
@@ -1075,7 +1143,73 @@ if(APPLE)
     add_dependencies(glove_exec_audit_test glove)
     add_test(NAME glove_exec_audit COMMAND glove_exec_audit_test)
     set_tests_properties(glove_exec_audit PROPERTIES TIMEOUT 30)
+
+    add_executable(glove_exec_denial_audit_test run/glove_exec_denial_audit_test.cpp)
+    target_link_libraries(glove_exec_denial_audit_test PRIVATE glove_kernel)
+    target_compile_definitions(glove_exec_denial_audit_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_exec_denial_audit_test glove)
+    add_test(NAME glove_exec_denial_audit COMMAND glove_exec_denial_audit_test)
+    set_tests_properties(
+        glove_exec_denial_audit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+    )
+
+    add_executable(glove_exec_denial_trace_test run/glove_exec_denial_trace_test.cpp)
+    target_link_libraries(glove_exec_denial_trace_test PRIVATE glove_container)
+    target_compile_definitions(glove_exec_denial_trace_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_exec_denial_trace_test glove)
+    add_test(NAME glove_exec_denial_trace COMMAND glove_exec_denial_trace_test)
+    set_tests_properties(
+        glove_exec_denial_trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+    )
 endif()
+
+add_executable(run_exit_audit_test run/exit_audit_test.cpp)
+target_link_libraries(run_exit_audit_test PRIVATE glove_run)
+target_include_directories(run_exit_audit_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_exit_audit COMMAND run_exit_audit_test)
+set_tests_properties(run_exit_audit PROPERTIES TIMEOUT 10)
+
+add_executable(run_denial_audit_test run/denial_audit_test.cpp)
+target_link_libraries(run_denial_audit_test PRIVATE glove_run)
+target_include_directories(run_denial_audit_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/run)
+add_test(NAME run_denial_audit COMMAND run_denial_audit_test)
+set_tests_properties(run_denial_audit PROPERTIES TIMEOUT 10)
+
+add_executable(run_decoys_test run/decoys_test.cpp)
+target_link_libraries(run_decoys_test PRIVATE glove_run)
+target_include_directories(run_decoys_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/run>
+)
+add_test(NAME run_decoys COMMAND run_decoys_test)
+set_tests_properties(run_decoys PROPERTIES TIMEOUT 30)
+
+add_executable(run_secret_resolve_test run/secret_resolve_test.cpp)
+target_link_libraries(run_secret_resolve_test PRIVATE glove_run)
+target_include_directories(run_secret_resolve_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/run>
+)
+add_test(NAME run_secret_resolve COMMAND run_secret_resolve_test)
+set_tests_properties(run_secret_resolve PROPERTIES TIMEOUT 30)
+
+add_executable(run_launch_profile_test run/launch_profile_test.cpp)
+target_link_libraries(run_launch_profile_test PRIVATE glove_run)
+target_include_directories(run_launch_profile_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/run>
+)
+add_test(NAME run_launch_profile COMMAND run_launch_profile_test)
+set_tests_properties(run_launch_profile PROPERTIES TIMEOUT 30)
+
+add_executable(run_denial_trace_writer_test run/denial_trace_writer_test.cpp)
+target_link_libraries(run_denial_trace_writer_test PRIVATE glove_run)
+target_include_directories(run_denial_trace_writer_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/run>
+)
+add_test(NAME run_denial_trace_writer COMMAND run_denial_trace_writer_test)
+set_tests_properties(run_denial_trace_writer PROPERTIES TIMEOUT 30)
 
 # F1 regression: upstream pipe fds must be close-on-exec so they cannot leak
 # into a later-spawned (contained) process. Cross-platform: needs /bin/sh,
@@ -1148,6 +1282,31 @@ endif()
 # Pinned-supply-chain tool tests (network-free; exercises tools/fetch_workerd.py).
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    # Denial model tooling: replay rows, stdlib trainer, C++ loader agree.
+    add_test(NAME denial_model_pipeline
+        COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_denial_model_pipeline.py
+            $<TARGET_FILE:glove-denial-replay>
+            ${CMAKE_SOURCE_DIR}/tools/denial_model/train.py)
+    set_tests_properties(denial_model_pipeline PROPERTIES TIMEOUT 120)
+    if(APPLE)
+        # Scenario collection under glove exec, including the leak check.
+        add_test(NAME denial_model_collect
+            COMMAND ${Python3_EXECUTABLE} -I
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_denial_collect.py
+                $<TARGET_FILE:glove>
+                $<TARGET_FILE:glove-denial-replay>
+                ${CMAKE_SOURCE_DIR}/tools/denial_model/collect.py)
+        set_tests_properties(
+            denial_model_collect PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77
+        )
+    endif()
+    # Launch profiles: CLI lifecycle, edit validation, and --profile launches.
+    add_test(NAME profile_cli
+        COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_profile_cli.py
+            $<TARGET_FILE:glove>)
+    set_tests_properties(profile_cli PROPERTIES TIMEOUT 120)
     add_test(NAME workerd_supply_chain
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_fetch_workerd.py)
     set_tests_properties(workerd_supply_chain PROPERTIES TIMEOUT 120)
@@ -1165,6 +1324,11 @@ set_tests_properties(reflect_codegen PROPERTIES TIMEOUT 10)
 add_executable(reflect_mcp_extension_test reflect/mcp_extension_test.cpp)
 target_link_libraries(reflect_mcp_extension_test PRIVATE glove_kernel glove_options)
 target_include_directories(reflect_mcp_extension_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR})
+# This target asserts its expectations with assert(). CMake defines NDEBUG for
+# Release, RelWithDebInfo, ASan, and TSan, which would compile every assertion
+# out and leave a test that cannot fail. -UNDEBUG is emitted after the preset
+# flags, so the assertions stay live in every configuration.
+target_compile_options(reflect_mcp_extension_test PRIVATE -UNDEBUG)
 add_test(NAME reflect_mcp_extension COMMAND reflect_mcp_extension_test)
 set_tests_properties(reflect_mcp_extension PROPERTIES TIMEOUT 10)
 if(GLOVE_REFLECTION_ENABLED)

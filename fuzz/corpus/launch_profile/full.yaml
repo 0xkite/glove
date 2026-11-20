@@ -1,0 +1,23 @@
+version: 1
+workspace: ~/src/project
+agent: claude-code
+read:
+  - /usr/share       # comment
+  - "~/notes # x"
+write: [~/scratch, '/tmp/it''s']
+env:
+  LANG: { value: en_US.UTF-8 }
+  PORT: { value: 8080 }
+  CI: { from: host }
+  NOTE:
+    value: "say \"hi\" é"
+egress:
+  - { host: registry.npmjs.org }
+  - host: example.com
+    port: 8443
+mcp:
+  - { name: yams, argv: [/usr/local/bin/yams, serve, --quiet] }
+allow: [yams.search]
+allow_arg:
+  - { tool: yams.search, field: path, prefix: /src }
+bridge_port: 8080

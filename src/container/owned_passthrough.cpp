@@ -5,6 +5,7 @@
 #endif
 
 #if defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX
+#    include "macos/darwin_process_group.hpp"
 #    include "macos/launch_command.hpp"
 #    include "owned_group_cleanup.hpp"
 #    include "signal_mailbox.hpp"
@@ -286,28 +287,18 @@ auto pause_tick(failures& errors) noexcept -> bool {
     return false;
 }
 
-// Inspection only: never signal the enumerated PIDs, whose identities are not
-// pinned. The original PGID stays numerically reserved by the unreaped leader.
-// Fixed enumeration capacity is a cleanup diagnostic bound, not a PID limit.
+// The original PGID stays numerically reserved by the unreaped leader.
 auto group_has_live_members(::pid_t group, failures& errors) noexcept -> std::optional<bool> {
-    std::array<struct kinfo_proc, 256> processes{};
-    std::size_t bytes = sizeof(processes);
-    int mib[]{CTL_KERN, KERN_PROC, KERN_PROC_PGRP, group};
-    if (::sysctl(mib, 4, processes.data(), &bytes, nullptr, 0) != 0) {
-        errors.add("ordinary group inspection unavailable (cleanup unresolved)", errno);
-        return std::nullopt;
+    const auto live = macos_detail::group_has_live_members(group);
+    if (live) {
+        return *live;
     }
-    if (bytes >= sizeof(processes) || bytes % sizeof(struct kinfo_proc) != 0) {
-        errors.add("ordinary group inspection truncated (cleanup unresolved)", EOVERFLOW);
-        return std::nullopt;
-    }
-    const auto count = bytes / sizeof(struct kinfo_proc);
-    for (std::size_t index = 0; index != count; ++index) {
-        if (processes[index].kp_proc.p_stat != SZOMB) {
-            return true;
-        }
-    }
-    return false;
+    errors.add(
+        live.error() == EOVERFLOW ? "ordinary group inspection truncated (cleanup unresolved)"
+                                  : "ordinary group inspection unavailable (cleanup unresolved)",
+        live.error()
+    );
+    return std::nullopt;
 }
 
 class owned_child {

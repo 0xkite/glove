@@ -7,18 +7,24 @@
 #include "glove/net/egress_proxy.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -35,6 +41,9 @@ struct origin_server {
     int fd = -1;
     std::uint16_t port = 0;
     std::thread thread;
+    // A non-zero delay holds the marker back until after the client has reset,
+    // so the proxy's relay write lands on a dead socket deterministically.
+    std::chrono::milliseconds marker_delay{0};
 
     auto start() -> bool {
         fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -59,6 +68,9 @@ struct origin_server {
         thread = std::thread([this] {
             int c = ::accept(fd, nullptr, nullptr);
             if (c >= 0) {
+                if (marker_delay.count() > 0) {
+                    std::this_thread::sleep_for(marker_delay);
+                }
                 const char* msg = "ORIGIN_HELLO";
                 (void)::write(c, msg, std::strlen(msg));
                 ::close(c);
@@ -93,6 +105,86 @@ auto connect_loopback(std::uint16_t port) -> int {
     }
     return s;
 }
+
+// connect() an already-open socket, so a descriptor can be reserved before the
+// process table is starved.
+auto connect_loopback_fd(int socket, std::uint16_t port) -> bool {
+    ::sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return ::connect(socket, reinterpret_cast<::sockaddr*>(&address), sizeof(address)) == 0;
+}
+
+// Read until `needle` appears or the deadline passes. Unlike read_some this is
+// bounded, so a mediator that stopped answering fails the test instead of
+// hanging it.
+auto read_within(int fd, const char* needle, int timeout_ms) -> std::string {
+    std::string out;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
+    while (std::chrono::steady_clock::now() < deadline) {
+        ::pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
+        if (::poll(&descriptor, 1, 20) <= 0) {
+            continue;
+        }
+        char buffer[256];
+        const ::ssize_t got = ::read(fd, buffer, sizeof(buffer));
+        if (got <= 0) {
+            break;
+        }
+        out.append(buffer, static_cast<std::size_t>(got));
+        if (out.find(needle) != std::string::npos) {
+            break;
+        }
+    }
+    return out;
+}
+
+// Fill this process's descriptor table so accept() fails with EMFILE, the
+// failure an untrusted agent can drive through fd pressure in the Glove host.
+// The proxy's listener and accept thread live in this process, which is exactly
+// the point. Restores the limit and closes every burned descriptor on scope
+// exit so a failing REQUIRE cannot leave the rest of the suite starved.
+struct fd_starve {
+    ::rlimit saved{};
+    bool lowered = false;
+    std::vector<int> held;
+
+    auto apply() -> bool {
+        if (::getrlimit(RLIMIT_NOFILE, &saved) != 0) {
+            return false;
+        }
+        auto target = saved;
+        if (target.rlim_cur > 64) {
+            target.rlim_cur = 64;
+        }
+        if (::setrlimit(RLIMIT_NOFILE, &target) != 0) {
+            return false;
+        }
+        lowered = true;
+        for (;;) {
+            const int fd = ::open("/dev/null", O_RDONLY);
+            if (fd < 0) {
+                break;
+            }
+            held.push_back(fd);
+        }
+        return errno == EMFILE;
+    }
+
+    void release() {
+        for (const int fd : held) {
+            ::close(fd);
+        }
+        held.clear();
+        if (lowered) {
+            (void)::setrlimit(RLIMIT_NOFILE, &saved);
+            lowered = false;
+        }
+    }
+
+    ~fd_starve() { release(); }
+};
 
 auto connect_unix(const std::filesystem::path& path) -> int {
     const int socket = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -309,6 +401,98 @@ auto run() -> int {
         ::close(c);
         REQUIRE(resp.find("503 Service Unavailable") != std::string::npos);
         REQUIRE(resp.find("ORIGIN_HELLO") == std::string::npos);
+    }
+
+    // A reset client must not terminate the mediator. The agent owns this
+    // socket, so a peer that sends CONNECT and then resets (SO_LINGER 0) makes
+    // the proxy's response write hit a dead socket. Plain write() would raise
+    // SIGPIPE and end the whole Glove process, taking audit and every other
+    // session with it; SO_NOSIGPIPE / MSG_NOSIGNAL must neutralise that. The
+    // audit emit is held open here so the reset is guaranteed to land before
+    // the tunnel-established response is written.
+    {
+        origin_server reset_origin;
+        REQUIRE(reset_origin.start());
+        glove::net::egress_options reset_opts;
+        reset_opts.allow = {
+            {.host = "localhost", .port = reset_origin.port, .allow_private = true}
+        };
+        reset_opts.on_event =
+            [](const glove::net::egress_event&) -> std::expected<void, std::string> {
+            std::this_thread::sleep_for(std::chrono::milliseconds{150});
+            return {};
+        };
+        auto reset_proxy_or = glove::net::start_egress_proxy(std::move(reset_opts));
+        REQUIRE(reset_proxy_or.has_value());
+        auto reset_proxy = std::move(*reset_proxy_or);
+        int c = connect_loopback(reset_proxy->port());
+        REQUIRE(c >= 0);
+        std::string req = "CONNECT localhost:" + std::to_string(reset_origin.port) +
+                          " HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: " +
+                          reset_proxy->proxy_authorization() + "\r\n\r\n";
+        REQUIRE(::write(c, req.data(), req.size()) == static_cast<::ssize_t>(req.size()));
+        ::linger reset{};
+        reset.l_onoff = 1;
+        reset.l_linger = 0;
+        REQUIRE(::setsockopt(c, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)) == 0);
+        ::close(c);
+        std::this_thread::sleep_for(std::chrono::milliseconds{400});
+
+        // The mediator is still here and its accept loop still answers.
+        int alive = connect_loopback(reset_proxy->port());
+        REQUIRE(alive >= 0);
+        std::string denied = "CONNECT evil.example.com:443 HTTP/1.1\r\nProxy-Authorization: " +
+                             reset_proxy->proxy_authorization() + "\r\n\r\n";
+        REQUIRE(
+            ::write(alive, denied.data(), denied.size()) == static_cast<::ssize_t>(denied.size())
+        );
+        const std::string answer = read_some(alive);
+        ::close(alive);
+        REQUIRE(answer.find("403 Forbidden") != std::string::npos);
+    }
+
+    // accept() must be allowed to fail. The agent owns the client end of this
+    // socket and shares the Glove process's descriptor table, so an aborted
+    // handshake or a full table (EMFILE) reaches the mediator's only accept
+    // thread. Treating one failed accept as final leaves the listener bound and
+    // the proxy URL still advertised, so every later CONNECT completes its
+    // handshake and then hangs unanswered while the session reports nothing:
+    // mediated egress and its audit stop with no error surfaced. The loop must
+    // survive and keep answering.
+    {
+        glove::net::egress_options starving_opts;
+        starving_opts.allow = {{.host = "localhost", .port = origin.port, .allow_private = true}};
+        auto starving_proxy_or = glove::net::start_egress_proxy(std::move(starving_opts));
+        REQUIRE(starving_proxy_or.has_value());
+        auto starving_proxy = std::move(*starving_proxy_or);
+
+        // Reserve the client descriptor first: connect() reuses it, while
+        // accept() needs a fresh one and must therefore fail.
+        const int starved_client = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(starved_client >= 0);
+        {
+            fd_starve starve;
+            REQUIRE(starve.apply());
+            REQUIRE(connect_loopback_fd(starved_client, starving_proxy->port()));
+            // Let the accept thread observe POLLIN and fail with no slot free.
+            std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        }
+        ::close(starved_client);
+
+        // The mediator must still be listening, accepting, and answering.
+        const int alive = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(alive >= 0);
+        REQUIRE(connect_loopback_fd(alive, starving_proxy->port()));
+        const std::string unauth_request = "CONNECT localhost:" + std::to_string(origin.port) +
+                                           " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        REQUIRE(
+            ::write(alive, unauth_request.data(), unauth_request.size()) ==
+            static_cast<::ssize_t>(unauth_request.size())
+        );
+        const std::string post_failure = read_within(alive, "Proxy Authentication Required", 3000);
+        ::close(alive);
+        std::fprintf(stderr, "post-accept-failure resp: %s\n", post_failure.c_str());
+        REQUIRE(post_failure.find("407 Proxy Authentication Required") != std::string::npos);
     }
     return 0;
 }

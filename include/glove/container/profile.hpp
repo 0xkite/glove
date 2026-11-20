@@ -233,6 +233,13 @@ struct profile {
     // 127.0.0.1:0). Does not grant external network egress.
     bool allow_loopback_listen = false;
 
+    // A Unix-domain socket the guest must be able to connect() to, such as the
+    // mediated MCP bridge. connect() on a Unix socket is a network-outbound
+    // operation, not a file read, so a broker needs its own path-filtered
+    // allow. validate() stores the canonical form because profile rule strings
+    // are matched against the resolved path and are never normalized.
+    std::optional<std::string> unix_socket_endpoint;
+
     // How the Linux seccomp escape-surface tripwire responds to explicit
     // escape/kernel-mutation syscalls (bpf, unshare, setns, mount API,
     // open_by_handle_at, pidfd_getfd, kexec, TIOCSTI, ...). Default
@@ -243,6 +250,12 @@ struct profile {
         deny_errno,
     };
     seccomp_escape_policy escape_policy = seccomp_escape_policy::terminate_container;
+
+    // Set only by the runner after it started denial telemetry. macOS gives
+    // every deny rule this tag instead of a fresh one; other backends ignore
+    // it. 32 lowercase hex characters. Not a secret from the contained
+    // process, which can read it.
+    std::optional<std::string> denial_tag;
 };
 
 // Validate and canonicalise a profile. Invalid, overlapping, contradictory,
