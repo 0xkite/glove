@@ -45,6 +45,64 @@ auto canonical_path(std::string_view raw, std::string_view label)
     return normal.string();
 }
 
+constexpr std::size_t max_link_spellings = 64U;
+constexpr std::size_t max_link_spelling_bytes = 4096U;
+
+auto add_link_spelling(std::vector<std::string>& links, std::string link)
+    -> std::expected<void, std::string> {
+    if (std::ranges::find(links, link) != links.end()) {
+        return {};
+    }
+    if (link.size() > max_link_spelling_bytes) {
+        return std::unexpected(std::string{"symlink spelling exceeds 4096 bytes"});
+    }
+    if (links.size() >= max_link_spellings) {
+        return std::unexpected(std::string{"too many symlinks in grant spellings (limit 64)"});
+    }
+    links.push_back(std::move(link));
+    return {};
+}
+
+// Records every symlink among the prefixes of the raw spelling, plus symlinks
+// reached by following a link's target (at most 8 hops). Errors from the
+// filesystem are ignored; canonical_path decides whether the path is usable.
+auto collect_link_spellings(std::string_view raw, std::vector<std::string>& links)
+    -> std::expected<void, std::string> {
+    const std::filesystem::path spelling{raw};
+    if (!spelling.is_absolute()) {
+        return {};
+    }
+    std::filesystem::path prefix = spelling.root_path();
+    for (const auto& part : spelling.relative_path()) {
+        prefix /= part;
+        std::error_code ec;
+        if (!std::filesystem::is_symlink(prefix, ec) || ec) {
+            continue;
+        }
+        std::filesystem::path link = prefix.lexically_normal();
+        for (int hop = 0; hop < 8; ++hop) {
+            if (auto added = add_link_spelling(links, link.string()); !added) {
+                return added;
+            }
+            std::error_code link_ec;
+            auto target = std::filesystem::read_symlink(link, link_ec);
+            if (link_ec) {
+                break;
+            }
+            if (target.is_relative()) {
+                target = link.parent_path() / target;
+            }
+            target = target.lexically_normal();
+            std::error_code target_ec;
+            if (!std::filesystem::is_symlink(target, target_ec) || target_ec) {
+                break;
+            }
+            link = std::move(target);
+        }
+    }
+    return {};
+}
+
 auto protected_path(std::string_view raw, std::string_view label, bool directory)
     -> std::expected<void, std::string> {
     if (raw.empty() || raw.size() > 4096U || raw.find('\0') != std::string_view::npos) {
@@ -236,6 +294,9 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
     }
     std::set<std::string> paths;
     for (auto& rule : copy.filesystem) {
+        if (auto links = collect_link_spellings(rule.path, copy.link_spellings); !links) {
+            return std::unexpected(links.error());
+        }
         auto path = canonical_path(rule.path, "filesystem rule");
         if (!path) {
             return std::unexpected(path.error());
@@ -309,6 +370,9 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
     for (auto& rule : copy.runtime_filesystem) {
         if (rule.writable) {
             return std::unexpected(std::string{"runtime filesystem rule must be read-only"});
+        }
+        if (auto links = collect_link_spellings(rule.path, copy.link_spellings); !links) {
+            return std::unexpected(links.error());
         }
         auto path = canonical_path(rule.path, "runtime filesystem rule");
         if (!path) {
