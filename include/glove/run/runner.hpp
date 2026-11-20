@@ -81,6 +81,9 @@ struct options {
     // Materialize guest agent configuration (e.g. ~/.pi/agent/models.json and
     // settings.json) into the private sandbox HOME directory.
     bool seed_guest_agent_home = false;
+    // The seeded harness is Pi: its local packages were offered for exposure,
+    // so report each one the sandbox still cannot load.
+    bool report_pi_packages = false;
 };
 
 // Run the contained agent end-to-end: build the profile, spawn the agent,
