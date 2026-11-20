@@ -66,6 +66,13 @@ struct options {
     // Preset agent profile (e.g. "claude-code", "codex", "pi") that selects a
     // credentialed reverse endpoint and generates the matching environment.
     std::optional<std::string> agent_preset;
+    // `--share-credential <provider>` (shell, Pi only): mediate one host
+    // provider key through the credentialed endpoint. The sandbox receives a
+    // session nonce and a loopback base URL, never the key itself.
+    std::optional<std::string> share_credential;
+    // `--share-credential-origin <host>`: required when the host models.json
+    // sends a catalog provider to a host Pi's catalog does not name.
+    std::optional<std::string> share_credential_origin;
     // Where the preset's provider credential comes from. Unset: the preset's
     // host environment variable (e.g. ANTHROPIC_API_KEY).
     std::optional<secret_reference> provider_secret;

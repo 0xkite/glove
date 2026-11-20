@@ -168,6 +168,11 @@ target_link_libraries(run_pi_host_config_test PRIVATE glove_run glaze::glaze)
 add_test(NAME run_pi_host_config COMMAND run_pi_host_config_test)
 set_tests_properties(run_pi_host_config PROPERTIES TIMEOUT 10)
 
+add_executable(run_pi_provider_share_test run/pi_provider_share_test.cpp)
+target_link_libraries(run_pi_provider_share_test PRIVATE glove_run)
+add_test(NAME run_pi_provider_share COMMAND run_pi_provider_share_test)
+set_tests_properties(run_pi_provider_share PROPERTIES TIMEOUT 10)
+
 add_executable(run_provider_endpoint_test run/provider_endpoint_test.cpp)
 target_link_libraries(run_provider_endpoint_test PRIVATE glove_run)
 target_include_directories(run_provider_endpoint_test PRIVATE ${CMAKE_SOURCE_DIR}/src/run)
@@ -695,6 +700,13 @@ if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_dependencies(glove_shell_pi_config_test glove)
     add_test(NAME glove_shell_pi_config COMMAND glove_shell_pi_config_test)
     set_tests_properties(glove_shell_pi_config PROPERTIES TIMEOUT 30)
+
+    add_executable(glove_shell_pi_share_credential_test run/glove_shell_pi_share_credential_test.cpp)
+    target_compile_definitions(glove_shell_pi_share_credential_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_shell_pi_share_credential_test glove)
+    add_test(NAME glove_shell_pi_share_credential COMMAND glove_shell_pi_share_credential_test)
+    set_tests_properties(glove_shell_pi_share_credential PROPERTIES TIMEOUT 60)
 endif()
 
 if(APPLE)

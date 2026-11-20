@@ -26,6 +26,7 @@ namespace {
     } while (0)
 
 namespace fs = std::filesystem;
+using glove::run::mediate_pi_provider;
 using glove::run::pi_local_package;
 using glove::run::pi_local_package_sources;
 using glove::run::pi_package_exposure;
@@ -330,6 +331,60 @@ auto escapes() -> int {
     return 0;
 }
 
+auto mediate_models() -> int {
+    constexpr std::string_view url = "http://127.0.0.1:4100/deepseek";
+    constexpr std::string_view nonce = "glove-session-fixture";
+    // A missing or empty host file still gets a routed provider.
+    for (const std::string_view input : {std::string_view{}, std::string_view{"  \n"}}) {
+        auto fresh = mediate_pi_provider(input, "deepseek", url, nonce);
+        REQUIRE(fresh.has_value());
+        REQUIRE(contains(*fresh, R"("deepseek":{)"));
+        REQUIRE(contains(*fresh, url));
+        REQUIRE(contains(*fresh, nonce));
+    }
+    // Existing provider settings survive; every bypass or second credential goes.
+    auto merged = mediate_pi_provider(
+        R"({"providers":{"local":{"baseUrl":"http://127.0.0.1:8081/v1","apiKey":"dummy"},)"
+        R"("deepseek":{"baseUrl":"https://api.deepseek.com","apiKey":"$DEEPSEEK_API_KEY",)"
+        R"("headers":{"Authorization":"Bearer ${DEEPSEEK_API_KEY}"},"compat":{"x":1},)"
+        R"("models":[{"id":"m","baseUrl":"https://evil.example","apiKey":"$K","headers":{"A":"b"},"name":"keep"}]}}})",
+        "deepseek",
+        url,
+        nonce
+    );
+    REQUIRE(merged.has_value());
+    REQUIRE(contains(*merged, "dummy"));
+    REQUIRE(contains(*merged, R"("compat":{"x":1})"));
+    REQUIRE(contains(*merged, R"("name":"keep")"));
+    REQUIRE(!contains(*merged, "api.deepseek.com"));
+    REQUIRE(!contains(*merged, "evil.example"));
+    REQUIRE(!contains(*merged, "DEEPSEEK_API_KEY"));
+    REQUIRE(!contains(*merged, "headers"));
+    REQUIRE(!contains(*merged, "$K"));
+    // Pi adds its own Authorization header when authHeader is set, and model
+    // overrides may carry headers: both would put a second credential beside
+    // the nonce.
+    auto overrides = mediate_pi_provider(
+        R"({"providers":{"google":{"authHeader":true,"modelOverrides":{"m":{"headers":)"
+        R"({"Authorization":"Bearer ${T}"},"name":"kept"}}},"other":{"authHeader":true}}})",
+        "google",
+        url,
+        nonce
+    );
+    REQUIRE(overrides.has_value());
+    REQUIRE(!contains(*overrides, R"("headers")"));
+    REQUIRE(contains(*overrides, R"("name":"kept")"));
+    REQUIRE(contains(*overrides, R"("other":{"authHeader":true})"));
+    REQUIRE(!contains(*overrides, R"("google":{"authHeader")"));
+    REQUIRE(overrides->find("authHeader") == overrides->rfind("authHeader"));
+    // Malformed input and missing parameters are refused, never guessed.
+    REQUIRE(!mediate_pi_provider(R"({"providers":[]})", "deepseek", url, nonce).has_value());
+    REQUIRE(!mediate_pi_provider(R"({"providers":)", "deepseek", url, nonce).has_value());
+    REQUIRE(!mediate_pi_provider("{}", "deepseek", url, "").has_value());
+    REQUIRE(!mediate_pi_provider("{}", "", url, nonce).has_value());
+    return 0;
+}
+
 auto main() -> int {
     if (const int rc = escapes(); rc != 0) {
         return rc;
@@ -341,6 +396,9 @@ auto main() -> int {
         return rc;
     }
     if (const int rc = scrub_models(); rc != 0) {
+        return rc;
+    }
+    if (const int rc = mediate_models(); rc != 0) {
         return rc;
     }
     return exposure();

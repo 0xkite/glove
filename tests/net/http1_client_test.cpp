@@ -308,6 +308,19 @@ auto serialization_cases() -> int {
     REQUIRE(bearer->find("Authorization: Bearer sk-ant-secret\r\n") != std::string::npos);
     REQUIRE(bearer->find("x-api-key") == std::string::npos);
 
+    auto goog = serialize_request(request, credential_scheme::x_goog_api_key);
+    REQUIRE(goog);
+    REQUIRE(goog->find("x-goog-api-key: sk-ant-secret\r\n") != std::string::npos);
+    REQUIRE(goog->find("Authorization") == std::string::npos);
+    REQUIRE(goog->find("x-api-key:") == std::string::npos);
+    auto agent_goog = request;
+    agent_goog.headers.emplace_back("x-goog-api-key", "agent-supplied");
+    // A credential field the transport owns is refused, never forwarded beside
+    // the injected one.
+    auto refused_owned = serialize_request(agent_goog, credential_scheme::bearer);
+    REQUIRE(!refused_owned);
+    REQUIRE(refused_owned.error().find("owned by the transport") != std::string::npos);
+
     request.upstream_port = 8443;
     auto ported = serialize_request(request, credential_scheme::x_api_key);
     REQUIRE(ported);

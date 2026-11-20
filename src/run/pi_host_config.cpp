@@ -664,6 +664,61 @@ auto scrub_pi_models_credentials(std::string_view models_json)
     return write_object(*models, "models.json");
 }
 
+auto mediate_pi_provider(
+    std::string_view models_json,
+    std::string_view provider,
+    std::string_view base_url,
+    std::string_view nonce
+) -> std::expected<std::string, std::string> {
+    if (provider.empty() || base_url.empty() || nonce.empty()) {
+        return std::unexpected(std::string{"mediated provider needs a name, base URL, and nonce"});
+    }
+    auto models = parse_object(
+        trim(models_json).empty() ? std::string_view{"{}"} : models_json, "models.json"
+    );
+    if (!models) {
+        return std::unexpected(models.error());
+    }
+    auto& root = models->get_object();
+    auto providers = root.find("providers");
+    if (providers == root.end()) {
+        providers = root.emplace("providers", glz::generic::object_t{}).first;
+    } else if (!providers->second.is_object()) {
+        return std::unexpected(std::string{"models.json providers must be an object"});
+    }
+    auto& by_name = providers->second.get_object();
+    auto entry = by_name.find(provider);
+    if (entry == by_name.end() || !entry->second.is_object()) {
+        entry = by_name.insert_or_assign(std::string{provider}, glz::generic::object_t{}).first;
+    }
+    auto& fields = entry->second.get_object();
+    fields.erase("headers");
+    fields.erase("authHeader");
+    if (auto overrides = fields.find("modelOverrides");
+        overrides != fields.end() && overrides->second.is_object()) {
+        for (auto& [model_id, model] : overrides->second.get_object()) {
+            if (model.is_object()) {
+                for (const char* key : {"baseUrl", "apiKey", "headers"}) {
+                    model.get_object().erase(key);
+                }
+            }
+        }
+    }
+    fields["baseUrl"] = std::string{base_url};
+    fields["apiKey"] = std::string{nonce};
+    if (auto list = fields.find("models"); list != fields.end() && list->second.is_array()) {
+        for (auto& model : list->second.get_array()) {
+            if (model.is_object()) {
+                auto& model_fields = model.get_object();
+                for (const char* key : {"baseUrl", "apiKey", "headers"}) {
+                    model_fields.erase(key);
+                }
+            }
+        }
+    }
+    return write_object(*models, "models.json");
+}
+
 auto printable(std::string_view text) -> std::string {
     static constexpr char hex[] = "0123456789abcdef";
     std::string out;

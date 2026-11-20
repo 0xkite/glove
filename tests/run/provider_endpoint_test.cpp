@@ -1,3 +1,5 @@
+#include "glove/run/pi_provider_share.hpp"
+
 #include "provider_endpoint.hpp"
 
 #include <cstdio>
@@ -83,6 +85,52 @@ auto main() -> int {
         )) {
         std::fprintf(stderr, "fixed provider surface mismatch\n");
         return 1;
+    }
+    // A shared Pi provider becomes one client-placed rule whose upstream and
+    // paths come from the resolved provider data, never from a provider table.
+    {
+        glove::run::pi_shared_provider shared{
+            .name = "google",
+            .host = "generativelanguage.googleapis.com",
+            .port = 443,
+            .base_path = "/v1beta",
+            .allowed_paths = {"/v1beta/models/*"},
+            .origin_from_models_json = false,
+            .catalog_hosts = {},
+        };
+        auto shared_options = glove::run::detail::make_shared_provider_endpoint_options(
+            shared, "host-secret-sentinel", "glove-session-fixture"
+        );
+        if (!shared_options || shared_options->endpoints.size() != 1 || !shared_options->forward) {
+            std::fprintf(stderr, "shared provider endpoint missing\n");
+            return 1;
+        }
+        const auto& rule = shared_options->endpoints.front();
+        if (rule.provider != endpoint_provider::client_placed || rule.path_prefix != "/p/google" ||
+            rule.upstream_host != "generativelanguage.googleapis.com" ||
+            rule.upstream_port != 443 || rule.allowed_paths != shared.allowed_paths ||
+            rule.allowed_methods != std::vector<std::string>{"POST"} ||
+            rule.secret_token != "host-secret-sentinel" ||
+            rule.session_nonce != "glove-session-fixture") {
+            std::fprintf(stderr, "shared provider rule mismatch\n");
+            return 1;
+        }
+        glove::net::upstream_request elsewhere;
+        elsewhere.upstream_host = "api.anthropic.com";
+        elsewhere.upstream_port = 443;
+        auto denied = shared_options->forward(
+            elsewhere, {}, std::chrono::steady_clock::now() + std::chrono::seconds{1}
+        );
+        if (denied || denied.error() != "upstream not in the forwarder allowlist") {
+            std::fprintf(stderr, "shared provider forwarder is not pinned\n");
+            return 1;
+        }
+        auto no_paths = shared;
+        no_paths.allowed_paths.clear();
+        if (glove::run::detail::make_shared_provider_endpoint_options(no_paths, "s", "n")) {
+            std::fprintf(stderr, "shared provider without paths accepted\n");
+            return 1;
+        }
     }
     if (make_provider_endpoint_options(static_cast<provider_surface>(255), "secret", "nonce") ||
         make_provider_endpoint_options(provider_surface::pi_openai, "", "nonce") ||

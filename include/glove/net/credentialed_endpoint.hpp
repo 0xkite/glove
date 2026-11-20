@@ -16,6 +16,11 @@ enum class endpoint_provider : std::uint8_t {
     openai,
     github,
     custom,
+    // The credential is injected into the field where the client presented
+    // the session nonce (`Authorization: Bearer`, `x-api-key`, or
+    // `x-goog-api-key`), so one rule serves any provider whose client formats
+    // its own authentication header.
+    client_placed,
 };
 
 struct credentialed_endpoint_rule {
@@ -26,7 +31,9 @@ struct credentialed_endpoint_rule {
     std::string secret_token;  // Maintained in host memory only
     std::string session_nonce; // Ephemeral token required from sandbox
     std::vector<std::string> allowed_methods = {"POST"};
-    std::vector<std::string> allowed_paths; // Empty means allow all under prefix
+    // Empty means allow all under prefix. An entry is an exact path, a subtree
+    // ("/v1/*"), or one segment ending in a suffix ("/v1/models/*:generate").
+    std::vector<std::string> allowed_paths;
 };
 
 struct endpoint_event {
@@ -55,6 +62,9 @@ struct upstream_request {
     // are already removed: the transport sets Host and the credential itself.
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    // Lowercase name of the header that carried the session nonce. Used to
+    // place the secret for `endpoint_provider::client_placed`.
+    std::string credential_field;
     // The provider credential to present. Host memory only; never leaves it as
     // plain agent-visible state.
     std::string secret_token;

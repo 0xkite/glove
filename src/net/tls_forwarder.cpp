@@ -14,13 +14,25 @@ namespace glove::net {
 
 namespace {
 
-auto scheme_for(endpoint_provider provider) -> std::optional<http::credential_scheme> {
-    switch (provider) {
+auto scheme_for(const upstream_request& request) -> std::optional<http::credential_scheme> {
+    switch (request.provider) {
     case endpoint_provider::anthropic:
         return http::credential_scheme::x_api_key;
     case endpoint_provider::openai:
     case endpoint_provider::github:
         return http::credential_scheme::bearer;
+    case endpoint_provider::client_placed:
+        // Only the three fields the endpoint accepts a nonce from.
+        if (request.credential_field == "authorization") {
+            return http::credential_scheme::bearer;
+        }
+        if (request.credential_field == "x-api-key") {
+            return http::credential_scheme::x_api_key;
+        }
+        if (request.credential_field == "x-goog-api-key") {
+            return http::credential_scheme::x_goog_api_key;
+        }
+        break;
     case endpoint_provider::custom:
         // No defined credential field, so nothing safe to inject.
         break;
@@ -48,7 +60,7 @@ auto make_tls_forwarder(tls_forwarder_options opts) -> upstream_forwarder {
         if (!permitted) {
             return std::unexpected(std::string{"upstream not in the forwarder allowlist"});
         }
-        const auto scheme = scheme_for(request.provider);
+        const auto scheme = scheme_for(request);
         if (!scheme) {
             return std::unexpected(std::string{"provider has no credential scheme"});
         }

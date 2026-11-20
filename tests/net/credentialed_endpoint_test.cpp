@@ -579,6 +579,120 @@ auto run() -> int {
     }
 
     REQUIRE(!recorded_events.empty());
+
+    // A client-placed rule forwards the secret in the field where the client
+    // presented the nonce, for each supported credential header.
+    {
+        glove::net::credentialed_endpoint_options placed;
+        placed.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::client_placed,
+            .path_prefix = "/p/google",
+            .upstream_host = "generativelanguage.googleapis.com",
+            .upstream_port = 443,
+            .secret_token = "google-host-secret",
+            .session_nonce = "glove-nonce-placed",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1beta/models/*"},
+        });
+        std::vector<glove::net::upstream_request> seen;
+        placed.forward = [&](
+                             const glove::net::upstream_request& request,
+                             std::stop_token,
+                             std::chrono::steady_clock::time_point
+                         ) -> std::expected<glove::net::upstream_response, std::string> {
+            seen.push_back(request);
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.body = "{}";
+            return response;
+        };
+        auto placed_endpoint = glove::net::start_credentialed_endpoint(std::move(placed));
+        REQUIRE(placed_endpoint.has_value());
+        const auto placed_port = (*placed_endpoint)->port();
+        const std::string target =
+            "POST /p/google/v1beta/models/m:streamGenerateContent?alt=sse HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n";
+        for (const auto& [field, line] : std::vector<std::pair<std::string, std::string>>{
+                 {"x-goog-api-key", "x-goog-api-key: glove-nonce-placed\r\n"},
+                 {"x-api-key", "x-api-key: glove-nonce-placed\r\n"},
+                 {"authorization", "Authorization: Bearer glove-nonce-placed\r\n"},
+             }) {
+            const auto resp =
+                send_and_receive(placed_port, target + line + "Content-Length: 0\r\n\r\n");
+            REQUIRE(resp.starts_with("HTTP/1.1 200 OK"));
+            REQUIRE(!seen.empty());
+            REQUIRE(seen.back().credential_field == field);
+            REQUIRE(seen.back().secret_token == "google-host-secret");
+            REQUIRE(seen.back().target == "/v1beta/models/m:streamGenerateContent?alt=sse");
+            for (const auto& [name, value] : seen.back().headers) {
+                REQUIRE(name != "x-goog-api-key");
+                REQUIRE(value.find("glove-nonce-placed") == std::string::npos);
+            }
+        }
+        const auto before = seen.size();
+        const auto wrong = send_and_receive(
+            placed_port, target + "x-goog-api-key: other\r\nContent-Length: 0\r\n\r\n"
+        );
+        REQUIRE(wrong.starts_with("HTTP/1.1 401 Unauthorized"));
+        const auto both = send_and_receive(
+            placed_port,
+            target + "x-goog-api-key: glove-nonce-placed\r\nx-api-key: glove-nonce-placed\r\n"
+                     "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(!both.starts_with("HTTP/1.1 200 OK"));
+        REQUIRE(seen.size() == before);
+    }
+
+    // `stem/*:suffix` admits one non-empty segment that ends in the suffix.
+    {
+        glove::net::credentialed_endpoint_options methods;
+        methods.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::client_placed,
+            .path_prefix = "/p/google",
+            .upstream_host = "generativelanguage.googleapis.com",
+            .upstream_port = 443,
+            .secret_token = "google-host-secret",
+            .session_nonce = "glove-nonce-methods",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1beta/models/*:generateContent"},
+        });
+        std::size_t forwarded = 0;
+        methods.forward = [&](
+                              const glove::net::upstream_request&,
+                              std::stop_token,
+                              std::chrono::steady_clock::time_point
+                          ) -> std::expected<glove::net::upstream_response, std::string> {
+            ++forwarded;
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.body = "{}";
+            return response;
+        };
+        auto methods_endpoint = glove::net::start_credentialed_endpoint(std::move(methods));
+        REQUIRE(methods_endpoint.has_value());
+        const auto methods_port = (*methods_endpoint)->port();
+        const auto post = [&](const std::string& path) {
+            return send_and_receive(
+                methods_port,
+                "POST /p/google" + path +
+                    " HTTP/1.1\r\nHost: 127.0.0.1\r\nx-goog-api-key: glove-nonce-methods\r\n"
+                    "Content-Length: 0\r\n\r\n"
+            );
+        };
+        REQUIRE(
+            post("/v1beta/models/gemini-2.5-flash:generateContent").starts_with("HTTP/1.1 200")
+        );
+        for (const std::string path : {
+                 "/v1beta/models/m:predict",
+                 "/v1beta/models/a/b:generateContent",
+                 "/v1beta/models/:generateContent",
+                 "/v1beta/models/m:generateContentX",
+                 "/v1beta/models/m",
+             }) {
+            REQUIRE(!post(path).starts_with("HTTP/1.1 200"));
+        }
+        REQUIRE(forwarded == 1);
+    }
     return 0;
 }
 
