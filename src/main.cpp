@@ -2,6 +2,7 @@
 #include "glove/host/runtime_policy.hpp"
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/json_codec.hpp"
+#include "glove/run/pi_host_config.hpp"
 #include "glove/run/runner.hpp"
 #include "glove/term/terminal.hpp"
 #include "glove/version.hpp"
@@ -637,6 +638,58 @@ void add_verified_agent_read_dir(
     add_non_overlapping_read_dir(opts, canon);
 }
 
+// Expose the local packages and resources named in host Pi settings read-only,
+// so one kept outside the approved roots (for example a source checkout) still
+// loads. The runner drops any that end up unreadable from the guest settings,
+// so a refused package degrades to "not loaded" with a warning.
+void add_pi_local_packages(
+    glove::run::options& opts,
+    const std::filesystem::path& home_dir,
+    const std::filesystem::path& pi_agent_dir
+) {
+    std::vector<std::filesystem::path> agent_writable{opts.writable.begin(), opts.writable.end()};
+    if (opts.workspace) {
+        agent_writable.push_back(*opts.workspace);
+    }
+    auto text = glove::run::read_host_pi_settings(pi_agent_dir, home_dir, agent_writable);
+    if (!text) {
+        return;
+    }
+    auto packages = glove::run::pi_local_package_sources(*text, pi_agent_dir, home_dir);
+    if (!packages) {
+        return;
+    }
+    const std::array<std::filesystem::path, 2> dotfiles_roots{
+        home_dir / "Documents" / "depend" / "dotfiles", home_dir / ".dotfiles"
+    };
+    for (const auto& package : *packages) {
+        if (is_subpath_of(package.resolved, pi_agent_dir)) {
+            continue;
+        }
+        auto canonical = glove::run::pi_package_exposure(package.resolved, home_dir, pi_agent_dir);
+        if (!canonical) {
+            continue;
+        }
+        const bool approved = std::ranges::any_of(dotfiles_roots, [&](const auto& root) {
+            std::error_code ec;
+            const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+            return !ec && is_subpath_of(*canonical, canonical_root);
+        });
+        const auto before = opts.readable.size();
+        add_non_overlapping_read_dir(opts, *canonical);
+        if (!approved && opts.readable.size() > before) {
+            // A package outside the approved roots is visible on every launch,
+            // so name it: settings.json is the only thing that put it there.
+            std::fprintf(
+                stderr,
+                "glove: exposing Pi package '%s' read-only (from %s)\n",
+                glove::run::printable(canonical->string()).c_str(),
+                glove::run::printable((pi_agent_dir / "settings.json").string()).c_str()
+            );
+        }
+    }
+}
+
 void add_unique_path_dir(glove::run::options& opts, const std::filesystem::path& dir) {
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec) || ec) {
@@ -767,6 +820,10 @@ auto attach_agent_harness_closure(
         add_verified_agent_read_dir(
             opts, dotfiles_dir / "pi" / ".pi" / "agent" / "packages", approved_pi_roots
         );
+        if (driver == "pi") {
+            add_pi_local_packages(opts, home_dir, pi_agent_dir);
+            opts.report_pi_packages = true;
+        }
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "antigravity-cli");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "claude");
         add_non_overlapping_read_dir(opts, home_dir / ".local" / "share" / "pi-node");

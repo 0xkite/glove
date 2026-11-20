@@ -3,6 +3,7 @@ add_library(glove_run STATIC
     provider_endpoint.cpp
     pi_selection.cpp
     pi_guest_config.cpp
+    pi_host_config.cpp
     pi_catalog.cpp
     pi_private_state.cpp
     native_private_state.cpp

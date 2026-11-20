@@ -16,6 +16,7 @@
 #include "glove/policy/engine.hpp"
 #include "glove/reflect/codegen.hpp"
 #include "glove/reflect/extension.hpp"
+#include "glove/run/pi_host_config.hpp"
 
 #include "provider_endpoint.hpp"
 
@@ -41,8 +42,10 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -394,6 +397,152 @@ auto detect_loopback_port_in_models_json(const std::filesystem::path& models_jso
     return std::nullopt;
 }
 
+auto read_small_file(const std::filesystem::path& path) -> std::optional<std::string> {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return std::nullopt;
+    }
+    constexpr std::size_t limit = 4U * 1024U * 1024U;
+    std::string text;
+    std::array<char, 8192> chunk{};
+    while (text.size() <= limit) {
+        const ::ssize_t n = ::read(fd, chunk.data(), chunk.size());
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        text.append(chunk.data(), static_cast<std::size_t>(n));
+    }
+    (void)::close(fd);
+    if (text.size() > limit) {
+        return std::nullopt;
+    }
+    return text;
+}
+
+// Replace a staged guest file through a same-directory temporary so a failed
+// write leaves the previous copy, never a truncated one.
+auto replace_file_0600(const std::filesystem::path& path, std::string_view text) -> bool {
+    const auto tmp = path.string() + ".tmp." + std::to_string(::getpid());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return false;
+    }
+    std::size_t written = 0;
+    bool ok = true;
+    while (written < text.size()) {
+        const ::ssize_t n = ::write(fd, text.data() + written, text.size() - written);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            ok = false;
+            break;
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    (void)::fchmod(fd, 0600);
+    (void)::close(fd);
+    if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0) {
+        (void)::unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+// Point local Pi packages at absolute paths the sandbox can read, and drop the
+// ones it cannot so Pi starts instead of aborting on an unreadable manifest.
+// Relative sources resolve from the host agent directory, as Pi resolves them.
+void stage_guest_pi_settings(
+    const std::filesystem::path& host_home,
+    const std::filesystem::path& host_pi_dir,
+    const std::filesystem::path& guest_pi_dir,
+    const glove::container::profile& profile,
+    bool report
+) {
+    const auto guest_settings = guest_pi_dir / "settings.json";
+    if (!std::filesystem::exists(std::filesystem::symlink_status(guest_settings))) {
+        return;
+    }
+    const auto text = read_small_file(guest_settings);
+    if (!text) {
+        (void)::unlink(guest_settings.c_str());
+        return;
+    }
+    auto packages = glove::run::pi_local_package_sources(*text, host_pi_dir, host_home);
+    if (!packages) {
+        // Keep the copy as staged: losing defaultProvider/defaultModel is worse
+        // than a local package path that may not resolve in the sandbox.
+        std::fprintf(
+            stderr,
+            "glove: Pi settings.json staged unchanged; local package paths not rewritten: %s\n",
+            packages.error().c_str()
+        );
+        return;
+    }
+    std::map<std::string, std::string> exposed;
+    for (const auto& package : *packages) {
+        // Entries under the agent directory keep their original form: the
+        // guest mirrors npm, skills, pi-subagents, pi-web-access, and missions
+        // there, and anything else under it was not loadable before either.
+        if (path_within(package.resolved, host_pi_dir)) {
+            const std::string_view declared{package.declared};
+            exposed.emplace(
+                package.declared,
+                std::string{declared.starts_with('+') ? declared.substr(1) : declared}
+            );
+            continue;
+        }
+        auto canonical = glove::run::pi_package_exposure(package.resolved, host_home, host_pi_dir);
+        const auto covers = [&](const auto& rule) {
+            return path_within(*canonical, std::filesystem::path{rule.path});
+        };
+        if (canonical && std::ranges::any_of(profile.filesystem, covers)) {
+            exposed.emplace(package.declared, canonical->string());
+            continue;
+        }
+        if (!report) {
+            continue;
+        }
+        std::string reason = canonical ? "path is not exposed" : canonical.error();
+        if (canonical && std::ranges::any_of(profile.filesystem, [&](const auto& rule) {
+                return path_within(std::filesystem::path{rule.path}, *canonical);
+            })) {
+            reason = "it contains the workspace or another mounted path; use a workspace "
+                     "outside it";
+        }
+        std::fprintf(
+            stderr,
+            "glove: Pi resource '%s' is not loaded in the sandbox (%s)\n",
+            glove::run::printable(package.declared).c_str(),
+            glove::run::printable(reason).c_str()
+        );
+    }
+    auto rewritten = glove::run::rewrite_pi_settings_packages(*text, exposed);
+    if (!rewritten || !replace_file_0600(guest_settings, *rewritten)) {
+        std::fprintf(stderr, "glove: Pi settings.json not staged: cannot rewrite packages\n");
+        (void)::unlink(guest_settings.c_str());
+    }
+}
+
+// Remove credentials from the staged models.json; on any failure the guest
+// gets no models.json rather than an unscrubbed one.
+void stage_guest_pi_models(const std::filesystem::path& guest_pi_dir) {
+    const auto guest_models = guest_pi_dir / "models.json";
+    if (!std::filesystem::exists(std::filesystem::symlink_status(guest_models))) {
+        return;
+    }
+    const auto text = read_small_file(guest_models);
+    auto scrubbed = text ? glove::run::scrub_pi_models_credentials(*text)
+                         : std::expected<std::string, std::string>{std::unexpected("unreadable")};
+    if (!scrubbed || !replace_file_0600(guest_models, *scrubbed)) {
+        std::fprintf(stderr, "glove: Pi models.json not staged: cannot remove credentials\n");
+        (void)::unlink(guest_models.c_str());
+    }
+}
+
 void provision_guest_agent_home(const options& opts, glove::container::profile& profile) noexcept {
     if (!opts.seed_guest_agent_home || !profile.home_dir) {
         return;
@@ -437,79 +586,10 @@ void provision_guest_agent_home(const options& opts, glove::container::profile& 
              }) {
             copy_regular_file_0600(host_pi_dir / name, guest_pi_dir / name, true);
         }
-        // Rewrite host-relative `../../` package paths in the staged guest
-        // `settings.json` (which on the host sit under `<HOME>/.pi/agent`) so
-        // local packages like `../../Documents/depend/dotfiles/pi/.pi/agent/packages/lsp-pi-cpp`
-        // resolve from the ephemeral guest `PI_CODING_AGENT_DIR`.
-        {
-            const auto guest_settings = guest_pi_dir / "settings.json";
-            std::ifstream settings_in(guest_settings, std::ios::binary);
-            if (settings_in) {
-                std::string settings_text((std::istreambuf_iterator<char>(settings_in)), {});
-                settings_in.close();
-                const std::string needle = "\"../../";
-                std::string escaped_home;
-                for (const char ch : host_home.string()) {
-                    if (ch == '"') {
-                        escaped_home += "\\\"";
-                    } else if (ch == '\\') {
-                        escaped_home += "\\\\";
-                    } else if (static_cast<unsigned char>(ch) < 0x20U) {
-                        static constexpr char kHex[] = "0123456789abcdef";
-                        escaped_home += "\\u00";
-                        escaped_home.push_back(
-                            kHex[(static_cast<unsigned char>(ch) >> 4U) & 0x0FU]
-                        );
-                        escaped_home.push_back(kHex[static_cast<unsigned char>(ch) & 0x0FU]);
-                    } else {
-                        escaped_home.push_back(ch);
-                    }
-                }
-                const std::string replacement = "\"" + escaped_home + "/";
-                std::size_t pos = 0;
-                bool modified = false;
-                while ((pos = settings_text.find(needle, pos)) != std::string::npos) {
-                    settings_text.replace(pos, needle.size(), replacement);
-                    pos += replacement.size();
-                    modified = true;
-                }
-                if (modified) {
-                    const auto tmp_settings =
-                        guest_settings.string() + ".tmp." + std::to_string(::getpid());
-                    const int sfd = ::open(
-                        tmp_settings.c_str(),
-                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                        0600
-                    );
-                    if (sfd >= 0) {
-                        std::size_t written = 0;
-                        bool write_ok = true;
-                        while (written < settings_text.size()) {
-                            const ::ssize_t n = ::write(
-                                sfd, settings_text.data() + written, settings_text.size() - written
-                            );
-                            if (n < 0 && errno == EINTR) {
-                                continue;
-                            }
-                            if (n <= 0) {
-                                write_ok = false;
-                                break;
-                            }
-                            written += static_cast<std::size_t>(n);
-                        }
-                        (void)::fchmod(sfd, 0600);
-                        (void)::close(sfd);
-                        if (write_ok) {
-                            if (::rename(tmp_settings.c_str(), guest_settings.c_str()) != 0) {
-                                (void)::unlink(tmp_settings.c_str());
-                            }
-                        } else {
-                            (void)::unlink(tmp_settings.c_str());
-                        }
-                    }
-                }
-            }
-        }
+        stage_guest_pi_settings(
+            host_home, host_pi_dir, guest_pi_dir, profile, opts.report_pi_packages
+        );
+        stage_guest_pi_models(guest_pi_dir);
         // Strictly preserve credential boundary: guest auth.json is ALWAYS empty `{}`.
         const auto guest_auth = guest_pi_dir / "auth.json";
         const int auth_fd =
