@@ -128,6 +128,6 @@ auto launch_contained_upstream(const upstream_launch_options& options)
 * **Phase 2: Detection Engine v1**:
   Implement canary generation and Aho-Corasick matching, Rabin-Karp secret hash scanning, and transport-level token/byte budget enforcement.
 * **Phase 3: Multi-Provider Expansion**:
-  Add OpenAI and GitHub endpoint presets and compatibility adapters for Codex, Pi, and Aider.
+  Derive endpoints from the harness's own provider data instead of adding one preset per provider: the upstream origin from the harness catalog and models configuration, the secret from the host credential store, and method/path limits keyed by API type (`openai-completions`, `anthropic-messages`, `google-generative-ai`, ...). The endpoint substitutes the session nonce for the secret wherever the client placed it in a credential header or key parameter, so it needs no per-provider header table. Providers whose upstream is templated or whose authentication is request signing (Bedrock SigV4, Vertex ADC) are refused. Compatibility adapters for Codex, Pi, and Aider follow the same rule.
 * **Phase 4: Contained MCP Upstreams**:
   Implement `contained_launcher` with per-upstream Glove profiles and pidfd supervision.
