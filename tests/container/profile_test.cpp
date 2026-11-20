@@ -307,6 +307,26 @@ auto run() -> int {
         fs::remove_all(tmp, ec);
     }
 
+    {
+        const char* home = std::getenv("HOME");
+        REQUIRE(home != nullptr && *home != '\0');
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path tmp = fs::path{home} / (".glove_t003b_" + std::to_string(::getpid()));
+        fs::create_directories(tmp / "real", ec);
+        REQUIRE(!ec);
+        glove::container::profile p;
+        p.filesystem.push_back({.path = (tmp / "real").string()});
+        p.link_spellings = {"/etc/injected"};
+        auto out = glove::container::validate(p);
+        REQUIRE(out.has_value());
+        REQUIRE(
+            std::ranges::find(out->link_spellings, std::string{"/etc/injected"}) ==
+            out->link_spellings.end()
+        );
+        fs::remove_all(tmp, ec);
+    }
+
     return 0;
 }
 
