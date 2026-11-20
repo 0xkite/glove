@@ -193,6 +193,12 @@ struct profile {
     // grants and accepts this read-only surface separately.
     std::vector<fs_rule> runtime_filesystem;
 
+    // Absolute paths of symlinks in the user's spelling of filesystem /
+    // runtime_filesystem grants. These are granted file-read-metadata only, so
+    // path resolution through them works; they are never granted read of content.
+    // Filled by validate().
+    std::vector<std::string> link_spellings;
+
     // Existing canonical single-link files in exact writable private-directory
     // grants. Reads and adjacent lock creation remain permitted; file mutation
     // and replacement, and renaming/removing their grant roots, are denied.

@@ -11,8 +11,11 @@
 #include "runtime_filesystem.hpp"
 
 #include <crt_externs.h>
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/ioctl.h>
+#include <sys/param.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -509,6 +512,14 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program, std::str
         append_read_rule(p, rule.path);
         append_parent_metadata_rules(p, rule.path);
     }
+    // Symlinks in a grant's spelling: path resolution needs their metadata, but
+    // never their content or any sibling link.
+    for (const auto& link : prof.link_spellings) {
+        p += "(allow file-read-metadata (literal \"";
+        p += sbpl_escape(link);
+        p += "\"))\n";
+        append_parent_metadata_rules(p, link);
+    }
     p += "(deny network*" + tagged + ")\n";
     // The imported system profile grants exactly one network endpoint - the
     // host syslog datagram socket - and a filtered allow outranks the
@@ -697,7 +708,24 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
     if (auto constraints = macos_detail::validate_launch_constraints(*checked); !constraints) {
         return std::unexpected(constraints.error());
     }
-    const auto& effective = *checked;
+    // Inherited stdio that is a regular file needs a metadata-only grant on its
+    // path (runtimes stat their stdio); nothing else about it is readable.
+    profile stdio_profile = *checked;
+    for (const int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
+        struct ::stat st{};
+        if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        std::array<char, MAXPATHLEN> path_buf{};
+        if (::fcntl(fd, F_GETPATH, path_buf.data()) == 0 && path_buf[0] == '/') {
+            std::string path{path_buf.data()};
+            if (std::ranges::find(stdio_profile.link_spellings, path) ==
+                stdio_profile.link_spellings.end()) {
+                stdio_profile.link_spellings.push_back(std::move(path));
+            }
+        }
+    }
+    const auto& effective = stdio_profile;
     auto resolved = resolve_program(effective, argv.front());
     if (!resolved) {
         return std::unexpected(resolved.error());

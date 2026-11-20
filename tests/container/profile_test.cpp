@@ -2,7 +2,12 @@
 
 #include "glove/container/profile.hpp"
 
+#include <unistd.h>
+
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -268,6 +273,58 @@ auto run() -> int {
         auto out = glove::container::validate(p);
         REQUIRE(!out.has_value());
         REQUIRE(out.error().find("empty path") != std::string::npos);
+    }
+
+    {
+        const char* home = std::getenv("HOME");
+        REQUIRE(home != nullptr && *home != '\0');
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path tmp = fs::path{home} / (".glove_t003_" + std::to_string(::getpid()));
+        fs::create_directories(tmp / "real", ec);
+        REQUIRE(!ec);
+        fs::create_directory_symlink("real", tmp / "link", ec);
+        REQUIRE(!ec);
+        const std::string real = fs::weakly_canonical(tmp / "real", ec).string();
+        {
+            glove::container::profile p;
+            p.filesystem.push_back({.path = (tmp / "link").string()});
+            auto out = glove::container::validate(p);
+            REQUIRE(out.has_value());
+            REQUIRE(out->filesystem.at(0).path == real);
+            REQUIRE(
+                std::ranges::find(out->link_spellings, (tmp / "link").string()) !=
+                out->link_spellings.end()
+            );
+        }
+        {
+            glove::container::profile p;
+            p.filesystem.push_back({.path = (tmp / "real").string()});
+            auto out = glove::container::validate(p);
+            REQUIRE(out.has_value());
+            REQUIRE(out->link_spellings.empty());
+        }
+        fs::remove_all(tmp, ec);
+    }
+
+    {
+        const char* home = std::getenv("HOME");
+        REQUIRE(home != nullptr && *home != '\0');
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path tmp = fs::path{home} / (".glove_t003b_" + std::to_string(::getpid()));
+        fs::create_directories(tmp / "real", ec);
+        REQUIRE(!ec);
+        glove::container::profile p;
+        p.filesystem.push_back({.path = (tmp / "real").string()});
+        p.link_spellings = {"/etc/injected"};
+        auto out = glove::container::validate(p);
+        REQUIRE(out.has_value());
+        REQUIRE(
+            std::ranges::find(out->link_spellings, std::string{"/etc/injected"}) ==
+            out->link_spellings.end()
+        );
+        fs::remove_all(tmp, ec);
     }
 
     return 0;
