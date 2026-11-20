@@ -1,5 +1,7 @@
 #include "glove/container/profile.hpp"
 
+#include "sandbox_denial_log.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -229,6 +231,9 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         return std::unexpected(bounded.error());
     }
     profile copy = p;
+    if (copy.denial_tag && !detail::is_denial_tag(*copy.denial_tag)) {
+        return std::unexpected(std::string{"denial tag must be 32 lowercase hex characters"});
+    }
     std::set<std::string> paths;
     for (auto& rule : copy.filesystem) {
         auto path = canonical_path(rule.path, "filesystem rule");
@@ -239,6 +244,13 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         if (!paths.insert(rule.path).second) {
             return std::unexpected(std::string{"duplicate filesystem rule: '"} + rule.path + "'");
         }
+    }
+    if (copy.unix_socket_endpoint) {
+        auto endpoint = canonical_path(*copy.unix_socket_endpoint, "Unix socket endpoint");
+        if (!endpoint) {
+            return std::unexpected(endpoint.error());
+        }
+        copy.unix_socket_endpoint = std::move(*endpoint);
     }
     std::vector<std::filesystem::path> fs_paths;
     fs_paths.reserve(copy.filesystem.size());

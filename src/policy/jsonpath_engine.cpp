@@ -146,7 +146,35 @@ private:
         const auto mismatch = std::mismatch(
             normal_root.begin(), normal_root.end(), normal_candidate.begin(), normal_candidate.end()
         );
-        return mismatch.first == normal_root.end();
+        if (mismatch.first != normal_root.end()) {
+            return false;
+        }
+        // weakly_canonical() resolves only components that exist. A dangling
+        // leaf symlink, and a self-loop that falls back to the lexical form,
+        // therefore compare as an in-grant name while a host-side open() follows
+        // the link out of the grant. Refuse any symlink in the unresolved tail;
+        // a component that does not exist ends the resolvable chain.
+        std::error_code ec;
+        auto current = normal_root;
+        for (const auto& part : normal_candidate.lexically_relative(normal_root)) {
+            if (part == ".") {
+                continue;
+            }
+            if (part == "..") {
+                return false;
+            }
+            current /= part;
+            const auto status = std::filesystem::symlink_status(current, ec);
+            if (ec) {
+                // An absent component ends the resolvable chain; nothing below
+                // it can redirect. Any other error fails closed.
+                return ec == std::errc::no_such_file_or_directory;
+            }
+            if (std::filesystem::is_symlink(status)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // Absolute prefixes are filesystem boundaries, not byte prefixes. This

@@ -48,6 +48,9 @@ fuzzers the same way, substituting `http_syntax`/`glove_http_syntax_fuzzer`,
 `egress_proxy`/`glove_egress_proxy_fuzzer`,
 `container_profile`/`glove_container_profile_fuzzer`, and
 `kernel_server`/`glove_kernel_server_fuzzer`.
+The macOS sandbox denial log parser uses `fuzz/corpus/sandbox_denial_log`
+(measured `log stream --style ndjson` lines) and
+`glove_sandbox_denial_log_fuzzer`.
 
 Crashes, sanitizer findings, or timeouts are failures. Minimize a reproducer
 before adding it to the checked corpus, and give each retained input a

@@ -53,6 +53,24 @@ newer for preset directory overrides; the default root retains CMake 3.28
 compatibility. The gate does not install toolchains; a locally
 provisioned formatter can be selected with `GLOVE_CLANG_FORMAT`.
 
+### Formatter pin
+
+The format stage requires exactly the version named
+`formatted_for_clang_format` in `scripts/preflight.sh`, because formatter
+output is only stable per version; CI installs the same release from PyPI. A
+rolling package manager will drift ahead of it (Homebrew ships a newer LLVM
+than the pin), so install the pinned wheel instead of using the system binary:
+
+```sh
+python3 -m venv "$HOME/.cache/glove-clang-format"
+"$HOME/.cache/glove-clang-format/bin/pip" install clang-format==23.1.1
+export PATH="$HOME/.cache/glove-clang-format/bin:$PATH"
+```
+
+The stage refuses to run on a different version rather than reporting a format
+result that is not portable to CI. `GLOVE_ALLOW_NEWER_CLANG_FORMAT=1` runs a
+newer version with the final banner marking the result non-authoritative.
+
 ### Sage consumer interoperability
 
 The Sage Rust consumer test is opt-in via `GLOVE_ENABLE_SAGE_INTEROP_TEST` and

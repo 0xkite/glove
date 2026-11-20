@@ -229,6 +229,61 @@ target_include_directories(glove_kernel_server_fuzzer PRIVATE
 )
 glove_configure_fuzzer(glove_kernel_server_fuzzer)
 
+add_library(glove_sandbox_denial_log_fuzz_support STATIC
+    ${CMAKE_SOURCE_DIR}/src/container/sandbox_denial_log.cpp
+)
+target_link_libraries(glove_sandbox_denial_log_fuzz_support PUBLIC glove_options)
+target_link_libraries(glove_sandbox_denial_log_fuzz_support PRIVATE glaze::glaze)
+target_compile_options(glove_sandbox_denial_log_fuzz_support PRIVATE -fsanitize=fuzzer-no-link)
+
+add_executable(glove_sandbox_denial_log_fuzzer sandbox_denial_log_fuzzer.cpp)
+target_link_libraries(
+    glove_sandbox_denial_log_fuzzer
+    PRIVATE glove_sandbox_denial_log_fuzz_support
+)
+target_include_directories(glove_sandbox_denial_log_fuzzer PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+)
+glove_configure_fuzzer(glove_sandbox_denial_log_fuzzer)
+
+add_library(glove_denial_model_fuzz_support STATIC
+    ${CMAKE_SOURCE_DIR}/src/container/denial_decision.cpp
+    ${CMAKE_SOURCE_DIR}/src/container/denial_trace.cpp
+    ${CMAKE_SOURCE_DIR}/src/container/denial_telemetry.cpp
+)
+target_link_libraries(glove_denial_model_fuzz_support PUBLIC glove_options)
+target_link_libraries(glove_denial_model_fuzz_support PRIVATE glaze::glaze)
+target_include_directories(glove_denial_model_fuzz_support
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+)
+target_compile_options(glove_denial_model_fuzz_support PRIVATE -fsanitize=fuzzer-no-link)
+
+add_executable(glove_denial_model_fuzzer denial_model_fuzzer.cpp)
+target_link_libraries(glove_denial_model_fuzzer PRIVATE glove_denial_model_fuzz_support)
+glove_configure_fuzzer(glove_denial_model_fuzzer)
+
+add_executable(glove_denial_trace_fuzzer denial_trace_fuzzer.cpp)
+target_link_libraries(glove_denial_trace_fuzzer PRIVATE glove_denial_model_fuzz_support)
+glove_configure_fuzzer(glove_denial_trace_fuzzer)
+
+add_library(glove_launch_profile_fuzz_support STATIC
+    ${CMAKE_SOURCE_DIR}/src/run/launch_profile_text.cpp
+    ${CMAKE_SOURCE_DIR}/src/run/yaml_subset.cpp
+    ${CMAKE_SOURCE_DIR}/src/run/secret_reference.cpp
+)
+target_link_libraries(glove_launch_profile_fuzz_support PUBLIC glove_options)
+target_link_libraries(glove_launch_profile_fuzz_support PRIVATE glaze::glaze)
+target_include_directories(glove_launch_profile_fuzz_support
+    PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    PRIVATE $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/run>
+)
+target_compile_options(glove_launch_profile_fuzz_support PRIVATE -fsanitize=fuzzer-no-link)
+
+add_executable(glove_launch_profile_fuzzer launch_profile_fuzzer.cpp)
+target_link_libraries(glove_launch_profile_fuzzer PRIVATE glove_launch_profile_fuzz_support)
+glove_configure_fuzzer(glove_launch_profile_fuzzer)
+
 # The Apple Container stats parser is compiled only on Apple platforms
 # (src/control/CMakeLists.txt), so this fuzzer only links there.
 if(APPLE)
