@@ -1177,8 +1177,11 @@ auto host_pi_provider_catalog(const std::filesystem::path& pi_agent_dir, std::st
 // Resolve the provider from host Pi data, read its secret on the host, and
 // start one client-placed endpoint for it. The guest receives only the
 // endpoint base URL and a session nonce (staged into its models.json later).
-auto start_shared_pi_provider(const options& opts, const std::shared_ptr<glove::audit::sink>& sink)
-    -> std::expected<preset_startup, std::string> {
+auto start_shared_pi_provider(
+    const options& opts,
+    const glove::container::profile& profile,
+    const std::shared_ptr<glove::audit::sink>& sink
+) -> std::expected<preset_startup, std::string> {
     const std::string name = opts.share_credential.value_or(std::string{});
     const char* home = std::getenv("HOME");
     if (home == nullptr || *home == '\0') {
@@ -1276,17 +1279,38 @@ auto start_shared_pi_provider(const options& opts, const std::shared_ptr<glove::
             provider->host + "; confirm with --share-credential-origin " + provider->host
         );
     }
-    auto auth_read = read_host_owned_config(pi_agent_dir / "auth.json", false);
-    if (!auth_read) {
-        return std::unexpected("cannot use the host Pi " + auth_read.error());
+    // A launch-profile secrets.provider names the key explicitly; it wins over
+    // Pi's own sources and never falls back to them.
+    std::expected<pi_shared_secret, std::string> secret = std::unexpected(std::string{});
+    if (opts.provider_secret) {
+        std::vector<std::string> exposed;
+        for (const auto& rule : profile.filesystem) {
+            exposed.push_back(rule.path);
+        }
+        auto resolved =
+            detail::resolve_secret(*opts.provider_secret, invoking_user_home(), exposed);
+        if (!resolved) {
+            return std::unexpected(resolved.error());
+        }
+        secret = pi_shared_secret{
+            .value = std::move(*resolved),
+            .environment_variable = opts.provider_secret->source == secret_source::env
+                                        ? std::optional<std::string>{opts.provider_secret->locator}
+                                        : std::nullopt,
+        };
+    } else {
+        auto auth_read = read_host_owned_config(pi_agent_dir / "auth.json", false);
+        if (!auth_read) {
+            return std::unexpected("cannot use the host Pi " + auth_read.error());
+        }
+        const std::string auth = auth_read->value_or(std::string{});
+        secret = pi_shared_provider_secret(name, auth, models, [](std::string_view variable) {
+            const std::string key{variable};
+            const char* value = std::getenv(key.c_str());
+            return value != nullptr && *value != '\0' ? std::optional<std::string>{value}
+                                                      : std::nullopt;
+        });
     }
-    const std::string auth = auth_read->value_or(std::string{});
-    auto secret = pi_shared_provider_secret(name, auth, models, [](std::string_view variable) {
-        const std::string key{variable};
-        const char* value = std::getenv(key.c_str());
-        return value != nullptr && *value != '\0' ? std::optional<std::string>{value}
-                                                  : std::nullopt;
-    });
     if (!secret) {
         return std::unexpected(secret.error());
     }
@@ -1299,6 +1323,14 @@ auto start_shared_pi_provider(const options& opts, const std::shared_ptr<glove::
             return std::unexpected(
                 "--share-credential cannot be combined with --env " + printable(forwarded) +
                 ", which carries the shared secret"
+            );
+        }
+    }
+    for (const auto& entry : opts.environment_values) {
+        if (entry.name == secret->environment_variable || entry.value == secret->value) {
+            return std::unexpected(
+                "--share-credential cannot be combined with environment value " +
+                printable(entry.name) + ", which carries the shared secret"
             );
         }
     }
@@ -1368,7 +1400,7 @@ auto start_agent_preset(
                 std::string{"--share-credential is supported only by glove shell --agent pi"}
             );
         }
-        return start_shared_pi_provider(opts, sink);
+        return start_shared_pi_provider(opts, profile, sink);
     }
     if (!opts.agent_preset) {
         if (opts.provider_secret) {
