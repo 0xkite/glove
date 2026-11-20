@@ -30,6 +30,24 @@ claim.
   bytes, and agent output as untrusted input.
 - Capability discovery must report constructed enforcement, not planned work.
 
+## Design principles
+
+- Generalize along the axis that varies. Harness and provider specifics are
+  data read from the harness's own configuration or catalog (for Pi: the
+  built-in provider catalog, `models.json`, `auth.json`), not code branches.
+  Before adding an enum value or an `if (name == "x")` for one provider or
+  harness, list what differs between instances and where each fact is already
+  declared; key code by that axis (for example the API type), not by the name.
+- Mediate, do not copy. Host secrets stay in host memory; the sandbox receives
+  an ephemeral nonce that only this session's endpoint accepts. A new
+  credential shape is a substitution rule, not a new preset.
+- Fail closed on what the data cannot describe. Templated or ambiguous
+  upstreams, request signing, and unknown API types are refused by name, never
+  guessed or approximated.
+- Test the mechanism, not the example. Red tests for a new capability cover at
+  least two or three distinct instances of the general case (for example
+  different credential header schemes), plus the refusals.
+
 ## Required gate
 
 Run:
