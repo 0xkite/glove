@@ -289,6 +289,7 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         return std::unexpected(bounded.error());
     }
     profile copy = p;
+    copy.link_spellings.clear(); // recomputed from the grants; never trusted from the caller
     if (copy.denial_tag && !detail::is_denial_tag(*copy.denial_tag)) {
         return std::unexpected(std::string{"denial tag must be 32 lowercase hex characters"});
     }
