@@ -327,6 +327,86 @@ auto run() -> int {
         fs::remove_all(tmp, ec);
     }
 
+    {
+        const char* home = std::getenv("HOME");
+        REQUIRE(home != nullptr && *home != '\0');
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path tmp = fs::path{home} / (".glove_t008_" + std::to_string(::getpid()));
+        fs::create_directories(tmp / "real" / "sub", ec);
+        REQUIRE(!ec);
+        fs::create_directory_symlink("real", tmp / "link", ec);
+        REQUIRE(!ec);
+        fs::create_directory_symlink("hop2", tmp / "hop1", ec);
+        REQUIRE(!ec);
+        fs::create_directory_symlink("real", tmp / "hop2", ec);
+        REQUIRE(!ec);
+        fs::create_directory_symlink("/etc", tmp / "evil", ec);
+        REQUIRE(!ec);
+        const auto has = [](const glove::container::profile& pr, const std::string& s) {
+            return std::ranges::find(pr.link_spellings, s) != pr.link_spellings.end();
+        };
+        const auto sorted = [](std::vector<std::string> v) {
+            std::ranges::sort(v);
+            return v;
+        };
+        {
+            // a. grant link; revalidation keeps the spelling
+            glove::container::profile p;
+            p.filesystem.push_back({.path = (tmp / "link").string()});
+            auto v1 = glove::container::validate(p);
+            REQUIRE(v1.has_value());
+            auto v2 = glove::container::validate(*v1);
+            REQUIRE(v2.has_value());
+            REQUIRE(has(*v2, (tmp / "link").string()));
+            // d. idempotence
+            auto v3 = glove::container::validate(*v2);
+            REQUIRE(v3.has_value());
+            REQUIRE(sorted(v3->link_spellings) == sorted(v2->link_spellings));
+        }
+        {
+            // b. two-hop chain
+            glove::container::profile p;
+            p.filesystem.push_back({.path = (tmp / "hop1").string()});
+            auto v1 = glove::container::validate(p);
+            REQUIRE(v1.has_value());
+            auto v2 = glove::container::validate(*v1);
+            REQUIRE(v2.has_value());
+            REQUIRE(has(*v2, (tmp / "hop1").string()));
+            REQUIRE(has(*v2, (tmp / "hop2").string()));
+        }
+        {
+            // c. link is a prefix component of the grant
+            glove::container::profile p;
+            p.filesystem.push_back({.path = (tmp / "link" / "sub").string()});
+            auto v1 = glove::container::validate(p);
+            REQUIRE(v1.has_value());
+            auto v2 = glove::container::validate(*v1);
+            REQUIRE(v2.has_value());
+            REQUIRE(has(*v2, (tmp / "link").string()));
+        }
+        {
+            // e. injected spellings are still refused
+            glove::container::profile p;
+            p.filesystem.push_back({.path = (tmp / "real").string()});
+            p.link_spellings = {"/etc/injected", (tmp / "evil").string()};
+            auto out = glove::container::validate(p);
+            REQUIRE(out.has_value());
+            REQUIRE(!has(*out, "/etc/injected"));
+            REQUIRE(!has(*out, (tmp / "evil").string()));
+        }
+        {
+            // f. a supplied spelling that resolves inside the grant is kept
+            glove::container::profile p;
+            p.filesystem.push_back({.path = (tmp / "real").string()});
+            p.link_spellings = {(tmp / "link").string()};
+            auto out = glove::container::validate(p);
+            REQUIRE(out.has_value());
+            REQUIRE(has(*out, (tmp / "link").string()));
+        }
+        fs::remove_all(tmp, ec);
+    }
+
     return 0;
 }
 
