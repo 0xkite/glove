@@ -19,6 +19,7 @@
 #include "glove/run/launch_profile.hpp"
 #include "glove/run/pi_host_config.hpp"
 
+#include "decoys.hpp"
 #include "exit_audit.hpp"
 #include "provider_endpoint.hpp"
 #include "secret_resolve.hpp"
@@ -1807,6 +1808,41 @@ auto finish_denial_telemetry(
 } // namespace
 #endif
 
+// Plants this launch's decoys outside every grant of the final profile,
+// after removing what crashed launches left behind. They are removed when
+// the returned set goes out of scope.
+auto plant_launch_decoys(
+    const options& opts,
+    const glove::container::profile& profile,
+    const std::shared_ptr<glove::audit::sink>& sink
+) -> std::expected<detail::decoy_set, std::string> {
+    if (opts.decoys.empty()) {
+        return detail::decoy_set{};
+    }
+    auto directory = detail::decoy_journal_directory();
+    if (!directory) {
+        return std::unexpected("decoys: " + directory.error());
+    }
+    static_cast<void>(detail::sweep_stale_decoys(*directory));
+    std::vector<std::string> exposed;
+    for (const auto& rule : profile.filesystem) {
+        exposed.push_back(rule.path);
+    }
+    auto planted = detail::decoy_set::plant(opts.decoys, exposed, *directory);
+    if (!planted) {
+        return std::unexpected(planted.error());
+    }
+    if (auto audited = record(
+            sink,
+            glove::audit::action::control,
+            "decoys_planted:" + std::to_string(planted->paths().size())
+        );
+        !audited) {
+        return std::unexpected("audit decoys: " + audited.error());
+    }
+    return planted;
+}
+
 auto execute(const options& opts) -> std::expected<int, std::string> {
     if (opts.agent_argv.empty()) {
         return std::unexpected(std::string{"runner: agent_argv is required"});
@@ -1867,12 +1903,17 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         }
     }
 
+    auto decoys = plant_launch_decoys(opts, *profile, *sink);
+    if (!decoys) {
+        return std::unexpected(decoys.error());
+    }
 #if defined(__APPLE__)
     auto denial_trace = open_denial_trace(opts, *profile);
     if (!denial_trace) {
         return std::unexpected(denial_trace.error());
     }
     detail::denial_audit_writer denial_writer{*sink};
+    denial_writer.watch_decoys(decoys->paths());
     auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
 #endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
@@ -2052,12 +2093,17 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         }
     }
 
+    auto decoys = plant_launch_decoys(opts, *profile, *sink);
+    if (!decoys) {
+        return std::unexpected(decoys.error());
+    }
 #if defined(__APPLE__)
     auto denial_trace = open_denial_trace(opts, *profile);
     if (!denial_trace) {
         return std::unexpected(denial_trace.error());
     }
     detail::denial_audit_writer denial_writer{*sink};
+    denial_writer.watch_decoys(decoys->paths());
     auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
 #endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());

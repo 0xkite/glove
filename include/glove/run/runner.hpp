@@ -69,6 +69,9 @@ struct options {
     // Where the preset's provider credential comes from. Unset: the preset's
     // host environment variable (e.g. ANTHROPIC_API_KEY).
     std::optional<secret_reference> provider_secret;
+    // Absolute host paths for canary decoys planted for this launch only;
+    // "{nonce}" becomes a per-launch value. See src/run/decoys.hpp.
+    std::vector<std::string> decoys;
     // Permit private-loopback socket binding/listening inside the sandbox's
     // isolated network namespace (required by runtimes like agy).
     bool allow_loopback_listen = false;

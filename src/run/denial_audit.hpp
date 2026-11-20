@@ -11,12 +11,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace glove::run::detail {
 
@@ -38,6 +41,10 @@ public:
 
     // A degraded state writes the live start record, then the degraded one.
     void record_start(glove::container::denial_telemetry_state state, std::string_view reason);
+    // Raw host paths of this launch's decoys. A denial whose target is one
+    // of them is also written as a "decoy" record with its own cap, so
+    // ordinary denial volume can never crowd it out. Call before start.
+    void watch_decoys(std::span<const std::filesystem::path> decoys);
     // Safe from any thread.
     void on_denial(const glove::container::sandbox_denial& denial);
     // Safe from any thread; at most one degraded record per writer.
@@ -73,7 +80,12 @@ private:
     std::uint64_t unsafe_fields_ = 0;
     std::uint64_t duplicates_ = 0;
     std::optional<std::string> first_error_;
+    std::vector<std::string> decoy_targets_; // encoded like denial targets
+    std::uint64_t decoy_recorded_ = 0;
+    std::uint64_t decoy_suppressed_ = 0;
 };
+
+constexpr std::size_t decoy_audit_per_session = 32;
 
 enum class denial_notice : std::uint8_t { starting, live, unavailable, stopping, degraded };
 

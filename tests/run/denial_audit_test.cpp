@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdio>
 #include <expected>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -115,6 +116,51 @@ auto all_clean(const std::vector<glove::audit::event>& events) -> bool {
         }
     }
     return true;
+}
+
+// A denial whose target is a decoy also gets a "decoy" record with its own
+// cap, even when the ordinary rate window is already full, and the summary
+// counts every hit.
+auto decoys() -> int {
+    auto sink = glove::audit::make_memory_sink();
+    fake_clock clock;
+    denial_audit_writer writer{sink, clock.function()};
+    const std::vector<std::filesystem::path> planted{"/Users/u/vault/glove_ab12", "/tmp/x\ny"};
+    writer.watch_decoys(planted);
+    writer.record_start(denial_telemetry_state::live, "");
+    for (int index = 0; index != 16; ++index) {
+        writer.on_denial(sample_denial()); // "/tmp/x%0Ay" is the encoded second decoy
+    }
+    auto read_decoy = sample_denial();
+    read_decoy.kind = "file_read";
+    read_decoy.operation = "file-read-data";
+    read_decoy.target = "/Users/u/vault/glove_ab12";
+    for (int index = 0; index != 40; ++index) {
+        writer.on_denial(read_decoy);
+    }
+    auto other = sample_denial();
+    other.target = "/Users/u/vault/glove_ab12.pub";
+    writer.on_denial(other);
+    REQUIRE(writer.finish(live_report()).has_value());
+    const auto events = sink->take();
+    std::size_t decoy_records = 0;
+    for (const auto& event : events) {
+        if (event.tool_name == "decoy") {
+            ++decoy_records;
+            REQUIRE(event.status != tool_call_status::ok);
+            REQUIRE(
+                event.arguments_json.contains("glove_ab12") ||
+                event.arguments_json.contains("/tmp/x%0Ay")
+            );
+            REQUIRE(!event.arguments_json.contains(".pub"));
+        }
+    }
+    REQUIRE(decoy_records == glove::run::detail::decoy_audit_per_session);
+    REQUIRE(events.back().tool_name == "summary");
+    REQUIRE(field(events.back().arguments_json, "decoys") == 2);
+    REQUIRE(field(events.back().arguments_json, "decoy_hits") == 56);
+    REQUIRE(all_clean(events));
+    return 0;
 }
 
 auto shapes() -> int {
@@ -378,9 +424,17 @@ auto notices() -> int {
 } // namespace
 
 int main() {
-    for (auto* step : {
-             shapes, rate, cap, unsafe, unavailable, early_degraded, degraded, sink_failure, notices
-         }) {
+    for (auto* step :
+         {shapes,
+          rate,
+          cap,
+          unsafe,
+          unavailable,
+          early_degraded,
+          degraded,
+          sink_failure,
+          notices,
+          decoys}) {
         if (const int failed = step(); failed != 0) {
             return failed;
         }

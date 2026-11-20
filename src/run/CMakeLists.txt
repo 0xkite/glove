@@ -2,6 +2,7 @@ add_library(glove_run STATIC
     runner.cpp
     exit_audit.cpp
     denial_audit.cpp
+    decoys.cpp
     denial_trace_writer.cpp
     launch_profile.cpp
     launch_profile_text.cpp

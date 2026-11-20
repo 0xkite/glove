@@ -3,6 +3,7 @@
 #include "glove/audit/event.hpp"
 #include "glove/mcp/messages.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace glove::run::detail {
@@ -94,6 +95,18 @@ void denial_audit_writer::record_start(
     }
 }
 
+void denial_audit_writer::watch_decoys(std::span<const std::filesystem::path> decoys) {
+    const std::lock_guard lock{mutex_};
+    for (const auto& decoy : decoys) {
+        auto encoded = glove::container::encode_untrusted(
+            decoy.native(), glove::container::max_denial_target_text_bytes
+        );
+        if (!encoded.truncated) {
+            decoy_targets_.push_back(std::move(encoded.text));
+        }
+    }
+}
+
 void denial_audit_writer::on_denial(const glove::container::sandbox_denial& denial) {
     const std::lock_guard lock{mutex_};
     if (finished_) {
@@ -103,6 +116,24 @@ void denial_audit_writer::on_denial(const glove::container::sandbox_denial& deni
     if (first_error_) {
         ++suppressed_error_;
         return;
+    }
+    if (!denial.target_truncated &&
+        std::ranges::find(decoy_targets_, denial.target) != decoy_targets_.end()) {
+        if (decoy_recorded_ == decoy_audit_per_session) {
+            ++decoy_suppressed_;
+        } else {
+            std::string decoy = R"({"operation":")";
+            decoy += checked(denial.operation, glove::container::max_denial_operation_text_bytes);
+            decoy += R"(","target":")";
+            decoy += checked(denial.target, glove::container::max_denial_target_text_bytes);
+            decoy += R"(","comm":")";
+            decoy += checked(denial.comm, glove::container::max_denial_comm_text_bytes);
+            decoy += R"(","pid":)";
+            decoy += std::to_string(denial.pid);
+            decoy += "}";
+            append("decoy", std::move(decoy), false, "a sandboxed process reached for a decoy");
+            ++decoy_recorded_;
+        }
     }
     if (recorded_ == denial_audit_per_session) {
         ++suppressed_cap_;
@@ -195,6 +226,12 @@ auto denial_audit_writer::finish(const glove::container::denial_monitor_report& 
         arguments += std::to_string(report.stream_rejected);
         arguments += R"(,"end_proof":)";
         arguments += boolean(report.end_proof);
+        if (!decoy_targets_.empty()) {
+            arguments += R"(,"decoys":)";
+            arguments += std::to_string(decoy_targets_.size());
+            arguments += R"(,"decoy_hits":)";
+            arguments += std::to_string(decoy_recorded_ + decoy_suppressed_);
+        }
         arguments += "}";
         append("summary", std::move(arguments), clean, std::move(error));
     }
