@@ -13,6 +13,7 @@ expose the configuration directory before the agent runs.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -193,6 +194,36 @@ def main():
         profile("noagent", f"version: 1\nsecrets:\n  provider: \"file://{key}\"\n")
         expect(glove(binary, secret_env, "exec", "--profile", "noagent", "--audit-log", audit,
                      "--", "/usr/bin/true"), 1, "needs an agent preset")
+        # A decoy is planted outside the sandbox for the launch, a sandboxed
+        # read of it is audited as a decoy hit when denial telemetry is live,
+        # and it is gone afterwards.
+        vault = root / "vault"
+        vault.mkdir(mode=0o700)
+        decoy = vault / "backup-token"
+        profile("decoy", f"version: 1\nworkspace: {workspace}\ndecoys:\n  - \"{decoy}\"\n")
+        decoy_audit = root / "audit" / "decoy.jsonl"
+        script = f'cat "{decoy}" > /dev/null 2>&1; exit 0'
+        expect(glove(binary, env, "exec", "--profile", "decoy", "--audit-log", str(decoy_audit),
+                     "--", "/bin/sh", "-c", script), 0)
+        if decoy.exists():
+            fail("the decoy outlived its launch")
+        records = [json.loads(line) for line in
+                   decoy_audit.read_text(encoding="utf-8").splitlines() if line]
+        if not any(r["tool"] == "decoys_planted:1" for r in records):
+            fail("the planted decoy was not audited")
+        live = any(r["tool"] == "telemetry" and '"live"' in r["arguments"] for r in records)
+        hits = [r for r in records if r["action"] == "sandbox_denial" and r["tool"] == "decoy"]
+        if live and not hits:
+            fail(f"a sandboxed read of the decoy was not audited:\n{records}")
+        if hits and "backup-token" not in hits[0]["arguments"]:
+            fail("the decoy record does not name the decoy")
+
+        profile("decoy_inside", f"version: 1\nworkspace: {workspace}\n"
+                                f"decoys:\n  - \"{workspace / 'canary'}\"\n")
+        expect(glove(binary, env, "exec", "--profile", "decoy_inside", "--audit-log",
+                     str(decoy_audit), "--", "/usr/bin/true"), 1, "sandbox can reach")
+        if (workspace / "canary").exists():
+            fail("a refused decoy was planted")
     print("profile cli ok")
 
 

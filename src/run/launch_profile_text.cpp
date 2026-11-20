@@ -57,6 +57,7 @@ struct profile_doc { // NOLINT(misc-use-internal-linkage)
     std::optional<std::vector<allow_arg_doc>> allow_arg;
     std::optional<std::uint16_t> bridge_port;
     std::optional<secrets_doc> secrets;
+    std::optional<std::vector<std::string>> decoys;
 };
 
 } // namespace glove::run::launch_profile_detail
@@ -262,6 +263,17 @@ auto convert(const profile_doc& doc) -> std::expected<launch_profile, std::strin
     if (auto ok = convert_network(doc, out); !ok) {
         return std::unexpected(ok.error());
     }
+    if (doc.decoys && doc.decoys->size() > 32U) {
+        return std::unexpected(std::string{"decoys: at most 32"});
+    }
+    if (auto ok = convert_paths(doc.decoys, "decoys", out.decoys); !ok) {
+        return std::unexpected(ok.error());
+    }
+    for (const auto& decoy : out.decoys) {
+        if (decoy == "~" || decoy.ends_with('/')) {
+            return std::unexpected("decoys: '" + decoy + "' must name a file");
+        }
+    }
     if (doc.secrets && doc.secrets->provider) {
         auto reference = parse_secret_reference(*doc.secrets->provider);
         if (!reference) {
@@ -315,7 +327,7 @@ auto operator==(const launch_profile& a, const launch_profile& b) -> bool {
     return a.workspace == b.workspace && a.agent == b.agent && a.read == b.read &&
            a.write == b.write && a.env == b.env && a.allow == b.allow &&
            a.bridge_port == b.bridge_port && a.provider_secret == b.provider_secret &&
-           std::ranges::equal(a.egress, b.egress, same_egress) &&
+           a.decoys == b.decoys && std::ranges::equal(a.egress, b.egress, same_egress) &&
            std::ranges::equal(a.mcp, b.mcp, same_mcp) &&
            std::ranges::equal(a.allow_arg, b.allow_arg, same_rule);
 }
@@ -378,6 +390,7 @@ auto encode_launch_profile(const launch_profile& profile) -> std::string {
     if (profile.bridge_port) {
         out += "bridge_port: " + std::to_string(*profile.bridge_port) + "\n";
     }
+    emit_list(out, "decoys", profile.decoys);
     if (profile.provider_secret) {
         out += "secrets:\n  provider: " + quote(format_secret_reference(*profile.provider_secret)) +
                "\n";
@@ -415,7 +428,11 @@ auto launch_profile_template() -> std::string_view {
            "# bridge_port: 8080              # host 127.0.0.1 port bridged inside\n"
            "\n"
            "# secrets:                       # resolved on the host; the sandbox sees a nonce\n"
-           "#   provider: keychain://glove/anthropic   # or env://NAME, file://~/path\n";
+           "#   provider: keychain://glove/anthropic   # or env://NAME, file://~/path\n"
+           "\n"
+           "# decoys:                        # canary files planted outside the sandbox for\n"
+           "#   - ~/.private/backup-token     # each launch; a sandboxed read is audited. Use\n"
+           "#                                 # names a probe would try but you do not have.\n";
 }
 
 } // namespace glove::run

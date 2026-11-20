@@ -258,6 +258,9 @@ auto apply_launch_profile(
     if (auto ok = paths(profile.write, cli.writable, out.writable); !ok) {
         return std::unexpected(ok.error());
     }
+    if (auto ok = paths(profile.decoys, cli.decoys, out.decoys); !ok) {
+        return std::unexpected(ok.error());
+    }
     merge_profile_lists(profile, cli, out);
     return out;
 }

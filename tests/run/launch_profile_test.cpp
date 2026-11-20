@@ -60,6 +60,9 @@ allow_arg:
 bridge_port: 8080
 secrets:
   provider: keychain://glove/anthropic
+decoys:
+  - "~/.private/glove_{nonce}"
+  - /var/tmp/glove-canary
 )";
 
 auto parses_full_profile() -> int {
@@ -89,6 +92,10 @@ auto parses_full_profile() -> int {
     REQUIRE(parsed->bridge_port == 8080);
     REQUIRE(parsed->provider_secret.has_value());
     REQUIRE(parsed->provider_secret->source == glove::run::secret_source::keychain);
+    REQUIRE(
+        (parsed->decoys ==
+         std::vector<std::string>{"~/.private/glove_{nonce}", "/var/tmp/glove-canary"})
+    );
 
     const auto encoded = glove::run::encode_launch_profile(*parsed);
     const auto reparsed = parse_launch_profile(encoded);
@@ -104,7 +111,7 @@ auto parses_full_profile() -> int {
     no_secret.provider_secret.reset();
     REQUIRE(!(no_secret == *parsed));
     using edit = void (*)(launch_profile&);
-    for (const edit change : std::array<edit, 11>{
+    for (const edit change : std::array<edit, 12>{
              [](launch_profile& p) { p.workspace = "/other"; },
              [](launch_profile& p) { p.agent = "pi"; },
              [](launch_profile& p) { p.read.pop_back(); },
@@ -116,6 +123,7 @@ auto parses_full_profile() -> int {
              [](launch_profile& p) { p.allow.clear(); },
              [](launch_profile& p) { p.allow_arg.front().required_prefix = "/x"; },
              [](launch_profile& p) { p.bridge_port = 1; },
+             [](launch_profile& p) { p.decoys.pop_back(); },
          }) {
         auto changed = *parsed;
         change(changed);
@@ -135,7 +143,7 @@ struct refusal {
 
 auto refuses_ambiguous_yaml() -> int {
     const std::string nul_text = std::string{"version: 1\nworkspace: /a"} + '\0' + "b\n";
-    const std::array<refusal, 43> cases{{
+    const std::array<refusal, 46> cases{{
         {"version: 1\nread: [/a]\nread: [/b]\n", "line 3: duplicate key 'read'"},
         {"version: 1\nenv:\n  A: { value: x }\n  A: { value: y }\n", "line 4: duplicate key 'A'"},
         {"version: 1\nenv:\n  A: { value: x, value: y }\n", "duplicate key 'value'"},
@@ -178,6 +186,9 @@ auto refuses_ambiguous_yaml() -> int {
         {"version: 1\nsecrets:\n  provider: ANTHROPIC_API_KEY\n", "secrets.provider"},
         {"version: 1\nsecrets:\n  provider: op://vault/item\n", "unsupported secret reference"},
         {"version: 1\nsecrets:\n  token: env://A\n", "unknown_key"},
+        {"version: 1\ndecoys: [relative/x]\n", "decoys: paths must be absolute"},
+        {"version: 1\ndecoys: [\"~/\"]\n", "must name a file"},
+        {"version: 1\ndecoys: [~/.private/glove_{nonce}]\n", "line 2"},
         {"version: 1\nmcp:\n  - { name: a, argv: [/x] }\n  - { name: a, argv: [/y] }\n",
          "unique server name"},
     }};

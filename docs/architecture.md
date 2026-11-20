@@ -512,6 +512,31 @@ bridge port replaces the profile's; list flags append.
   before. Password-manager CLIs (`op://` and similar) are not supported:
   they would run a program named by the profile.
 
+### Decoys
+
+`decoys:` in a profile lists host paths where glove plants a canary file for
+each `exec` or `run` launch (`src/run/decoys.cpp`). Each file is new
+(`O_EXCL`, mode `0600`) and holds one random `glvc_` token. Glove refuses a
+decoy inside or containing a filesystem grant, one whose directory is
+missing, not owned by the user, a symlink, or group- or other-writable (it
+never creates the directory), and one where a non-decoy file exists. On
+macOS a sandbox denial whose target is a decoy is written as a separate
+`decoy` audit record with its own cap of 32, and the denial summary counts
+`decoy_hits`; elsewhere decoys are content canaries only.
+
+The sandbox cannot list a decoy's directory, so a probe is seen only when it
+opens a decoy by its exact name: realistic fixed names (a credential file
+the user does not have) catch real probing, while a `{nonce}` name is seen
+only by a process told it (scripted scenarios). A fixed name already planted
+by another live launch is shared, not refused.
+
+Removal uses content, not process identity: glove unlinks a decoy only if it
+is still a regular single-link file of the user's holding exactly its
+canary. Each launch journals its decoys under
+`<XDG_STATE_HOME>/glove/decoys` before creating them and holds an exclusive
+lock on the journal while it runs; the next launch removes what a launch
+that no longer holds its lock left behind.
+
 The JSON environments `glove shell --save/--load` writes under
 `<XDG_CONFIG_HOME>/glove/envs` remain as session state; profiles are the
 operator-authored policy.

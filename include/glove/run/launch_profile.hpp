@@ -59,6 +59,8 @@ struct launch_profile {
     std::optional<std::uint16_t> bridge_port;
     // secrets.provider: the agent preset's provider credential.
     std::optional<secret_reference> provider_secret;
+    // decoys: canary files planted outside the sandbox for each launch.
+    std::vector<std::string> decoys;
 };
 
 [[nodiscard]] auto operator==(const launch_profile& a, const launch_profile& b) -> bool;
