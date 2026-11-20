@@ -197,12 +197,6 @@ void print_exec_usage() {
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
-        "  --share-credential <pi-provider>\n"
-        "                          with --agent pi: mediate the host API key for one Pi\n"
-        "                          provider; the sandbox gets a session nonce, never the key\n"
-        "  --share-credential-origin <host>\n"
-        "                          confirm the host when ~/.pi/agent/models.json redirects\n"
-        "                          a catalog provider\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
@@ -252,6 +246,12 @@ void print_shell_usage() {
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
+        "  --share-credential <pi-provider>\n"
+        "                          with --agent pi: mediate the host API key for one Pi\n"
+        "                          provider; the sandbox gets a session nonce, never the key\n"
+        "  --share-credential-origin <host>\n"
+        "                          confirm the host when ~/.pi/agent/models.json redirects\n"
+        "                          a catalog provider\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS through the egress proxy\n"
         "  --allow-loopback-listen allow private-loopback bind/listen inside the\n"
@@ -1557,8 +1557,9 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         } else if (driver != "pi") {
             refusal = "--share-credential requires --agent pi";
         } else if (!opts.egress.empty()) {
-            refusal = "--share-credential cannot be combined with --egress-allow: the provider "
-                      "is reached only through the credentialed endpoint";
+            refusal = "--share-credential cannot be combined with --egress-allow, including "
+                      "egress stored in a loaded environment (save it again without egress): "
+                      "the provider is reached only through the credentialed endpoint";
         } else {
             // A forwarded key variable would hand the sandbox a real secret
             // beside the mediated one.

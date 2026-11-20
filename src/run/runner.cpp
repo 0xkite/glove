@@ -325,7 +325,9 @@ auto read_host_owned_config(const std::filesystem::path& src, bool allow_owner_s
         open_path = target;
         expected_st = target_st;
     }
-    const int in_fd = ::open(open_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    // O_NONBLOCK: a FIFO planted in place of a config file must not hang the
+    // launch before the regular-file check below rejects it.
+    const int in_fd = ::open(open_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (in_fd < 0) {
         return refused("is not a readable owned regular file in an approved location");
     }
@@ -1166,12 +1168,43 @@ auto start_shared_pi_provider(const options& opts, const std::shared_ptr<glove::
     if (opts.workspace) {
         writable.push_back(opts.workspace->string());
     }
+    std::vector<std::filesystem::path> guarded{pi_root};
+    // A symlinked models.json is read from its target, so that folder decides
+    // where a key goes as much as ~/.pi does.
+    if (const auto target =
+            std::filesystem::canonical(home_dir / ".pi" / "agent" / "models.json", ec);
+        !ec && target.has_parent_path()) {
+        guarded.push_back(target.parent_path());
+    }
+    ec.clear();
+    const auto overlaps = [&](const std::filesystem::path& path) {
+        for (const auto& root : guarded) {
+#if defined(__APPLE__)
+            // APFS is usually case-insensitive: ~/.PI names ~/.pi.
+            const auto fold = [](const std::filesystem::path& value) {
+                std::string text = value.lexically_normal().string();
+                std::ranges::transform(text, text.begin(), [](char c) {
+                    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+                });
+                return std::filesystem::path{text};
+            };
+            if (path_within(fold(path), fold(root)) || path_within(fold(root), fold(path))) {
+                return true;
+            }
+#else
+            if (path_within(path, root) || path_within(root, path)) {
+                return true;
+            }
+#endif
+        }
+        return false;
+    };
     for (const auto& raw : writable) {
         const auto path = std::filesystem::weakly_canonical(std::filesystem::path{raw}, ec);
-        if (ec || path_within(path, pi_root) || path_within(pi_root, path)) {
+        if (ec || overlaps(path)) {
             return std::unexpected(
                 "--share-credential refuses a writable workspace or --write path that overlaps "
-                "~/.pi: " +
+                "~/.pi or the folder holding the host Pi models.json: " +
                 printable(raw)
             );
         }
