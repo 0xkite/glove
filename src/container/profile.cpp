@@ -289,7 +289,11 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         return std::unexpected(bounded.error());
     }
     profile copy = p;
-    copy.link_spellings.clear(); // recomputed from the grants; never trusted from the caller
+    // Spellings are recomputed from the grants. Incoming ones are re-admitted only when they are
+    // symlinks that resolve to, into, or above a grant, because validate() canonicalizes grant
+    // paths and runs more than once on the launch path.
+    auto incoming = std::move(copy.link_spellings);
+    copy.link_spellings.clear();
     if (copy.denial_tag && !detail::is_denial_tag(*copy.denial_tag)) {
         return std::unexpected(std::string{"denial tag must be 32 lowercase hex characters"});
     }
@@ -393,6 +397,36 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
             return std::unexpected(
                 std::string{"runtime and ordinary filesystem rules overlap: '"} + rule.path + "'"
             );
+        }
+    }
+    for (const auto& spelling : incoming) {
+        if (spelling.size() > max_link_spelling_bytes || spelling.find('\0') != std::string::npos) {
+            continue;
+        }
+        const std::filesystem::path spelled{spelling};
+        if (!spelled.is_absolute() || spelled.lexically_normal().string() != spelling) {
+            continue;
+        }
+        std::error_code link_ec;
+        if (!std::filesystem::is_symlink(spelled, link_ec) || link_ec) {
+            continue;
+        }
+        auto resolved = canonical_path(spelling, "link spelling");
+        if (!resolved) {
+            continue;
+        }
+        const std::filesystem::path target{*resolved};
+        const auto touches_grant = [&](const auto& rules) {
+            return std::ranges::any_of(rules, [&](const auto& rule) {
+                const std::filesystem::path grant{rule.path};
+                return path_within(target, grant) || path_within(grant, target);
+            });
+        };
+        if (!touches_grant(copy.filesystem) && !touches_grant(copy.runtime_filesystem)) {
+            continue;
+        }
+        if (auto added = add_link_spelling(copy.link_spellings, spelling); !added) {
+            return std::unexpected(added.error());
         }
     }
     std::vector<std::filesystem::path> runtime_fs_paths;
