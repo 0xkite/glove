@@ -488,6 +488,9 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program, std::str
     const auto tagged = tag_modifier(denial_tag);
     std::string p = "(version 1)\n(deny default" + tagged + ")\n(import \"system.sb\")\n";
     p += "(allow process-exec*)\n(allow process-fork)\n(allow sysctl-read)\n";
+    // Agents and harnesses must be able to stop their own descendants; processes
+    // outside the sandbox stay unsignalable under (deny default).
+    p += "(allow signal (target same-sandbox))\n";
     for (const auto* runtime : {"/bin", "/sbin", "/usr/bin", "/usr/sbin"}) {
         append_read_rule(p, runtime);
     }
