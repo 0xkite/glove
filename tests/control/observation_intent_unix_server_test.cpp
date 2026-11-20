@@ -1235,11 +1235,23 @@ auto run() -> int {
             for (const int descriptor : exhausted) {
                 ::close(descriptor);
             }
-            // The channel recovers: both the queued connection and the new
-            // recovery request are accepted and processed.
+#if defined(__APPLE__)
+            // XNU dequeues a pending connection before allocating its
+            // descriptor and closes it when that fails, so the queued client
+            // sees EOF and must retry; only the new request is served.
+            constexpr std::size_t surviving_requests = 1U;
+            pollfd held_poll{.fd = held.get(), .events = POLLIN, .revents = 0};
+            REQUIRE(::poll(&held_poll, 1, 1'000 * glove_test::timeout_scale) == 1);
+            char held_byte = 0;
+            REQUIRE(::recv(held.get(), &held_byte, 1, MSG_DONTWAIT) == 0);
+#else
+            // The queued connection stays queued across EMFILE, so both it
+            // and the new recovery request are accepted and processed.
+            constexpr std::size_t surviving_requests = 2U;
+#endif
             const auto count_before_retry = fixture->registry->record_count();
             serve_error.reset();
-            server_thread = serve_in_background(**retry_server, 2, serve_error);
+            server_thread = serve_in_background(**retry_server, surviving_requests, serve_error);
             auto retry_response = transact(
                 retry_socket, make_enqueue_request(channel_token, "intent-retry-recovered")
             );
@@ -1247,11 +1259,11 @@ auto run() -> int {
             REQUIRE(!serve_error.has_value());
             REQUIRE(retry_response.has_value());
             REQUIRE(decode_success(*retry_response).has_value());
-            REQUIRE(fixture->registry->record_count() == count_before_retry + 2U);
+            REQUIRE(fixture->registry->record_count() == count_before_retry + surviving_requests);
         } else {
-            // macOS keeps new allocations below its high-water mark, so the
-            // accept may simply succeed; the channel must still stay healthy
-            // and process both the queued and a fresh request.
+            // A soft limit above the 4096 probe cap never reaches EMFILE, so
+            // this run cannot exercise the retry; the channel must still stay
+            // healthy and process both the queued and a fresh request.
             for (const int descriptor : exhausted) {
                 ::close(descriptor);
             }
