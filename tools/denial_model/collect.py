@@ -12,6 +12,15 @@ workspace and these variables (passed with --env):
   GLOVE_SCENARIO_HOST_HOME  the invoking user's real home directory (inside
                             the sandbox $HOME is a private directory)
   GLOVE_SCENARIO_NONCE      a fresh random hex string for this run
+  GLOVE_SCENARIO_DECOY_1..3 decoy files planted for this run (see below)
+
+Every run, benign or not, gets the same three decoys: canary files that glove
+plants outside the sandbox through a launch profile and removes afterwards.
+They live in a directory made for the run, never in a real credential
+directory. The sandbox cannot list that directory, so a scenario reaches a
+decoy only by the name it is given, which models an agent that goes looking
+for a well-known secret path. The trace header lists the decoys, and the
+`target_decoy` feature counts denied accesses to them.
 
 A misbehaving scenario marks when it starts misbehaving by trying to create
 /glove-onset-$GLOVE_SCENARIO_NONCE. The collector takes that denial's time as
@@ -45,6 +54,8 @@ from pathlib import Path
 GROUPS = ("benign", "misbehaving")
 SPLIT_PATTERN = ("train", "train", "train", "validate", "test")
 RUN_TIMEOUT_S = 120
+DECOY_NAMES = ("backup-token", "vault-export.json", "recovery-codes.txt")
+PROFILE_NAME = "scenario"
 
 
 def scenarios(root: Path):
@@ -93,6 +104,24 @@ def clean_trace(raw: Path, marker: str):
     return kept, onset, state
 
 
+def write_profile(config: Path, vault: Path) -> list[Path]:
+    """A launch profile that plants the decoys and tells the scenario where
+    they are. glove requires the directory 0700 and the file 0600."""
+    profiles = config / "glove" / "profiles"
+    profiles.mkdir(mode=0o700, parents=True)
+    os.chmod(config / "glove", 0o700)
+    vault.mkdir(mode=0o700)
+    decoys = [vault / name for name in DECOY_NAMES]
+    text = "version: 1\nenv:\n"
+    for number, decoy in enumerate(decoys, start=1):
+        text += f"  GLOVE_SCENARIO_DECOY_{number}: {{ value: {json.dumps(str(decoy))} }}\n"
+    text += "decoys:\n" + "".join(f"  - {json.dumps(str(decoy))}\n" for decoy in decoys)
+    target = profiles / f"{PROFILE_NAME}.yaml"
+    with open(target, "w", encoding="ascii", opener=lambda p, f: os.open(p, f, 0o600)) as s:
+        s.write(text)
+    return decoys
+
+
 def run_once(glove: str, group: str, name: str, script: Path, home: Path, out: Path,
              index: int):
     nonce = secrets.token_hex(8)
@@ -103,9 +132,12 @@ def run_once(glove: str, group: str, name: str, script: Path, home: Path, out: P
         workspace.mkdir()
         shutil.copyfile(script, workspace / ".scenario.sh")
         raw = temp_path / "trace.jsonl"
+        config = temp_path / "config"
+        decoys = write_profile(config, temp_path / "vault")
         env = dict(os.environ, GLOVE_SCENARIO_HOST_HOME=str(home),
-                   GLOVE_SCENARIO_NONCE=nonce)
-        argv = [glove, "exec", "--workspace", str(workspace), "--denial-trace", str(raw),
+                   GLOVE_SCENARIO_NONCE=nonce, XDG_CONFIG_HOME=str(config))
+        argv = [glove, "exec", "--profile", PROFILE_NAME, "--workspace", str(workspace),
+                "--denial-trace", str(raw),
                 "--env", "GLOVE_SCENARIO_HOST_HOME", "--env", "GLOVE_SCENARIO_NONCE",
                 "--", "/bin/sh", str(workspace / ".scenario.sh")]
         try:
@@ -127,6 +159,12 @@ def run_once(glove: str, group: str, name: str, script: Path, home: Path, out: P
             print(f"  {name}#{index}: no trace written; skipped", file=sys.stderr)
             return None
         lines, onset, state = clean_trace(raw, marker)
+        planted = json.loads(lines[0]).get("decoys") if lines else None
+        if planted != [str(decoy) for decoy in decoys]:
+            sys.exit(f"{name}#{index}: the trace does not list the planted decoys: {planted}")
+        hits = sum(1 for line in lines if json.loads(line).get("target") in planted)
+        if group == "benign" and hits:
+            sys.exit(f"scenario bug: benign {name} reached for a decoy")
     if state != "live":
         print(f"  {name}#{index}: telemetry {state or 'incomplete'}; skipped", file=sys.stderr)
         return None
