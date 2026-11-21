@@ -8,6 +8,7 @@
 
 #include "denial_audit.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <expected>
@@ -160,6 +161,92 @@ auto decoys() -> int {
     REQUIRE(field(events.back().arguments_json, "decoys") == 2);
     REQUIRE(field(events.back().arguments_json, "decoy_hits") == 56);
     REQUIRE(all_clean(events));
+    return 0;
+}
+
+// A shadow decider's verdict is recorded once per escalation, whatever the
+// ordinary rate window holds, and the summary carries the highest verdict.
+// Nothing here can act on a verdict: the writer only appends records.
+auto shadow() -> int {
+    auto sink = glove::audit::make_memory_sink();
+    fake_clock clock;
+    denial_audit_writer writer{sink, clock.function()};
+    const glove::container::denial_context context{
+        .workspace_roots = {"/Users/u/proj"},
+        .home = "/Users/u",
+        .decoys = {"/Users/u/vault/token"},
+    };
+    writer.attach_decider(glove::container::make_heuristic_denial_decider(), context);
+    writer.record_start(denial_telemetry_state::live, "");
+    auto calm = sample_denial();
+    calm.target = "/Users/u/proj/x";
+    for (int index = 0; index != 20; ++index) {
+        writer.on_denial(calm); // fills the one-second audit window
+    }
+    auto reach = sample_denial();
+    reach.kind = "file_read";
+    reach.target = "/Users/u/vault/token";
+    clock.advance_ms(250);
+    writer.on_denial(reach);
+    writer.on_denial(reach);
+    clock.advance_ms(250);
+    writer.on_denial(reach);
+    writer.on_denial(reach);
+    REQUIRE(writer.finish(live_report()).has_value());
+    writer.on_denial(reach);
+    const auto events = sink->take();
+    std::vector<glove::audit::event> verdicts;
+    for (const auto& event : events) {
+        if (event.tool_name == "verdict") {
+            verdicts.push_back(event);
+        }
+    }
+    REQUIRE(verdicts.size() == 2);
+    REQUIRE(verdicts.at(0).arguments_json.contains(R"("mode":"shadow","arm":"heuristic")"));
+    REQUIRE(verdicts.at(0).arguments_json.contains(R"("verdict":"flag")"));
+    REQUIRE(field(verdicts.at(0).arguments_json, "denials") == 21);
+    REQUIRE(field(verdicts.at(0).arguments_json, "t_ms") == 250);
+    REQUIRE(verdicts.at(1).arguments_json.contains(R"("verdict":"terminate")"));
+    REQUIRE(field(verdicts.at(1).arguments_json, "denials") == 23);
+    REQUIRE(field(verdicts.at(1).arguments_json, "t_ms") == 500);
+    for (const auto& verdict : verdicts) {
+        REQUIRE(verdict.status != tool_call_status::ok);
+        REQUIRE(verdict.error_message == "shadow verdict; no action was taken");
+    }
+    REQUIRE(events.back().tool_name == "summary");
+    REQUIRE(
+        events.back().arguments_json.contains(R"("decider":"heuristic","verdict":"terminate")")
+    );
+    REQUIRE(all_clean(events));
+
+    // Without a decider the summary says nothing about one, and a decider
+    // attached after the start is ignored.
+    auto plain_sink = glove::audit::make_memory_sink();
+    denial_audit_writer plain{plain_sink, clock.function()};
+    plain.record_start(denial_telemetry_state::live, "");
+    plain.attach_decider(glove::container::make_heuristic_denial_decider(), context);
+    plain.on_denial(reach);
+    REQUIRE(plain.finish(live_report()).has_value());
+    for (const auto& event : plain_sink->take()) {
+        REQUIRE(event.tool_name != "verdict");
+        REQUIRE(!event.arguments_json.contains("decider"));
+    }
+
+    // A decider the operator asked for but glove could not use is recorded
+    // once, with its reason, and the launch's telemetry is otherwise as usual.
+    auto missing_sink = glove::audit::make_memory_sink();
+    denial_audit_writer missing{missing_sink, clock.function()};
+    missing.record_decider_unavailable("denial model: no such file");
+    missing.record_decider_unavailable("again");
+    missing.record_start(denial_telemetry_state::live, "");
+    REQUIRE(missing.finish(live_report()).has_value());
+    const auto missing_events = missing_sink->take();
+    REQUIRE(missing_events.front().tool_name == "decider");
+    REQUIRE(missing_events.front().status != tool_call_status::ok);
+    REQUIRE(missing_events.front().error_message == "denial model: no such file");
+    REQUIRE(std::ranges::count_if(missing_events, [](const auto& event) {
+                return event.tool_name == "decider";
+            }) == 1);
     return 0;
 }
 
@@ -434,7 +521,8 @@ int main() {
           degraded,
           sink_failure,
           notices,
-          decoys}) {
+          decoys,
+          shadow}) {
         if (const int failed = step(); failed != 0) {
             return failed;
         }

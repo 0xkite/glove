@@ -4,6 +4,8 @@
 #include "glove/mcp/messages.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <utility>
 
 namespace glove::run::detail {
@@ -27,6 +29,16 @@ auto state_name(glove::container::denial_telemetry_state state) -> std::string_v
         return "degraded";
     }
     return "unavailable";
+}
+
+// A score in [0, 1] as fixed text; anything else (a NaN from a broken
+// decider, for one) is written as 0.
+auto score_text(float score) -> std::string {
+    const double bounded = score >= 0.0F && score <= 1.0F ? static_cast<double>(score) : 0.0;
+    std::array<char, 16> buffer{};
+    const int written = std::snprintf(buffer.data(), buffer.size(), "%.3f", bounded);
+    return written > 0 ? std::string{buffer.data(), static_cast<std::size_t>(written)}
+                       : std::string{"0.000"};
 }
 
 } // namespace
@@ -107,12 +119,62 @@ void denial_audit_writer::watch_decoys(std::span<const std::filesystem::path> de
     }
 }
 
+void denial_audit_writer::attach_decider(
+    std::shared_ptr<const glove::container::denial_decider> decider,
+    const glove::container::denial_context& context
+) {
+    const std::lock_guard lock{mutex_};
+    if (!decider || started_ || finished_) {
+        return;
+    }
+    decider_ = std::move(decider);
+    features_.emplace(context);
+    decider_started_ = now_();
+}
+
+void denial_audit_writer::record_decider_unavailable(std::string_view reason) {
+    const std::lock_guard lock{mutex_};
+    if (finished_ || decider_unavailable_written_) {
+        return;
+    }
+    decider_unavailable_written_ = true;
+    append(
+        "decider",
+        R"({"state":"unavailable"})",
+        false,
+        checked(reason, glove::container::max_denial_reason_text_bytes)
+    );
+}
+
 void denial_audit_writer::on_denial(const glove::container::sandbox_denial& denial) {
     const std::lock_guard lock{mutex_};
     if (finished_) {
         return;
     }
     duplicates_ += denial.duplicate_reports;
+    if (decider_ && features_ && decider_started_) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now_() - *decider_started_);
+        features_->observe(denial, elapsed);
+        const auto decision = decider_->decide(features_->features(elapsed));
+        if (decision.verdict > highest_.verdict) {
+            highest_ = decision;
+            std::string verdict = R"({"mode":"shadow","arm":")";
+            verdict += checked(decider_->arm(), max_kind_bytes);
+            verdict += R"(","verdict":")";
+            verdict += glove::container::denial_verdict_name(decision.verdict);
+            verdict += R"(","score":)";
+            verdict += score_text(decision.score);
+            verdict += R"(,"denials":)";
+            verdict += std::to_string(features_->observed());
+            verdict += R"(,"t_ms":)";
+            verdict += std::to_string(elapsed.count());
+            verdict += "}";
+            append("verdict", std::move(verdict), false, "shadow verdict; no action was taken");
+        } else if (decision.verdict == highest_.verdict && decision.score > highest_.score) {
+            highest_.score = decision.score;
+        }
+    }
     if (first_error_) {
         ++suppressed_error_;
         return;
@@ -226,6 +288,14 @@ auto denial_audit_writer::finish(const glove::container::denial_monitor_report& 
         arguments += std::to_string(report.stream_rejected);
         arguments += R"(,"end_proof":)";
         arguments += boolean(report.end_proof);
+        if (decider_) {
+            arguments += R"(,"decider":")";
+            arguments += checked(decider_->arm(), max_kind_bytes);
+            arguments += R"(","verdict":")";
+            arguments += glove::container::denial_verdict_name(highest_.verdict);
+            arguments += R"(","score":)";
+            arguments += score_text(highest_.score);
+        }
         if (!decoy_targets_.empty()) {
             arguments += R"(,"decoys":)";
             arguments += std::to_string(decoy_targets_.size());
