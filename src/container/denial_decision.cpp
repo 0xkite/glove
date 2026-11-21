@@ -17,7 +17,7 @@ namespace glove::container {
 
 namespace {
 
-// Schema version 1. Every value is log1p of a count or of seconds, so a
+// Schema version 2. Every value is log1p of a count or of seconds, so a
 // linear model sees a usable scale and thresholds compare monotonically.
 constexpr std::array<std::string_view, denial_feature_count> feature_names{
     "denials",
@@ -45,6 +45,7 @@ constexpr std::array<std::string_view, denial_feature_count> feature_names{
     "target_other_path",
     "target_none",
     "write_outside_workspace",
+    "target_decoy",
     "distinct_targets",
     "distinct_comms",
     "truncated_targets",
@@ -71,15 +72,16 @@ constexpr std::size_t f_target_device = 21;
 constexpr std::size_t f_target_other_path = 22;
 constexpr std::size_t f_target_none = 23;
 constexpr std::size_t f_write_outside_workspace = 24;
-constexpr std::size_t f_distinct_targets = 25;
-constexpr std::size_t f_distinct_comms = 26;
-constexpr std::size_t f_truncated_targets = 27;
-constexpr std::size_t f_duplicate_reports = 28;
-constexpr std::size_t f_rate_1s = 29;
-constexpr std::size_t f_rate_10s = 30;
-constexpr std::size_t f_elapsed_seconds = 31;
-constexpr std::size_t f_first_denial_seconds = 32;
-constexpr std::size_t f_idle_seconds = 33;
+constexpr std::size_t f_target_decoy = 25;
+constexpr std::size_t f_distinct_targets = 26;
+constexpr std::size_t f_distinct_comms = 27;
+constexpr std::size_t f_truncated_targets = 28;
+constexpr std::size_t f_duplicate_reports = 29;
+constexpr std::size_t f_rate_1s = 30;
+constexpr std::size_t f_rate_10s = 31;
+constexpr std::size_t f_elapsed_seconds = 32;
+constexpr std::size_t f_first_denial_seconds = 33;
+constexpr std::size_t f_idle_seconds = 34;
 
 static_assert(f_idle_seconds + 1 == denial_feature_count);
 
@@ -213,9 +215,19 @@ auto denial_verdict_name(denial_verdict verdict) noexcept -> std::string_view {
 }
 
 auto make_denial_context(
-    std::span<const std::string> raw_workspace_roots, std::string_view raw_home
+    std::span<const std::string> raw_workspace_roots,
+    std::string_view raw_home,
+    std::span<const std::string> raw_decoys
 ) -> denial_context {
-    denial_context out{.workspace_roots = {}, .home = encoded_root(raw_home)};
+    denial_context out{.workspace_roots = {}, .home = encoded_root(raw_home), .decoys = {}};
+    for (const auto& raw : raw_decoys) {
+        if (out.decoys.size() == max_denial_context_decoys) {
+            break;
+        }
+        if (auto decoy = encoded_root(raw); !decoy.empty()) {
+            out.decoys.push_back(std::move(decoy));
+        }
+    }
     for (const auto& raw : raw_workspace_roots) {
         if (out.workspace_roots.size() == max_denial_context_roots) {
             break;
@@ -235,6 +247,14 @@ denial_feature_builder::denial_feature_builder(const denial_context& context)
         }
         if (auto normalized = normalized_root(root); !normalized.empty()) {
             roots_.push_back(std::move(normalized));
+        }
+    }
+    for (const auto& decoy : context.decoys) {
+        if (decoys_.size() == max_denial_context_decoys) {
+            break;
+        }
+        if (auto normalized = normalized_root(decoy); !normalized.empty()) {
+            decoys_.push_back(std::move(normalized));
         }
     }
 }
@@ -308,6 +328,10 @@ void denial_feature_builder::observe(
         target_class = f_target_system;
     }
     ++counts_.at(target_class);
+    // A decoy is counted on top of its class: nothing legitimate names one.
+    if (std::ranges::find(decoys_, target) != decoys_.end()) {
+        ++std::get<f_target_decoy>(counts_);
+    }
     if (denial.kind == "file_write" && target_class != f_target_workspace &&
         target_class != f_target_temp && target_class != f_target_none) {
         ++std::get<f_write_outside_workspace>(counts_);
@@ -375,6 +399,8 @@ public:
     explicit heuristic_decider(denial_heuristic_thresholds limits)
         : flag_secret_{log_scale(limits.flag_secret)},
           terminate_secret_{log_scale(limits.terminate_secret)},
+          flag_decoy_{log_scale(limits.flag_decoy)},
+          terminate_decoy_{log_scale(limits.terminate_decoy)},
           flag_rate_{log_scale(limits.flag_rate_1s)},
           terminate_rate_{log_scale(limits.terminate_rate_10s)},
           flag_distinct_{log_scale(limits.flag_distinct_targets)} {}
@@ -384,14 +410,15 @@ public:
     [[nodiscard]] auto decide(const denial_features& in) const noexcept
         -> denial_decision override {
         const bool secret_and_egress =
-            std::get<f_target_home_secret>(in) > 0.0F &&
+            (std::get<f_target_home_secret>(in) > 0.0F || std::get<f_target_decoy>(in) > 0.0F) &&
             (std::get<f_kind_network>(in) > 0.0F || std::get<f_write_outside_workspace>(in) > 0.0F);
-        if (std::get<f_target_home_secret>(in) >= terminate_secret_ || secret_and_egress ||
+        if (std::get<f_target_home_secret>(in) >= terminate_secret_ ||
+            std::get<f_target_decoy>(in) >= terminate_decoy_ || secret_and_egress ||
             std::get<f_rate_10s>(in) >= terminate_rate_) {
             return {.verdict = denial_verdict::terminate, .score = 1.0F};
         }
         if (std::get<f_target_home_secret>(in) >= flag_secret_ ||
-            std::get<f_rate_1s>(in) >= flag_rate_ ||
+            std::get<f_target_decoy>(in) >= flag_decoy_ || std::get<f_rate_1s>(in) >= flag_rate_ ||
             std::get<f_distinct_targets>(in) >= flag_distinct_) {
             return {.verdict = denial_verdict::flag, .score = 0.5F};
         }
@@ -401,6 +428,8 @@ public:
 private:
     float flag_secret_;
     float terminate_secret_;
+    float flag_decoy_;
+    float terminate_decoy_;
     float flag_rate_;
     float terminate_rate_;
     float flag_distinct_;

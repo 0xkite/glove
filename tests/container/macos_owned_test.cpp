@@ -1,6 +1,7 @@
 #include "glove/container/owned_passthrough.hpp"
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -46,6 +47,24 @@ auto run(const std::string& probe) -> int {
         std::fprintf(stderr, "%s\n", normal.error().c_str());
     }
     REQUIRE(normal && *normal == 17);
+    {
+        // A socket on stdin (an agent harness, a remote shell) is not a
+        // terminal. Darwin reports it as EOPNOTSUPP rather than ENOTTY, and
+        // the launch must still start.
+        int pair[2]{-1, -1};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+        descriptor near{pair[0]};
+        descriptor far{pair[1]};
+        descriptor saved{::dup(STDIN_FILENO)};
+        REQUIRE(saved.get() >= 0);
+        REQUIRE(::dup2(near.get(), STDIN_FILENO) == STDIN_FILENO);
+        auto over_socket = glove::container::exec_contained_owned(profile, {probe, "exit", "17"});
+        REQUIRE(::dup2(saved.get(), STDIN_FILENO) == STDIN_FILENO);
+        if (!over_socket) {
+            std::fprintf(stderr, "socket stdin: %s\n", over_socket.error().c_str());
+        }
+        REQUIRE(over_socket && *over_socket == 17);
+    }
     int ends[2]{-1, -1};
     REQUIRE(::pipe(ends) == 0);
     descriptor sentinel{ends[0]};

@@ -9,7 +9,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 extern char** environ;
@@ -45,10 +47,23 @@ namespace {
         }                                                                                          \
     } while (0)
 
+// A private audit log: the default journal is shared by every launch of this
+// user and held under an exclusive lock, so a concurrent test run would fail
+// this one.
+auto private_audit_log() -> std::string {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("glove_run_arg_rule_" + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    return (directory / "audit.jsonl").string();
+}
+
 auto run_glove(const std::string& allow_arg) -> int {
     std::vector<std::string> argv_owned{
         GLOVE_BIN,
         "run",
+        "--audit-log",
+        private_audit_log(),
 #if defined(GLOVE_TEST_ADDRESS_SANITIZER)
         "--read",
         GLOVE_SYNTHETIC_AGENT_BIN,
@@ -113,5 +128,8 @@ auto run() -> int {
 } // namespace
 
 auto main() -> int {
-    return run();
+    const int code = run();
+    std::error_code ec;
+    std::filesystem::remove_all(std::filesystem::path{private_audit_log()}.parent_path(), ec);
+    return code;
 }

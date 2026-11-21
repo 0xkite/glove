@@ -203,10 +203,18 @@ def main():
         profile("decoy", f"version: 1\nworkspace: {workspace}\ndecoys:\n  - \"{decoy}\"\n")
         decoy_audit = root / "audit" / "decoy.jsonl"
         script = f'cat "{decoy}" > /dev/null 2>&1; exit 0'
+        decoy_trace = root / "audit" / "decoy.trace.jsonl"
         expect(glove(binary, env, "exec", "--profile", "decoy", "--audit-log", str(decoy_audit),
-                     "--", "/bin/sh", "-c", script), 0)
+                     "--denial-trace", str(decoy_trace), "--", "/bin/sh", "-c", script), 0)
         if decoy.exists():
             fail("the decoy outlived its launch")
+        # The trace header names the decoy as the kernel reports it, so a
+        # replay counts the hit.
+        trace = [json.loads(line) for line in
+                 decoy_trace.read_text(encoding="utf-8").splitlines() if line]
+        named = os.path.realpath(decoy)
+        if trace[0].get("decoys") != [named]:
+            fail(f"the trace header does not name the decoy: {trace[0]}")
         records = [json.loads(line) for line in
                    decoy_audit.read_text(encoding="utf-8").splitlines() if line]
         if not any(r["tool"] == "decoys_planted:1" for r in records):
@@ -217,6 +225,8 @@ def main():
             fail(f"a sandboxed read of the decoy was not audited:\n{records}")
         if hits and "backup-token" not in hits[0]["arguments"]:
             fail("the decoy record does not name the decoy")
+        if hits and not any(r["type"] == "event" and r["target"] == named for r in trace):
+            fail(f"the traced denial does not match the header's decoy: {trace}")
 
         profile("decoy_inside", f"version: 1\nworkspace: {workspace}\n"
                                 f"decoys:\n  - \"{workspace / 'canary'}\"\n")

@@ -599,12 +599,13 @@ two "macOS denial telemetry" rows of the [threat model](threat-model.md).
 become a verdict. It is not wired into any launch path yet: no verdict is
 recorded or acted on.
 
-- `denial_feature_builder` turns the denial stream into 34 features (schema
-  version 1): counts by kind and by target class (workspace, home credential
+- `denial_feature_builder` turns the denial stream into 35 features (schema
+  version 2): counts by kind and by target class (workspace, home credential
   store, other home, system, temp, device, other, none), writes outside the
-  workspace, distinct targets and process names, rates over 1 s and 10 s, and
-  timing. Values are `log1p` scaled. Memory is bounded: the rate window holds
-  4096 entries and each distinct set 1024.
+  workspace, denied accesses to this launch's decoys (exact path only),
+  distinct targets and process names, rates over 1 s and 10 s, and timing.
+  Values are `log1p` scaled. Memory is bounded: the rate window holds 4096
+  entries and each distinct set 1024.
 - `denial_decider::decide` maps features to `proceed`, `flag` or `terminate`
   with a score in [0, 1]. It is a pure function: no I/O, no blocking.
 - The product arm is a model trained offline and loaded with
@@ -615,15 +616,15 @@ recorded or acted on.
 - `make_heuristic_denial_decider` is a fixed-threshold arm kept only to
   compare against the model.
 - `glove run|exec --denial-trace <path>` records the launch's raw denials to
-  a new file (JSON lines: a header with the classification context, one line
-  per denial with its time since launch, an end line with the monitor's
-  report). It holds at most 16384 events; the rest are counted as dropped.
+  a new file (JSON lines: a header with the classification context,
+  including the launch's decoy paths, one line per denial with its time
+  since launch, an end line with the monitor's report). It holds at most 16384 events; the rest are counted as dropped.
   The file is created with `O_EXCL|O_NOFOLLOW` and mode 0600, and a path that
   any profile mount exposes is refused before the agent starts. A trace holds
   host paths the agent tried to reach, so it is opt-in. Write failures are
   reported after the agent exits. `parse_denial_trace` reads a trace back as
   untrusted input; traces store events, not features, so a corpus survives a
-  feature schema change.
+  feature schema change. Version 1 traces, which had no decoys, still load.
 - `glove-denial-replay` (built, not installed) replays traces into feature
   rows and evaluates arms; `tools/denial_model/` holds the scenario
   collector, the trainer and the cross-validated ablation. See its README.

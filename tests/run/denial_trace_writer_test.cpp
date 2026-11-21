@@ -74,7 +74,7 @@ auto read_file(const std::filesystem::path& path) -> std::string {
 }
 
 auto context() -> denial_context {
-    return {.workspace_roots = {"/w"}, .home = "/h"};
+    return {.workspace_roots = {"/w"}, .home = "/h", .decoys = {"/v/token"}};
 }
 
 auto denial(std::string target) -> sandbox_denial {
@@ -138,7 +138,7 @@ auto refuses_existing(const temporary_tree& tree) -> int {
     REQUIRE(!denial_trace_writer::create(link, context()).has_value());
     REQUIRE(!std::filesystem::exists(tree.path() / "target"));
     REQUIRE(!denial_trace_writer::create(tree.path() / "no" / "dir", context()).has_value());
-    const denial_context bad{.workspace_roots = {"relative"}, .home = ""};
+    const denial_context bad{.workspace_roots = {"relative"}, .home = "", .decoys = {}};
     REQUIRE(!denial_trace_writer::create(tree.path() / "bad2", bad).has_value());
     REQUIRE(!std::filesystem::exists(tree.path() / "bad2"));
     return 0;

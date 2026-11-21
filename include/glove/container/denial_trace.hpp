@@ -24,7 +24,9 @@
 
 namespace glove::container {
 
-constexpr std::uint32_t denial_trace_version = 1;
+// Version 2 added the header's decoys. Version 1 traces still load, with no
+// decoys, so an older corpus stays usable.
+constexpr std::uint32_t denial_trace_version = 2;
 constexpr std::size_t max_denial_trace_events = 16384;
 constexpr std::size_t max_denial_trace_bytes = std::size_t{32} << 20U;
 constexpr std::size_t max_denial_trace_line_bytes = std::size_t{64} << 10U;

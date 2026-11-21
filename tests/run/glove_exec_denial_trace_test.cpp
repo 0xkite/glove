@@ -48,6 +48,7 @@ auto read_file(const std::filesystem::path& path) -> std::string {
 auto glove_exec(
     const std::filesystem::path& workspace,
     const std::filesystem::path& trace,
+    const std::filesystem::path& audit,
     const std::string& script,
     const std::filesystem::path& stderr_path
 ) -> int {
@@ -68,6 +69,10 @@ auto glove_exec(
             workspace.c_str(),
             "--denial-trace",
             trace.c_str(),
+            // Private, so a concurrent launch holding the default journal
+            // cannot fail this one.
+            "--audit-log",
+            audit.c_str(),
             "--",
             "/bin/sh",
             "-c",
@@ -95,6 +100,7 @@ auto records(int number, const std::filesystem::path& home) -> int {
     const int status = glove_exec(
         workspace,
         trace_path,
+        base / "audit.jsonl",
         "/usr/bin/touch '" + forbidden.string() + "'; exit 0",
         base / "stderr.txt"
     );
@@ -154,7 +160,7 @@ auto refuses(const std::filesystem::path&) -> int {
 
     // Inside the workspace: the agent could rewrite its own trace.
     const auto inside = workspace / "trace.jsonl";
-    int status = glove_exec(workspace, inside, script, base / "stderr1.txt");
+    int status = glove_exec(workspace, inside, base / "audit.jsonl", script, base / "stderr1.txt");
     REQUIRE(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) != 0);
     REQUIRE(!std::filesystem::exists(ran, ec));
     REQUIRE(!std::filesystem::exists(inside, ec));
@@ -163,7 +169,7 @@ auto refuses(const std::filesystem::path&) -> int {
     // An existing file is never overwritten or appended to.
     const auto existing = base / "existing.jsonl";
     std::ofstream{existing} << "keep\n";
-    status = glove_exec(workspace, existing, script, base / "stderr2.txt");
+    status = glove_exec(workspace, existing, base / "audit.jsonl", script, base / "stderr2.txt");
     REQUIRE(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) != 0);
     REQUIRE(!std::filesystem::exists(ran, ec));
     REQUIRE(read_file(existing) == "keep\n");

@@ -32,7 +32,11 @@ using glove::container::sandbox_denial;
 using std::chrono::milliseconds;
 
 auto context() -> denial_context {
-    return {.workspace_roots = {"/Users/u/proj", "/private/tmp/a%25b"}, .home = "/Users/u"};
+    return {
+        .workspace_roots = {"/Users/u/proj", "/private/tmp/a%25b"},
+        .home = "/Users/u",
+        .decoys = {"/Users/u/vault/token"},
+    };
 }
 
 auto event(long long at, std::string kind, std::string target) -> denial_trace_event {
@@ -82,6 +86,7 @@ auto round_trip() -> int {
     REQUIRE(trace.has_value());
     REQUIRE(trace->context.home == "/Users/u");
     REQUIRE(trace->context.workspace_roots == context().workspace_roots);
+    REQUIRE(trace->context.decoys == context().decoys);
     REQUIRE(trace->events.size() == 3);
     const auto& first = trace->events.front();
     REQUIRE(first.at == milliseconds{5});
@@ -112,11 +117,31 @@ auto writer_refuses() -> int {
     REQUIRE(!denial_trace_event_line(event(1, "File", "/a")).has_value());
     auto ambiguous_with_text = event(1, "ambiguous", "/a");
     REQUIRE(!denial_trace_event_line(ambiguous_with_text).has_value());
-    REQUIRE(!denial_trace_header_line({.workspace_roots = {"relative"}, .home = ""}).has_value());
-    REQUIRE(!denial_trace_header_line({.workspace_roots = {"/a/"}, .home = ""}).has_value());
-    REQUIRE(!denial_trace_header_line({.workspace_roots = {}, .home = "/"}).has_value());
-    REQUIRE(!denial_trace_header_line({.workspace_roots = {"/a b\\c"}, .home = ""}).has_value());
-    REQUIRE(denial_trace_header_line({.workspace_roots = {}, .home = ""}).has_value());
+    REQUIRE(!denial_trace_header_line(
+                 {.workspace_roots = {"relative"}, .home = "", .decoys = {}}
+    ).has_value());
+    REQUIRE(!denial_trace_header_line(
+                 {.workspace_roots = {"/a/"}, .home = "", .decoys = {}}
+    ).has_value());
+    REQUIRE(
+        !denial_trace_header_line({.workspace_roots = {}, .home = "/", .decoys = {}}).has_value()
+    );
+    REQUIRE(!denial_trace_header_line(
+                 {.workspace_roots = {"/a b\\c"}, .home = "", .decoys = {}}
+    ).has_value());
+    REQUIRE(
+        denial_trace_header_line({.workspace_roots = {}, .home = "", .decoys = {}}).has_value()
+    );
+    REQUIRE(!denial_trace_header_line({.workspace_roots = {}, .home = "", .decoys = {"/a/"}})
+                 .has_value());
+    REQUIRE(!denial_trace_header_line({
+                                          .workspace_roots = {},
+                                          .home = "",
+                                          .decoys = std::vector<std::string>(
+                                              glove::container::max_denial_context_decoys + 1, "/d"
+                                          ),
+                                      })
+                 .has_value());
     REQUIRE(!denial_trace_end_line({.at = milliseconds{1}, .reason = "a\nb"}).has_value());
     return 0;
 }
@@ -156,8 +181,27 @@ auto reader_refuses() -> int {
     REQUIRE(refused(with(R"("t_ms":10)", R"("t_ms":99999999999999)")));
     REQUIRE(refused(with(R"("type":"event")", R"("type":"end")")));
     auto bad_header = header();
-    bad_header.replace(bad_header.find(R"("version":1)"), 11, R"("version":2)");
+    bad_header.replace(bad_header.find(R"("version":2)"), 11, R"("version":3)");
     REQUIRE(refused(bad_header));
+    // A version 1 header had no decoys and still loads; neither version
+    // accepts the other's shape.
+    const std::string old_header =
+        R"({"type":"header","format":"glove-denial-trace","version":1,"home":"/Users/u",)"
+        R"("workspace_roots":["/Users/u/proj"]})"
+        "\n";
+    const auto old_trace = parse_denial_trace(old_header + ok_event);
+    REQUIRE(old_trace.has_value());
+    REQUIRE(old_trace->context.home == "/Users/u" && old_trace->context.decoys.empty());
+    REQUIRE(old_trace->events.size() == 1);
+    auto old_as_new = old_header;
+    old_as_new.replace(old_as_new.find(R"("version":1)"), 11, R"("version":2)");
+    REQUIRE(refused(old_as_new));
+    auto new_as_old = header();
+    new_as_old.replace(new_as_old.find(R"("version":2)"), 11, R"("version":1)");
+    REQUIRE(refused(new_as_old));
+    auto bad_decoy = header();
+    bad_decoy.replace(bad_decoy.find("/Users/u/vault/token"), 20, "Users/u/vault/token/");
+    REQUIRE(refused(bad_decoy));
     auto bad_root = header();
     bad_root.replace(bad_root.find("/Users/u/proj"), 13, "Users/u/proj");
     REQUIRE(refused(bad_root));

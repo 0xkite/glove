@@ -1,0 +1,6 @@
+{"type":"header","format":"glove-denial-trace","version":2,"home":"/Users/u","workspace_roots":["/Users/u/proj","/private/tmp/w"],"decoys":["/Users/u/vault/token"]}
+{"type":"event","t_ms":1,"kind":"file_read","operation":"file-read-data","target":"/dev/tty","target_truncated":false,"comm":"bash","pid":10,"duplicate_reports":0,"readings":1}
+{"type":"event","t_ms":5,"kind":"file_write","operation":"file-write-create","target":"/Users/u/.zshrc","target_truncated":false,"comm":"touch","pid":10,"duplicate_reports":0,"readings":1}
+{"type":"event","t_ms":9,"kind":"ambiguous","operation":"","target":"","target_truncated":false,"comm":"","pid":0,"duplicate_reports":0,"readings":2}
+{"type":"event","t_ms":12,"kind":"network","operation":"network-outbound","target":"","target_truncated":false,"comm":"curl","pid":10,"duplicate_reports":0,"readings":1}
+{"type":"end","t_ms":20,"state":"live","reason":"","end_proof":true,"stream_events":4,"stream_rejected":1,"dropped":0}

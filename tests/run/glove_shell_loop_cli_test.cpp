@@ -30,7 +30,21 @@ namespace {
         }                                                                                          \
     } while (0)
 
+// Every launch gets a private audit log: the default journal is shared by
+// every launch of this user and held under an exclusive lock, so a concurrent
+// test run would fail this one.
+auto private_audit_directory() -> std::filesystem::path {
+    return std::filesystem::temp_directory_path() /
+           ("glove_shell_loop_audit_" + std::to_string(::getpid()));
+}
+
 auto run_glove(std::vector<std::string> argv_owned) -> int {
+    std::error_code ec;
+    std::filesystem::create_directories(private_audit_directory(), ec);
+    argv_owned.insert(
+        argv_owned.begin() + 2,
+        {"--audit-log", (private_audit_directory() / "audit.jsonl").string()}
+    );
     std::vector<char*> argv;
     argv.reserve(argv_owned.size() + 1);
     for (auto& value : argv_owned) {
@@ -195,6 +209,7 @@ auto run() -> int {
     }
 
     std::filesystem::remove_all(base, ec);
+    std::filesystem::remove_all(private_audit_directory(), ec);
     return 0;
 }
 

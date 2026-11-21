@@ -56,7 +56,11 @@ auto denial(std::string kind, std::string target) -> sandbox_denial {
 }
 
 auto context() -> denial_context {
-    return {.workspace_roots = {"/Users/u/proj/"}, .home = "/Users/u"};
+    return {
+        .workspace_roots = {"/Users/u/proj/"},
+        .home = "/Users/u",
+        .decoys = {"/Users/u/vault/token"},
+    };
 }
 
 auto schema() -> int {
@@ -127,9 +131,38 @@ auto encoded_context() -> int {
     REQUIRE(counted(features, "target_workspace", 1));
     REQUIRE(counted(features, "target_home_secret", 1));
     // A context that is not encoded text is ignored, not re-encoded.
-    denial_feature_builder raw{{.workspace_roots = {"/w/a b\"c"}, .home = "/h"}};
+    denial_feature_builder raw{{.workspace_roots = {"/w/a b\"c"}, .home = "/h", .decoys = {}}};
     raw.observe(denial("file_read", "/w/a b%22c/f"), milliseconds{0});
     REQUIRE(counted(raw.features(milliseconds{0}), "target_other_path", 1));
+    return 0;
+}
+
+// A decoy matches only its exact path, is counted on top of its class, and
+// reaches the builder through make_denial_context in the kernel's spelling.
+auto decoys() -> int {
+    denial_feature_builder builder{context()};
+    builder.observe(denial("file_read", "/Users/u/vault/token"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/vault/token"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/vault/token2"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/vault"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/vault/token/x"), milliseconds{0});
+    const auto features = builder.features(milliseconds{0});
+    REQUIRE(counted(features, "target_decoy", 2));
+    REQUIRE(counted(features, "target_home_other", 5));
+
+    const std::vector<std::string> none;
+    std::vector<std::string> raw{"relative", "/", "/d/a\"b"};
+    for (std::size_t index = 0; index != 40; ++index) {
+        raw.push_back("/d/" + std::to_string(index));
+    }
+    const auto made = make_denial_context(none, "/h", raw);
+    REQUIRE(made.decoys.size() == glove::container::max_denial_context_decoys);
+    REQUIRE(made.decoys.front() == "/d/a%22b");
+    denial_feature_builder encoded{made};
+    encoded.observe(denial("file_read", "/d/a%22b"), milliseconds{0});
+    encoded.observe(denial("file_read", "/d/30"), milliseconds{0});
+    encoded.observe(denial("file_read", "/d/31"), milliseconds{0});
+    REQUIRE(counted(encoded.features(milliseconds{0}), "target_decoy", 2));
     return 0;
 }
 
@@ -199,6 +232,10 @@ auto heuristic() -> int {
     REQUIRE(verdict({denial("file_read", "/Users/u/proj/x")}) == denial_verdict::proceed);
     REQUIRE(verdict({secret}) == denial_verdict::flag);
     REQUIRE(verdict({secret, secret, secret}) == denial_verdict::terminate);
+    const auto decoy = denial("file_read", "/Users/u/vault/token");
+    REQUIRE(verdict({decoy}) == denial_verdict::flag);
+    REQUIRE(verdict({decoy, decoy, decoy}) == denial_verdict::terminate);
+    REQUIRE(verdict({decoy, denial("network", "")}) == denial_verdict::terminate);
     REQUIRE(verdict({secret, denial("network", "")}) == denial_verdict::terminate);
     REQUIRE(
         verdict({secret, denial("file_write", "/Users/u/.zshrc")}) == denial_verdict::terminate
@@ -216,7 +253,7 @@ auto heuristic() -> int {
 struct model_text {
     std::string format = R"("glove-denial-model")";
     std::string version = "1";
-    std::string schema = "1";
+    std::string schema = "2";
     std::string features;
     std::string type = R"("logistic")";
     std::string bias = "-4";
@@ -279,16 +316,16 @@ auto models() -> int {
     trees.type = R"("gbdt")";
     trees.weights = "[]";
     trees.bias = "0";
-    trees.trees = R"([{"nodes":[{"feature":30,"threshold":3,"left":1,"right":2,"value":0},)"
+    trees.trees = R"([{"nodes":[{"feature":31,"threshold":3,"left":1,"right":2,"value":0},)"
                   R"({"feature":-1,"threshold":0,"left":0,"right":0,"value":-5},)"
                   R"({"feature":-1,"threshold":0,"left":0,"right":0,"value":4}]},)"
                   R"({"nodes":[{"feature":-1,"threshold":0,"left":0,"right":0,"value":1}]}])";
     auto tree_model = load_denial_model(trees.text());
     REQUIRE(tree_model.has_value());
-    REQUIRE(index_of("rate_10s") == 30);
+    REQUIRE(index_of("rate_10s") == 31);
     denial_features calm{};
     denial_features burst{};
-    burst.at(30) = 5.0F;
+    burst.at(31) = 5.0F;
     REQUIRE((*tree_model)->decide(calm).verdict == denial_verdict::proceed);
     REQUIRE((*tree_model)->decide(burst).verdict == denial_verdict::terminate);
     return 0;
@@ -322,7 +359,7 @@ auto malformed_models() -> int {
 
     REQUIRE(rejected_after([](model_text& m) { m.format = R"("other")"; }));
     REQUIRE(rejected_after([](model_text& m) { m.version = "2"; }));
-    REQUIRE(rejected_after([](model_text& m) { m.schema = "2"; }));
+    REQUIRE(rejected_after([](model_text& m) { m.schema = "1"; }));
     REQUIRE(rejected_after([](model_text& m) { m.type = R"("forest")"; }));
     REQUIRE(rejected_after([](model_text& m) { m.extra = R"(,"note":1)"; }));
     REQUIRE(rejected_after([](model_text& m) { m.flag = "0"; }));
@@ -354,7 +391,7 @@ auto malformed_models() -> int {
         tree_model(R"([{"feature":0,"threshold":0,"left":1,"right":2,"value":0},)" + leaf + "]")
     ));
     REQUIRE(rejected(
-        tree_model(R"([{"feature":34,"threshold":0,"left":1,"right":1,"value":0},)" + leaf + "]")
+        tree_model(R"([{"feature":35,"threshold":0,"left":1,"right":1,"value":0},)" + leaf + "]")
     ));
     REQUIRE(rejected(
         tree_model(R"([{"feature":-2,"threshold":0,"left":1,"right":1,"value":0},)" + leaf + "]")
@@ -377,6 +414,7 @@ int main() {
          {schema,
           target_classes,
           encoded_context,
+          decoys,
           writes,
           rates_and_time,
           bounds,

@@ -31,8 +31,15 @@ $R evaluate corpus/manifest.jsonl --model model.json
 ## Scenarios
 
 A scenario is a POSIX sh script run in an empty workspace. Inside the sandbox
-`$HOME` is private; the real home is `$GLOVE_SCENARIO_HOST_HOME`. A
-misbehaving scenario marks its onset with
+`$HOME` is private; the real home is `$GLOVE_SCENARIO_HOST_HOME`. Every run
+also gets three decoys, `$GLOVE_SCENARIO_DECOY_1` to `_3`: canary files glove
+plants outside the sandbox in a directory made for that run (never a real
+credential directory) and removes afterwards. A scenario that reads one is
+misbehaving by construction, and the `target_decoy` feature counts it; the
+`decoy_*` scenarios measure that the signal arrives, not that a model is
+clever.
+
+A misbehaving scenario marks its onset with
 `( /usr/bin/touch "/glove-onset-$GLOVE_SCENARIO_NONCE" ) 2>/dev/null`; the
 collector records that denial's time and removes it from the trace.
 
@@ -41,7 +48,7 @@ Scenarios must be harmless if the sandbox fails:
 - write only names containing `$GLOVE_SCENARIO_NONCE`;
 - append zero bytes (`/usr/bin/true >> file`), only to files that exist;
 - connect only to loopback or TEST-NET (192.0.2.0/24);
-- read secrets only through decoy names that do not exist.
+- read secrets only through the run's decoys, or names that do not exist.
 
 Wrap each denied command in a subshell: in `sh`, a failed redirection on a
 special builtin ends the script. The collector stops with an error if any
