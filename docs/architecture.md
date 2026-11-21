@@ -519,6 +519,13 @@ equal to the credential bridge or proxy port; duplicates collapse. Linux
 refuses non-empty `service_ports` (`service ports are not supported on Linux
 yet`).
 
+A service port is raw TCP to whatever listens on that host port. It bypasses
+the egress proxy's allow-list and egress audit, and Glove cannot tell what the
+listener is. Grant only ports whose listener you control and trust with the
+guest. Never grant another session's credential bridge or egress proxy port,
+or a host-side forward proxy: through those, the guest would gain that
+credential or unrestricted egress.
+
 `--bridge-port` bridges one port when no credential bridge or egress proxy
 takes the endpoint. Combined with `--share-credential` or egress it is
 refused (`--bridge-port cannot be used with ...; use --service-port for plain
