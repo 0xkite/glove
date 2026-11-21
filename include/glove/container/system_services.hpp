@@ -10,7 +10,9 @@
 // guessed. Linux entries carry no rules: Linux accepts the names and enforces
 // nothing for them.
 
+#include <expected>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace glove::container {
@@ -30,5 +32,12 @@ struct system_service_entry {
 // The entry for NAME, or nullptr when NAME is not in the catalog.
 [[nodiscard]] auto find_system_service(std::string_view name) noexcept
     -> const system_service_entry*;
+
+// Ok when NAME is a catalog name; otherwise a message that names the problem.
+[[nodiscard]] auto check_system_service_name(std::string_view name)
+    -> std::expected<void, std::string>;
+
+// The catalog names joined with ", " in catalog order.
+[[nodiscard]] auto system_service_names() -> std::string;
 
 } // namespace glove::container
