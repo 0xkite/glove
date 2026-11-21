@@ -83,7 +83,8 @@ auto target_classes() -> int {
         {"file_read", "/Users/u/.gnupg/pubring.kbx", "target_home_secret"},
         {"file_read", "/Users/u/Library/Keychains/login.keychain-db", "target_home_secret"},
         {"file_read", "/Users/u/.gnupgx", "target_home_other"},
-        {"file_read", "/Users/u/Documents/x", "target_home_other"},
+        {"file_read", "/Users/u/Documents/x", "target_home_personal"},
+        {"file_read", "/Users/u/Documentsx", "target_home_other"},
         {"file_read", "/Users/uv/x", "target_other_path"},
         {"file_read", "/usr/lib/libz.dylib", "target_system"},
         {"file_read", "/private/tmp/x", "target_temp"},
@@ -163,6 +164,44 @@ auto decoys() -> int {
     encoded.observe(denial("file_read", "/d/30"), milliseconds{0});
     encoded.observe(denial("file_read", "/d/31"), milliseconds{0});
     REQUIRE(counted(encoded.features(milliseconds{0}), "target_decoy", 2));
+    return 0;
+}
+
+// Personal folders are their own class, apart from tool configuration, and a
+// denied write to a place that makes code run later is counted on top of its
+// class. Reading a startup file is not persistence.
+auto personal_and_persistence() -> int {
+    denial_feature_builder builder{context()};
+    builder.observe(denial("file_read", "/Users/u/Documents/tax.pdf"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/Library/Mail"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/Documentsx/a"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/.gitconfig"), milliseconds{0});
+    builder.observe(denial("file_read", "/Users/u/.zshrc"), milliseconds{0});
+    builder.observe(denial("file_write", "/Users/u/.zshrc"), milliseconds{0});
+    builder.observe(denial("file_write", "/Users/u/.zshrc.bak"), milliseconds{0});
+    builder.observe(denial("file_write", "/Users/u/Library/LaunchAgents/x.plist"), milliseconds{0});
+    builder.observe(denial("file_write", "/Library/LaunchDaemons/x.plist"), milliseconds{0});
+    builder.observe(denial("file_write", "/private/var/at/tabs/u"), milliseconds{0});
+    builder.observe(denial("file_write", "/Users/u/proj/.zshrc"), milliseconds{0});
+    const auto features = builder.features(milliseconds{0});
+    REQUIRE(counted(features, "target_home_personal", 2));
+    REQUIRE(counted(features, "target_home_other", 6));
+    REQUIRE(counted(features, "write_persistence", 4));
+    REQUIRE(counted(features, "write_outside_workspace", 5));
+
+    const auto arm = make_heuristic_denial_decider();
+    const auto verdict = [&](const std::vector<sandbox_denial>& items) {
+        denial_feature_builder one{context()};
+        for (const auto& item : items) {
+            one.observe(item, milliseconds{0});
+        }
+        return arm->decide(one.features(milliseconds{0})).verdict;
+    };
+    const auto personal = denial("file_read", "/Users/u/Desktop/a");
+    REQUIRE(verdict({personal, personal}) == denial_verdict::proceed);
+    REQUIRE(verdict({personal, personal, personal}) == denial_verdict::flag);
+    REQUIRE(verdict({denial("file_read", "/Users/u/.zshrc")}) == denial_verdict::proceed);
+    REQUIRE(verdict({denial("file_write", "/Users/u/.zshrc")}) == denial_verdict::flag);
     return 0;
 }
 
@@ -253,7 +292,7 @@ auto heuristic() -> int {
 struct model_text {
     std::string format = R"("glove-denial-model")";
     std::string version = "1";
-    std::string schema = "2";
+    std::string schema = "3";
     std::string features;
     std::string type = R"("logistic")";
     std::string bias = "-4";
@@ -316,16 +355,16 @@ auto models() -> int {
     trees.type = R"("gbdt")";
     trees.weights = "[]";
     trees.bias = "0";
-    trees.trees = R"([{"nodes":[{"feature":31,"threshold":3,"left":1,"right":2,"value":0},)"
+    trees.trees = R"([{"nodes":[{"feature":33,"threshold":3,"left":1,"right":2,"value":0},)"
                   R"({"feature":-1,"threshold":0,"left":0,"right":0,"value":-5},)"
                   R"({"feature":-1,"threshold":0,"left":0,"right":0,"value":4}]},)"
                   R"({"nodes":[{"feature":-1,"threshold":0,"left":0,"right":0,"value":1}]}])";
     auto tree_model = load_denial_model(trees.text());
     REQUIRE(tree_model.has_value());
-    REQUIRE(index_of("rate_10s") == 31);
+    REQUIRE(index_of("rate_10s") == 33);
     denial_features calm{};
     denial_features burst{};
-    burst.at(31) = 5.0F;
+    burst.at(33) = 5.0F;
     REQUIRE((*tree_model)->decide(calm).verdict == denial_verdict::proceed);
     REQUIRE((*tree_model)->decide(burst).verdict == denial_verdict::terminate);
     return 0;
@@ -391,7 +430,7 @@ auto malformed_models() -> int {
         tree_model(R"([{"feature":0,"threshold":0,"left":1,"right":2,"value":0},)" + leaf + "]")
     ));
     REQUIRE(rejected(
-        tree_model(R"([{"feature":35,"threshold":0,"left":1,"right":1,"value":0},)" + leaf + "]")
+        tree_model(R"([{"feature":37,"threshold":0,"left":1,"right":1,"value":0},)" + leaf + "]")
     ));
     REQUIRE(rejected(
         tree_model(R"([{"feature":-2,"threshold":0,"left":1,"right":1,"value":0},)" + leaf + "]")
@@ -415,6 +454,7 @@ int main() {
           target_classes,
           encoded_context,
           decoys,
+          personal_and_persistence,
           writes,
           rates_and_time,
           bounds,

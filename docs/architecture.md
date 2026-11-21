@@ -627,10 +627,12 @@ two "macOS denial telemetry" rows of the [threat model](threat-model.md).
 become a verdict. `glove run|exec --denial-model <file>` (macOS) evaluates a
 trained model on each denial and records its verdict; nothing acts on one.
 
-- `denial_feature_builder` turns the denial stream into 35 features (schema
-  version 2): counts by kind and by target class (workspace, home credential
-  store, other home, system, temp, device, other, none), writes outside the
-  workspace, denied accesses to this launch's decoys (exact path only),
+- `denial_feature_builder` turns the denial stream into 37 features (schema
+  version 3): counts by kind and by target class (workspace, home credential
+  store, home personal folders, other home, system, temp, device, other,
+  none), writes outside the workspace, denied writes to places that make code
+  run later (launch items, scheduled jobs, shell startup files), denied
+  accesses to this launch's decoys (exact path only),
   distinct targets and process names, rates over 1 s and 10 s, and timing.
   Values are `log1p` scaled. Memory is bounded: the rate window holds 4096
   entries and each distinct set 1024.
