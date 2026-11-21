@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -441,6 +442,59 @@ auto run() -> int {
         // One bad name refuses the whole list, even next to a good one.
         p.system_services = {"network-config", "bogus"};
         REQUIRE(!glove::container::validate(p).has_value());
+    }
+
+    // Plain host-loopback service ports: independent of proxy and bridge_endpoint.
+    {
+        glove::container::profile p;
+        p.service_ports = {18002, 18000, 18001, 18000};
+        auto out = glove::container::validate(p);
+        REQUIRE(out.has_value());
+        REQUIRE((out->service_ports == std::vector<std::uint16_t>{18000, 18001, 18002}));
+
+        p.service_ports = {18000, 0};
+        auto zero = glove::container::validate(p);
+        REQUIRE(!zero.has_value());
+        REQUIRE(zero.error() == "service port must be non-zero");
+
+        p.service_ports.clear();
+        for (std::uint16_t port = 18000; port < 18016; ++port) {
+            p.service_ports.push_back(port);
+        }
+        REQUIRE(glove::container::validate(p).has_value());
+        p.service_ports.push_back(18016);
+        REQUIRE(!glove::container::validate(p).has_value());
+
+        // Duplicates collapse before the count limit applies.
+        p.service_ports.assign(17, 18000);
+        auto collapsed = glove::container::validate(p);
+        REQUIRE(collapsed.has_value());
+        REQUIRE(collapsed->service_ports.size() == 1);
+
+        // Alongside the credentialed bridge: accepted, unless the port is the bridge's.
+        glove::container::profile bridged;
+        bridged.bridge_endpoint = glove::container::bridge_endpoint_settings{.port = 9000};
+        bridged.service_ports = {18000, 18001};
+        REQUIRE(glove::container::validate(bridged).has_value());
+        bridged.service_ports = {9000};
+        auto clash = glove::container::validate(bridged);
+        REQUIRE(!clash.has_value());
+        REQUIRE(clash.error() == "service port 9000 is the credential bridge port");
+
+        // Alongside the egress proxy: accepted, unless the port is the proxy's.
+        glove::container::profile proxied;
+        proxied.proxy =
+            glove::container::proxy_settings{.port = 9100, .url = "http://glove:x@127.0.0.1:9100"};
+        proxied.service_ports = {18000};
+        REQUIRE(glove::container::validate(proxied).has_value());
+        proxied.service_ports = {9100};
+        REQUIRE(!glove::container::validate(proxied).has_value());
+
+        // The credential-bridge exclusion is unchanged.
+        glove::container::profile both = proxied;
+        both.service_ports = {18000};
+        both.bridge_endpoint = glove::container::bridge_endpoint_settings{.port = 9000};
+        REQUIRE(!glove::container::validate(both).has_value());
     }
 
     return 0;

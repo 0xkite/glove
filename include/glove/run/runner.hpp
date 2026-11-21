@@ -91,6 +91,8 @@ struct options {
     // Optional plain host-loopback TCP port bridged into the sandbox's private
     // 127.0.0.1 (e.g. 8080 for a local llama.cpp server in Pi's models.json).
     std::optional<std::uint16_t> bridge_port;
+    // Plain host-loopback TCP service ports (declaration only in the red commit).
+    std::vector<std::uint16_t> service_ports;
     // Materialize guest agent configuration (e.g. ~/.pi/agent/models.json and
     // settings.json) into the private sandbox HOME directory.
     bool seed_guest_agent_home = false;

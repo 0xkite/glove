@@ -230,6 +230,9 @@ struct profile {
     // over a raw CONNECT tunnel.
     std::optional<bridge_endpoint_settings> bridge_endpoint;
 
+    // Declaration only in the red commit; see the green commit for semantics.
+    std::vector<std::uint16_t> service_ports;
+
     // When present, launch is rejected unless the selected spawner reports
     // complete enforcement and observable receipts for every limit.
     std::optional<resource_limits> required_limits;

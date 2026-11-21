@@ -222,6 +222,30 @@ auto run() -> int {
     );
     REQUIRE(refused("envfwd", {"--share-credential", "deepseek", "--env", "EXAMPLE_API_KEY"}));
     REQUIRE(refused("codex", {"--share-credential", "deepseek"}, "codex"));
+    // --bridge-port cannot apply next to a preset bridge: refused, not dropped.
+    REQUIRE(refused("bridge-port", {"--share-credential", "deepseek", "--bridge-port", "8099"}));
+    REQUIRE(
+        refused("service-port-zero", {"--share-credential", "deepseek", "--service-port", "0"})
+    );
+    // Plain loopback service ports are accepted next to the credential bridge.
+    {
+        fs::remove(fx.out / "env.txt", ec);
+        REQUIRE(
+            run_glove(
+                fx.argv(
+                    "service-port",
+                    {"--share-credential",
+                     "deepseek",
+                     "--service-port",
+                     "18000",
+                     "--service-port",
+                     "18001"}
+                ),
+                fx.env()
+            ) == 0
+        );
+        REQUIRE(fs::exists(fx.out / "env.txt"));
+    }
     // A writable mount of host Pi data could redirect a later shared key.
     REQUIRE(refused("write-pi", {"--share-credential", "deepseek", "--write", pi_agent.string()}));
     REQUIRE(refused(
