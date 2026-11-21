@@ -1328,6 +1328,13 @@ if(Python3_Interpreter_FOUND)
             $<TARGET_FILE:glove-denial-replay>
             ${CMAKE_SOURCE_DIR}/tools/denial_model/train.py)
     set_tests_properties(denial_model_pipeline PROPERTIES TIMEOUT 120)
+    # Real-session labeling writes a manifest the replay tool accepts.
+    add_test(NAME denial_model_label
+        COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_denial_label.py
+            $<TARGET_FILE:glove-denial-replay>
+            ${CMAKE_SOURCE_DIR}/tools/denial_model/label.py)
+    set_tests_properties(denial_model_label PROPERTIES TIMEOUT 60)
     if(APPLE)
         # Scenario collection under glove exec, including the leak check.
         add_test(NAME denial_model_collect
