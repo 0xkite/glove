@@ -6,17 +6,26 @@ can enforce managed-session isolation. The boundary and its motivation are in
 
 ## Prerequisites
 
-- macOS or Linux, CMake **3.28+**, Ninja, Git, and a C++23 compiler/toolchain;
-- Linux: `pkg-config` and `libseccomp` development headers;
-- macOS: Xcode Command Line Tools and a compatible Clang toolchain.
+- macOS or Linux, CMake **3.28+**, Ninja, Git, and Clang with a C++23
+  standard library (see [toolchain.md](toolchain.md) for what is verified);
+- Linux: `pkg-config`, and development headers for `libseccomp` and
+  OpenSSL 3;
+- macOS: Xcode Command Line Tools.
+- Network access to GitHub on the first configure, to fetch Glaze (see
+  [Controlled-source builds](#controlled-source-builds)).
 
 On Debian/Ubuntu:
 
 ```sh
 sudo apt-get update
 sudo apt-get install --yes \
-  build-essential clang cmake ninja-build git pkg-config libseccomp-dev
+  clang libc++-dev libc++abi-dev cmake ninja-build git pkg-config \
+  libseccomp-dev libssl-dev
 ```
+
+Ubuntu 24.04's Clang 18 needs libc++ for the C++23 library; `setup.sh` and
+`scripts/configure.sh` add `-stdlib=libc++` when the default library fails
+their probe. A bare `cmake --preset` does not.
 
 `yams` is optional and only enables the macOS integration-test surface.
 
@@ -32,10 +41,13 @@ sudo apt-get install --yes \
 For iteration:
 
 ```sh
-cmake --preset dev
+scripts/configure.sh dev      # or: cmake --preset dev
 cmake --build --preset dev
 ctest --preset dev
 ```
+
+Presets, CMake options, environment variables, and the compiler flags each
+one produces are in [toolchain.md](toolchain.md).
 
 Run the full local gate before review or release:
 
