@@ -493,7 +493,10 @@ launch-profile key `system_services: [names]`, or the saved-environment key
   and so the host's network layout. It grants no network access by itself:
   `(deny network*)` and the egress rules still decide connections.
 - `tls-config` adds a read-only grant, resolved through the same
-  canonicalization and symlink-spelling rules as other read grants.
+  canonicalization and symlink-spelling rules as other read grants. Catalog
+  paths pass the same Glove-root exposure check as every other grant
+  (`filesystem`, `runtime_filesystem` and system-service read paths), so no
+  entry can expose Glove's own configuration or state.
 - Linux accepts the names and emits no rule for them: the entries carry no
   Linux rules.
 

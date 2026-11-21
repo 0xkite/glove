@@ -1,3 +1,4 @@
+#include "glove/container/system_services.hpp"
 #include "glove/detail/descriptor_limit.hpp"
 #include "glove/host/config.hpp"
 #include "glove/host/runtime_policy.hpp"
@@ -83,9 +84,10 @@ void print_run_usage() {
         "                                       to 443). Without any,\n"
         "                                       the agent has no network.\n"
         "  --system-service <name>              opt in to a host system service from the\n"
-        "                                       catalog (network-config, tls-config; may be\n"
+        "                                       catalog (%s; may be\n"
         "                                       repeated; default none)\n"
-        "  -h, --help                           show this help and exit\n"
+        "  -h, --help                           show this help and exit\n",
+        glove::container::system_service_names().c_str()
     );
 }
 
@@ -211,7 +213,7 @@ void print_exec_usage() {
         "  --service-port <port>   allow a plain host 127.0.0.1 TCP service (repeatable;\n"
         "                          works with --share-credential; no credential)\n"
         "  --system-service <name> opt in to a host system service from the catalog\n"
-        "                          (network-config, tls-config; repeatable; default none)\n"
+        "                          (%s; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --denial-trace <path>   record this launch's sandbox denials to a new file\n"
         "                          (macOS; for training denial deciders)\n"
@@ -229,7 +231,8 @@ void print_exec_usage() {
         "                          endpoint into the sandbox, and injects the real key\n"
         "                          on the host side; the sandbox sees only an ephemeral\n"
         "                          session nonce.\n"
-        "  -h, --help              show this help and exit\n"
+        "  -h, --help              show this help and exit\n",
+        glove::container::system_service_names().c_str()
     );
 }
 
@@ -267,7 +270,7 @@ void print_shell_usage() {
         "  --service-port <port>   allow a plain host 127.0.0.1 TCP service (repeatable;\n"
         "                          works with --share-credential; no credential)\n"
         "  --system-service <name> opt in to a host system service from the catalog\n"
-        "                          (network-config, tls-config; repeatable; default none)\n"
+        "                          (%s; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --share-credential <pi-provider>\n"
         "                          with --agent pi: mediate the host API key for one Pi\n"
@@ -280,7 +283,8 @@ void print_shell_usage() {
         "  --allow-loopback-listen allow private-loopback bind/listen inside the\n"
         "                          sandbox network namespace (enabled by default)\n"
         "  --herdr                 report lifecycle to host Herdr\n"
-        "  -h, --help              show this help and exit\n"
+        "  -h, --help              show this help and exit\n",
+        glove::container::system_service_names().c_str()
     );
 }
 
@@ -316,13 +320,14 @@ void print_loop_usage() {
         "  --service-port <port>   allow a plain host 127.0.0.1 TCP service (repeatable;\n"
         "                          works with --share-credential; no credential)\n"
         "  --system-service <name> opt in to a host system service from the catalog\n"
-        "                          (network-config, tls-config; repeatable; default none)\n"
+        "                          (%s; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS through the egress proxy\n"
         "  --allow-loopback-listen allow private-loopback bind/listen inside the sandbox\n"
         "  --herdr                 report lifecycle to host Herdr\n"
-        "  -h, --help              show this help and exit\n"
+        "  -h, --help              show this help and exit\n",
+        glove::container::system_service_names().c_str()
     );
 }
 

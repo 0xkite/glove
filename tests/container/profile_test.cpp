@@ -1,6 +1,7 @@
 // Profile validation: round-trip a valid profile, reject the obvious mistakes.
 
 #include "glove/container/profile.hpp"
+#include "glove/container/system_services.hpp"
 
 #include <unistd.h>
 
@@ -407,6 +408,42 @@ auto run() -> int {
             REQUIRE(has(*out, (tmp / "link").string()));
         }
         fs::remove_all(tmp, ec);
+    }
+
+    // Every grant kind is visible to the Glove-root exposure check.
+    {
+        glove::container::profile p;
+        p.filesystem.push_back({.path = "/usr/bin", .writable = false});
+        p.runtime_filesystem.push_back({.path = "/usr/lib", .writable = false});
+        p.system_services = {"tls-config"};
+        auto out = glove::container::validate(p);
+        REQUIRE(out.has_value());
+        const auto paths = glove::container::exposed_grant_paths(*out);
+        REQUIRE(std::ranges::find(paths, out->filesystem.at(0).path) != paths.end());
+        REQUIRE(std::ranges::find(paths, out->runtime_filesystem.at(0).path) != paths.end());
+        REQUIRE(!out->system_service_read_paths.empty());
+        REQUIRE(std::ranges::find(paths, out->system_service_read_paths.at(0)) != paths.end());
+        REQUIRE(paths.size() == 3);
+    }
+
+    // The catalog is the single source for service names and their checks.
+    {
+        using glove::container::check_system_service_name;
+        REQUIRE(check_system_service_name("network-config").has_value());
+        REQUIRE(check_system_service_name("tls-config").has_value());
+        auto unknown = check_system_service_name("no-such-service");
+        REQUIRE(!unknown.has_value());
+        REQUIRE(unknown.error().contains("unknown system service 'no-such-service'"));
+        auto raw = check_system_service_name("com.apple.SystemConfiguration.configd");
+        REQUIRE(!raw.has_value());
+        REQUIRE(raw.error().contains("raw mach service names are not accepted"));
+        auto empty = check_system_service_name("");
+        REQUIRE(!empty.has_value());
+        REQUIRE(empty.error().contains("1-64 bytes"));
+        auto longer = check_system_service_name(std::string(65, 'a'));
+        REQUIRE(!longer.has_value());
+        REQUIRE(longer.error().contains("1-64 bytes"));
+        REQUIRE(glove::container::system_service_names() == "network-config, tls-config");
     }
 
     // Host system services come from a vetted catalog: known names validate

@@ -292,6 +292,10 @@ struct profile {
 // or root-wide grants are rejected before a sandbox process is started.
 auto validate(const profile& p) -> std::expected<profile, std::string>;
 
+// Paths of every filesystem rule, runtime_filesystem rule and
+// system_service_read_paths entry, in that order.
+[[nodiscard]] auto exposed_grant_paths(const profile& p) -> std::vector<std::string>;
+
 // Verify that a validated profile can be enforced by a platform capability
 // report. This check is intentionally separate from structural validation so
 // profiles can be planned and inspected on machines that cannot run them.
