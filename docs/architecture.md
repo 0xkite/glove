@@ -468,6 +468,21 @@ Authenticated terminal receipts form an HMAC chain anchored by Sage. The
 general JSONL activity log and session-state journal are not protected against a
 same-user host process that can rewrite them.
 
+`glove run`, `exec`, `shell` and `loop` record to
+`<XDG_STATE_HOME>/glove/logs/session.jsonl` unless `--audit-log` names a
+journal. A journal has one writer for as long as its launch lives, held by an
+exclusive lock, so records of two launches never interleave. A launch that
+finds the default journal held by another live launch records to its own
+`session.<16 hex>.jsonl` beside it (same directory, mode 0600, same 10 MiB
+bound) and prints one stderr line with a fixed prefix, `glove: another launch
+holds the default audit journal; this launch records to `, followed by the
+path to the end of the line. At most 64 such journals are kept: creating
+another removes journals that no live launch holds, oldest modification time
+first, and never one whose lock is held. Only a held lock
+is worked around; a default journal that is not this user's owner-only
+single-link regular file is still an error, and so is an `--audit-log` path
+that another launch is using.
+
 Detailed policy and file invariants are defined in
 [session-policy.md](session-policy.md).
 

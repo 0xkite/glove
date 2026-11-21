@@ -1,6 +1,7 @@
 add_library(glove_run STATIC
     runner.cpp
     exit_audit.cpp
+    audit_journal.cpp
     denial_audit.cpp
     denial_shadow.cpp
     decoys.cpp

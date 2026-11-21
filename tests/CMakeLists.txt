@@ -1218,6 +1218,14 @@ target_include_directories(run_decoys_test PRIVATE
 add_test(NAME run_decoys COMMAND run_decoys_test)
 set_tests_properties(run_decoys PROPERTIES TIMEOUT 30)
 
+add_executable(run_audit_journal_test run/audit_journal_test.cpp)
+target_link_libraries(run_audit_journal_test PRIVATE glove_run)
+target_include_directories(run_audit_journal_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/run
+)
+add_test(NAME run_audit_journal COMMAND run_audit_journal_test)
+set_tests_properties(run_audit_journal PROPERTIES TIMEOUT 30)
+
 add_executable(run_denial_shadow_test run/denial_shadow_test.cpp)
 target_link_libraries(run_denial_shadow_test PRIVATE glove_run)
 target_include_directories(run_denial_shadow_test PRIVATE
@@ -1348,6 +1356,12 @@ if(Python3_Interpreter_FOUND)
         )
     endif()
     # Launch profiles: CLI lifecycle, edit validation, and --profile launches.
+    # Concurrent launches with the default journal do not fail each other.
+    add_test(NAME concurrent_audit_journal
+        COMMAND ${Python3_EXECUTABLE} -I
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_concurrent_audit_journal.py
+            $<TARGET_FILE:glove>)
+    set_tests_properties(concurrent_audit_journal PROPERTIES TIMEOUT 240 SKIP_RETURN_CODE 77)
     add_test(NAME profile_cli
         COMMAND ${Python3_EXECUTABLE} -I
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_profile_cli.py
