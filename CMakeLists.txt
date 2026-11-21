@@ -32,6 +32,15 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(ProjectOptions)
 include(CompilerWarnings)
 include(Sanitizers)
+include(Hardening)
+
+# Position-independent executables, so address-space layout randomization
+# covers the program image. Directory scope: it must precede every target.
+if(GLOVE_HARDENING)
+    include(CheckPIESupported)
+    check_pie_supported(LANGUAGES CXX)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 include(Dependencies)
 
 # Optional ccache speedup
@@ -73,6 +82,7 @@ if(GLOVE_STOP_TOKEN_COMPILE_OPTION)
 endif()
 glove_set_warnings(glove_options)
 glove_apply_sanitizers(glove_options)
+glove_apply_hardening(glove_options)
 target_compile_features(glove_options INTERFACE cxx_std_23)
 
 string(TOUPPER "${GLOVE_REFLECTION}" _glove_reflection_mode)
@@ -187,3 +197,4 @@ message(STATUS "  GLOVE_BUILD_BENCHMARKS : ${GLOVE_BUILD_BENCHMARKS}")
 message(STATUS "  GLOVE_BUILD_FUZZERS  : ${GLOVE_BUILD_FUZZERS}")
 message(STATUS "  GLOVE_SANITIZER      : ${GLOVE_SANITIZER}")
 message(STATUS "  GLOVE_WARNINGS_AS_ERRORS : ${GLOVE_WARNINGS_AS_ERRORS}")
+message(STATUS "  GLOVE_HARDENING      : ${GLOVE_HARDENING_APPLIED}")

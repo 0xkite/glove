@@ -94,9 +94,8 @@ bitten: `std::ranges::find(strings, "literal")` does not compile as C++26
 
 `setup.sh` uses `release`; `setup.sh Debug` uses `dev`.
 
-No preset adds hardening flags. The release build has no
-`_FORTIFY_SOURCE`, stack protector, libc++ hardening mode, or RELRO/PIE
-options beyond the compiler's and platform's defaults.
+Every preset except `dev` also gets [hardening](#hardening); the sanitizer
+presets get only its standard-library checks.
 
 ## CMake options
 
@@ -107,6 +106,7 @@ Pass with `-D<name>=<value>` at configure time.
 | `GLOVE_REFLECTION` | `OFF` | see [Language standard](#language-standard) |
 | `GLOVE_SANITIZER` | `none` | `none`, `address`, `address+undefined`, `thread`, `memory`. Adds `-fno-omit-frame-pointer -g`. `memory` is refused on macOS and is in no preset or gate. |
 | `GLOVE_WARNINGS_AS_ERRORS` | `OFF` | adds `-Werror` |
+| `GLOVE_HARDENING` | `ON` | see [Hardening](#hardening); the `dev` preset sets `OFF` |
 | `GLOVE_BUILD_FUZZERS` | `OFF` | builds `fuzz/`; Clang only |
 | `GLOVE_BUILD_BENCHMARKS` | `OFF` | builds `benchmarks/` |
 | `GLOVE_WITH_GHOSTTY` | `OFF` | builds the libghostty terminal frontend; needs `-DGHOSTTY_ROOT=<prefix>` |
@@ -117,6 +117,45 @@ Pass with `-D<name>=<value>` at configure time.
 
 `ccache` is used as the compiler launcher whenever it is on `PATH`. This
 replaces a `CMAKE_CXX_COMPILER_LAUNCHER` given on the command line.
+
+## Hardening
+
+`GLOVE_HARDENING=ON` (`cmake/Hardening.cmake`) adds the flags below to every
+Glove target. Each is probed; one the toolchain rejects is left out, and
+`configure` prints what was applied:
+
+```text
+--   GLOVE_HARDENING      : _GLIBCXX_ASSERTIONS, -fstack-protector-strong, ...
+```
+
+| Flag | Effect | Where |
+|---|---|---|
+| `_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST` or `_GLIBCXX_ASSERTIONS` | out-of-bounds `operator[]`, `front()` on an empty container and similar abort instead of being undefined | libc++ / libstdc++; also in sanitizer builds |
+| `-fstack-protector-strong` | stack canaries | all |
+| `-ftrivial-auto-var-init=zero` | uninitialized locals read as zero | all |
+| `-fstack-clash-protection` | probes large stack allocations | Linux |
+| `-fcf-protection=full` | Intel CET branch and return protection | x86-64 |
+| `-mbranch-protection=standard` | pointer authentication and BTI | arm64 |
+| `-D_FORTIFY_SOURCE=3` | checked libc calls | Linux, optimized builds |
+| `-Wl,-z,relro -Wl,-z,now` | read-only relocations, no lazy binding | Linux |
+| `-Wl,-z,noexecstack` | non-executable stack | Linux |
+| position-independent executables | ASLR covers the program image | all |
+
+With a sanitizer only the first row applies: the sanitizers instrument the
+stack themselves, `_FORTIFY_SOURCE` conflicts with ASan's interceptors, and
+zeroed locals would hide what MemorySanitizer looks for. So the gate's tests
+run with the library checks, and the full set is exercised by `ctest --preset
+release`, which `setup.sh` runs.
+
+A library check that fires aborts the process.
+
+Measured on Linux x86-64 (Clang 23, release with LTO): the `glove` binary
+grows about 6% (3.30 MB to 3.50 MB). On the `glove_mcp_benchmark`
+microbenchmarks the round trip went from about 460 ns to about 515 ns and
+decode was within run-to-run noise. Nothing was measured on macOS.
+
+Not included: `-fno-delete-null-pointer-checks`, `-fno-strict-overflow`,
+`-fno-strict-aliasing`, and the libc++ `EXTENSIVE` and `DEBUG` modes.
 
 ## Warnings
 
