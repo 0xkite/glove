@@ -1,4 +1,4 @@
-#include "glove/control/session_registry_wire.hpp"
+#include "session_registry_wire.hpp"
 
 #include "glove/container/digest.hpp"
 

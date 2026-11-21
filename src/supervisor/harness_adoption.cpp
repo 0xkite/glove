@@ -50,6 +50,10 @@ constexpr std::uint64_t max_payload_bytes = std::uint64_t{2} * 1024U * 1024U * 1
 constexpr std::size_t max_payload_entries = 200'000U;
 constexpr std::size_t max_payload_roots = 64U;
 constexpr std::size_t max_relative_path_bytes = 4'096U;
+// Both payload walks recurse once per directory level and hold descriptors
+// for each, so depth has its own bound, not only the path-length one. A
+// snapshot source may be 128 levels deep, and its payload root sits above it.
+constexpr std::size_t max_payload_depth = 129U;
 constexpr std::size_t max_tree_manifest_bytes = std::size_t{64} * 1024U * 1024U;
 constexpr std::size_t copy_buffer_bytes = std::size_t{64} * 1024U;
 constexpr auto permission_mask = 0777U;
@@ -438,8 +442,12 @@ auto hash_payload_file(
     return {};
 }
 
-auto snapshot_tree_digest_at(int descriptor, std::string_view prefix, tree_state& state)
-    -> std::expected<void, std::string> {
+auto snapshot_tree_digest_at(
+    int descriptor, std::string_view prefix, tree_state& state, std::size_t depth
+) -> std::expected<void, std::string> {
+    if (depth > max_payload_depth) {
+        return std::unexpected(std::string{"adoption payload exceeds its depth bound"});
+    }
     auto entries = directory_entries(descriptor, max_payload_entries - state.entries);
     if (!entries) {
         return std::unexpected(entries.error());
@@ -482,7 +490,8 @@ auto snapshot_tree_digest_at(int descriptor, std::string_view prefix, tree_state
             if (auto recorded = record_tree_entry(state, relative, std::move(encoded)); !recorded) {
                 return recorded;
             }
-            if (auto nested = snapshot_tree_digest_at(child->get(), relative, state); !nested) {
+            if (auto nested = snapshot_tree_digest_at(child->get(), relative, state, depth + 1U);
+                !nested) {
                 return nested;
             }
             continue;
@@ -508,7 +517,7 @@ auto snapshot_tree_digest_at(int descriptor) -> std::expected<tree_digest, std::
         return std::unexpected(std::string{"adoption payload root is unsafe"});
     }
     tree_state state;
-    if (auto scanned = snapshot_tree_digest_at(descriptor, {}, state); !scanned) {
+    if (auto scanned = snapshot_tree_digest_at(descriptor, {}, state, 0); !scanned) {
         return std::unexpected(scanned.error());
     }
     // The host planner hashes one flat lexicographic relative-path sequence. The
@@ -727,8 +736,11 @@ auto reserve_copy_entry(copy_state& state) -> std::expected<void, std::string> {
     return {};
 }
 
-auto copy_payload_tree(int source_fd, int destination_fd, copy_state& state)
+auto copy_payload_tree(int source_fd, int destination_fd, copy_state& state, std::size_t depth)
     -> std::expected<void, std::string> {
+    if (depth > max_payload_depth) {
+        return std::unexpected(std::string{"adoption payload exceeds its depth bound"});
+    }
     auto entries = directory_entries(source_fd, max_payload_entries - state.entries);
     if (!entries) {
         return std::unexpected(entries.error());
@@ -759,7 +771,8 @@ auto copy_payload_tree(int source_fd, int destination_fd, copy_state& state)
                 !owner_only_directory(destination_metadata, 0700U)) {
                 return std::unexpected(std::string{"adopted payload directory is unsafe"});
             }
-            if (auto copied = copy_payload_tree(source->get(), destination->get(), state);
+            if (auto copied =
+                    copy_payload_tree(source->get(), destination->get(), state, depth + 1U);
                 !copied) {
                 return copied;
             }
@@ -1123,7 +1136,7 @@ auto materialize_native_harness_adoption_projection(
             !owner_only_directory(destination_metadata, 0700U)) {
             return std::unexpected(std::string{"adopted extension root is unsafe"});
         }
-        if (auto copied_tree = copy_payload_tree(source->get(), destination->get(), copied);
+        if (auto copied_tree = copy_payload_tree(source->get(), destination->get(), copied, 0);
             !copied_tree) {
             return copied_tree;
         }

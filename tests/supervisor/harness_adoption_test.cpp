@@ -316,6 +316,30 @@ auto run() -> int {
     REQUIRE(!glove::supervisor::resolve_native_harness_adoption(hard_linked_manifest->policy, "pi")
                  .has_value());
 
+    // A payload nested past the depth bound is refused for its depth, before
+    // its digest is compared; a shallower change fails on the digest instead.
+    for (const std::size_t levels : {std::size_t{20}, std::size_t{131}}) {
+        auto deep = make_fixture(temporary.root(), "deep-" + std::to_string(levels));
+        REQUIRE(deep.has_value());
+        const auto payload_root = deep->payload_file.parent_path();
+        REQUIRE(::chmod(payload_root.c_str(), 0700) == 0);
+        std::vector<std::filesystem::path> chain{payload_root};
+        for (std::size_t level = 0; level != levels; ++level) {
+            chain.push_back(chain.back() / "d");
+            REQUIRE(::mkdir(chain.back().c_str(), 0700) == 0);
+        }
+        for (auto directory = chain.rbegin(); directory != chain.rend(); ++directory) {
+            REQUIRE(::chmod(directory->c_str(), 0500) == 0);
+        }
+        const auto refused = glove::supervisor::resolve_native_harness_adoption(deep->policy, "pi");
+        REQUIRE(!refused.has_value());
+        REQUIRE(refused.error().contains("depth bound") == (levels > 129));
+        // Let the fixture's cleanup remove the read-only chain.
+        for (const auto& directory : chain) {
+            REQUIRE(::chmod(directory.c_str(), 0700) == 0);
+        }
+    }
+
     auto malformed = make_fixture(temporary.root(), "malformed");
     REQUIRE(malformed.has_value());
     auto malformed_contents = read_file(malformed->manifest_path);
