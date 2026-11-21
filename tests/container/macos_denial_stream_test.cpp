@@ -50,6 +50,7 @@ using clock_type = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
 std::string corpus_dir;
+std::string self_path;
 
 // The fixed tag of the tagged corpus seeds, and the foreign tag inside one.
 constexpr std::string_view seed_tag = "00112233445566778899aabbccddeeff";
@@ -382,13 +383,83 @@ auto lost_child_is_not_signalled() -> int {
     const auto destroying = clock_type::now();
     stream.reset();
     const auto took = elapsed_ms(destroying);
-    const bool survived = group_has_live_members(pid);
-    // The sleep keeps group pid alive, so the number cannot have been reused.
-    (void)::kill(-pid, SIGKILL);
-    (void)wait_for([&] { return !group_has_live_members(pid); }, milliseconds{2000});
+    // The stream does not signal a child it no longer owns, so it does not
+    // wait out the stop grace either. The watcher, a member of the group,
+    // ends the group once the stream lets go of the lifeline.
+    const bool ended = wait_for([&] { return !group_has_live_members(pid); }, milliseconds{2000});
+    if (!ended) {
+        (void)::kill(-pid, SIGKILL);
+    }
     REQUIRE(took < 1000);
-    REQUIRE(survived);
+    REQUIRE(ended);
     std::printf("T9 ok\n");
+    return 0;
+}
+
+// Child mode for T14: holds a stream whose child never exits or writes, the
+// shape of `log stream` with a predicate that matches nothing, and reports
+// the child's group on stdout.
+auto hold_stream() -> int {
+    watcher watch;
+    auto started =
+        denial_stream::start(watch.options(seed_tag, {"/bin/sh", "-c", "sleep 300 & wait"}));
+    if (!started.has_value()) {
+        return 3;
+    }
+    std::printf("%d\n", static_cast<int>((*started)->child_pid_for_test()));
+    std::fflush(stdout);
+    // Bounded, so a holder whose test died does not stay behind.
+    std::this_thread::sleep_for(std::chrono::seconds{60});
+    return 4;
+}
+
+// T14: a holder killed with SIGKILL runs no destructor, and its stream's
+// process group still ends.
+auto killed_holder_leaves_no_stream_child() -> int {
+    std::array<int, 2> out{-1, -1};
+    REQUIRE(::pipe(out.data()) == 0);
+    ::posix_spawn_file_actions_t actions{};
+    REQUIRE(::posix_spawn_file_actions_init(&actions) == 0);
+    REQUIRE(::posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO) == 0);
+    REQUIRE(::posix_spawn_file_actions_addclose(&actions, out[0]) == 0);
+    REQUIRE(::posix_spawn_file_actions_addclose(&actions, out[1]) == 0);
+    std::string mode = "--hold-stream";
+    std::array<char*, 3> args{self_path.data(), mode.data(), nullptr};
+    std::array<char*, 1> env{nullptr};
+    ::pid_t holder = -1;
+    const int rc =
+        ::posix_spawn(&holder, self_path.c_str(), &actions, nullptr, args.data(), env.data());
+    ::posix_spawn_file_actions_destroy(&actions);
+    ::close(out[1]);
+    REQUIRE(rc == 0);
+    std::string line;
+    std::array<char, 32> chunk{};
+    while (line.find('\n') == std::string::npos && line.size() < chunk.size()) {
+        const ::ssize_t got = ::read(out[0], chunk.data(), chunk.size());
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            break;
+        }
+        line.append(chunk.data(), static_cast<std::size_t>(got));
+    }
+    ::close(out[0]);
+    const ::pid_t group = line.ends_with('\n') ? static_cast<::pid_t>(std::atoi(line.c_str())) : -1;
+    if (group <= 1) {
+        kill_and_reap(holder);
+    }
+    REQUIRE(group > 1);
+    std::this_thread::sleep_for(milliseconds{200});
+    const bool live_before = group_has_live_members(group);
+    kill_and_reap(holder);
+    const bool ended = wait_for([&] { return !group_has_live_members(group); }, milliseconds{5000});
+    if (!ended) {
+        (void)::kill(-group, SIGKILL);
+    }
+    REQUIRE(live_before);
+    REQUIRE(ended);
+    std::printf("T14 ok\n");
     return 0;
 }
 
@@ -483,7 +554,11 @@ auto bad_tag_is_refused() -> int {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
+    if (argc == 2 && std::string_view{argv[1]} == "--hold-stream") {
+        return hold_stream();
+    }
+    self_path = argv[0];
+    if (argc != 2 || !self_path.starts_with('/')) {
         std::fprintf(stderr, "usage: container_macos_denial_stream_test <corpus-dir>\n");
         return 2;
     }
@@ -503,7 +578,8 @@ int main(int argc, char** argv) {
           other_tag_is_not_delivered,
           canary_is_not_delivered,
           untagged_replay_is_dropped,
-          bad_tag_is_refused}) {
+          bad_tag_is_refused,
+          killed_holder_leaves_no_stream_child}) {
         if (const int failed = step(); failed != 0) {
             return failed;
         }

@@ -36,6 +36,17 @@ constexpr int stop_poll_interval_ms = 10;
 constexpr int drain_deadline_ms = 1000;
 
 constexpr int max_canary_tag_tries = 4;
+constexpr int watcher_exit_deadline_ms = 1000;
+
+// The child never learns that glove died: its predicate matches one launch,
+// so it writes nothing and gets no SIGPIPE. This watcher is spawned into the
+// child's process group with its stdin on a pipe whose only write end glove
+// holds. When glove exits for any reason, SIGKILL included, the read ends and
+// the watcher kills its own group. It names no process by number: while it
+// lives it is a member of the group, so the group cannot be another one.
+auto watcher_argv() -> std::vector<std::string> {
+    return {"/bin/sh", "-c", "read -r _; kill -KILL 0"};
+}
 
 // The kernel provenance check is repeated in the parser; the predicate only
 // drops forged and unrelated records at the source. "\n" is written as the
@@ -71,10 +82,22 @@ void sleep_ms(int milliseconds) noexcept {
     (void)::nanosleep(&delay, nullptr);
 }
 
-// Spawns argv with stdin and stderr on /dev/null and stdout on stdout_fd (or
-// /dev/null when negative). Only descriptors named here are inherited.
-auto spawn_child(const std::vector<std::string>& argv, int stdout_fd, bool own_group)
-    -> std::expected<::pid_t, int> {
+// spawn_child's process group choice: the caller's, a new one, or an existing
+// one named by an unreaped child of the caller.
+struct spawn_group {
+    bool set = false;
+    ::pid_t group = 0;
+};
+
+constexpr spawn_group inherit_group{};
+constexpr spawn_group new_group{.set = true, .group = 0};
+
+// Spawns argv with stderr on /dev/null, and stdin and stdout on the given
+// descriptors (or /dev/null when negative). Only descriptors named here are
+// inherited.
+auto spawn_child(
+    const std::vector<std::string>& argv, int stdin_fd, int stdout_fd, spawn_group group
+) -> std::expected<::pid_t, int> {
     ::posix_spawn_file_actions_t actions{};
     if (const int rc = ::posix_spawn_file_actions_init(&actions); rc != 0) {
         return std::unexpected(rc);
@@ -84,7 +107,10 @@ auto spawn_child(const std::vector<std::string>& argv, int stdout_fd, bool own_g
         ::posix_spawn_file_actions_destroy(&actions);
         return std::unexpected(rc);
     }
-    int rc = ::posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    int rc =
+        stdin_fd >= 0
+            ? ::posix_spawn_file_actions_adddup2(&actions, stdin_fd, STDIN_FILENO)
+            : ::posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     if (rc == 0) {
         rc = stdout_fd >= 0 ? ::posix_spawn_file_actions_adddup2(&actions, stdout_fd, STDOUT_FILENO)
                             : ::posix_spawn_file_actions_addopen(
@@ -95,10 +121,10 @@ auto spawn_child(const std::vector<std::string>& argv, int stdout_fd, bool own_g
         rc = ::posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     }
     short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
-    if (own_group) {
+    if (group.set) {
         flags |= POSIX_SPAWN_SETPGROUP;
         if (rc == 0) {
-            rc = ::posix_spawnattr_setpgroup(&attr, 0);
+            rc = ::posix_spawnattr_setpgroup(&attr, group.group);
         }
     }
     if (rc == 0) {
@@ -161,6 +187,10 @@ struct denial_stream::implementation {
     ::pid_t child = -1;
     bool child_owned = false;
     int read_fd = -1;
+    // The watcher is glove's own unreaped child until release_watcher, so its
+    // PID is an identity for that long.
+    ::pid_t watcher = -1;
+    int lifeline_fd = -1;
 
     std::atomic<denial_stream_state> current{denial_stream_state::starting};
     std::atomic<std::uint64_t> lines{0};
@@ -381,6 +411,33 @@ struct denial_stream::implementation {
         child_owned = false;
     }
 
+    // Runs after stop_child. Closing the lifeline is what ends a watcher that
+    // stop_child did not signal (a child reaped elsewhere); that watcher then
+    // ends the rest of its group itself.
+    void release_watcher() noexcept {
+        if (lifeline_fd >= 0) {
+            ::close(lifeline_fd);
+            lifeline_fd = -1;
+        }
+        if (watcher <= 0) {
+            return;
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{watcher_exit_deadline_ms};
+        auto status = observe_child(watcher);
+        while (status == child_status::running && std::chrono::steady_clock::now() < deadline) {
+            sleep_ms(stop_poll_interval_ms);
+            status = observe_child(watcher);
+        }
+        if (status == child_status::running) {
+            (void)::kill(watcher, SIGKILL);
+        }
+        if (status != child_status::lost) {
+            reap(watcher);
+        }
+        watcher = -1;
+    }
+
     auto spawn_canary() -> std::expected<canary, int> {
         std::string nonce = make_denial_tag();
         const std::vector<std::string> argv{
@@ -390,7 +447,7 @@ struct denial_stream::implementation {
             "/usr/bin/touch",
             std::string{canary_path_prefix} + nonce,
         };
-        auto pid = spawn_child(argv, -1, false);
+        auto pid = spawn_child(argv, -1, -1, inherit_group);
         if (!pid) {
             return std::unexpected(pid.error());
         }
@@ -405,6 +462,7 @@ denial_stream::~denial_stream() {
     try {
         impl_->reader.request_stop();
         impl_->stop_child();
+        impl_->release_watcher();
         if (impl_->reader.joinable()) {
             impl_->reader.join();
         }
@@ -449,7 +507,7 @@ auto denial_stream::start(denial_stream_options options)
             return std::unexpected(errno_text("denial stream pipe", error));
         }
     }
-    auto pid = spawn_child(options.argv, pipe_fds[1], true);
+    auto pid = spawn_child(options.argv, -1, pipe_fds[1], new_group);
     ::close(pipe_fds[1]);
     if (!pid) {
         ::close(pipe_fds[0]);
@@ -461,8 +519,29 @@ auto denial_stream::start(denial_stream_options options)
     impl->child = *pid;
     impl->child_owned = true;
     impl->read_fd = pipe_fds[0];
-    // Owned before the reader exists, so a failure below still stops the child.
+    // Owned before the watcher and the reader exist, so a failure below still
+    // stops the child.
     auto stream = std::unique_ptr<denial_stream>(new denial_stream(std::move(impl)));
+    // A stream that would outlive a killed glove is refused, not started. The
+    // child is unreaped here, so its group exists for the watcher to join.
+    std::array<int, 2> lifeline{-1, -1};
+    if (::pipe(lifeline.data()) != 0) {
+        return std::unexpected(errno_text("denial stream lifeline", errno));
+    }
+    stream->impl_->lifeline_fd = lifeline[1];
+    if (::fcntl(lifeline[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        ::fcntl(lifeline[1], F_SETFD, FD_CLOEXEC) != 0) {
+        const int error = errno;
+        ::close(lifeline[0]);
+        return std::unexpected(errno_text("denial stream lifeline", error));
+    }
+    auto watcher_pid =
+        spawn_child(watcher_argv(), lifeline[0], -1, {.set = true, .group = stream->impl_->child});
+    ::close(lifeline[0]);
+    if (!watcher_pid) {
+        return std::unexpected(errno_text("denial stream watcher spawn", watcher_pid.error()));
+    }
+    stream->impl_->watcher = *watcher_pid;
     implementation* const state = stream->impl_.get();
     stream->impl_->reader = std::jthread{[state](const std::stop_token& stop) {
         try {
