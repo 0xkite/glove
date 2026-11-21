@@ -64,6 +64,18 @@ def main():
             fail("profile directory is not 0700")
 
         expect(glove(binary, env, "profile", "new", "../escape"), 1, "invalid profile name")
+        # A flag is never taken as a name: help is help, and anything else
+        # that starts like a flag, or would be a hidden file, is refused.
+        for command in ("new", "edit", "show", "check", "path"):
+            expect(glove(binary, env, "profile", command, "--help"), 0, "usage: glove profile")
+            expect(glove(binary, env, "profile", command, "-h"), 0, "usage: glove profile")
+        for name in ("--force", "-x", ".hidden"):
+            expect(glove(binary, env, "profile", "new", name), 1, "invalid profile name")
+            expect(glove(binary, env, "profile", "path", name), 1, "invalid profile name")
+            expect(glove(binary, env, "exec", "--profile", name, "--", "/usr/bin/true"), 1,
+                   "invalid profile name")
+        if any(directory.iterdir()):
+            fail(f"a refused name created a file: {list(directory.iterdir())}")
         expect(glove(binary, env, "profile", "new", "demo"), 0, "demo.yaml", where="stdout")
         demo = directory / "demo.yaml"
         if stat.S_IMODE(demo.stat().st_mode) != 0o600:
