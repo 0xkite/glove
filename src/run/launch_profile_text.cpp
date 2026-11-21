@@ -57,6 +57,7 @@ struct profile_doc { // NOLINT(misc-use-internal-linkage)
     std::optional<std::vector<std::string>> allow;
     std::optional<std::vector<allow_arg_doc>> allow_arg;
     std::optional<std::uint16_t> bridge_port;
+    std::optional<std::vector<std::uint16_t>> service_ports;
     std::optional<secrets_doc> secrets;
     std::optional<std::vector<std::string>> decoys;
     std::optional<std::vector<std::string>> system_services;
@@ -231,7 +232,7 @@ auto convert(const profile_doc& doc) -> std::expected<launch_profile, std::strin
     }
     if (!bounded(doc.read) || !bounded(doc.write) || !bounded(doc.egress) || !bounded(doc.mcp) ||
         !bounded(doc.allow) || !bounded(doc.allow_arg) || !bounded(doc.system_services) ||
-        (doc.env && doc.env->size() > max_launch_profile_entries)) {
+        !bounded(doc.service_ports) || (doc.env && doc.env->size() > max_launch_profile_entries)) {
         return std::unexpected(std::string{"profile has too many entries in one list"});
     }
     launch_profile out;
@@ -252,6 +253,12 @@ auto convert(const profile_doc& doc) -> std::expected<launch_profile, std::strin
             return std::unexpected(std::string{"bridge_port: must be 1-65535"});
         }
         out.bridge_port = doc.bridge_port;
+    }
+    for (const auto port : doc.service_ports.value_or(std::vector<std::uint16_t>{})) {
+        if (port == 0) {
+            return std::unexpected(std::string{"service_ports: must be 1-65535"});
+        }
+        out.service_ports.push_back(port);
     }
     if (auto ok = convert_paths(doc.read, "read", out.read); !ok) {
         return std::unexpected(ok.error());
@@ -344,8 +351,9 @@ auto operator==(const launch_profile& a, const launch_profile& b) -> bool {
     };
     return a.workspace == b.workspace && a.agent == b.agent && a.read == b.read &&
            a.write == b.write && a.env == b.env && a.allow == b.allow &&
-           a.bridge_port == b.bridge_port && a.provider_secret == b.provider_secret &&
-           a.decoys == b.decoys && a.system_services == b.system_services &&
+           a.bridge_port == b.bridge_port && a.service_ports == b.service_ports &&
+           a.provider_secret == b.provider_secret && a.decoys == b.decoys &&
+           a.system_services == b.system_services &&
            std::ranges::equal(a.egress, b.egress, same_egress) &&
            std::ranges::equal(a.mcp, b.mcp, same_mcp) &&
            std::ranges::equal(a.allow_arg, b.allow_arg, same_rule);
@@ -409,6 +417,13 @@ auto encode_launch_profile(const launch_profile& profile) -> std::string {
     if (profile.bridge_port) {
         out += "bridge_port: " + std::to_string(*profile.bridge_port) + "\n";
     }
+    if (!profile.service_ports.empty()) {
+        out += "service_ports: [";
+        for (std::size_t i = 0; i < profile.service_ports.size(); ++i) {
+            out += (i == 0 ? "" : ", ") + std::to_string(profile.service_ports[i]);
+        }
+        out += "]\n";
+    }
     emit_list(out, "decoys", profile.decoys);
     emit_list(out, "system_services", profile.system_services);
     if (profile.provider_secret) {
@@ -446,6 +461,7 @@ auto launch_profile_template() -> std::string_view {
            "#   - { tool: yams.search, field: path, prefix: /src }\n"
            "\n"
            "# bridge_port: 8080              # host 127.0.0.1 port bridged inside\n"
+           "# service_ports: [18000, 18001]  # plain host loopback services (no credential)\n"
            "\n"
            "# secrets:                       # resolved on the host; the sandbox sees a nonce\n"
            "#   provider: keychain://glove/anthropic   # or env://NAME, file://~/path\n"

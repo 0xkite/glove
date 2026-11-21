@@ -26,6 +26,11 @@ struct reserved_entry {
     std::string name;
 };
 
+// Linux has no bridge for plain service ports yet, so its spawners refuse a
+// non-empty `profile::service_ports` with this message before launch.
+inline constexpr std::string_view service_ports_unsupported_on_linux =
+    "service ports are not supported on Linux yet";
+
 struct proxy_settings {
     std::uint16_t port = 0;
     // Credential-bearing loopback URL injected into the standard proxy
@@ -230,7 +235,11 @@ struct profile {
     // over a raw CONNECT tunnel.
     std::optional<bridge_endpoint_settings> bridge_endpoint;
 
-    // Declaration only in the red commit; see the green commit for semantics.
+    // Plain host-loopback TCP services the guest may connect to. They carry no
+    // credential, so they are independent of `proxy` and of the credentialed
+    // `bridge_endpoint`. validate() sorts and deduplicates them and refuses a
+    // zero port, more than 16 ports, and the bridge or proxy port. macOS grants
+    // each exact 127.0.0.1 TCP port in SBPL; Linux refuses a non-empty list.
     std::vector<std::uint16_t> service_ports;
 
     // When present, launch is rejected unless the selected spawner reports

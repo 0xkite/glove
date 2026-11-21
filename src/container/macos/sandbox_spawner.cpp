@@ -555,6 +555,13 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program, std::str
         p += std::to_string(prof.bridge_endpoint->port);
         p += "\") (socket-domain AF_INET)))\n";
     }
+    for (const std::uint16_t port : prof.service_ports) {
+        // Plain uncredentialed loopback services: the same rule form as the
+        // bridge endpoint above, one exact IPv4 TCP port each.
+        p += "(allow network-outbound (require-all (remote tcp \"localhost:";
+        p += std::to_string(port);
+        p += "\") (socket-domain AF_INET)))\n";
+    }
     if (prof.proxy) {
         // The egress proxy always advertises a numeric 127.0.0.1 URL, so the
         // AF_INET socket-domain filter costs nothing and keeps this rule from

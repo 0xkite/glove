@@ -208,6 +208,8 @@ void print_exec_usage() {
         "  --allow-arg <tool>:<field>=<prefix>\n"
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
+        "  --service-port <port>   allow a plain host 127.0.0.1 TCP service (repeatable;\n"
+        "                          works with --share-credential; no credential)\n"
         "  --system-service <name> opt in to a host system service from the catalog\n"
         "                          (network-config, tls-config; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
@@ -262,6 +264,8 @@ void print_shell_usage() {
         "  --allow-arg <tool>:<field>=<prefix>\n"
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
+        "  --service-port <port>   allow a plain host 127.0.0.1 TCP service (repeatable;\n"
+        "                          works with --share-credential; no credential)\n"
         "  --system-service <name> opt in to a host system service from the catalog\n"
         "                          (network-config, tls-config; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
@@ -309,6 +313,8 @@ void print_loop_usage() {
         "  --allow-arg <tool>:<field>=<prefix>\n"
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
+        "  --service-port <port>   allow a plain host 127.0.0.1 TCP service (repeatable;\n"
+        "                          works with --share-credential; no credential)\n"
         "  --system-service <name> opt in to a host system service from the catalog\n"
         "                          (network-config, tls-config; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
@@ -551,6 +557,33 @@ auto parse_sandbox_flag(
             return 2;
         }
         opts.bridge_port = static_cast<std::uint16_t>(port_val);
+        i += 2;
+        return 0;
+    }
+    if (a == "--service-port") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --service-port needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        int port_val = 0;
+        const std::string_view pstr{args[i + 1]};
+        const auto [ptr, ec] = std::from_chars(pstr.data(), pstr.data() + pstr.size(), port_val);
+        if (pstr.empty() || ec != std::errc{} || ptr != pstr.data() + pstr.size() || port_val < 1 ||
+            port_val > 65535) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --service-port must be an integer in [1, 65535]\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        opts.service_ports.push_back(static_cast<std::uint16_t>(port_val));
         i += 2;
         return 0;
     }
@@ -1226,6 +1259,13 @@ void save_env_profile(
         }
     }
 
+    // The shared reflect JSON codec only reads string arrays, so service ports
+    // are stored as decimal strings.
+    std::vector<std::string> service_port_strings;
+    for (const auto port : opts.service_ports) {
+        service_port_strings.push_back(std::to_string(port));
+    }
+
     const std::int64_t starttime = read_proc_starttime(active_pid);
     std::ostringstream out;
     out << "{\n"
@@ -1241,6 +1281,7 @@ void save_env_profile(
         << "  \"egress\": " << json_string_array(egress) << ",\n"
         << "  \"bridge_port\": " << (opts.bridge_port ? static_cast<long>(*opts.bridge_port) : 0L)
         << ",\n"
+        << "  \"service_ports\": " << json_string_array(service_port_strings) << ",\n"
         << "  \"active_pid\": " << active_pid << ",\n"
         << "  \"active_starttime\": " << starttime << "\n"
         << "}\n";
@@ -1424,6 +1465,29 @@ auto load_env_profile(std::string_view name, glove::run::options& opts)
             );
         }
         opts.system_services.insert(opts.system_services.end(), arr->begin(), arr->end());
+    }
+    if (auto it = parsed->find("service_ports"); it != parsed->end()) {
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'service_ports' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        for (const auto& text : *arr) {
+            unsigned port = 0;
+            const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), port);
+            const bool digits = !text.empty() && std::ranges::all_of(text, [](char ch) {
+                return ch >= '0' && ch <= '9';
+            });
+            if (!digits || ec != std::errc{} || ptr != text.data() + text.size() || port < 1 ||
+                port > 65535) {
+                return std::unexpected(
+                    "invalid service port '" + text + "' in saved environment '" +
+                    std::string{name} + "'"
+                );
+            }
+            opts.service_ports.push_back(static_cast<std::uint16_t>(port));
+        }
     }
     if (auto it = parsed->find("bridge_port"); it != parsed->end()) {
         const auto* n = std::get_if<std::int64_t>(&it->second);
@@ -1657,6 +1721,9 @@ auto shell_subcommand(std::span<char* const> args) -> int {
             loaded.prefix_rules.end(), opts.prefix_rules.begin(), opts.prefix_rules.end()
         );
         loaded.egress.insert(loaded.egress.end(), opts.egress.begin(), opts.egress.end());
+        loaded.service_ports.insert(
+            loaded.service_ports.end(), opts.service_ports.begin(), opts.service_ports.end()
+        );
         opts = std::move(loaded);
     }
 

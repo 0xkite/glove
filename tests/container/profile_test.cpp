@@ -490,6 +490,11 @@ auto run() -> int {
         proxied.service_ports = {9100};
         REQUIRE(!glove::container::validate(proxied).has_value());
 
+        REQUIRE(
+            glove::container::service_ports_unsupported_on_linux ==
+            "service ports are not supported on Linux yet"
+        );
+
         // The credential-bridge exclusion is unchanged.
         glove::container::profile both = proxied;
         both.service_ports = {18000};

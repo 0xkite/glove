@@ -324,6 +324,40 @@ auto run() -> int {
         REQUIRE(loaded_models.find("glove-session-") != std::string::npos);
     }
 
+    // Saved environments keep service ports as decimal strings and read them back.
+    {
+        const auto envs = fx.base / "config" / "glove" / "envs";
+        REQUIRE(
+            run_glove(
+                fx.argv(
+                    "svc-save",
+                    {"--save", "svcenv", "--service-port", "18000", "--service-port", "18001"}
+                ),
+                fx.env()
+            ) == 0
+        );
+        const auto saved = slurp(envs / "svcenv.json");
+        REQUIRE(saved.find("\"service_ports\": [\"18000\", \"18001\"]") != std::string::npos);
+        fs::remove(envs / "last.json", ec);
+        fs::remove(fx.out / "env.txt", ec);
+        auto svc_load = fx.argv("svc-load", {});
+        svc_load.insert(svc_load.begin() + 2, "svcenv");
+        REQUIRE(run_glove(svc_load, fx.env()) == 0);
+        REQUIRE(
+            slurp(envs / "last.json").find("\"service_ports\": [\"18000\", \"18001\"]") !=
+            std::string::npos
+        );
+        for (const char* bad : {"0", "abc", "70000", ""}) {
+            std::ofstream(envs / "badports.json")
+                << "{\n  \"service_ports\": [\"" << bad << "\"]\n}\n";
+            fs::remove(fx.out / "env.txt", ec);
+            auto bad_load = fx.argv("svc-bad", {});
+            bad_load.insert(bad_load.begin() + 2, "badports");
+            REQUIRE(run_glove(bad_load, fx.env()) != 0);
+            REQUIRE(!fs::exists(fx.out / "env.txt"));
+        }
+    }
+
     // Second HOME: a dotfiles-symlinked models.json that defines a custom
     // provider (key from a named host variable) and redirects a catalog one.
     fixture fx2 = fx;

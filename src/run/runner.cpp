@@ -192,6 +192,7 @@ auto build_profile(const options& opts, const std::filesystem::path& runtime_roo
     glove::container::profile profile;
     profile.allow_loopback_listen = opts.allow_loopback_listen;
     profile.system_services = opts.system_services;
+    profile.service_ports = opts.service_ports;
     if (auto environment = append_selected_environment(profile, opts); !environment) {
         return std::unexpected(environment.error());
     }
@@ -2304,6 +2305,17 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         if (auto staged = stage_mediated_pi_provider(*profile, *preset); !staged) {
             return std::unexpected(staged.error());
         }
+    }
+    // --bridge-port cannot apply when a credential bridge or the egress proxy
+    // takes the endpoint; refuse it instead of dropping it silently.
+    if (opts.bridge_port && (preset->bridge || profile->proxy)) {
+        return std::unexpected(
+            std::string{"--bridge-port cannot be used with "} +
+            (opts.share_credential ? "--share-credential"
+             : preset->bridge      ? "a provider-secret credential bridge"
+                                   : "egress") +
+            "; use --service-port for plain loopback services"
+        );
     }
     if (preset->bridge) {
         profile->bridge_endpoint = *preset->bridge;
