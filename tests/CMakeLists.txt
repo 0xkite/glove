@@ -1348,3 +1348,15 @@ if(GLOVE_REFLECTION_ENABLED)
 else()
     message(STATUS "  reflect codegen test     : fallback-only (reflection unavailable)")
 endif()
+
+# Every test gets its own state directory. A glove launch without --audit-log
+# appends to <XDG_STATE_HOME>/glove/logs/session.jsonl under an exclusive
+# lock, so tests sharing the user's default directory fail each other when
+# two run at once (ctest -j, or two build trees at the same time), and they
+# would write test records into the user's real journal. A test that sets
+# XDG_STATE_HOME itself still overrides this.
+get_property(glove_all_tests DIRECTORY PROPERTY TESTS)
+foreach(glove_test_name IN LISTS glove_all_tests)
+    set_property(TEST ${glove_test_name} APPEND PROPERTY ENVIRONMENT
+        "XDG_STATE_HOME=${CMAKE_BINARY_DIR}/test-state/${glove_test_name}")
+endforeach()

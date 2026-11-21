@@ -138,6 +138,9 @@ def run_once(glove: str, group: str, name: str, script: Path, home: Path, out: P
                    GLOVE_SCENARIO_NONCE=nonce, XDG_CONFIG_HOME=str(config))
         argv = [glove, "exec", "--profile", PROFILE_NAME, "--workspace", str(workspace),
                 "--denial-trace", str(raw),
+                # Private: scenario noise stays out of the user's journal, and
+                # a concurrent launch holding that journal cannot fail the run.
+                "--audit-log", str(temp_path / "audit.jsonl"),
                 "--env", "GLOVE_SCENARIO_HOST_HOME", "--env", "GLOVE_SCENARIO_NONCE",
                 "--", "/bin/sh", str(workspace / ".scenario.sh")]
         try:
