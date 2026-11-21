@@ -178,7 +178,11 @@ auto open_default_audit_journal(
                 .sink = std::move(*own), .path = std::move(own_path), .overflow = true
             };
         }
-        if (own.error() != glove::audit::jsonl_sink_busy) {
+        // Busy: the name collided with a live launch. Removed: another
+        // launch's retention pass took the file before this one locked it.
+        // Either way another name is drawn.
+        if (own.error() != glove::audit::jsonl_sink_busy &&
+            own.error() != glove::audit::jsonl_sink_removed) {
             return std::unexpected(own.error());
         }
         last_error = own.error();

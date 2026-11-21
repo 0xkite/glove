@@ -277,8 +277,16 @@ auto make_jsonl_sink(const std::filesystem::path& path, jsonl_sink_limits limits
         return std::unexpected(system_error("open audit journal"));
     }
     struct stat metadata{};
-    if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
-        metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
+    if (::fstat(descriptor, &metadata) != 0) {
+        const auto error = system_error("inspect audit journal");
+        ::close(descriptor);
+        return std::unexpected(error);
+    }
+    if (S_ISREG(metadata.st_mode) && metadata.st_nlink == 0) {
+        ::close(descriptor);
+        return std::unexpected(std::string{jsonl_sink_removed});
+    }
+    if (!S_ISREG(metadata.st_mode) || metadata.st_uid != ::geteuid() || metadata.st_nlink != 1 ||
         (static_cast<unsigned int>(metadata.st_mode) & 0777U) != 0600U) {
         ::close(descriptor);
         return std::unexpected(
@@ -292,6 +300,25 @@ auto make_jsonl_sink(const std::filesystem::path& path, jsonl_sink_limits limits
         const auto error = errno == EWOULDBLOCK || errno == EAGAIN
                                ? std::string{jsonl_sink_busy}
                                : system_error("lock audit journal");
+        ::close(descriptor);
+        return std::unexpected(error);
+    }
+    // open, fstat and flock are separate calls. Another launch's retention
+    // pass may have locked, unlinked and released this file between them, and
+    // a sink on a file with no name loses every record when it closes. The
+    // lock is held now, and retention unlinks only what it could lock, so
+    // this answer cannot change. Model: formal/AuditJournal.tla.
+    struct stat locked{};
+    if (::fstat(descriptor, &locked) != 0) {
+        const auto error = system_error("inspect audit journal");
+        ::close(descriptor);
+        return std::unexpected(error);
+    }
+    if (locked.st_nlink != 1) {
+        const auto error =
+            locked.st_nlink == 0
+                ? std::string{jsonl_sink_removed}
+                : std::string{"audit journal must be an owner-only single-link regular file"};
         ::close(descriptor);
         return std::unexpected(error);
     }
