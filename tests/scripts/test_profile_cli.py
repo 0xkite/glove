@@ -240,6 +240,48 @@ def main():
         if hits and not any(r["type"] == "event" and r["target"] == named for r in trace):
             fail(f"the traced denial does not match the header's decoy: {trace}")
 
+        # A shadow decider's verdict on the same reach is recorded and nothing
+        # acts on it: the command still exits 0. The model scores only decoys.
+        model = json.loads((Path(__file__).resolve().parents[2] / "fuzz" / "corpus" /
+                            "denial_model" / "logistic.json").read_text(encoding="ascii"))
+        model["bias"] = -5
+        model["weights"] = [20 if name == "target_decoy" else 0 for name in model["features"]]
+        model_path = root / "audit" / "model.json"
+        model_path.write_text(json.dumps(model), encoding="ascii")
+        model_path.chmod(0o600)
+        shadow_audit = root / "audit" / "shadow.jsonl"
+        expect(glove(binary, env, "exec", "--profile", "decoy", "--audit-log", str(shadow_audit),
+                     "--denial-model", str(model_path), "--", "/bin/sh", "-c", script), 0)
+        records = [json.loads(line) for line in
+                   shadow_audit.read_text(encoding="utf-8").splitlines() if line]
+        live = any(r["tool"] == "telemetry" and '"live"' in r["arguments"] for r in records)
+        verdicts = [json.loads(r["arguments"]) for r in records if r["tool"] == "verdict"]
+        summary = [json.loads(r["arguments"]) for r in records if r["tool"] == "summary"]
+        if live:
+            if [v["verdict"] for v in verdicts] != ["terminate"] or verdicts[0]["mode"] != "shadow":
+                fail(f"the shadow verdict was not recorded once: {verdicts}")
+            if summary[-1].get("decider") != "model" or summary[-1].get("verdict") != "terminate":
+                fail(f"the summary does not carry the shadow verdict: {summary}")
+        # A model glove cannot use never stops the launch: it is recorded,
+        # reported, and the command runs without a decider.
+        for bad, why in ((root / "audit" / "absent.json", "no such file"),
+                         (workspace / "model.json", "sandbox can reach")):
+            if bad.parent == workspace:
+                bad.write_text(json.dumps(model), encoding="ascii")
+            unusable_audit = root / "audit" / f"unusable-{bad.parent.name}.jsonl"
+            result = expect(glove(binary, env, "exec", "--profile", "decoy", "--audit-log",
+                                  str(unusable_audit), "--denial-model", str(bad), "--",
+                                  "/bin/sh", "-c", script), 0, why)
+            if "without a decider" not in result.stderr:
+                fail(f"an unusable model was not reported: {result.stderr}")
+            records = [json.loads(line) for line in
+                       unusable_audit.read_text(encoding="utf-8").splitlines() if line]
+            deciders = [r for r in records if r["tool"] == "decider"]
+            if len(deciders) != 1 or why not in deciders[0]["error"]:
+                fail(f"an unusable model was not audited: {deciders}")
+            if any(r["tool"] == "verdict" for r in records):
+                fail("a verdict was recorded without a decider")
+
         profile("decoy_inside", f"version: 1\nworkspace: {workspace}\n"
                                 f"decoys:\n  - \"{workspace / 'canary'}\"\n")
         expect(glove(binary, env, "exec", "--profile", "decoy_inside", "--audit-log",
