@@ -73,6 +73,8 @@ void print_run_usage() {
         "                                       (default: in-memory)\n"
         "  --denial-trace <path>                record this launch's sandbox denials to a\n"
         "                                       new file (macOS; for training deciders)\n"
+        "  --denial-model <path>                record a trained model's verdict on this\n"
+        "                                       launch's denials; nothing acts on it (macOS)\n"
         "  --workspace <path>                   read-write workspace bound for the agent\n"
         "                                       (default: none)\n"
         "  --read <path>                        expose one additional path read-only\n"
@@ -217,6 +219,8 @@ void print_exec_usage() {
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --denial-trace <path>   record this launch's sandbox denials to a new file\n"
         "                          (macOS; for training denial deciders)\n"
+        "  --denial-model <path>   record a trained model's verdict on this launch's\n"
+        "                          denials; nothing acts on it (macOS)\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
@@ -677,6 +681,15 @@ auto exec_subcommand(std::span<char* const> args) -> int {
                 return 2;
             }
             opts.denial_trace = std::filesystem::path{args[i + 1]};
+            i += 2;
+            continue;
+        }
+        if (a == "--denial-model") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "glove exec: --denial-model needs an argument\n");
+                return 2;
+            }
+            opts.denial_model = std::filesystem::path{args[i + 1]};
             i += 2;
             continue;
         }
@@ -2238,6 +2251,15 @@ auto run_subcommand(std::span<char* const> args) -> int {
                 return 2;
             }
             opts.denial_trace = std::filesystem::path{args[i + 1]};
+            i += 2;
+            continue;
+        }
+        if (a == "--denial-model") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "glove run: --denial-model needs an argument\n");
+                return 2;
+            }
+            opts.denial_model = std::filesystem::path{args[i + 1]};
             i += 2;
             continue;
         }

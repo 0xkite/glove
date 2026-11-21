@@ -621,11 +621,11 @@ it.
 Measurements are in [sbpl-reference.md](sbpl-reference.md); the limits are the
 two "macOS denial telemetry" rows of the [threat model](threat-model.md).
 
-### Denial decisions (interface only)
+### Denial decisions (shadow only)
 
 `include/glove/container/denial_decision.hpp` defines how a session's denials
-become a verdict. It is not wired into any launch path yet: no verdict is
-recorded or acted on.
+become a verdict. `glove run|exec --denial-model <file>` (macOS) evaluates a
+trained model on each denial and records its verdict; nothing acts on one.
 
 - `denial_feature_builder` turns the denial stream into 35 features (schema
   version 2): counts by kind and by target class (workspace, home credential
@@ -657,8 +657,20 @@ recorded or acted on.
   rows and evaluates arms; `tools/denial_model/` holds the scenario
   collector, the trainer and the cross-validated ablation. See its README.
 
-A decider can only escalate. The planned use records verdicts (shadow mode)
-until the operator enables termination, which goes through the
+- Shadow records: the denial audit writer feeds each denial to the model on
+  the telemetry thread and appends a `verdict` record (`mode`, `arm`,
+  `verdict`, `score`, denial count, time since launch) only when the verdict
+  escalates, so at most two per launch, outside the ordinary rate caps. The
+  summary carries the highest verdict and score.
+- The model file is refused when it is not one regular file, when another
+  local user could have written it (not owned by this user or root, or
+  group/other-writable), when any grant of the launch reaches it, or when it
+  is not a valid model for this feature schema. A refused model never stops
+  the launch: glove records a `decider` record with the reason, says so on
+  stderr, and runs the agent sandboxed without a decider.
+
+A decider can only escalate. Verdicts are recorded (shadow mode) until the
+operator enables termination, which is not built; it would go through the
 identity-checked group teardown. A missing or invalid model leaves the session
 sandboxed with no reaction. Features come from agent-chosen bytes, so an
 agent can steer its own verdict, but not what the sandbox allows.

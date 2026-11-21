@@ -5,6 +5,7 @@
 // without it. Telemetry only: nothing here can stop, delay or fail a launch.
 
 #include "glove/audit/sink.hpp"
+#include "glove/container/denial_decision.hpp"
 #include "glove/container/denial_telemetry.hpp"
 
 #include <chrono>
@@ -45,6 +46,17 @@ public:
     // of them is also written as a "decoy" record with its own cap, so
     // ordinary denial volume can never crowd it out. Call before start.
     void watch_decoys(std::span<const std::filesystem::path> decoys);
+    // Shadow decisions: DECIDER's verdict over this launch's denials is
+    // recorded and never acted on. A "verdict" record is written each time
+    // the verdict escalates (so at most two), and the summary carries the
+    // highest one. Call before start.
+    void attach_decider(
+        std::shared_ptr<const glove::container::denial_decider> decider,
+        const glove::container::denial_context& context
+    );
+    // Records once that the operator asked for a decider that could not be
+    // used; the launch runs sandboxed without one.
+    void record_decider_unavailable(std::string_view reason);
     // Safe from any thread.
     void on_denial(const glove::container::sandbox_denial& denial);
     // Safe from any thread; at most one degraded record per writer.
@@ -83,6 +95,11 @@ private:
     std::vector<std::string> decoy_targets_; // encoded like denial targets
     std::uint64_t decoy_recorded_ = 0;
     std::uint64_t decoy_suppressed_ = 0;
+    std::shared_ptr<const glove::container::denial_decider> decider_;
+    std::optional<glove::container::denial_feature_builder> features_;
+    std::optional<std::chrono::steady_clock::time_point> decider_started_;
+    glove::container::denial_decision highest_;
+    bool decider_unavailable_written_ = false;
 };
 
 constexpr std::size_t decoy_audit_per_session = 32;

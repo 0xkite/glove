@@ -63,6 +63,7 @@
 #    include "glove/container/denial_telemetry.hpp"
 
 #    include "denial_audit.hpp"
+#    include "denial_shadow.hpp"
 #    include "denial_trace_writer.hpp"
 
 #    include <mach-o/dyld.h>
@@ -2031,6 +2032,54 @@ auto host_home() -> std::string {
     return ec ? std::string{} : home.string();
 }
 
+// How this launch's denial targets are classified: its writable grants, the
+// user's home, and its decoys, each as the kernel resolves it.
+auto launch_denial_context(
+    const glove::container::profile& profile, std::span<const std::filesystem::path> decoys
+) -> glove::container::denial_context {
+    std::error_code ec;
+    std::vector<std::string> roots;
+    for (const auto& rule : profile.filesystem) {
+        if (!rule.writable) {
+            continue;
+        }
+        const std::filesystem::path root{rule.path};
+        const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+        roots.push_back(ec ? root.string() : canonical_root.string());
+    }
+    std::vector<std::string> decoy_targets;
+    for (const auto& decoy : decoys) {
+        const auto canonical_decoy = std::filesystem::weakly_canonical(decoy, ec);
+        decoy_targets.push_back(ec ? decoy.string() : canonical_decoy.string());
+    }
+    return glove::container::make_denial_context(roots, host_home(), decoy_targets);
+}
+
+// Attaches the operator's --denial-model as a shadow decider. A model that
+// cannot be used is recorded and reported, and the launch runs without one:
+// detection is never something a launch depends on.
+void attach_shadow_decider(
+    const options& opts,
+    const glove::container::profile& profile,
+    std::span<const std::filesystem::path> decoys,
+    detail::denial_audit_writer& denial_writer
+) {
+    if (!opts.denial_model) {
+        return;
+    }
+    auto decider = detail::load_shadow_decider(
+        *opts.denial_model, glove::container::exposed_grant_paths(profile)
+    );
+    if (!decider) {
+        denial_writer.record_decider_unavailable(decider.error());
+        const std::string line =
+            "glove: " + decider.error() + "; the agent still runs sandboxed, without a decider\n";
+        static_cast<void>(std::fputs(line.c_str(), stderr));
+        return;
+    }
+    denial_writer.attach_decider(std::move(*decider), launch_denial_context(profile, decoys));
+}
+
 // Opens the operator's --denial-trace file, or returns null when none was
 // asked for. The file must not be reachable through any mount of the final
 // profile, or the agent could read or rewrite its own training record.
@@ -2052,7 +2101,6 @@ auto open_denial_trace(
         return std::unexpected(std::string{"denial trace directory cannot be resolved"});
     }
     const auto resolved = parent / absolute.filename();
-    std::vector<std::string> roots;
     for (const auto& rule : profile.filesystem) {
         const std::filesystem::path root{rule.path};
         auto canonical_root = std::filesystem::weakly_canonical(root, ec);
@@ -2066,19 +2114,8 @@ auto open_denial_trace(
                 rule.path + "'"
             );
         }
-        if (rule.writable) {
-            roots.push_back(canonical_root.string());
-        }
     }
-    // Denials name a target as the kernel resolved it.
-    std::vector<std::string> decoy_targets;
-    for (const auto& decoy : decoys) {
-        const auto canonical_decoy = std::filesystem::weakly_canonical(decoy, ec);
-        decoy_targets.push_back(ec ? decoy.string() : canonical_decoy.string());
-    }
-    return detail::denial_trace_writer::create(
-        resolved, glove::container::make_denial_context(roots, host_home(), decoy_targets)
-    );
+    return detail::denial_trace_writer::create(resolved, launch_denial_context(profile, decoys));
 }
 
 auto start_denial_telemetry(
@@ -2190,6 +2227,9 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (opts.denial_trace) {
         return std::unexpected(std::string{"denial traces are recorded on macOS only"});
     }
+    if (opts.denial_model) {
+        return std::unexpected(std::string{"denial models are evaluated on macOS only"});
+    }
 #endif
     auto runtime = private_runtime::create();
     if (!runtime) {
@@ -2248,6 +2288,7 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     }
     detail::denial_audit_writer denial_writer{*sink};
     denial_writer.watch_decoys(decoys->paths());
+    attach_shadow_decider(opts, *profile, decoys->paths(), denial_writer);
     auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
 #endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());
@@ -2288,6 +2329,9 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
 #if !defined(__APPLE__)
     if (opts.denial_trace) {
         return std::unexpected(std::string{"denial traces are recorded on macOS only"});
+    }
+    if (opts.denial_model) {
+        return std::unexpected(std::string{"denial models are evaluated on macOS only"});
     }
 #endif
     auto runtime = private_runtime::create();
@@ -2454,6 +2498,7 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
     }
     detail::denial_audit_writer denial_writer{*sink};
     denial_writer.watch_decoys(decoys->paths());
+    attach_shadow_decider(opts, *profile, decoys->paths(), denial_writer);
     auto denial_monitor = start_denial_telemetry(denial_writer, denial_trace->get(), *profile);
 #endif
     if (auto audited = record(*sink, glove::audit::action::agent_launch, opts.agent_argv.front());

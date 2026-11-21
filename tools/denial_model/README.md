@@ -54,6 +54,14 @@ Wrap each denied command in a subshell: in `sh`, a failed redirection on a
 special builtin ends the script. The collector stops with an error if any
 file carrying the nonce exists after a run.
 
+## Shadow mode
+
+`glove run|exec --denial-model model.json` evaluates a trained model on the
+launch's denials and writes its verdict to the audit log as `verdict` records
+and in the denial summary. Nothing acts on a verdict. Keep the model outside
+every path the launch grants, owned by you and not group- or other-writable;
+a model glove cannot use is reported and the launch runs without one.
+
 ## Real sessions
 
 Record real sessions with `glove run|exec --denial-trace <file>`, label them

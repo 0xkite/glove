@@ -46,6 +46,8 @@ struct options {
     // collected to train and evaluate denial deciders. Never inside a path
     // the agent can reach.
     std::optional<std::filesystem::path> denial_trace;
+    // A trained denial model whose verdicts are recorded and never acted on.
+    std::optional<std::filesystem::path> denial_model;
     // Optional read-write workspace path exposed to the agent. When unset,
     // both modes use only a per-run private empty working directory.
     std::optional<std::filesystem::path> workspace;
