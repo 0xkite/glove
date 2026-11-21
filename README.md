@@ -35,6 +35,8 @@ are in [`docs/architecture.md`](docs/architecture.md) and
 ## Documentation
 
 - [`docs/build.md`](docs/build.md) — build and validation
+- [`docs/toolchain.md`](docs/toolchain.md) — compilers, C++23/C++26 selection,
+  presets, options, and flags
 - [`docs/host-setup.md`](docs/host-setup.md) — owner-local machine setup
 - [`docs/session-policy.md`](docs/session-policy.md) — managed-session policy
   contract
