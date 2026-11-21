@@ -246,6 +246,18 @@ struct profile {
     // are matched against the resolved path and are never normalized.
     std::optional<std::string> unix_socket_endpoint;
 
+    // Opt-in host system services, by name from the vetted catalog in
+    // system_services.hpp. Empty by default: a launch exposes none. validate()
+    // refuses names not in the catalog (raw platform names included), then
+    // deduplicates and sorts. macOS grants the mach-lookup names and read-only
+    // paths each selected entry lists; Linux accepts the names and enforces
+    // nothing for them.
+    std::vector<std::string> system_services;
+
+    // Derived by validate() from the selected services: their canonical read
+    // paths. Recomputed from the catalog; never trusted from the caller.
+    std::vector<std::string> system_service_read_paths;
+
     // How the Linux seccomp escape-surface tripwire responds to explicit
     // escape/kernel-mutation syscalls (bpf, unshare, setns, mount API,
     // open_by_handle_at, pidfd_getfd, kexec, TIOCSTI, ...). Default

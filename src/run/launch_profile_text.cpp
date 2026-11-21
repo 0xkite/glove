@@ -1,6 +1,7 @@
 // Launch profile text: the strict YAML subset, the schema, and the
 // canonical encoding. No filesystem or host state, so fuzzers link it alone.
 
+#include "glove/container/system_services.hpp"
 #include "glove/run/launch_profile.hpp"
 
 #include "yaml_subset.hpp"
@@ -58,6 +59,7 @@ struct profile_doc { // NOLINT(misc-use-internal-linkage)
     std::optional<std::uint16_t> bridge_port;
     std::optional<secrets_doc> secrets;
     std::optional<std::vector<std::string>> decoys;
+    std::optional<std::vector<std::string>> system_services;
 };
 
 } // namespace glove::run::launch_profile_detail
@@ -228,7 +230,7 @@ auto convert(const profile_doc& doc) -> std::expected<launch_profile, std::strin
         return std::unexpected("unsupported profile version " + std::to_string(doc.version));
     }
     if (!bounded(doc.read) || !bounded(doc.write) || !bounded(doc.egress) || !bounded(doc.mcp) ||
-        !bounded(doc.allow) || !bounded(doc.allow_arg) ||
+        !bounded(doc.allow) || !bounded(doc.allow_arg) || !bounded(doc.system_services) ||
         (doc.env && doc.env->size() > max_launch_profile_entries)) {
         return std::unexpected(std::string{"profile has too many entries in one list"});
     }
@@ -273,6 +275,22 @@ auto convert(const profile_doc& doc) -> std::expected<launch_profile, std::strin
         if (decoy == "~" || decoy.ends_with('/')) {
             return std::unexpected("decoys: '" + decoy + "' must name a file");
         }
+    }
+    for (const auto& name : doc.system_services.value_or(std::vector<std::string>{})) {
+        if (name.empty() || name.size() > 64U) {
+            return std::unexpected(std::string{"system_services: names are 1-64 bytes"});
+        }
+        if (name.contains('.')) {
+            return std::unexpected(
+                "system_services: '" + name +
+                "' looks like a raw platform service name; raw mach service names are not "
+                "accepted, select a catalog name"
+            );
+        }
+        if (glove::container::find_system_service(name) == nullptr) {
+            return std::unexpected("system_services: unknown system service '" + name + "'");
+        }
+        out.system_services.push_back(name);
     }
     if (doc.secrets && doc.secrets->provider) {
         auto reference = parse_secret_reference(*doc.secrets->provider);
@@ -327,7 +345,8 @@ auto operator==(const launch_profile& a, const launch_profile& b) -> bool {
     return a.workspace == b.workspace && a.agent == b.agent && a.read == b.read &&
            a.write == b.write && a.env == b.env && a.allow == b.allow &&
            a.bridge_port == b.bridge_port && a.provider_secret == b.provider_secret &&
-           a.decoys == b.decoys && std::ranges::equal(a.egress, b.egress, same_egress) &&
+           a.decoys == b.decoys && a.system_services == b.system_services &&
+           std::ranges::equal(a.egress, b.egress, same_egress) &&
            std::ranges::equal(a.mcp, b.mcp, same_mcp) &&
            std::ranges::equal(a.allow_arg, b.allow_arg, same_rule);
 }
@@ -391,6 +410,7 @@ auto encode_launch_profile(const launch_profile& profile) -> std::string {
         out += "bridge_port: " + std::to_string(*profile.bridge_port) + "\n";
     }
     emit_list(out, "decoys", profile.decoys);
+    emit_list(out, "system_services", profile.system_services);
     if (profile.provider_secret) {
         out += "secrets:\n  provider: " + quote(format_secret_reference(*profile.provider_secret)) +
                "\n";
@@ -429,6 +449,10 @@ auto launch_profile_template() -> std::string_view {
            "\n"
            "# secrets:                       # resolved on the host; the sandbox sees a nonce\n"
            "#   provider: keychain://glove/anthropic   # or env://NAME, file://~/path\n"
+           "\n"
+           "# system_services:               # opt-in host services from the catalog:\n"
+           "#   - network-config              # network-config (system proxy settings)\n"
+           "#   - tls-config                  # tls-config (/private/etc/ssl for curl)\n"
            "\n"
            "# decoys:                        # canary files planted outside the sandbox for\n"
            "#   - ~/.private/backup-token     # each launch; a sandboxed read is audited. Use\n"

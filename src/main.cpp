@@ -82,6 +82,9 @@ void print_run_usage() {
         "                                       leading '.' matches subdomains; port defaults\n"
         "                                       to 443). Without any,\n"
         "                                       the agent has no network.\n"
+        "  --system-service <name>              opt in to a host system service from the\n"
+        "                                       catalog (network-config, tls-config; may be\n"
+        "                                       repeated; default none)\n"
         "  -h, --help                           show this help and exit\n"
     );
 }
@@ -205,6 +208,8 @@ void print_exec_usage() {
         "  --allow-arg <tool>:<field>=<prefix>\n"
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
+        "  --system-service <name> opt in to a host system service from the catalog\n"
+        "                          (network-config, tls-config; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --denial-trace <path>   record this launch's sandbox denials to a new file\n"
         "                          (macOS; for training denial deciders)\n"
@@ -257,6 +262,8 @@ void print_shell_usage() {
         "  --allow-arg <tool>:<field>=<prefix>\n"
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
+        "  --system-service <name> opt in to a host system service from the catalog\n"
+        "                          (network-config, tls-config; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --share-credential <pi-provider>\n"
         "                          with --agent pi: mediate the host API key for one Pi\n"
@@ -302,6 +309,8 @@ void print_loop_usage() {
         "  --allow-arg <tool>:<field>=<prefix>\n"
         "                          argument prefix constraint on an allowed tool\n"
         "  --bridge-port <port>    bridge a host 127.0.0.1 TCP port into the sandbox\n"
+        "  --system-service <name> opt in to a host system service from the catalog\n"
+        "                          (network-config, tls-config; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS through the egress proxy\n"
@@ -409,6 +418,21 @@ auto parse_sandbox_flag(
         } else {
             opts.audit_log = std::filesystem::path{args[i + 1]};
         }
+        i += 2;
+        return 0;
+    }
+    if (a == "--system-service") {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --system-service needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        // The catalog decides which names exist; validate() refuses the rest at launch.
+        opts.system_services.emplace_back(args[i + 1]);
         i += 2;
         return 0;
     }
@@ -1392,6 +1416,15 @@ auto load_env_profile(std::string_view name, glove::run::options& opts)
             opts.egress.push_back(std::move(*e));
         }
     }
+    if (auto it = parsed->find("system_services"); it != parsed->end()) {
+        const auto* arr = std::get_if<std::vector<std::string>>(&it->second);
+        if (arr == nullptr) {
+            return std::unexpected(
+                "invalid 'system_services' in saved environment '" + std::string{name} + "'"
+            );
+        }
+        opts.system_services.insert(opts.system_services.end(), arr->begin(), arr->end());
+    }
     if (auto it = parsed->find("bridge_port"); it != parsed->end()) {
         const auto* n = std::get_if<std::int64_t>(&it->second);
         if (n == nullptr || (*n != 0 && (*n < 1 || *n > 65535))) {
@@ -2162,6 +2195,15 @@ auto run_subcommand(std::span<char* const> args) -> int {
             } else {
                 opts.environment_names.emplace_back(args[i + 1]);
             }
+            i += 2;
+            continue;
+        }
+        if (a == "--system-service") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "glove run: --system-service needs an argument\n");
+                return 2;
+            }
+            opts.system_services.emplace_back(args[i + 1]);
             i += 2;
             continue;
         }

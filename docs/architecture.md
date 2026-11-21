@@ -471,6 +471,32 @@ same-user host process that can rewrite them.
 Detailed policy and file invariants are defined in
 [session-policy.md](session-policy.md).
 
+## System services
+
+A launch exposes no host system service by default. It can opt in to named
+entries from a fixed catalog (`include/glove/container/system_services.hpp`)
+with `--system-service <name>` (repeatable; `exec`, `shell`, `run`, `loop`), the
+launch-profile key `system_services: [names]`, or the saved-environment key
+`system_services` (an array of strings). All three feed one list that
+`validate()` checks against the catalog.
+
+| Name             | macOS grant                                                 | Exposes                                                              |
+|------------------|-------------------------------------------------------------|----------------------------------------------------------------------|
+| `network-config` | `mach-lookup` of `com.apple.SystemConfiguration.configd`    | host network and proxy configuration, read through configd          |
+| `tls-config`     | read-only `/private/etc/ssl`                                | the system TLS trust configuration for LibreSSL/OpenSSL clients (curl) |
+
+- Unknown names are refused with `unknown system service '<name>'`. Raw
+  platform names such as a mach service name are refused by design: only a
+  catalog entry can widen the sandbox, and each entry is reviewed for what it
+  reveals. Names are 1-64 bytes; duplicates are removed and the list is sorted.
+- `network-config` lets the guest learn the host's network and proxy settings,
+  and so the host's network layout. It grants no network access by itself:
+  `(deny network*)` and the egress rules still decide connections.
+- `tls-config` adds a read-only grant, resolved through the same
+  canonicalization and symlink-spelling rules as other read grants.
+- Linux accepts the names and emits no rule for them: the entries carry no
+  Linux rules.
+
 ## Launch profiles
 
 `glove exec`, `glove run`, and `glove shell` accept `--profile <name>`, read

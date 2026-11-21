@@ -1040,6 +1040,16 @@ if(APPLE)
     add_test(NAME container_macos_sandbox COMMAND container_macos_sandbox_test)
     set_tests_properties(container_macos_sandbox PROPERTIES TIMEOUT 30)
 
+    # Opt-in host system services: SBPL grants follow the catalog selection and
+    # real clients (curl, a system-configuration user) initialize in the sandbox.
+    add_executable(container_macos_system_services_test container/macos_system_services_test.cpp)
+    target_link_libraries(container_macos_system_services_test PRIVATE glove_kernel)
+    target_include_directories(container_macos_system_services_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+    )
+    add_test(NAME container_macos_system_services COMMAND container_macos_system_services_test)
+    set_tests_properties(container_macos_system_services PROPERTIES TIMEOUT 60)
+
     # Supervised log-stream child for sandbox denial telemetry (not wired into
     # any launch path). Skips (77) when this user cannot run `log stream`.
     add_executable(container_macos_denial_stream_test container/macos_denial_stream_test.cpp)

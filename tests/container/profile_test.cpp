@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -405,6 +406,41 @@ auto run() -> int {
             REQUIRE(has(*out, (tmp / "link").string()));
         }
         fs::remove_all(tmp, ec);
+    }
+
+    // Host system services come from a vetted catalog: known names validate
+    // (sorted, deduplicated); unknown, raw, empty and oversized names refuse.
+    {
+        glove::container::profile p;
+        p.system_services = {"tls-config", "network-config", "tls-config"};
+        auto out = glove::container::validate(p);
+        REQUIRE(out.has_value());
+        REQUIRE(out->system_services == (std::vector<std::string>{"network-config", "tls-config"}));
+
+        glove::container::profile none;
+        auto empty = glove::container::validate(none);
+        REQUIRE(empty.has_value());
+        REQUIRE(empty->system_services.empty());
+
+        p.system_services = {"no-such-service"};
+        auto unknown = glove::container::validate(p);
+        REQUIRE(!unknown.has_value());
+        REQUIRE(unknown.error().contains("unknown system service 'no-such-service'"));
+
+        p.system_services = {"com.apple.SystemConfiguration.configd"};
+        auto raw = glove::container::validate(p);
+        REQUIRE(!raw.has_value());
+        REQUIRE(raw.error().contains("raw mach service names are not accepted"));
+
+        p.system_services = {""};
+        REQUIRE(!glove::container::validate(p).has_value());
+
+        p.system_services = {std::string(65, 'a')};
+        REQUIRE(!glove::container::validate(p).has_value());
+
+        // One bad name refuses the whole list, even next to a good one.
+        p.system_services = {"network-config", "bogus"};
+        REQUIRE(!glove::container::validate(p).has_value());
     }
 
     return 0;

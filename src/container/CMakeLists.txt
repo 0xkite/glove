@@ -8,6 +8,7 @@ add_library(glove_container STATIC
     refinement_protocol.cpp
     resource_monitor.cpp
     sandbox_denial_log.cpp
+    system_services.cpp
     denial_telemetry.cpp
     denial_decision.cpp
     denial_trace.cpp

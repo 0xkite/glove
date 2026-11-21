@@ -191,6 +191,7 @@ auto build_profile(const options& opts, const std::filesystem::path& runtime_roo
     -> std::expected<glove::container::profile, std::string> {
     glove::container::profile profile;
     profile.allow_loopback_listen = opts.allow_loopback_listen;
+    profile.system_services = opts.system_services;
     if (auto environment = append_selected_environment(profile, opts); !environment) {
         return std::unexpected(environment.error());
     }

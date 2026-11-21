@@ -79,6 +79,9 @@ struct options {
     // Absolute host paths for canary decoys planted for this launch only;
     // "{nonce}" becomes a per-launch value. See src/run/decoys.hpp.
     std::vector<std::string> decoys;
+    // Opt-in host system services by catalog name (container/system_services.hpp);
+    // empty by default. Feeds profile::system_services, which validate() checks.
+    std::vector<std::string> system_services;
     // Permit private-loopback socket binding/listening inside the sandbox's
     // isolated network namespace (required by runtimes like agy).
     bool allow_loopback_listen = false;

@@ -61,6 +61,9 @@ struct launch_profile {
     std::optional<secret_reference> provider_secret;
     // decoys: canary files planted outside the sandbox for each launch.
     std::vector<std::string> decoys;
+    // Opt-in host system services, catalog names only; unknown names fail at
+    // load. See container/system_services.hpp.
+    std::vector<std::string> system_services;
 };
 
 [[nodiscard]] auto operator==(const launch_profile& a, const launch_profile& b) -> bool;
