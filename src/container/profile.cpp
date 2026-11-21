@@ -1,5 +1,7 @@
 #include "glove/container/profile.hpp"
 
+#include "glove/container/system_services.hpp"
+
 #include "sandbox_denial_log.hpp"
 
 #include <algorithm>
@@ -98,6 +100,50 @@ auto collect_link_spellings(std::string_view raw, std::vector<std::string>& link
                 break;
             }
             link = std::move(target);
+        }
+    }
+    return {};
+}
+
+// Checks the selected service names against the catalog, then replaces the
+// list with its sorted deduplicated form and derives the canonical read paths
+// the selection grants. One bad name refuses the whole list.
+auto resolve_system_services(profile& p) -> std::expected<void, std::string> {
+    p.system_service_read_paths.clear(); // recomputed from the catalog; never trusted
+    if (p.system_services.size() > 64U) {
+        return std::unexpected(std::string{"too many system services (limit 64)"});
+    }
+    for (const auto& name : p.system_services) {
+        if (name.empty() || name.size() > 64U) {
+            return std::unexpected(std::string{"system service name must be 1-64 bytes"});
+        }
+        if (name.contains('.')) {
+            return std::unexpected(
+                "system service '" + name +
+                "' looks like a raw platform service name; raw mach service names are not "
+                "accepted, select a catalog name"
+            );
+        }
+        if (find_system_service(name) == nullptr) {
+            return std::unexpected("unknown system service '" + name + "'");
+        }
+    }
+    std::ranges::sort(p.system_services);
+    const auto dup = std::ranges::unique(p.system_services);
+    p.system_services.erase(dup.begin(), dup.end());
+    for (const auto& name : p.system_services) {
+        for (const auto path : find_system_service(name)->macos_read_paths) {
+            if (auto links = collect_link_spellings(path, p.link_spellings); !links) {
+                return std::unexpected(links.error());
+            }
+            auto canonical = canonical_path(path, "system service read path");
+            if (!canonical) {
+                return std::unexpected(canonical.error());
+            }
+            if (std::ranges::find(p.system_service_read_paths, *canonical) ==
+                p.system_service_read_paths.end()) {
+                p.system_service_read_paths.push_back(std::move(*canonical));
+            }
         }
     }
     return {};
@@ -317,6 +363,9 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
             return std::unexpected(endpoint.error());
         }
         copy.unix_socket_endpoint = std::move(*endpoint);
+    }
+    if (auto services = resolve_system_services(copy); !services) {
+        return std::unexpected(services.error());
     }
     std::vector<std::filesystem::path> fs_paths;
     fs_paths.reserve(copy.filesystem.size());

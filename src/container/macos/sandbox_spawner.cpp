@@ -3,6 +3,7 @@
 
 #include "glove/container/profile.hpp"
 #include "glove/container/spawner.hpp"
+#include "glove/container/system_services.hpp"
 #include "glove/mcp/transport.hpp"
 
 #include "darwin_process_group.hpp"
@@ -519,6 +520,23 @@ auto generate_sbpl(const profile& prof, std::string_view agent_program, std::str
         p += sbpl_escape(link);
         p += "\"))\n";
         append_parent_metadata_rules(p, link);
+    }
+    // Opt-in host system services. validate() already refused names outside the
+    // catalog and derived the canonical read paths, so this only renders the
+    // selected entries; an empty selection emits nothing. Allow rules carry no
+    // denial tag, like the other allows.
+    for (const auto& name : prof.system_services) {
+        if (const auto* entry = find_system_service(name)) {
+            for (const auto service : entry->macos_mach_services) {
+                p += "(allow mach-lookup (global-name \"";
+                p += sbpl_escape(service);
+                p += "\"))\n";
+            }
+        }
+    }
+    for (const auto& path : prof.system_service_read_paths) {
+        append_read_rule(p, path);
+        append_parent_metadata_rules(p, path);
     }
     p += "(deny network*" + tagged + ")\n";
     // The imported system profile grants exactly one network endpoint - the

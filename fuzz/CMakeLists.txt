@@ -181,6 +181,7 @@ glove_configure_fuzzer(glove_egress_proxy_fuzzer)
 
 add_library(glove_container_profile_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/container/profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/container/system_services.cpp
 )
 target_link_libraries(glove_container_profile_fuzz_support PUBLIC glove_options)
 target_include_directories(glove_container_profile_fuzz_support
@@ -271,6 +272,7 @@ add_library(glove_launch_profile_fuzz_support STATIC
     ${CMAKE_SOURCE_DIR}/src/run/launch_profile_text.cpp
     ${CMAKE_SOURCE_DIR}/src/run/yaml_subset.cpp
     ${CMAKE_SOURCE_DIR}/src/run/secret_reference.cpp
+    ${CMAKE_SOURCE_DIR}/src/container/system_services.cpp
 )
 target_link_libraries(glove_launch_profile_fuzz_support PUBLIC glove_options)
 target_link_libraries(glove_launch_profile_fuzz_support PRIVATE glaze::glaze)

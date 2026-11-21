@@ -196,6 +196,10 @@ void merge_profile_lists(const launch_profile& profile, const options& cli, opti
     out.egress.insert(out.egress.end(), cli.egress.begin(), cli.egress.end());
     out.upstreams = profile.mcp;
     out.upstreams.insert(out.upstreams.end(), cli.upstreams.begin(), cli.upstreams.end());
+    out.system_services = profile.system_services;
+    out.system_services.insert(
+        out.system_services.end(), cli.system_services.begin(), cli.system_services.end()
+    );
     out.allow = profile.allow;
     out.allow.insert(out.allow.end(), cli.allow.begin(), cli.allow.end());
     out.prefix_rules = profile.allow_arg;
