@@ -342,7 +342,8 @@ auto profile_command(std::span<char* const> arguments) -> int {
     const std::string_view command{arguments[0]};
     const auto argument =
         arguments.size() > 1 ? std::string_view{arguments[1]} : std::string_view{};
-    if (command == "-h" || command == "--help" || command == "help") {
+    if (command == "-h" || command == "--help" || command == "help" || argument == "-h" ||
+        argument == "--help") {
         usage();
         return 0;
     }

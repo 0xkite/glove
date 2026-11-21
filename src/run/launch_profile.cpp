@@ -127,10 +127,11 @@ auto launch_profile_directory() -> std::expected<std::filesystem::path, std::str
 
 auto launch_profile_path(std::string_view name)
     -> std::expected<std::filesystem::path, std::string> {
-    if (!glove::host::is_valid_policy_name(name)) {
+    // A leading '-' is a mistyped flag, never a name.
+    if (!glove::host::is_valid_policy_name(name) || name.starts_with('-')) {
         return std::unexpected(
             "invalid profile name '" + std::string{name} +
-            "' (letters, digits, '-', '_', '.'; at most 64)"
+            "' (letters, digits, '-', '_', '.'; at most 64; not starting with '-' or '.')"
         );
     }
     auto directory = launch_profile_directory();
