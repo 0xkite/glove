@@ -33,6 +33,7 @@ include(ProjectOptions)
 include(CompilerWarnings)
 include(Sanitizers)
 include(Hardening)
+include(Coverage)
 
 # Position-independent executables, so address-space layout randomization
 # covers the program image. Directory scope: it must precede every target.
@@ -83,6 +84,7 @@ endif()
 glove_set_warnings(glove_options)
 glove_apply_sanitizers(glove_options)
 glove_apply_hardening(glove_options)
+glove_apply_coverage(glove_options)
 target_compile_features(glove_options INTERFACE cxx_std_23)
 
 string(TOUPPER "${GLOVE_REFLECTION}" _glove_reflection_mode)
@@ -196,5 +198,6 @@ message(STATUS "  GLOVE_ENABLE_SAGE_INTEROP_TEST : ${GLOVE_ENABLE_SAGE_INTEROP_T
 message(STATUS "  GLOVE_BUILD_BENCHMARKS : ${GLOVE_BUILD_BENCHMARKS}")
 message(STATUS "  GLOVE_BUILD_FUZZERS  : ${GLOVE_BUILD_FUZZERS}")
 message(STATUS "  GLOVE_SANITIZER      : ${GLOVE_SANITIZER}")
+message(STATUS "  GLOVE_COVERAGE       : ${GLOVE_COVERAGE}")
 message(STATUS "  GLOVE_WARNINGS_AS_ERRORS : ${GLOVE_WARNINGS_AS_ERRORS}")
 message(STATUS "  GLOVE_HARDENING      : ${GLOVE_HARDENING_APPLIED}")

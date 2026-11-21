@@ -238,6 +238,14 @@ add_executable(host_runtime_snapshot_bounds_test host/runtime_snapshot_bounds_te
 target_link_libraries(host_runtime_snapshot_bounds_test PRIVATE glove_host)
 add_test(NAME host_runtime_snapshot_bounds COMMAND host_runtime_snapshot_bounds_test)
 set_tests_properties(host_runtime_snapshot_bounds PROPERTIES TIMEOUT 15)
+if(GLOVE_COVERAGE)
+    # The test lowers RLIMIT_FSIZE to 1 KiB. An instrumented child then dies
+    # writing its profile, which is not what the test is about. /dev/null is
+    # not a regular file, so the limit does not apply to it.
+    set_tests_properties(
+        host_runtime_snapshot_bounds PROPERTIES ENVIRONMENT "LLVM_PROFILE_FILE=/dev/null"
+    )
+endif()
 
 add_executable(host_snapshot_cleanup_test host/snapshot_cleanup_test.cpp)
 target_link_libraries(host_snapshot_cleanup_test PRIVATE glove_host)
