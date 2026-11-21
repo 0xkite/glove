@@ -1368,6 +1368,12 @@ else()
     message(STATUS "  reflect codegen test     : fallback-only (reflection unavailable)")
 endif()
 
+# Glaze is a private dependency: an installed header must not require it.
+add_test(NAME public_headers_do_not_require_glaze
+    COMMAND ${CMAKE_COMMAND} -DGLOVE_INCLUDE_DIR=${CMAKE_SOURCE_DIR}/include
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_public_headers.cmake)
+set_tests_properties(public_headers_do_not_require_glaze PROPERTIES TIMEOUT 30)
+
 # Every test gets its own state directory. A glove launch without --audit-log
 # appends to <XDG_STATE_HOME>/glove/logs/session.jsonl under an exclusive
 # lock, so tests sharing the user's default directory fail each other when

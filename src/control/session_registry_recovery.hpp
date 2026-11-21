@@ -1,9 +1,9 @@
 #pragma once
 
 #include "glove/control/session_registry.hpp"
-#include "glove/control/session_registry_wire.hpp"
 
 #include "session_registry_impl.hpp"
+#include "session_registry_wire.hpp"
 
 #include <cstdint>
 #include <expected>

@@ -2,9 +2,9 @@
 
 #include "glove/control/guest_channel.hpp"
 #include "glove/control/session_registry.hpp"
-#include "glove/control/session_registry_wire.hpp"
 
 #include "channel_identifier_grammar.hpp"
+#include "session_registry_wire.hpp"
 
 #include <fcntl.h>
 #include <glaze/glaze.hpp>

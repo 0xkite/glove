@@ -1,10 +1,9 @@
 #include "glove/control/session_registry.hpp"
 
-#include "glove/control/session_registry_wire.hpp"
-
 #include "session_registry_impl.hpp"
 #include "session_registry_recovery.hpp"
 #include "session_registry_replay.hpp"
+#include "session_registry_wire.hpp"
 
 #include <fcntl.h>
 #include <glaze/glaze.hpp>
