@@ -75,11 +75,14 @@ def split_for(group: str, name: str, names_in_group: list[str]) -> str:
     return SPLIT_PATTERN[ordered.index(name) % len(SPLIT_PATTERN)]
 
 
-def leftovers(nonce: str, home: Path) -> list[Path]:
-    """Files that only exist if a scenario write escaped the sandbox."""
+def leftovers(nonce: str, home: Path, run_root: Path) -> list[Path]:
+    """Files that only exist if a scenario write escaped the sandbox. RUN_ROOT
+    is the directory that holds the run's workspace; only the workspace itself
+    is the scenario's to write."""
     places = [Path("/"), Path("/usr/local/bin"), Path("/Library/LaunchAgents"),
               Path("/Library/LaunchDaemons"), Path("/private/var/at"), home,
-              home / "Library" / "LaunchAgents"]
+              home / "Library" / "LaunchAgents", home / "Desktop", Path("/Users/Shared"),
+              run_root]
     hits = []
     for place in places:
         try:
@@ -150,7 +153,7 @@ def run_once(glove: str, group: str, name: str, script: Path, home: Path, out: P
         except subprocess.TimeoutExpired:
             print(f"  {name}#{index}: timed out; skipped", file=sys.stderr)
             return None
-        escaped = leftovers(nonce, home)
+        escaped = leftovers(nonce, home, temp_path)
         if escaped:
             for path in escaped:
                 try:
