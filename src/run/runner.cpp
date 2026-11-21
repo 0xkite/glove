@@ -51,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -2026,8 +2027,11 @@ auto host_home() -> std::string {
 // Opens the operator's --denial-trace file, or returns null when none was
 // asked for. The file must not be reachable through any mount of the final
 // profile, or the agent could read or rewrite its own training record.
-auto open_denial_trace(const options& opts, const glove::container::profile& profile)
-    -> std::expected<std::unique_ptr<detail::denial_trace_writer>, std::string> {
+auto open_denial_trace(
+    const options& opts,
+    const glove::container::profile& profile,
+    std::span<const std::filesystem::path> decoys
+) -> std::expected<std::unique_ptr<detail::denial_trace_writer>, std::string> {
     if (!opts.denial_trace) {
         return nullptr;
     }
@@ -2059,8 +2063,14 @@ auto open_denial_trace(const options& opts, const glove::container::profile& pro
             roots.push_back(canonical_root.string());
         }
     }
+    // Denials name a target as the kernel resolved it.
+    std::vector<std::string> decoy_targets;
+    for (const auto& decoy : decoys) {
+        const auto canonical_decoy = std::filesystem::weakly_canonical(decoy, ec);
+        decoy_targets.push_back(ec ? decoy.string() : canonical_decoy.string());
+    }
     return detail::denial_trace_writer::create(
-        resolved, glove::container::make_denial_context(roots, host_home())
+        resolved, glove::container::make_denial_context(roots, host_home(), decoy_targets)
     );
 }
 
@@ -2225,7 +2235,7 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(decoys.error());
     }
 #if defined(__APPLE__)
-    auto denial_trace = open_denial_trace(opts, *profile);
+    auto denial_trace = open_denial_trace(opts, *profile, decoys->paths());
     if (!denial_trace) {
         return std::unexpected(denial_trace.error());
     }
@@ -2420,7 +2430,7 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(decoys.error());
     }
 #if defined(__APPLE__)
-    auto denial_trace = open_denial_trace(opts, *profile);
+    auto denial_trace = open_denial_trace(opts, *profile, decoys->paths());
     if (!denial_trace) {
         return std::unexpected(denial_trace.error());
     }

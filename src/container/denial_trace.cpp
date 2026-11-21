@@ -24,6 +24,17 @@ struct header_record {
     std::uint32_t version = denial_trace_version;
     std::string home;
     std::vector<std::string> workspace_roots;
+    std::vector<std::string> decoys;
+};
+
+// The version 1 header, which had no decoys.
+// NOLINTNEXTLINE(misc-use-internal-linkage): Glaze reflection needs linkage.
+struct header_record_v1 {
+    std::string type = "header";
+    std::string format = "glove-denial-trace";
+    std::uint32_t version = 1;
+    std::string home;
+    std::vector<std::string> workspace_roots;
 };
 
 // NOLINTNEXTLINE(misc-use-internal-linkage): Glaze reflection needs linkage.
@@ -59,6 +70,7 @@ namespace {
 using denial_trace_detail::end_record;
 using denial_trace_detail::event_record;
 using denial_trace_detail::header_record;
+using denial_trace_detail::header_record_v1;
 
 struct trace_opts : glz::opts {
     bool validate_trailing_whitespace = true;
@@ -91,7 +103,9 @@ auto valid_root(std::string_view root) -> bool {
 auto valid_context(const denial_context& context) -> bool {
     return (context.home.empty() || valid_root(context.home)) &&
            context.workspace_roots.size() <= max_denial_context_roots &&
-           std::ranges::all_of(context.workspace_roots, valid_root);
+           std::ranges::all_of(context.workspace_roots, valid_root) &&
+           context.decoys.size() <= max_denial_context_decoys &&
+           std::ranges::all_of(context.decoys, valid_root);
 }
 
 auto valid_kind(std::string_view kind) -> bool {
@@ -200,15 +214,30 @@ struct trace_reader {
     }
 
     auto header(std::string_view text) -> std::expected<void, std::string> {
+        if (!text.starts_with(header_prefix)) {
+            return refuse("first line is not a header");
+        }
         header_record record;
-        if (!text.starts_with(header_prefix) || !read_line(text, record) ||
-            record.type != "header" || record.format != "glove-denial-trace" ||
+        if (header_record_v1 old; read_line(text, old)) {
+            record = {
+                .type = std::move(old.type),
+                .format = std::move(old.format),
+                .version = old.version == 1 ? denial_trace_version : 0,
+                .home = std::move(old.home),
+                .workspace_roots = std::move(old.workspace_roots),
+                .decoys = {},
+            };
+        } else if (!read_line(text, record)) {
+            return refuse("first line is not a header");
+        }
+        if (record.type != "header" || record.format != "glove-denial-trace" ||
             record.version != denial_trace_version) {
-            return refuse("first line is not a version 1 header");
+            return refuse("first line is not a version 1 or 2 header");
         }
         trace.context = {
             .workspace_roots = std::move(record.workspace_roots),
             .home = std::move(record.home),
+            .decoys = std::move(record.decoys),
         };
         if (!valid_context(trace.context)) {
             return refuse("header context is not encoded directories");
@@ -267,6 +296,7 @@ auto denial_trace_header_line(const denial_context& context)
     header_record record;
     record.home = context.home;
     record.workspace_roots = context.workspace_roots;
+    record.decoys = context.decoys;
     return line_of(record);
 }
 
