@@ -17,6 +17,7 @@
 #include <fstream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -282,7 +283,7 @@ auto run() -> int {
         REQUIRE(library_mount->source_content_digest == library_digest());
         const auto runtime_home_mount = std::ranges::find(
             prepared_mounts,
-            "/home/agent",
+            std::string_view{"/home/agent"},
             &glove::supervisor::linux_detail::session_mount::target_path
         );
         REQUIRE(runtime_home_mount != prepared_mounts.end());
@@ -316,7 +317,7 @@ auto run() -> int {
     const auto credential_mounts = first_prepared->lifecycle->mounts();
     const auto credential_mount = std::ranges::find(
         credential_mounts,
-        "/home/agent/.codex/auth.json",
+        std::string_view{"/home/agent/.codex/auth.json"},
         &glove::supervisor::linux_detail::session_mount::target_path
     );
     REQUIRE(credential_mount != credential_mounts.end());

@@ -75,7 +75,7 @@ auto positive_cases() -> int {
         REQUIRE(validate_native_startup_recipe(input, *recipe));
         REQUIRE(recipe->argv.front() == f.runtime.launch_executable.string());
         REQUIRE(recipe->argv[1] == f.runtime.launch_arguments.front());
-        const auto session = std::ranges::find(recipe->argv, "--session-dir");
+        const auto session = std::ranges::find(recipe->argv, std::string_view{"--session-dir"});
         REQUIRE(session != recipe->argv.end());
         REQUIRE(
             std::distance(session, recipe->argv.end()) ==
