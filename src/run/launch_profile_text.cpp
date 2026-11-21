@@ -12,6 +12,7 @@
 #include <map>
 #include <ranges>
 #include <set>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -284,18 +285,8 @@ auto convert(const profile_doc& doc) -> std::expected<launch_profile, std::strin
         }
     }
     for (const auto& name : doc.system_services.value_or(std::vector<std::string>{})) {
-        if (name.empty() || name.size() > 64U) {
-            return std::unexpected(std::string{"system_services: names are 1-64 bytes"});
-        }
-        if (name.contains('.')) {
-            return std::unexpected(
-                "system_services: '" + name +
-                "' looks like a raw platform service name; raw mach service names are not "
-                "accepted, select a catalog name"
-            );
-        }
-        if (glove::container::find_system_service(name) == nullptr) {
-            return std::unexpected("system_services: unknown system service '" + name + "'");
+        if (auto checked = glove::container::check_system_service_name(name); !checked) {
+            return std::unexpected("system_services: " + checked.error());
         }
         out.system_services.push_back(name);
     }
@@ -434,45 +425,49 @@ auto encode_launch_profile(const launch_profile& profile) -> std::string {
 }
 
 auto launch_profile_template() -> std::string_view {
-    return "# glove launch profile. Glove reads this file on the host; the sandbox\n"
-           "# can never read or write it. Paths are absolute or start with ~/.\n"
-           "# Check it with: glove profile check <name>\n"
-           "version: 1\n"
-           "\n"
-           "# workspace: ~/src/project       # read-write working directory\n"
-           "# agent: claude-code             # mediated provider credentials\n"
-           "\n"
-           "# read:                          # extra read-only paths\n"
-           "#   - /opt/datasets\n"
-           "# write:                         # extra read-write paths\n"
-           "#   - ~/scratch\n"
-           "\n"
-           "# env:                           # nothing is inherited by default\n"
-           "#   LANG: { value: en_US.UTF-8 }\n"
-           "#   CI: { from: host }\n"
-           "\n"
-           "# egress:                        # outbound HTTPS; none means no network\n"
-           "#   - { host: registry.npmjs.org, port: 443 }\n"
-           "\n"
-           "# mcp:\n"
-           "#   - { name: yams, argv: [/usr/local/bin/yams, serve, --quiet] }\n"
-           "# allow: [yams.search]\n"
-           "# allow_arg:\n"
-           "#   - { tool: yams.search, field: path, prefix: /src }\n"
-           "\n"
-           "# bridge_port: 8080              # host 127.0.0.1 port bridged inside\n"
-           "# service_ports: [18000, 18001]  # plain host loopback services (no credential)\n"
-           "\n"
-           "# secrets:                       # resolved on the host; the sandbox sees a nonce\n"
-           "#   provider: keychain://glove/anthropic   # or env://NAME, file://~/path\n"
-           "\n"
-           "# system_services:               # opt-in host services from the catalog:\n"
-           "#   - network-config              # network-config (system proxy settings)\n"
-           "#   - tls-config                  # tls-config (/private/etc/ssl for curl)\n"
-           "\n"
-           "# decoys:                        # canary files planted outside the sandbox for\n"
-           "#   - ~/.private/backup-token     # each launch; a sandboxed read is audited. Use\n"
-           "#                                 # names a probe would try but you do not have.\n";
+    static const std::string text = [] {
+        std::string out =
+            "# glove launch profile. Glove reads this file on the host; the sandbox\n"
+            "# can never read or write it. Paths are absolute or start with ~/.\n"
+            "# Check it with: glove profile check <name>\n"
+            "version: 1\n"
+            "\n"
+            "# workspace: ~/src/project       # read-write working directory\n"
+            "# agent: claude-code             # mediated provider credentials\n"
+            "\n"
+            "# read:                          # extra read-only paths\n"
+            "#   - /opt/datasets\n"
+            "# write:                         # extra read-write paths\n"
+            "#   - ~/scratch\n"
+            "\n"
+            "# env:                           # nothing is inherited by default\n"
+            "#   LANG: { value: en_US.UTF-8 }\n"
+            "#   CI: { from: host }\n"
+            "\n"
+            "# egress:                        # outbound HTTPS; none means no network\n"
+            "#   - { host: registry.npmjs.org, port: 443 }\n"
+            "\n"
+            "# mcp:\n"
+            "#   - { name: yams, argv: [/usr/local/bin/yams, serve, --quiet] }\n"
+            "# allow: [yams.search]\n"
+            "# allow_arg:\n"
+            "#   - { tool: yams.search, field: path, prefix: /src }\n"
+            "\n"
+            "# bridge_port: 8080              # host 127.0.0.1 port bridged inside\n"
+            "# service_ports: [18000, 18001]  # plain host loopback services (no credential)\n"
+            "\n"
+            "# secrets:                       # resolved on the host; the sandbox sees a nonce\n"
+            "#   provider: keychain://glove/anthropic   # or env://NAME, file://~/path\n"
+            "\n"
+            "# system_services:               # opt-in host services from the catalog:\n";
+        out += "#   [" + glove::container::system_service_names() + "]\n";
+        out += "\n"
+               "# decoys:                        # canary files planted outside the sandbox for\n"
+               "#   - ~/.private/backup-token     # each launch; a sandboxed read is audited. Use\n"
+               "#                                 # names a probe would try but you do not have.\n";
+        return out;
+    }();
+    return text;
 }
 
 } // namespace glove::run

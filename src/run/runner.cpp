@@ -759,11 +759,10 @@ auto prepare_profile(const options& opts, const std::filesystem::path& runtime_r
     // Glove's own configuration and state stay host-only, whatever the
     // operator granted: an agent that could write a launch profile would
     // choose its next sandbox.
-    std::vector<std::string> exposed;
-    for (const auto& rule : validated->filesystem) {
-        exposed.push_back(rule.path);
-    }
-    if (auto refused = refuse_glove_root_exposure(exposed, protected_glove_roots()); !refused) {
+    if (auto refused = refuse_glove_root_exposure(
+            glove::container::exposed_grant_paths(*validated), protected_glove_roots()
+        );
+        !refused) {
         return std::unexpected(refused.error());
     }
     if (auto prepared = provision(*validated); !prepared) {
@@ -775,6 +774,12 @@ auto prepare_profile(const options& opts, const std::filesystem::path& runtime_r
         return std::unexpected(
             std::string{"profile changed during provisioning: "} + revalidated.error()
         );
+    }
+    if (auto refused = refuse_glove_root_exposure(
+            glove::container::exposed_grant_paths(*revalidated), protected_glove_roots()
+        );
+        !refused) {
+        return std::unexpected(refused.error());
     }
     return revalidated;
 }

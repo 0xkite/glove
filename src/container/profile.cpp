@@ -115,18 +115,8 @@ auto resolve_system_services(profile& p) -> std::expected<void, std::string> {
         return std::unexpected(std::string{"too many system services (limit 64)"});
     }
     for (const auto& name : p.system_services) {
-        if (name.empty() || name.size() > 64U) {
-            return std::unexpected(std::string{"system service name must be 1-64 bytes"});
-        }
-        if (name.contains('.')) {
-            return std::unexpected(
-                "system service '" + name +
-                "' looks like a raw platform service name; raw mach service names are not "
-                "accepted, select a catalog name"
-            );
-        }
-        if (find_system_service(name) == nullptr) {
-            return std::unexpected("unknown system service '" + name + "'");
+        if (auto checked = check_system_service_name(name); !checked) {
+            return std::unexpected(checked.error());
         }
     }
     std::ranges::sort(p.system_services);
@@ -329,6 +319,20 @@ auto resource_enforcement_capabilities::complete() const noexcept -> bool {
            wall_time == enforcement_mechanism::watchdog &&
            disk == enforcement_mechanism::filesystem_quota &&
            terminal_output == enforcement_mechanism::byte_counter && receipt_schema_version == 1;
+}
+
+auto exposed_grant_paths(const profile& p) -> std::vector<std::string> {
+    std::vector<std::string> paths;
+    for (const auto& rule : p.filesystem) {
+        paths.push_back(rule.path);
+    }
+    for (const auto& rule : p.runtime_filesystem) {
+        paths.push_back(rule.path);
+    }
+    for (const auto& path : p.system_service_read_paths) {
+        paths.push_back(path);
+    }
+    return paths;
 }
 
 auto validate(const profile& p) -> std::expected<profile, std::string> {
