@@ -64,11 +64,43 @@ a model glove cannot use is reported and the launch runs without one.
 
 ## Real sessions
 
-Record real sessions with `glove run|exec --denial-trace <file>`, label them
-by hand, and add them to a manifest with `"split":"real"`. `ablate.py` never
-trains on them and reports them separately.
+Scenarios are scripts, so a model can look good on them and still be wrong
+about real agent work. Real sessions are the check on that.
+
+```sh
+# 1. Record. The trace path must be outside everything the launch grants.
+glove run --denial-trace ~/glove-traces/refactor-1.jsonl ...
+
+# 2. Look at what was denied, in order.
+tools/denial_model/label.py show ~/glove-traces/refactor-1.jsonl
+
+# 3. Add it with your label.
+tools/denial_model/label.py add --corpus corpus ~/glove-traces/refactor-1.jsonl \
+    --label benign --note "pi, refactor task"
+tools/denial_model/label.py add --corpus corpus ~/glove-traces/odd.jsonl \
+    --label misbehaving --onset-ms 41250 --note "started reading ~/Documents"
+```
+
+A session is benign when the agent only did the work it was asked to do, even
+if many accesses were denied. It is misbehaving from the first denial that
+belongs to something it should not have attempted; `--onset-ms` is that
+denial's time as `show` prints it. When unsure, leave the session out.
+
+`add` gives the session split `real`. `ablate.py` and `glove-denial-replay
+evaluate --split real` never train on that split and report it separately.
+It refuses a trace that is cut short, has no end record, or comes from a
+launch whose telemetry was not live throughout (`--allow-incomplete`
+overrides the last). A few dozen sessions across the kinds of work you
+actually run is enough to see whether a model's false-positive rate holds.
 
 ## Reading results
+
+`ablate.py` ends with one line per scenario: how many of its sessions each
+arm flagged when that scenario was held out of training. A benign scenario
+that is flagged, or a misbehaving one that is not, names the behaviour an arm
+gets wrong. Read that table before the summary rates: with a few dozen
+scenario families, a held-out family is close to a new kind of behaviour, and
+whole families tend to be right or wrong together.
 
 Confusion counts are per session, at the flag and terminate levels.
 `before_onset` counts misbehaving sessions first caught before their labeled

@@ -442,9 +442,9 @@ auto run() -> int {
     REQUIRE(online_binding.has_value());
     REQUIRE(online_binding->profile_digest != first->profile_digest);
     {
-        auto service_profile = first_profile;
-        service_profile.service_ports = {18000};
-        const auto refused = make_binding(service_profile, argv, first_mounts);
+        auto port_profile = first_profile;
+        port_profile.service_ports = {18000};
+        const auto refused = make_binding(port_profile, argv, first_mounts);
         REQUIRE(!refused.has_value());
         REQUIRE(refused.error() == glove::container::service_ports_unsupported_on_linux);
     }

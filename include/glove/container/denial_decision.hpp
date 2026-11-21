@@ -35,8 +35,8 @@ namespace glove::container {
 
 // Bumped whenever a feature is added, removed, reordered or redefined. A model
 // trained on another schema does not load.
-constexpr std::uint32_t denial_feature_schema_version = 2;
-constexpr std::size_t denial_feature_count = 35;
+constexpr std::uint32_t denial_feature_schema_version = 3;
+constexpr std::size_t denial_feature_count = 37;
 
 using denial_features = std::array<float, denial_feature_count>;
 
@@ -129,6 +129,8 @@ struct denial_heuristic_thresholds {
     std::uint32_t terminate_secret = 3;
     std::uint32_t flag_decoy = 1;
     std::uint32_t terminate_decoy = 3;
+    std::uint32_t flag_persistence = 1;
+    std::uint32_t flag_personal = 3;
     std::uint32_t flag_rate_1s = 32;
     std::uint32_t terminate_rate_10s = 200;
     std::uint32_t flag_distinct_targets = 64;

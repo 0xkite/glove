@@ -17,7 +17,7 @@ namespace glove::container {
 
 namespace {
 
-// Schema version 2. Every value is log1p of a count or of seconds, so a
+// Schema version 3. Every value is log1p of a count or of seconds, so a
 // linear model sees a usable scale and thresholds compare monotonically.
 constexpr std::array<std::string_view, denial_feature_count> feature_names{
     "denials",
@@ -38,6 +38,7 @@ constexpr std::array<std::string_view, denial_feature_count> feature_names{
     "ambiguous",
     "target_workspace",
     "target_home_secret",
+    "target_home_personal",
     "target_home_other",
     "target_system",
     "target_temp",
@@ -45,6 +46,7 @@ constexpr std::array<std::string_view, denial_feature_count> feature_names{
     "target_other_path",
     "target_none",
     "write_outside_workspace",
+    "write_persistence",
     "target_decoy",
     "distinct_targets",
     "distinct_comms",
@@ -65,23 +67,25 @@ constexpr std::size_t f_kind_other = 14;
 constexpr std::size_t f_ambiguous = 15;
 constexpr std::size_t f_target_workspace = 16;
 constexpr std::size_t f_target_home_secret = 17;
-constexpr std::size_t f_target_home_other = 18;
-constexpr std::size_t f_target_system = 19;
-constexpr std::size_t f_target_temp = 20;
-constexpr std::size_t f_target_device = 21;
-constexpr std::size_t f_target_other_path = 22;
-constexpr std::size_t f_target_none = 23;
-constexpr std::size_t f_write_outside_workspace = 24;
-constexpr std::size_t f_target_decoy = 25;
-constexpr std::size_t f_distinct_targets = 26;
-constexpr std::size_t f_distinct_comms = 27;
-constexpr std::size_t f_truncated_targets = 28;
-constexpr std::size_t f_duplicate_reports = 29;
-constexpr std::size_t f_rate_1s = 30;
-constexpr std::size_t f_rate_10s = 31;
-constexpr std::size_t f_elapsed_seconds = 32;
-constexpr std::size_t f_first_denial_seconds = 33;
-constexpr std::size_t f_idle_seconds = 34;
+constexpr std::size_t f_target_home_personal = 18;
+constexpr std::size_t f_target_home_other = 19;
+constexpr std::size_t f_target_system = 20;
+constexpr std::size_t f_target_temp = 21;
+constexpr std::size_t f_target_device = 22;
+constexpr std::size_t f_target_other_path = 23;
+constexpr std::size_t f_target_none = 24;
+constexpr std::size_t f_write_outside_workspace = 25;
+constexpr std::size_t f_write_persistence = 26;
+constexpr std::size_t f_target_decoy = 27;
+constexpr std::size_t f_distinct_targets = 28;
+constexpr std::size_t f_distinct_comms = 29;
+constexpr std::size_t f_truncated_targets = 30;
+constexpr std::size_t f_duplicate_reports = 31;
+constexpr std::size_t f_rate_1s = 32;
+constexpr std::size_t f_rate_10s = 33;
+constexpr std::size_t f_elapsed_seconds = 34;
+constexpr std::size_t f_first_denial_seconds = 35;
+constexpr std::size_t f_idle_seconds = 36;
 
 static_assert(f_idle_seconds + 1 == denial_feature_count);
 
@@ -122,6 +126,47 @@ constexpr std::array<std::string_view, 16> home_secret_suffixes{
     "/Library/Cookies",
     "/Library/Application Support/Google/Chrome",
     "/Library/Application Support/Firefox",
+};
+
+// Where a person's own documents, media, mail and messages live under the
+// home directory, as opposed to tool configuration. Ordinary agent work reads
+// dotfiles; it has little reason to walk these.
+constexpr std::array<std::string_view, 11> home_personal_suffixes{
+    "/Documents",
+    "/Desktop",
+    "/Downloads",
+    "/Pictures",
+    "/Movies",
+    "/Music",
+    "/Library/Mail",
+    "/Library/Messages",
+    "/Library/Calendars",
+    "/Library/Safari",
+    "/Library/Application Support/AddressBook",
+};
+
+// Places that make code run again later: per-user and system launch items,
+// scheduled jobs, and shell startup files. A denied write to one is counted;
+// reading a startup file is ordinary.
+constexpr std::array<std::string_view, 9> home_persistence_suffixes{
+    "/Library/LaunchAgents",
+    "/.zshrc",
+    "/.zshenv",
+    "/.zprofile",
+    "/.zlogin",
+    "/.bashrc",
+    "/.bash_profile",
+    "/.profile",
+    "/.config/fish",
+};
+
+constexpr std::array<std::string_view, 6> system_persistence_prefixes{
+    "/Library/LaunchAgents",
+    "/Library/LaunchDaemons",
+    "/System/Library/LaunchDaemons",
+    "/private/var/at",
+    "/usr/lib/cron",
+    "/private/etc/periodic",
 };
 
 constexpr std::array<std::string_view, 9> system_prefixes{
@@ -310,12 +355,14 @@ void denial_feature_builder::observe(
         target_class = f_target_workspace;
     } else if (!home_.empty() && within(target, home_)) {
         const auto rest = target.substr(home_.size());
-        target_class =
-            std::ranges::any_of(
-                home_secret_suffixes, [&](std::string_view suffix) { return within(rest, suffix); }
-            )
-                ? f_target_home_secret
-                : f_target_home_other;
+        const auto under = [&](std::string_view suffix) { return within(rest, suffix); };
+        if (std::ranges::any_of(home_secret_suffixes, under)) {
+            target_class = f_target_home_secret;
+        } else if (std::ranges::any_of(home_personal_suffixes, under)) {
+            target_class = f_target_home_personal;
+        } else {
+            target_class = f_target_home_other;
+        }
     } else if (std::ranges::any_of(temp_prefixes, [&](std::string_view prefix) {
                    return within(target, prefix);
                })) {
@@ -335,6 +382,19 @@ void denial_feature_builder::observe(
     if (denial.kind == "file_write" && target_class != f_target_workspace &&
         target_class != f_target_temp && target_class != f_target_none) {
         ++std::get<f_write_outside_workspace>(counts_);
+    }
+    if (denial.kind == "file_write") {
+        const bool home_persistence =
+            !home_.empty() && within(target, home_) &&
+            std::ranges::any_of(home_persistence_suffixes, [&](std::string_view suffix) {
+                return within(target.substr(home_.size()), suffix);
+            });
+        if (home_persistence ||
+            std::ranges::any_of(system_persistence_prefixes, [&](std::string_view prefix) {
+                return within(target, prefix);
+            })) {
+            ++std::get<f_write_persistence>(counts_);
+        }
     }
 }
 
@@ -401,6 +461,8 @@ public:
           terminate_secret_{log_scale(limits.terminate_secret)},
           flag_decoy_{log_scale(limits.flag_decoy)},
           terminate_decoy_{log_scale(limits.terminate_decoy)},
+          flag_persistence_{log_scale(limits.flag_persistence)},
+          flag_personal_{log_scale(limits.flag_personal)},
           flag_rate_{log_scale(limits.flag_rate_1s)},
           terminate_rate_{log_scale(limits.terminate_rate_10s)},
           flag_distinct_{log_scale(limits.flag_distinct_targets)} {}
@@ -418,7 +480,10 @@ public:
             return {.verdict = denial_verdict::terminate, .score = 1.0F};
         }
         if (std::get<f_target_home_secret>(in) >= flag_secret_ ||
-            std::get<f_target_decoy>(in) >= flag_decoy_ || std::get<f_rate_1s>(in) >= flag_rate_ ||
+            std::get<f_target_decoy>(in) >= flag_decoy_ ||
+            std::get<f_write_persistence>(in) >= flag_persistence_ ||
+            std::get<f_target_home_personal>(in) >= flag_personal_ ||
+            std::get<f_rate_1s>(in) >= flag_rate_ ||
             std::get<f_distinct_targets>(in) >= flag_distinct_) {
             return {.verdict = denial_verdict::flag, .score = 0.5F};
         }
@@ -430,6 +495,8 @@ private:
     float terminate_secret_;
     float flag_decoy_;
     float terminate_decoy_;
+    float flag_persistence_;
+    float flag_personal_;
     float flag_rate_;
     float terminate_rate_;
     float flag_distinct_;
