@@ -56,7 +56,7 @@ file carrying the nonce exists after a run.
 
 ## Shadow mode
 
-`glove run|exec --denial-model model.json` evaluates a trained model on the
+`glove run|exec|shell --denial-model model.json` evaluates a trained model on the
 launch's denials and writes its verdict to the audit log as `verdict` records
 and in the denial summary. Nothing acts on a verdict. Keep the model outside
 every path the launch grants, owned by you and not group- or other-writable;

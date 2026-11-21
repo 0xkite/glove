@@ -1,7 +1,6 @@
-// `glove exec --denial-trace` on macOS records a short-lived child's denial
-// to a new trace file that parses back and replays into features. A trace
-// path the agent could reach, or an existing file, stops the launch before
-// the agent runs.
+// `glove exec --denial-trace` and `glove shell --denial-trace` on macOS record a short-lived
+// child's denial to a new trace file that parses back and replays into features. A trace path the
+// agent could reach, or an existing file, stops the launch before the agent runs.
 
 #include "glove/container/denial_decision.hpp"
 #include "glove/container/denial_trace.hpp"
@@ -50,7 +49,8 @@ auto glove_exec(
     const std::filesystem::path& trace,
     const std::filesystem::path& audit,
     const std::string& script,
-    const std::filesystem::path& stderr_path
+    const std::filesystem::path& stderr_path,
+    const char* subcommand = "exec"
 ) -> int {
     const ::pid_t child = ::fork();
     if (child < 0) {
@@ -64,7 +64,7 @@ auto glove_exec(
         ::execl(
             GLOVE_BIN,
             GLOVE_BIN,
-            "exec",
+            subcommand,
             "--workspace",
             workspace.c_str(),
             "--denial-trace",
@@ -85,7 +85,8 @@ auto glove_exec(
     return ::waitpid(child, &status, 0) == child ? status : -1;
 }
 
-auto records(int number, const std::filesystem::path& home) -> int {
+auto records(int number, const std::filesystem::path& home, const char* subcommand = "exec")
+    -> int {
     std::error_code ec;
     const auto base =
         std::filesystem::canonical(std::filesystem::temp_directory_path()) /
@@ -102,7 +103,8 @@ auto records(int number, const std::filesystem::path& home) -> int {
         trace_path,
         base / "audit.jsonl",
         "/usr/bin/touch '" + forbidden.string() + "'; exit 0",
-        base / "stderr.txt"
+        base / "stderr.txt",
+        subcommand
     );
     if (std::filesystem::exists(forbidden, ec)) {
         std::filesystem::remove(forbidden, ec);
@@ -143,7 +145,7 @@ auto records(int number, const std::filesystem::path& home) -> int {
         std::ranges::find(names, std::string_view{"write_outside_workspace"}) - names.begin()
     );
     REQUIRE(features.at(at) >= static_cast<float>(std::log1p(1.0)));
-    std::printf("T trial %d ok (%zu events)\n", number, trace->events.size());
+    std::printf("T %s trial %d ok (%zu events)\n", subcommand, number, trace->events.size());
     std::filesystem::remove_all(base, ec);
     return 0;
 }
@@ -173,6 +175,14 @@ auto refuses(const std::filesystem::path&) -> int {
     REQUIRE(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) != 0);
     REQUIRE(!std::filesystem::exists(ran, ec));
     REQUIRE(read_file(existing) == "keep\n");
+
+    // `glove shell` takes the same flag and applies the same refusal.
+    status =
+        glove_exec(workspace, inside, base / "audit.jsonl", script, base / "stderr3.txt", "shell");
+    REQUIRE(status >= 0 && WIFEXITED(status) && WEXITSTATUS(status) != 0);
+    REQUIRE(!std::filesystem::exists(ran, ec));
+    REQUIRE(!std::filesystem::exists(inside, ec));
+    REQUIRE(read_file(base / "stderr3.txt").contains("denial trace destination is exposed"));
     std::printf("R ok\n");
     std::filesystem::remove_all(base, ec);
     return 0;
@@ -191,6 +201,9 @@ auto main() -> int {
         if (const int failed = records(number, home); failed != 0) {
             return failed;
         }
+    }
+    if (const int failed = records(trials + 1, home, "shell"); failed != 0) {
+        return failed;
     }
     if (const int failed = refuses(home); failed != 0) {
         return failed;

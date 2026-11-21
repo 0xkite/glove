@@ -276,6 +276,10 @@ void print_shell_usage() {
         "  --system-service <name> opt in to a host system service from the catalog\n"
         "                          (%s; repeatable; default none)\n"
         "  --audit-log <path>      append launch, exit, and egress events as JSONL\n"
+        "  --denial-trace <path>   record this launch's sandbox denials to a new file\n"
+        "                          (macOS; for training denial deciders)\n"
+        "  --denial-model <path>   record a trained model's verdict on this launch's\n"
+        "                          denials; nothing acts on it (macOS)\n"
         "  --share-credential <pi-provider>\n"
         "                          with --agent pi: mediate the host API key for one Pi\n"
         "                          provider; the sandbox gets a session nonce, never the key\n"
@@ -433,6 +437,26 @@ auto parse_sandbox_flag(
         } else {
             opts.audit_log = std::filesystem::path{args[i + 1]};
         }
+        i += 2;
+        return 0;
+    }
+    // One launch, one trace: the file must be new. `glove loop` runs a launch
+    // per turn, so it does not take these.
+    if ((a == "--denial-trace" || a == "--denial-model") &&
+        (cmd_name == "exec" || cmd_name == "shell")) {
+        if (i + 1 >= args.size()) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: %.*s needs an argument\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data(),
+                static_cast<int>(a.size()),
+                a.data()
+            );
+            return 2;
+        }
+        (a == "--denial-trace" ? opts.denial_trace : opts.denial_model) =
+            std::filesystem::path{args[i + 1]};
         i += 2;
         return 0;
     }
@@ -674,24 +698,6 @@ auto exec_subcommand(std::span<char* const> args) -> int {
         if (a == "-h" || a == "--help") {
             print_exec_usage();
             return 0;
-        }
-        if (a == "--denial-trace") {
-            if (i + 1 >= args.size()) {
-                std::fprintf(stderr, "glove exec: --denial-trace needs an argument\n");
-                return 2;
-            }
-            opts.denial_trace = std::filesystem::path{args[i + 1]};
-            i += 2;
-            continue;
-        }
-        if (a == "--denial-model") {
-            if (i + 1 >= args.size()) {
-                std::fprintf(stderr, "glove exec: --denial-model needs an argument\n");
-                return 2;
-            }
-            opts.denial_model = std::filesystem::path{args[i + 1]};
-            i += 2;
-            continue;
         }
         if (const auto handled = parse_profile_flag(args, i, profile_name, "exec")) {
             if (*handled != 0) {
@@ -1713,6 +1719,8 @@ auto shell_subcommand(std::span<char* const> args) -> int {
             loaded.audit_log = opts.audit_log;
         }
         // Not stored in saved environments; a flag given at load time applies.
+        loaded.denial_trace = opts.denial_trace;
+        loaded.denial_model = opts.denial_model;
         loaded.share_credential = opts.share_credential;
         loaded.share_credential_origin = opts.share_credential_origin;
         // A path given both in the profile and on the command line is one rule.
