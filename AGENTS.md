@@ -128,6 +128,7 @@ platform.
 | `tests/` | CTest targets organized by module |
 | `cmake/` | warnings, sanitizers, dependencies |
 | `scripts/preflight.sh` | repository gate |
+| `formal/` | TLA+ models, checked by `scripts/tlc.sh` |
 
 ## Change checklist
 

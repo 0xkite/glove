@@ -38,6 +38,7 @@ are in [`docs/architecture.md`](docs/architecture.md) and
 - [`docs/toolchain.md`](docs/toolchain.md) — compilers, C++23/C++26 selection,
   presets, options, and flags
 - [`docs/host-setup.md`](docs/host-setup.md) — owner-local machine setup
+- [`docs/formal-verification.md`](docs/formal-verification.md) — TLA+ models
 - [`docs/session-policy.md`](docs/session-policy.md) — managed-session policy
   contract
 - [`docs/hostile-content-analysis.md`](docs/hostile-content-analysis.md) —
