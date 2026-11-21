@@ -20,6 +20,7 @@
 #include "glove/run/pi_host_config.hpp"
 #include "glove/run/pi_provider_share.hpp"
 
+#include "audit_journal.hpp"
 #include "decoys.hpp"
 #include "exit_audit.hpp"
 #include "provider_endpoint.hpp"
@@ -1024,6 +1025,22 @@ auto build_audit_sink(const std::optional<std::filesystem::path>& path, bool is_
         glove::audit::jsonl_sink_limits limits{};
         if (is_default_log) {
             limits.max_file_bytes = 10U * 1024U * 1024U;
+        }
+        if (is_default_log) {
+            // Concurrent launches each need a journal; only an explicit
+            // --audit-log that is in use stays an error.
+            auto journal = detail::open_default_audit_journal(*path, limits);
+            if (!journal) {
+                return std::unexpected(
+                    "failed to open audit journal '" + path->string() + "': " + journal.error()
+                );
+            }
+            if (journal->overflow) {
+                const std::string line = std::string{detail::own_audit_journal_notice_prefix} +
+                                         journal->path.string() + "\n";
+                static_cast<void>(std::fputs(line.c_str(), stderr));
+            }
+            return std::move(journal->sink);
         }
         auto file_sink = glove::audit::make_jsonl_sink(*path, limits);
         if (!file_sink) {

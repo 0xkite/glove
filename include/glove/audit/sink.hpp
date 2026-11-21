@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace glove::audit {
@@ -50,6 +51,11 @@ auto make_memory_sink() -> std::shared_ptr<memory_sink>;
 struct jsonl_sink_limits {
     std::uint64_t max_file_bytes = 0;
 };
+
+// The exact error make_jsonl_sink returns when another process holds the
+// journal's lock. A journal has one writer for as long as its sink lives.
+inline constexpr std::string_view jsonl_sink_busy =
+    "audit journal is in use by another glove launch";
 
 auto make_jsonl_sink(const std::filesystem::path& path, jsonl_sink_limits limits = {})
     -> std::expected<std::shared_ptr<sink>, std::string>;

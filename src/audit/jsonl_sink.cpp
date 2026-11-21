@@ -289,7 +289,9 @@ auto make_jsonl_sink(const std::filesystem::path& path, jsonl_sink_limits limits
         if (errno == EINTR) {
             continue;
         }
-        const auto error = system_error("lock audit journal");
+        const auto error = errno == EWOULDBLOCK || errno == EAGAIN
+                               ? std::string{jsonl_sink_busy}
+                               : system_error("lock audit journal");
         ::close(descriptor);
         return std::unexpected(error);
     }
