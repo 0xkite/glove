@@ -14,7 +14,7 @@ annotations, or CMake reflection detection in this repository.
 - Test: `tests/reflect/codegen_test.cpp` (`reflect_codegen`)
 
 ## Rules (Verified on GCC 16.2.1 + Clang 23.1.5)
-1. **Tri-state CMake option**: Keep `GLOVE_REFLECTION` as `AUTO|ON|OFF` (default `AUTO`).
+1. **Tri-state CMake option**: Keep `GLOVE_REFLECTION` as `AUTO|ON|OFF` (default `OFF`).
    - `AUTO` probes `-freflection` (GCC 16+) and `-freflection-latest` (clang-p2996)
      under `CMAKE_CXX_STANDARD=26` with `#include <meta>` / `<experimental/meta>`.
    - Hosts without P2996 (Clang 18, Apple Clang) must still configure and pass

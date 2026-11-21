@@ -7,9 +7,9 @@ maintaining hand-written schema strings.
 
 ## Build Configuration (`GLOVE_REFLECTION`)
 
-`GLOVE_REFLECTION` accepts `AUTO` (default), `ON`, or `OFF`:
+`GLOVE_REFLECTION` accepts `OFF` (default), `AUTO`, or `ON`:
 
-- `AUTO` (default): `CMakeLists.txt` sets `CMAKE_CXX_STANDARD=26` and probes
+- `AUTO`: `CMakeLists.txt` sets `CMAKE_CXX_STANDARD=26` and probes
   `-freflection` (GCC 16+) and `-freflection-latest` (clang-p2996) by compiling
   a `<meta>` / `<experimental/meta>` program that reads members and
   annotations the way `codegen.hpp` does. A compiler that accepts the flag
@@ -21,7 +21,8 @@ maintaining hand-written schema strings.
     (`glove::reflect::reflection_available` is `false`).
 - `ON`: requires a P2996-capable compiler and fails CMake configuration if `<meta>`
   is unavailable.
-- `OFF`: forces reflection off even when the host compiler supports it.
+- `OFF` (default): no probe; reflection is off and the build is C++23 even
+  when the host compiler supports reflection.
 
 Enabling reflection compiles every target as C++26, not only the reflection
 headers; see [toolchain.md](toolchain.md#language-standard). CI builds with

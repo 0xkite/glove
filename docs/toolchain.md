@@ -11,7 +11,7 @@ that changes the build. Prerequisites and the build commands are in
 | Clang 18 + libc++ 18, Ubuntu 24.04 | C++23 | CI on every PR, full gate |
 | Apple Clang (Xcode on the `macos-15` runner) | C++23 | CI on every PR, full gate |
 | Clang 23 + libstdc++ 16, Linux | C++23 | by hand |
-| GCC 16 + libstdc++ 16, Linux | C++26 | by hand, no `-Werror` (see below) |
+| GCC 16 + libstdc++ 16, Linux | C++23, and C++26 with `GLOVE_REFLECTION=ON` | by hand, no `-Werror` (see below) |
 
 Only the first two rows are a continuing guarantee. Nothing in CI builds with
 GCC or as C++26.
@@ -34,14 +34,15 @@ GCC is not a gated compiler:
 C++23 is the baseline: `CMAKE_CXX_STANDARD 23`, required, no GNU extensions
 (`-std=c++23`, never `-std=gnu++23`).
 
-The build becomes C++26 only when reflection is enabled. Nothing else selects
-C++26, and there is no option to ask for C++26 without reflection.
+The build becomes C++26 only when reflection is enabled, and reflection is
+off unless asked for. Nothing else selects C++26, and there is no option to
+ask for C++26 without reflection.
 
 | `GLOVE_REFLECTION` | Behavior |
 |---|---|
-| `AUTO` (default) | probe the compiler; C++26 with reflection if the probe passes, otherwise C++23 |
+| `OFF` (default) | C++23 always; no probe |
+| `AUTO` | probe the compiler; C++26 with reflection if the probe passes, otherwise C++23 |
 | `ON` | as `AUTO`, but configuration fails if the probe fails |
-| `OFF` | C++23 always |
 
 The probe tries `-freflection` (GCC 16+), then `-freflection-latest`
 (clang-p2996). For each flag the compiler accepts, it compiles a program that
@@ -50,9 +51,9 @@ uses `<meta>`, `nonstatic_data_members_of`, `annotations_of`, `extract`, and
 (Clang 23 does) stays on C++23.
 
 When the probe passes, every target gets `-std=c++26`, the reflection flag,
-and `GLOVE_HAS_REFLECTION=1`. So **the default build on a GCC 16 host is
-C++26, and on a Clang host C++23**, from the same command. To get the same
-standard everywhere, pass `-DGLOVE_REFLECTION=OFF`.
+and `GLOVE_HAS_REFLECTION=1`. With `AUTO`, the same command therefore
+builds C++26 on a GCC 16 host and C++23 on a Clang host; that is why the
+default is `OFF`.
 
 Code must compile as both. Guard reflection code with
 `#if defined(GLOVE_HAS_REFLECTION)`; see
@@ -65,7 +66,7 @@ bitten: `std::ranges::find(strings, "literal")` does not compile as C++26
 
 ```text
 --   C++ standard         : 23
---   GLOVE_REFLECTION     : AUTO
+--   GLOVE_REFLECTION     : OFF
 ```
 
 ### Standard library
@@ -103,7 +104,7 @@ Pass with `-D<name>=<value>` at configure time.
 
 | Option | Default | Effect |
 |---|---|---|
-| `GLOVE_REFLECTION` | `AUTO` | see [Language standard](#language-standard) |
+| `GLOVE_REFLECTION` | `OFF` | see [Language standard](#language-standard) |
 | `GLOVE_SANITIZER` | `none` | `none`, `address`, `address+undefined`, `thread`, `memory`. Adds `-fno-omit-frame-pointer -g`. `memory` is refused on macOS and is in no preset or gate. |
 | `GLOVE_WARNINGS_AS_ERRORS` | `OFF` | adds `-Werror` |
 | `GLOVE_BUILD_FUZZERS` | `OFF` | builds `fuzz/`; Clang only |
