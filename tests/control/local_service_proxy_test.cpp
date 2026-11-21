@@ -1453,7 +1453,7 @@ auto run(bool privileged_only) -> int {
             REQUIRE(
                 std::ranges::find(
                     prepared->profile.environment,
-                    "GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local"
+                    std::string_view{"GLOVE_LOCAL_SERVICE_DIR=/run/glove-services/local"}
                 ) != prepared->profile.environment.end()
             );
             const auto mounts = prepared->lifecycle->mounts();
@@ -1528,13 +1528,13 @@ auto run(bool privileged_only) -> int {
         REQUIRE(
             std::ranges::find(
                 inherited_prepared->profile.environment,
-                R"(GLOVE_LOCAL_SERVICE_FDS_V1={"sage-observe":3})"
+                std::string_view{R"(GLOVE_LOCAL_SERVICE_FDS_V1={"sage-observe":3})"}
             ) != inherited_prepared->profile.environment.end()
         );
         REQUIRE(
             std::ranges::find(
                 inherited_prepared->profile.environment,
-                "GLOVE_GUEST_CHANNEL_SERVICE_ALIAS=sage-observe"
+                std::string_view{"GLOVE_GUEST_CHANNEL_SERVICE_ALIAS=sage-observe"}
             ) != inherited_prepared->profile.environment.end()
         );
         REQUIRE(std::ranges::none_of(inherited_prepared->lifecycle->mounts(), [](const auto& item) {
