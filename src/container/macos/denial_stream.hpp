@@ -66,6 +66,8 @@ public:
     auto operator=(denial_stream&&) -> denial_stream& = delete;
     // Stops the child within denial_stream_stop_grace_ms plus a bounded
     // drain, signalling it only while it is unreaped, and joins the reader.
+    // If the process dies without running this, a watcher in the child's
+    // process group ends that group.
     // A callback that never returns blocks this destructor, and the object
     // must not be destroyed from inside a callback.
     ~denial_stream();

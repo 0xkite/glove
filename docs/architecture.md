@@ -618,6 +618,10 @@ it.
 - The runner starts one `log stream` child per `glove run` or `glove exec`
   session, filtered to kernel Sandbox messages that end with the session's
   tag. Every deny rule of the session's profile carries that tag.
+- The child must not outlive glove. Glove stops it on a normal exit. For any
+  other exit, SIGKILL included, a `/bin/sh` watcher in the child's process
+  group reads a pipe whose only write end glove holds, and kills that group
+  when the pipe closes.
 - Liveness is proven with a canary before the agent starts (at most 2 s) and
   once more at exit (at most 1 s). The log is ordered, so the closing canary is
   the flush barrier for the session's own denials.
