@@ -1,5 +1,7 @@
 #include "glove/container/owned_passthrough.hpp"
 
+#include <sys/stat.h>
+
 #if defined(__APPLE__)
 #    include <TargetConditionals.h>
 #endif
@@ -244,10 +246,15 @@ public:
 
     auto prepare() noexcept -> bool {
         if (::isatty(fd_) == 0) {
-            if (errno == ENOTTY) {
+            const int error = errno;
+            // Darwin reports a socket as EOPNOTSUPP, not ENOTTY. A descriptor
+            // that is provably a socket is not a terminal; any other error
+            // (a closed descriptor, for one) still refuses the launch.
+            struct stat metadata{};
+            if (error == ENOTTY || (::fstat(fd_, &metadata) == 0 && S_ISSOCK(metadata.st_mode))) {
                 return true;
             }
-            errors_.add("isatty stdin snapshot", errno);
+            errors_.add("isatty stdin snapshot", error);
             return false;
         }
         foreground_ = ::tcgetpgrp(fd_);
