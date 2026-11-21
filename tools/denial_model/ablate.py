@@ -11,7 +11,8 @@ scored in every fold and reported separately, as drift evidence.
         --corpus corpus --folds 5 --out ablation.json
 
 Arms: heuristic (fixed thresholds), logistic, gbdt. Confusion counts are
-summed over folds; latency and timing are pooled. Timings are only
+summed over folds, and each test scenario is also scored on its own, so the
+report shows which behaviours an arm gets wrong; latency and timing are pooled. Timings are only
 comparable from an optimized, unsanitized build of glove-denial-replay.
 """
 
@@ -93,6 +94,8 @@ def main():
     features_ns = []
     timing_build = None
     per_fold = []
+    # scenario -> {"label", "sessions", arm -> {"flag": n, "terminate": n}}
+    by_scenario = {}
 
     with tempfile.TemporaryDirectory(prefix="glove-ablate-") as temp:
         temp = Path(temp)
@@ -143,6 +146,26 @@ def main():
                                                 arm_report["decide_ns_p99"]))
                     if split == "test":
                         reports[kind] = report
+                # Each test scenario on its own, so a wrong arm can be traced
+                # to the behaviour it gets wrong.
+                for scenario in sorted(n for n, f in folds_of.items() if f == fold):
+                    single = temp / "scenario.jsonl"
+                    members = [e for e in entries
+                               if e["split"] != "real" and scenario_of(e) == scenario]
+                    with open(single, "w", encoding="ascii") as stream:
+                        for entry in members:
+                            stream.write(json.dumps(dict(
+                                entry, split="test", trace=str(corpus / entry["trace"]))) + "\n")
+                    report = json.loads(run([args.replay, "evaluate", str(single),
+                                             "--model", str(model), "--split", "test"]))
+                    record = by_scenario.setdefault(scenario, {
+                        "label": members[0]["label"], "sessions": len(members)})
+                    for arm_report in report["arms"]:
+                        arm = kind if arm_report["arm"] == "model" else "heuristic"
+                        record[arm] = {
+                            level: arm_report[level]["true_positive"]
+                            + arm_report[level]["false_positive"]
+                            for level in ("flag", "terminate")}
             per_fold.append({
                 "fold": fold,
                 "test_scenarios": sorted(n for n, f in folds_of.items() if f == fold),
@@ -157,6 +180,7 @@ def main():
         "timing_build": timing_build,
         "folds": per_fold,
         "features_ns_mean": sum(features_ns) / len(features_ns) if features_ns else None,
+        "scenarios": dict(sorted(by_scenario.items())),
         "arms": {
             arm: {
                 "test": {level: rates(summed[arm][level]) for level in ("flag", "terminate")},
@@ -182,6 +206,11 @@ def main():
                   f"{r['false_positive_rate']:5.2f} {r['before_onset']:5d} "
                   f"{lat if lat is not None else '-':>7} "
                   f"{result['arms'][arm]['decide_ns_mean']:7.0f}")
+    print("\nsessions flagged, by scenario (benign should be 0, misbehaving all):")
+    print(f"{'scenario':38} {'n':>3} " + " ".join(f"{arm:>9}" for arm in arms))
+    for name, record in sorted(by_scenario.items()):
+        print(f"{name:38} {record['sessions']:3d} "
+              + " ".join(f"{record[arm]['flag']:9d}" for arm in arms))
 
 
 if __name__ == "__main__":

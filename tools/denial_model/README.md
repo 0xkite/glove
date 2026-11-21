@@ -95,6 +95,13 @@ actually run is enough to see whether a model's false-positive rate holds.
 
 ## Reading results
 
+`ablate.py` ends with one line per scenario: how many of its sessions each
+arm flagged when that scenario was held out of training. A benign scenario
+that is flagged, or a misbehaving one that is not, names the behaviour an arm
+gets wrong. Read that table before the summary rates: with a few dozen
+scenario families, a held-out family is close to a new kind of behaviour, and
+whole families tend to be right or wrong together.
+
 Confusion counts are per session, at the flag and terminate levels.
 `before_onset` counts misbehaving sessions first caught before their labeled
 onset (a fire on benign behaviour). Timings are comparable only when the
