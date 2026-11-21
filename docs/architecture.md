@@ -503,8 +503,33 @@ launch-profile key `system_services: [names]`, or the saved-environment key
 from `<XDG_CONFIG_HOME>/glove/profiles/<name>.yaml`. A profile names the
 workspace, agent preset, read and write grants, environment (a literal
 `value` or `from: host`), egress rules, MCP upstreams, tool allow rules, and
-bridge port. Command-line flags layer on top: a flag workspace, agent, or
-bridge port replaces the profile's; list flags append.
+bridge port, and service ports. Command-line flags layer on top: a flag
+workspace, agent, or bridge port replaces the profile's; list flags append.
+
+### Service ports
+
+`--service-port <port>` (repeatable; profile key `service_ports: [ports]`;
+saved-environment key `service_ports`, an array of decimal strings) lets the
+guest connect to plain host-loopback TCP services, for example a Sage Worker
+or a relay, next to `--share-credential` or the egress proxy. Service ports
+carry no credential and are independent of the credentialed bridge endpoint
+and of `proxy`. macOS grants each port with the same exact-port SBPL rule the
+bridge endpoint uses. A profile refuses port 0, more than 16 ports, and a port
+equal to the credential bridge or proxy port; duplicates collapse. Linux
+refuses non-empty `service_ports` (`service ports are not supported on Linux
+yet`).
+
+A service port is raw TCP to whatever listens on that host port. It bypasses
+the egress proxy's allow-list and egress audit, and Glove cannot tell what the
+listener is. Grant only ports whose listener you control and trust with the
+guest. Never grant another session's credential bridge or egress proxy port,
+or a host-side forward proxy: through those, the guest would gain that
+credential or unrestricted egress.
+
+`--bridge-port` bridges one port when no credential bridge or egress proxy
+takes the endpoint. Combined with `--share-credential` or egress it is
+refused (`--bridge-port cannot be used with ...; use --service-port for plain
+loopback services`) instead of being ignored.
 
 - Glove reads profiles on the host before any sandbox exists. The profile
   directory must be owner-only (`0700`) with no group- or other-writable

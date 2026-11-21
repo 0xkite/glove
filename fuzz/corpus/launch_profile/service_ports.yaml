@@ -1,0 +1,2 @@
+version: 1
+service_ports: [18000, 18001]

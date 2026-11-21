@@ -48,6 +48,7 @@ auto canonical_path(std::string_view raw, std::string_view label)
 }
 
 constexpr std::size_t max_link_spellings = 64U;
+constexpr std::size_t max_service_ports = 16U;
 constexpr std::size_t max_link_spelling_bytes = 4096U;
 
 auto add_link_spelling(std::vector<std::string>& links, std::string link)
@@ -580,6 +581,29 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
     }
     if (copy.bridge_endpoint && copy.bridge_endpoint->port == 0) {
         return std::unexpected(std::string{"bridge_endpoint requires a non-zero port"});
+    }
+    std::ranges::sort(copy.service_ports);
+    const auto duplicates = std::ranges::unique(copy.service_ports);
+    copy.service_ports.erase(duplicates.begin(), duplicates.end());
+    if (!copy.service_ports.empty() && copy.service_ports.front() == 0) {
+        return std::unexpected(std::string{"service port must be non-zero"});
+    }
+    if (copy.service_ports.size() > max_service_ports) {
+        return std::unexpected(
+            std::string{"at most "} + std::to_string(max_service_ports) + " service ports"
+        );
+    }
+    for (const std::uint16_t port : copy.service_ports) {
+        if (copy.bridge_endpoint && copy.bridge_endpoint->port == port) {
+            return std::unexpected(
+                "service port " + std::to_string(port) + " is the credential bridge port"
+            );
+        }
+        if (copy.proxy && copy.proxy->port == port) {
+            return std::unexpected(
+                "service port " + std::to_string(port) + " is the egress proxy port"
+            );
+        }
     }
     if (copy.required_limits) {
         const auto& limits = *copy.required_limits;

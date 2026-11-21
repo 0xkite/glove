@@ -551,6 +551,9 @@ auto bind_managed_launch_projection_from_fd(
             std::string{"managed launch does not support bridge_endpoint; use glove exec"}
         );
     }
+    if (!checked->service_ports.empty()) {
+        return std::unexpected(std::string{glove::container::service_ports_unsupported_on_linux});
+    }
     if (checked->escape_policy != profile::seccomp_escape_policy::terminate_container) {
         return std::unexpected(
             std::string{"managed launch requires seccomp escape_policy=terminate_container"}

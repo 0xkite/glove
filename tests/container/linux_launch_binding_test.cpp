@@ -441,6 +441,13 @@ auto run() -> int {
     auto online_binding = make_binding(online_profile, argv, first_mounts);
     REQUIRE(online_binding.has_value());
     REQUIRE(online_binding->profile_digest != first->profile_digest);
+    {
+        auto service_profile = first_profile;
+        service_profile.service_ports = {18000};
+        const auto refused = make_binding(service_profile, argv, first_mounts);
+        REQUIRE(!refused.has_value());
+        REQUIRE(refused.error() == glove::container::service_ports_unsupported_on_linux);
+    }
     online_profile.proxy->url = "http://glove:ephemeral-b@127.0.0.1:43117";
     auto changed_egress_capability = make_binding(online_profile, argv, first_mounts);
     REQUIRE(changed_egress_capability.has_value());

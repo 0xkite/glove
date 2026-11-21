@@ -57,6 +57,8 @@ struct launch_profile {
     std::vector<std::string> allow;
     std::vector<glove::policy::argument_prefix_rule> allow_arg;
     std::optional<std::uint16_t> bridge_port;
+    // Declaration only in the red commit.
+    std::vector<std::uint16_t> service_ports;
     // secrets.provider: the agent preset's provider credential.
     std::optional<secret_reference> provider_secret;
     // decoys: canary files planted outside the sandbox for each launch.

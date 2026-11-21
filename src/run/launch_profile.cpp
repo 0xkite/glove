@@ -200,6 +200,10 @@ void merge_profile_lists(const launch_profile& profile, const options& cli, opti
     out.system_services.insert(
         out.system_services.end(), cli.system_services.begin(), cli.system_services.end()
     );
+    out.service_ports = profile.service_ports;
+    out.service_ports.insert(
+        out.service_ports.end(), cli.service_ports.begin(), cli.service_ports.end()
+    );
     out.allow = profile.allow;
     out.allow.insert(out.allow.end(), cli.allow.begin(), cli.allow.end());
     out.prefix_rules = profile.allow_arg;

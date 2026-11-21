@@ -1956,6 +1956,9 @@ public:
         if (!checked) {
             return std::unexpected(std::string{"profile: "} + checked.error());
         }
+        if (!checked->service_ports.empty()) {
+            return std::unexpected(std::string{service_ports_unsupported_on_linux});
+        }
         if (auto limits = require_resource_enforcement(*checked, resource_capabilities());
             !limits) {
             return std::unexpected(limits.error());
@@ -2251,6 +2254,9 @@ auto prepare_managed_launch(
         return std::unexpected(std::string{"profile: "} + checked.error());
     }
     checked->work_dir = managed_work_dir;
+    if (!checked->service_ports.empty()) {
+        return std::unexpected(std::string{service_ports_unsupported_on_linux});
+    }
     if (checked->required_limits != std::optional<resource_limits>{lifecycle.limits()}) {
         return std::unexpected(std::string{"managed session resource limits mismatch"});
     }
@@ -3080,6 +3086,9 @@ auto exec_contained(
     auto checked = validate(prof);
     if (!checked) {
         return std::unexpected(std::string{"profile: "} + checked.error());
+    }
+    if (!checked->service_ports.empty()) {
+        return std::unexpected(std::string{service_ports_unsupported_on_linux});
     }
     if (auto limits = require_resource_enforcement(*checked, linux_resource_capabilities());
         !limits) {

@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -281,6 +282,39 @@ auto parses_system_services() -> int {
     return 0;
 }
 
+auto parses_service_ports() -> int {
+    const auto parsed = parse_launch_profile("version: 1\nservice_ports: [18000, 18001]\n");
+    if (!parsed) {
+        std::fprintf(stderr, "%s\n", parsed.error().c_str());
+    }
+    REQUIRE(parsed.has_value());
+    REQUIRE((parsed->service_ports == std::vector<std::uint16_t>{18000, 18001}));
+    const auto encoded = glove::run::encode_launch_profile(*parsed);
+    const auto reparsed = parse_launch_profile(encoded);
+    REQUIRE(reparsed.has_value());
+    REQUIRE(*reparsed == *parsed);
+    auto changed = *parsed;
+    changed.service_ports.pop_back();
+    REQUIRE(!(changed == *parsed));
+
+    REQUIRE(!parse_launch_profile("version: 1\nservice_ports: [0]\n").has_value());
+    REQUIRE(!parse_launch_profile("version: 1\nservice_ports: [70000]\n").has_value());
+    REQUIRE(!parse_launch_profile("version: 1\nservice_ports: [18000, 0]\n").has_value());
+    // Unknown sibling keys are still refused next to the new one.
+    const auto sibling = parse_launch_profile("version: 1\nservice_ports: [18000]\nbogus: 1\n");
+    REQUIRE(!sibling.has_value());
+    REQUIRE(sibling.error().contains("unknown_key"));
+
+    // A CLI --service-port appends to the profile's list.
+    glove::run::options cli;
+    cli.service_ports = {18002};
+    cli.agent_argv = {"/bin/true"};
+    const auto applied = glove::run::apply_launch_profile(*parsed, cli, "/home/u");
+    REQUIRE(applied.has_value());
+    REQUIRE((applied->service_ports == std::vector<std::uint16_t>{18000, 18001, 18002}));
+    return 0;
+}
+
 auto layers_command_line() -> int {
     auto parsed = parse_launch_profile(
         "version: 1\n"
@@ -441,6 +475,7 @@ int main() {
           refuses_ambiguous_yaml,
           accepts_plain_subtleties,
           parses_system_services,
+          parses_service_ports,
           layers_command_line}) {
         if (const int failed = step(); failed != 0) {
             return failed;

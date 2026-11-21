@@ -1150,6 +1150,15 @@ if(APPLE)
     set_tests_properties(container_macos_endpoint container_macos_runtime_filesystem
         container_macos_configuration PROPERTIES TIMEOUT 30)
 
+    # Plain host-loopback service ports: SBPL shape and live reachability.
+    add_executable(container_macos_service_ports_test container/macos_service_ports_test.cpp)
+    target_link_libraries(container_macos_service_ports_test PRIVATE glove_container)
+    target_include_directories(container_macos_service_ports_test PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/container>
+    )
+    add_test(NAME container_macos_service_ports COMMAND container_macos_service_ports_test)
+    set_tests_properties(container_macos_service_ports PROPERTIES TIMEOUT 60)
+
     # Policy-owned Codex discovery is tested against the locally installed
     # harness when present. This is SBPL-only and intentionally not a claim of
     # production resource enforcement on macOS.
