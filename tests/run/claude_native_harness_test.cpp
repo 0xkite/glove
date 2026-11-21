@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -200,7 +201,7 @@ auto interactive_encoding() -> int {
     no_workspace.workspace = {};
     REQUIRE(!adapter.encode_startup(no_workspace));
     REQUIRE(bytes.find("oauth") == std::string::npos && bytes.find("/Users") == std::string::npos);
-    REQUIRE(std::ranges::find(recipe->argv, "--print") == recipe->argv.end());
+    REQUIRE(std::ranges::find(recipe->argv, std::string_view{"--print"}) == recipe->argv.end());
     // Writable flag mismatches are refused by the core validator.
     auto mutated = *recipe;
     mutated.configuration[1].writable = false;
@@ -220,7 +221,7 @@ auto encoding() -> int {
     REQUIRE(start->argv.front() == "/protected/runtime/claude");
     REQUIRE(start->argv[1] == "--bare");
     REQUIRE(find_value(start->argv, "--session-id") == conversation);
-    REQUIRE(std::ranges::find(start->argv, "--resume") == start->argv.end());
+    REQUIRE(std::ranges::find(start->argv, std::string_view{"--resume"}) == start->argv.end());
     REQUIRE(find_value(start->argv, "--model") == "claude-fixture-model");
     REQUIRE(find_value(start->argv, "--tools").empty());
     REQUIRE(start->argv.back() == f.arguments.front());
@@ -242,7 +243,9 @@ auto encoding() -> int {
     REQUIRE(resume);
     REQUIRE(validate_native_startup_recipe(f.input(), *resume));
     REQUIRE(find_value(resume->argv, "--resume") == conversation);
-    REQUIRE(std::ranges::find(resume->argv, "--session-id") == resume->argv.end());
+    REQUIRE(
+        std::ranges::find(resume->argv, std::string_view{"--session-id"}) == resume->argv.end()
+    );
     REQUIRE(resume->argv.size() == start->argv.size());
     // A resume recipe is refused against a start input and vice versa.
     f.resume = false;

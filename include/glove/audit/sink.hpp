@@ -57,6 +57,12 @@ struct jsonl_sink_limits {
 inline constexpr std::string_view jsonl_sink_busy =
     "audit journal is in use by another glove launch";
 
+// The exact error make_jsonl_sink returns when the file lost its name
+// between being opened and being locked. Records written to it would be
+// unreachable, so no sink is made.
+inline constexpr std::string_view jsonl_sink_removed =
+    "audit journal was removed while it was being opened";
+
 auto make_jsonl_sink(const std::filesystem::path& path, jsonl_sink_limits limits = {})
     -> std::expected<std::shared_ptr<sink>, std::string>;
 

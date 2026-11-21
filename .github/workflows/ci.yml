@@ -79,3 +79,26 @@ jobs:
         env:
           GLOVE_PREPARE_LINUX_USERNS: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: scripts/preflight.sh
+
+  formal:
+    name: TLA+ models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Fetch TLC
+        # Pinned by content: a release asset can be replaced, a digest cannot.
+        run: |
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/tla2tools.jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $RUNNER_TEMP/tla2tools.jar" \
+            | sha256sum --check
+
+      - name: Check models
+        run: |
+          java -version
+          GLOVE_TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" scripts/tlc.sh

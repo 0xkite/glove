@@ -1,10 +1,16 @@
 include_guard(GLOBAL)
 
-set(GLOVE_REFLECTION "AUTO" CACHE STRING
-    "C++26 P2996 reflection mode: AUTO|ON|OFF (AUTO enables when compiler supports <meta>)")
+# OFF by default so every host compiles the same language standard (C++23).
+# AUTO and ON compile every target as C++26 where the compiler supports it.
+set(GLOVE_REFLECTION "OFF" CACHE STRING
+    "C++26 P2996 reflection mode: OFF|AUTO|ON (AUTO enables when compiler supports <meta>)")
 set_property(CACHE GLOVE_REFLECTION PROPERTY STRINGS AUTO ON OFF)
 option(GLOVE_WITH_GHOSTTY     "Build the libghostty terminal frontend"                       OFF)
 option(GLOVE_WARNINGS_AS_ERRORS "Treat warnings as errors"                                   OFF)
+option(GLOVE_HARDENING
+    "Add exploit mitigations and standard-library precondition checks"
+    ON
+)
 option(GLOVE_ENABLE_SAGE_INTEROP_TEST
     "Run the Sage Rust client against the real Glove receipt server fixture"
     OFF

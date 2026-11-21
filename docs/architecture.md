@@ -643,7 +643,7 @@ two "macOS denial telemetry" rows of the [threat model](threat-model.md).
 ### Denial decisions (shadow only)
 
 `include/glove/container/denial_decision.hpp` defines how a session's denials
-become a verdict. `glove run|exec --denial-model <file>` (macOS) evaluates a
+become a verdict. `glove run|exec|shell --denial-model <file>` (macOS) evaluates a
 trained model on each denial and records its verdict; nothing acts on one.
 
 - `denial_feature_builder` turns the denial stream into 37 features (schema
@@ -664,7 +664,7 @@ trained model on each denial and records its verdict; nothing acts on one.
   any check does not load.
 - `make_heuristic_denial_decider` is a fixed-threshold arm kept only to
   compare against the model.
-- `glove run|exec --denial-trace <path>` records the launch's raw denials to
+- `glove run|exec|shell --denial-trace <path>` records the launch's raw denials to
   a new file (JSON lines: a header with the classification context,
   including the launch's decoy paths, one line per denial with its time
   since launch, an end line with the monitor's report). It holds at most 16384 events; the rest are counted as dropped.

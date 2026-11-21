@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #include <iterator>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -166,6 +168,68 @@ auto retention(const std::filesystem::path& root) -> int {
     return 0;
 }
 
+// Launches that open their journals at the same moment, with every older
+// journal held by a live launch, so each retention pass can only pick a file
+// another thread has created and not yet locked. A sink must never come back
+// on a file retention removed: its records would have no name to be read by.
+// Model: formal/AuditJournal.tla, invariant WriterIsNamed.
+auto retention_race(const std::filesystem::path& root) -> int {
+    const auto directory = root / "race";
+    REQUIRE(std::filesystem::create_directory(directory));
+    const auto shared = directory / "session.jsonl";
+    auto holder = open_default_audit_journal(shared, {});
+    REQUIRE(holder.has_value() && !holder->overflow);
+    std::vector<glove::run::detail::default_audit_journal> live;
+    for (std::size_t index = 0; index != max_overflow_audit_journals; ++index) {
+        auto journal = open_default_audit_journal(shared, {});
+        REQUIRE(journal.has_value() && journal->overflow);
+        live.push_back(std::move(*journal));
+    }
+
+    constexpr int threads = 8;
+    constexpr int rounds = 1500;
+    std::atomic<int> unnamed{0};
+    std::atomic<int> unexpected_errors{0};
+    std::atomic<int> opened{0};
+    {
+        std::vector<std::jthread> workers;
+        for (int worker = 0; worker != threads; ++worker) {
+            workers.emplace_back([&] {
+                for (int round = 0; round != rounds; ++round) {
+                    auto journal = open_default_audit_journal(shared, {});
+                    if (!journal) {
+                        // Running out of names under this contention is
+                        // allowed; any other error is not.
+                        if (journal.error() != glove::audit::jsonl_sink_busy &&
+                            journal.error() != glove::audit::jsonl_sink_removed) {
+                            if (unexpected_errors.fetch_add(1) == 0) {
+                                std::fprintf(
+                                    stderr, "retention race: %s\n", journal.error().c_str()
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    opened.fetch_add(1);
+                    struct stat named{};
+                    if (!record(*journal->sink, "race") ||
+                        ::lstat(journal->path.c_str(), &named) != 0 || named.st_size == 0) {
+                        unnamed.fetch_add(1);
+                    }
+                }
+            });
+        }
+    }
+    std::fprintf(stderr, "retention race: %d opened\n", opened.load());
+    REQUIRE(unexpected_errors.load() == 0);
+    REQUIRE(unnamed.load() == 0);
+    REQUIRE(opened.load() > threads * rounds / 2);
+    for (const auto& journal : live) {
+        REQUIRE(std::filesystem::exists(journal.path));
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -177,7 +241,7 @@ int main() {
     }
     const std::filesystem::path root{pattern};
     int failed = names();
-    for (auto* step : {concurrent, unsafe, retention}) {
+    for (auto* step : {concurrent, unsafe, retention, retention_race}) {
         if (failed == 0) {
             failed = step(root);
         }
