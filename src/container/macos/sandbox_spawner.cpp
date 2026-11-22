@@ -717,8 +717,9 @@ auto sandboxed_env(const profile& prof) -> std::vector<std::string> {
 // no MCP pipe, no kernel. Blocks until the agent exits; returns its code. Used
 // by `glove exec` for a real, self-driving agent (its terminal + LLM are its
 // own; glove is the perimeter + egress, not an MCP counterparty).
-auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
-    -> std::expected<int, std::string> {
+auto exec_passthrough(
+    const profile& prof, const std::vector<std::string>& argv, std::chrono::milliseconds stop_grace
+) -> std::expected<int, std::string> {
     // Inherited stdio that is a regular file needs a metadata-only grant on its
     // path (runtimes stat their stdio); nothing else about it is readable.
     std::vector<std::string> stdio_files;
@@ -736,7 +737,9 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
     // SIGTERM, SIGINT, SIGHUP or SIGQUIT sent to glove is passed to the agent,
     // escalated to SIGKILL after a grace period, and control returns to the
     // caller, which still has its exit record and cleanup to do.
-    return macos_detail::exec_owned_with_stdio_files(prof, argv, std::move(stdio_files));
+    return macos_detail::exec_owned_with_stdio_files(
+        prof, argv, std::move(stdio_files), stop_grace
+    );
 }
 
 auto macos_resource_capabilities() noexcept -> resource_enforcement_capabilities {
@@ -941,13 +944,33 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
         !limits) {
         return std::unexpected(limits.error());
     }
-    return exec_passthrough(prof, argv);
+    return exec_passthrough(prof, argv, default_stop_grace);
 }
 
 auto exec_contained(
     const profile& prof, const std::vector<std::string>& argv, escape_event_observer /*on_escape*/
 ) -> std::expected<int, std::string> {
     return exec_contained(prof, argv);
+}
+
+auto exec_contained(
+    const profile& prof,
+    const std::vector<std::string>& argv,
+    escape_event_observer /*on_escape*/,
+    std::chrono::milliseconds stop_grace
+) -> std::expected<int, std::string> {
+    if (stop_grace < min_stop_grace || stop_grace > max_stop_grace) {
+        return std::unexpected(std::string{"stop grace must be between 0.1 and 60 seconds"});
+    }
+    auto checked = validate(prof);
+    if (!checked) {
+        return std::unexpected(std::string{"profile: "} + checked.error());
+    }
+    if (auto limits = require_resource_enforcement(*checked, macos_resource_capabilities());
+        !limits) {
+        return std::unexpected(limits.error());
+    }
+    return exec_passthrough(prof, argv, stop_grace);
 }
 
 } // namespace glove::container

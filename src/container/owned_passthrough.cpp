@@ -1,5 +1,7 @@
 #include "glove/container/owned_passthrough.hpp"
 
+#include "glove/container/spawner.hpp"
+
 #include <sys/stat.h>
 
 #if defined(__APPLE__)
@@ -690,6 +692,7 @@ auto run_owned(
     const std::vector<std::string>& argv,
     std::stop_token stop,
     std::chrono::milliseconds termination_grace,
+    std::chrono::milliseconds max_grace,
     const std::vector<std::string>& stdio_files
 ) -> std::expected<int, std::string> {
 #if defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX &&                               \
@@ -701,9 +704,7 @@ auto run_owned(
             prof,
             argv,
             stop,
-            std::clamp(
-                termination_grace, std::chrono::milliseconds{1}, std::chrono::milliseconds{3000}
-            ),
+            std::clamp(termination_grace, std::chrono::milliseconds{1}, max_grace),
             stdio_files,
             errors
         );
@@ -727,6 +728,7 @@ auto run_owned(
     (void)argv;
     (void)stop;
     (void)termination_grace;
+    (void)max_grace;
     (void)stdio_files;
     return std::unexpected(
         std::string{"owned passthrough unsupported: native macOS CLOEXEC_DEFAULT and waitid "
@@ -743,14 +745,20 @@ auto exec_contained_owned(
     std::stop_token stop,
     std::chrono::milliseconds termination_grace
 ) -> std::expected<int, std::string> {
-    return run_owned(prof, argv, std::move(stop), termination_grace, {});
+    return run_owned(
+        prof, argv, std::move(stop), termination_grace, std::chrono::milliseconds{3000}, {}
+    );
 }
 
 #if defined(__APPLE__)
 auto macos_detail::exec_owned_with_stdio_files(
-    const profile& prof, const std::vector<std::string>& argv, std::vector<std::string> stdio_files
+    const profile& prof,
+    const std::vector<std::string>& argv,
+    std::vector<std::string> stdio_files,
+    std::chrono::milliseconds stop_grace
 ) -> std::expected<int, std::string> {
-    return run_owned(prof, argv, {}, std::chrono::milliseconds{1500}, stdio_files);
+    // exec and shell bound the grace themselves (min/max_stop_grace).
+    return run_owned(prof, argv, {}, stop_grace, max_stop_grace, stdio_files);
 }
 #endif
 

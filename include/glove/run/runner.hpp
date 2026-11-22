@@ -4,6 +4,7 @@
 #include "glove/policy/engine.hpp"
 #include "glove/run/secret_reference.hpp"
 
+#include <chrono>
 #include <expected>
 #include <filesystem>
 #include <optional>
@@ -48,6 +49,9 @@ struct options {
     std::optional<std::filesystem::path> denial_trace;
     // A trained denial model whose verdicts are recorded and never acted on.
     std::optional<std::filesystem::path> denial_model;
+    // Time a direct agent has to exit after glove passes it a termination
+    // signal (`glove exec`/`shell`); unset means container::default_stop_grace.
+    std::optional<std::chrono::milliseconds> stop_grace;
     // Optional read-write workspace path exposed to the agent. When unset,
     // both modes use only a per-run private empty working directory.
     std::optional<std::filesystem::path> workspace;

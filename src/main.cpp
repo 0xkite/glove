@@ -1,3 +1,4 @@
+#include "glove/container/spawner.hpp"
 #include "glove/container/system_services.hpp"
 #include "glove/detail/descriptor_limit.hpp"
 #include "glove/host/config.hpp"
@@ -222,6 +223,9 @@ void print_exec_usage() {
         "                          (macOS; for training denial deciders)\n"
         "  --denial-model <path>   record a trained model's verdict on this launch's\n"
         "                          denials; nothing acts on it (macOS)\n"
+        "  --stop-grace <seconds>  time the agent has to exit after glove passes it\n"
+        "                          SIGTERM, SIGINT, SIGHUP or SIGQUIT before it is\n"
+        "                          killed (0.1 to 60; default 1.5)\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
@@ -281,6 +285,9 @@ void print_shell_usage() {
         "                          (macOS; for training denial deciders)\n"
         "  --denial-model <path>   record a trained model's verdict on this launch's\n"
         "                          denials; nothing acts on it (macOS)\n"
+        "  --stop-grace <seconds>  time the agent has to exit after glove passes it\n"
+        "                          SIGTERM, SIGINT, SIGHUP or SIGQUIT before it is\n"
+        "                          killed (0.1 to 60; default 1.5)\n"
         "  --share-credential <pi-provider>\n"
         "                          with --agent pi: mediate the host API key for one Pi\n"
         "                          provider; the sandbox gets a session nonce, never the key\n"
@@ -343,6 +350,39 @@ void print_loop_usage() {
 // Parse flags shared across `exec`, `shell`, and `loop`.
 // Returns std::nullopt if args[i] is not a shared sandbox flag, 0 if consumed,
 // or 2 on parse error.
+// Decimal seconds with at most three fraction digits, as milliseconds,
+// within the bounds glove::container accepts.
+auto parse_stop_grace(std::string_view text) -> std::optional<long long> {
+    const auto dot = text.find('.');
+    const auto whole = text.substr(0, dot);
+    const auto fraction = dot == std::string_view::npos ? std::string_view{} : text.substr(dot + 1);
+    if (whole.empty() || whole.size() > 2 || fraction.size() > 3 ||
+        (dot != std::string_view::npos && fraction.empty())) {
+        return std::nullopt;
+    }
+    long long milliseconds = 0;
+    for (const char c : whole) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        milliseconds = milliseconds * 10 + (c - '0');
+    }
+    milliseconds *= 1000;
+    long long scale = 100;
+    for (const char c : fraction) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+        milliseconds += (c - '0') * scale;
+        scale /= 10;
+    }
+    if (milliseconds < glove::container::min_stop_grace.count() ||
+        milliseconds > glove::container::max_stop_grace.count()) {
+        return std::nullopt;
+    }
+    return milliseconds;
+}
+
 auto parse_sandbox_flag(
     std::span<char* const> args,
     std::size_t& i,
@@ -438,6 +478,23 @@ auto parse_sandbox_flag(
         } else {
             opts.audit_log = std::filesystem::path{args[i + 1]};
         }
+        i += 2;
+        return 0;
+    }
+    if (a == "--stop-grace" && (cmd_name == "exec" || cmd_name == "shell")) {
+        const auto grace =
+            i + 1 < args.size() ? parse_stop_grace(args[i + 1]) : std::optional<long long>{};
+        if (!grace) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: --stop-grace needs seconds between 0.1 and 60 (for example 10 or "
+                "0.5)\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data()
+            );
+            return 2;
+        }
+        opts.stop_grace = std::chrono::milliseconds{*grace};
         i += 2;
         return 0;
     }
@@ -1760,6 +1817,7 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         // Not stored in saved environments; a flag given at load time applies.
         loaded.denial_trace = opts.denial_trace;
         loaded.denial_model = opts.denial_model;
+        loaded.stop_grace = opts.stop_grace;
         loaded.share_credential = opts.share_credential;
         loaded.share_credential_origin = opts.share_credential_origin;
         // A path given both in the profile and on the command line is one rule.

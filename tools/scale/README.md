@@ -40,7 +40,8 @@ Host memory is the drop in MemAvailable and includes the shell agents. Each
 glove process held 2 threads and 7 descriptors at every size. One run each;
 other work shared the host.
 
-At 4000, 37 agents had not exited within glove's fixed 1.5 s grace after
+At 4000, 37 agents had not exited within glove's default 1.5 s grace after
 SIGTERM because the host was saturated, and were killed (exit 137); every
-launch still wrote its exit record. One harness process needed 35 s to
+launch still wrote its exit record. `glove exec --stop-grace <seconds>`
+raises the grace. One harness process needed 35 s to
 spawn 4000 launches.

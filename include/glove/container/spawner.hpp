@@ -3,6 +3,7 @@
 #include "glove/container/profile.hpp"
 #include "glove/mcp/transport.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -101,6 +102,20 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
 
 auto exec_contained(
     const profile& prof, const std::vector<std::string>& argv, escape_event_observer on_escape
+) -> std::expected<int, std::string>;
+
+// How long a passthrough agent has to exit after glove passes it a SIGINT,
+// SIGQUIT, SIGTERM or SIGHUP, before it is killed. A value outside
+// [min_stop_grace, max_stop_grace] is refused.
+constexpr std::chrono::milliseconds default_stop_grace{1500};
+constexpr std::chrono::milliseconds min_stop_grace{100};
+constexpr std::chrono::milliseconds max_stop_grace{60000};
+
+auto exec_contained(
+    const profile& prof,
+    const std::vector<std::string>& argv,
+    escape_event_observer on_escape,
+    std::chrono::milliseconds stop_grace
 ) -> std::expected<int, std::string>;
 
 } // namespace glove::container

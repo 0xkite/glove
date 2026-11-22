@@ -2535,7 +2535,8 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
                 escape_event.detail.c_str(),
                 static_cast<int>(escape_event.pid)
             ));
-        }
+        },
+        opts.stop_grace.value_or(glove::container::default_stop_grace)
     );
 #if defined(__APPLE__)
     auto denial_audit =
