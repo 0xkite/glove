@@ -79,6 +79,15 @@ auto sample_denial() -> sandbox_denial {
     };
 }
 
+// A denial no other call returns: volume tests need distinct ones, because a
+// repeat of a recorded denial is counted and not written.
+auto distinct_denial() -> sandbox_denial {
+    static int next = 0;
+    auto denial = sample_denial();
+    denial.target += "-" + std::to_string(next++);
+    return denial;
+}
+
 auto live_report() -> denial_monitor_report {
     return {
         .state = denial_telemetry_state::live,
@@ -273,7 +282,7 @@ auto shapes() -> int {
     REQUIRE(events[2].tool_name == "summary");
     REQUIRE(
         events[2].arguments_json ==
-        R"({"state":"live","recorded":1,"suppressed_rate":0,"suppressed_cap":0,"suppressed_error":0,"unsafe_fields":0,"duplicates":2,"stream_events":5,"stream_rejected":1,"end_proof":true})"
+        R"({"state":"live","recorded":1,"suppressed_rate":0,"suppressed_cap":0,"suppressed_repeat":0,"suppressed_error":0,"unsafe_fields":0,"duplicates":2,"stream_events":5,"stream_rejected":1,"end_proof":true})"
     );
     REQUIRE(events[2].status == tool_call_status::ok);
     REQUIRE(all_clean(events));
@@ -286,11 +295,11 @@ auto rate() -> int {
     denial_audit_writer writer{sink, clock.function()};
     writer.record_start(denial_telemetry_state::live, "");
     for (int index = 0; index != 40; ++index) {
-        writer.on_denial(sample_denial());
+        writer.on_denial(distinct_denial());
     }
     clock.advance_ms(1000);
     for (int index = 0; index != 40; ++index) {
-        writer.on_denial(sample_denial());
+        writer.on_denial(distinct_denial());
     }
     REQUIRE(writer.finish(live_report()).has_value());
     const auto events = sink->take();
@@ -308,7 +317,7 @@ auto cap() -> int {
     writer.record_start(denial_telemetry_state::live, "");
     for (int windows = 0; windows != 20; ++windows) {
         for (int index = 0; index != 16; ++index) {
-            writer.on_denial(sample_denial());
+            writer.on_denial(distinct_denial());
         }
         clock.advance_ms(1000);
     }
@@ -317,6 +326,74 @@ auto cap() -> int {
     REQUIRE(field(events.back().arguments_json, "recorded") == 256);
     REQUIRE(field(events.back().arguments_json, "suppressed_cap") == 64);
     REQUIRE(field(events.back().arguments_json, "suppressed_rate") == 0);
+    return 0;
+}
+
+// Repeats of a recorded denial are counted, not written, and do not use up
+// the session's records; a different pid is still the same denial, and a
+// different kind, operation, target or process name is not. A truncated
+// target is never treated as a repeat.
+auto repeats() -> int {
+    auto sink = glove::audit::make_memory_sink();
+    fake_clock clock;
+    denial_audit_writer writer{sink, clock.function()};
+    writer.record_start(denial_telemetry_state::live, "");
+    for (int index = 0; index != 1000; ++index) {
+        auto denial = sample_denial();
+        denial.pid = 100 + index;
+        writer.on_denial(denial);
+        clock.advance_ms(100);
+    }
+    for (const int change : {0, 1, 2, 3}) {
+        auto denial = sample_denial();
+        (change == 0   ? denial.kind
+         : change == 1 ? denial.operation
+         : change == 2 ? denial.target
+                       : denial.comm) += "2";
+        writer.on_denial(denial);
+        writer.on_denial(denial);
+        clock.advance_ms(100);
+    }
+    auto cut = sample_denial();
+    cut.target_truncated = true;
+    writer.on_denial(cut);
+    writer.on_denial(cut);
+    // The session's records are still available after all those repeats.
+    clock.advance_ms(1000);
+    writer.on_denial(distinct_denial());
+    REQUIRE(writer.finish(live_report()).has_value());
+    const auto events = sink->take();
+    const auto& summary = events.back().arguments_json;
+    REQUIRE(field(summary, "recorded") == 1 + 4 + 2 + 1);
+    REQUIRE(field(summary, "suppressed_repeat") == 999 + 4);
+    REQUIRE(field(summary, "suppressed_cap") == 0);
+    REQUIRE(field(summary, "suppressed_rate") == 0);
+    REQUIRE(events.size() == 1 + 8 + 1);
+    return 0;
+}
+
+// A denial first seen while the rate limit applies was not recorded, so its
+// next occurrence is written.
+auto repeat_after_rate_limit() -> int {
+    auto sink = glove::audit::make_memory_sink();
+    fake_clock clock;
+    denial_audit_writer writer{sink, clock.function()};
+    writer.record_start(denial_telemetry_state::live, "");
+    for (int index = 0; index != 16; ++index) {
+        writer.on_denial(distinct_denial());
+    }
+    auto late = sample_denial();
+    late.target = "/tmp/late";
+    writer.on_denial(late);
+    clock.advance_ms(1000);
+    writer.on_denial(late);
+    writer.on_denial(late);
+    REQUIRE(writer.finish(live_report()).has_value());
+    const auto events = sink->take();
+    const auto& summary = events.back().arguments_json;
+    REQUIRE(field(summary, "recorded") == 17);
+    REQUIRE(field(summary, "suppressed_rate") == 1);
+    REQUIRE(field(summary, "suppressed_repeat") == 1);
     return 0;
 }
 
@@ -430,11 +507,11 @@ auto sink_failure() -> int {
     auto sink = std::make_shared<failing_after_sink>(2);
     denial_audit_writer writer{sink};
     writer.record_start(denial_telemetry_state::live, "");
-    writer.on_denial(sample_denial());
-    writer.on_denial(sample_denial()); // third record() fails
+    writer.on_denial(distinct_denial());
+    writer.on_denial(distinct_denial()); // third record() fails
     REQUIRE(sink->calls == 3);
-    writer.on_denial(sample_denial());
-    writer.on_denial(sample_denial());
+    writer.on_denial(distinct_denial());
+    writer.on_denial(distinct_denial());
     REQUIRE(sink->calls == 3);
     const auto finished = writer.finish(live_report());
     REQUIRE(sink->calls == 4);
@@ -460,8 +537,8 @@ auto sink_failure() -> int {
     both->second = failing;
     denial_audit_writer counted{both};
     counted.record_start(denial_telemetry_state::live, "");
-    counted.on_denial(sample_denial()); // fails
-    counted.on_denial(sample_denial()); // suppressed
+    counted.on_denial(distinct_denial()); // fails
+    counted.on_denial(distinct_denial()); // suppressed
     (void)counted.finish(live_report());
     const auto events = memory->take();
     REQUIRE(field(events.back().arguments_json, "suppressed_error") == 1);
@@ -515,6 +592,8 @@ int main() {
          {shapes,
           rate,
           cap,
+          repeats,
+          repeat_after_rate_limit,
           unsafe,
           unavailable,
           early_degraded,

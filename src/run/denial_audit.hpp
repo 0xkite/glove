@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,6 +26,9 @@
 namespace glove::run::detail {
 
 constexpr std::size_t denial_audit_per_second = 16;
+// Distinct denials: one that repeats a recorded kind, operation, target and
+// process name is counted in the summary and not written again, so repeats
+// cannot use up the session's records before something new happens.
 constexpr std::size_t denial_audit_per_session = 256;
 
 class denial_audit_writer final {
@@ -88,6 +92,9 @@ private:
     std::uint64_t recorded_ = 0;
     std::uint64_t suppressed_rate_ = 0;
     std::uint64_t suppressed_cap_ = 0;
+    std::uint64_t suppressed_repeat_ = 0;
+    // Identities of the recorded denials; at most denial_audit_per_session.
+    std::set<std::string, std::less<>> recorded_identities_;
     std::uint64_t suppressed_error_ = 0;
     std::uint64_t unsafe_fields_ = 0;
     std::uint64_t duplicates_ = 0;

@@ -14,6 +14,35 @@ namespace {
 
 constexpr std::size_t max_kind_bytes = 32;
 constexpr auto window = std::chrono::milliseconds{1000};
+// Longer identities are not tracked: such a denial is written every time.
+constexpr std::size_t max_identity_bytes = 1024;
+
+// What makes two denials the same for the audit trail. The pid is left out:
+// a loop that spawns a process per attempt is still one behaviour. Empty when
+// the denial cannot be identified exactly, which makes it never a repeat.
+auto identity(const glove::container::sandbox_denial& denial) -> std::string {
+    constexpr char separator = '\x1f';
+    const std::array<std::string_view, 4> parts{
+        denial.kind, denial.operation, denial.target, denial.comm
+    };
+    std::size_t bytes = parts.size();
+    for (const auto part : parts) {
+        if (part.find(separator) != std::string_view::npos) {
+            return {};
+        }
+        bytes += part.size();
+    }
+    if (denial.target_truncated || bytes > max_identity_bytes) {
+        return {};
+    }
+    std::string text;
+    text.reserve(bytes);
+    for (const auto part : parts) {
+        text += part;
+        text += separator;
+    }
+    return text;
+}
 
 auto boolean(bool value) -> std::string_view {
     return value ? "true" : "false";
@@ -197,6 +226,11 @@ void denial_audit_writer::on_denial(const glove::container::sandbox_denial& deni
             ++decoy_recorded_;
         }
     }
+    auto same_as = identity(denial);
+    if (!same_as.empty() && recorded_identities_.contains(same_as)) {
+        ++suppressed_repeat_;
+        return;
+    }
     if (recorded_ == denial_audit_per_session) {
         ++suppressed_cap_;
         return;
@@ -226,6 +260,9 @@ void denial_audit_writer::on_denial(const glove::container::sandbox_denial& deni
     arguments += std::to_string(denial.readings);
     arguments += "}";
     append(checked(denial.kind, max_kind_bytes), std::move(arguments), true, {});
+    if (!same_as.empty()) {
+        recorded_identities_.insert(std::move(same_as));
+    }
     ++recorded_;
     ++window_count_;
 }
@@ -272,6 +309,8 @@ auto denial_audit_writer::finish(const glove::container::denial_monitor_report& 
         arguments += std::to_string(suppressed_rate_);
         arguments += R"(,"suppressed_cap":)";
         arguments += std::to_string(suppressed_cap_);
+        arguments += R"(,"suppressed_repeat":)";
+        arguments += std::to_string(suppressed_repeat_);
         arguments += R"(,"suppressed_error":)";
         arguments += std::to_string(suppressed_error_);
         // The reason is checked first so its own rejection is counted below.

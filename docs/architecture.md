@@ -639,8 +639,12 @@ it.
   the flush barrier for the session's own denials.
 - Each accepted denial becomes one `sandbox_denial` audit record with kind,
   operation, target, process name and pid, percent-encoded and bounded (target
-  512 bytes, 16 records per second, 256 per session). One `telemetry` record is
-  written at start and one `summary` record at exit.
+  512 bytes, 16 records per second, 256 per session). A denial with the same
+  kind, operation, target and process name as one already recorded is not
+  written again; the summary counts these as `suppressed_repeat`. So the 256
+  records are distinct denials, and the time and pid of a repeat are only in a
+  `--denial-trace` file. One `telemetry` record is written at start and one
+  `summary` record at exit.
 - If the stream cannot be started or proven, one `telemetry` record says
   `unavailable` and the session runs sandboxed without telemetry.
 - An audit append failure of a telemetry record is returned as an error after
