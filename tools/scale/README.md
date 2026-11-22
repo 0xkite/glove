@@ -8,6 +8,11 @@ cmake --build --preset release --target glove
 tools/scale/scale.py --glove build/release/src/glove --count 1000 --resume --out run-1000
 ```
 
+On macOS each launch also starts a `log stream` process for denial
+telemetry; `samples.csv` counts them, and the stop phase reports how each
+launch's telemetry started (`live`, `unavailable`, `degraded`) and how many
+ended other than live.
+
 `<out>/summary.json` has start latency (spawn to the agent's ready file),
 stop latency and exit codes, how many audit journals have the exit record,
 and peak glove memory, threads and descriptors; `<out>/samples.csv` has one

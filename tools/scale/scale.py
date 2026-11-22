@@ -169,11 +169,22 @@ def start_round(launches, glove, root, round_name, per_second, deadline_s) -> di
             "exited_before_ready_codes": sorted(set(exited))}
 
 
+def log_stream_count() -> int | None:
+    """Running `log stream` processes on macOS (one per launch with denial
+    telemetry); None elsewhere."""
+    if sys.platform != "darwin":
+        return None
+    result = subprocess.run(["pgrep", "-f", "^/usr/bin/log stream"], capture_output=True,
+                            text=True, check=False)
+    return len(result.stdout.split())
+
+
 def hold(launches, seconds, samples, phase) -> None:
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         pids = [l.process.pid for l in launches if l.process.poll() is None]
-        row = {"t": round(time.time(), 1), "phase": phase, "alive": len(pids)}
+        row = {"t": round(time.time(), 1), "phase": phase, "alive": len(pids),
+               "log_streams": log_stream_count()}
         row.update(process_stats(pids))
         row.update(host_stats())
         samples.append(row)
@@ -210,7 +221,27 @@ def stop_round(launches, deadline_s) -> dict:
             pass
     return {"exit_ms": percentiles(list(took.values())), "killed_after_deadline": len(stuck),
             "exit_codes": {str(k): v for k, v in sorted(codes.items())},
-            "with_exit_record": with_exit_record}
+            "with_exit_record": with_exit_record,
+            "denial_telemetry": telemetry_states(launches)}
+
+
+def telemetry_states(launches) -> dict:
+    """How each launch's macOS denial telemetry started (the first telemetry
+    record in its audit journal), and how many summaries were not live."""
+    started: dict[str, int] = {}
+    ended_not_live = 0
+    for launch in launches:
+        state = "no record"
+        try:
+            for line in launch.audit.read_text(errors="replace").splitlines():
+                if '"tool":"telemetry"' in line and state == "no record":
+                    state = line.split('\\"state\\":\\"', 1)[-1].split("\\", 1)[0]
+                if '"tool":"summary"' in line and '\\"state\\":\\"live\\"' not in line:
+                    ended_not_live += 1
+        except OSError:
+            state = "no journal"
+        started[state] = started.get(state, 0) + 1
+    return {"started": started, "summary_not_live": ended_not_live}
 
 
 def main() -> int:
@@ -269,7 +300,8 @@ def main() -> int:
             "load1": peak["load1"], "mem_available_kib": peak["mem_available_kib"]}
     (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     with open(root / "samples.csv", "w", encoding="ascii") as stream:
-        keys = ["t", "phase", "alive", "rss_kib", "threads", "fds", "load1", "mem_available_kib"]
+        keys = ["t", "phase", "alive", "log_streams", "rss_kib", "threads", "fds", "load1",
+                "mem_available_kib"]
         stream.write(",".join(keys) + "\n")
         for row in samples:
             stream.write(",".join("" if row.get(k) is None else str(row[k]) for k in keys) + "\n")
