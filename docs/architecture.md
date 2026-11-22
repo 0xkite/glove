@@ -495,6 +495,36 @@ is worked around; a default journal that is not this user's owner-only
 single-link regular file is still an error, and so is an `--audit-log` path
 that another launch is using.
 
+### Where configuration and state live
+
+Configuration is files. The `glove` CLI reads them itself; `run`, `exec`,
+`shell` and `loop` never contact `gloved`, and the control protocol has no
+method that reads or changes configuration. `gloved` loads its own
+`config.json` and the state files that file names.
+
+`<config>` is `$XDG_CONFIG_HOME/glove` (default `~/.config/glove`), `<state>`
+is `$XDG_STATE_HOME/glove` (default `~/.local/state/glove`) and `<data>` is
+`$XDG_DATA_HOME/glove` (default `~/.local/share/glove`). The runtime directory
+is `<state>/runtime`; `XDG_RUNTIME_DIR` is not used for it.
+
+| Path | What | Read by | Written by |
+|---|---|---|---|
+| `<config>/config.json` | service configuration | `gloved`, `glove status`, `doctor`, `session` | `glove setup` |
+| `<config>/policies/<name>.json` | session policies | `glove setup`, `glove policy` | `glove policy install` |
+| `<config>/path-exposure-policy.json` | path exposure policy | `gloved` | `glove setup` |
+| `<config>/profiles/<name>.yaml` | launch profiles | `--profile` | `glove profile new`, `edit` |
+| `<config>/envs/<name>.json` | saved shell environments | `glove shell --load`, `--list` | `glove shell --save`, and `last` after each launch |
+| `<state>/logs/session*.jsonl` | default audit journals | you | `run`, `exec`, `shell`, `loop` |
+| `<state>/decoys` | decoy journals | `glove` | `glove` |
+| `<state>/audit.key`, `receipts.journal`, `sessions.journal`, `path-exposures.journal`, `materializations/` | service state | `gloved` | `gloved` |
+| `<state>/runtime/gloved.sock`, `gloved.lock` | control socket and lock | `glove` | `gloved` |
+| `<data>/library-bundles` | library bundles | `gloved` | `gloved` |
+
+Profiles, saved environments and `config.json` are read only when they are a
+regular single-link file owned by the invoking user with mode 0600. A denial
+trace and a denial model have no default location; `--denial-trace` and
+`--denial-model` name them.
+
 Detailed policy and file invariants are defined in
 [session-policy.md](session-policy.md).
 
