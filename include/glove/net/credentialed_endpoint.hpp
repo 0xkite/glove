@@ -44,6 +44,12 @@ struct endpoint_event {
     std::string detail;
     std::size_t request_bytes = 0;
     std::size_t response_bytes = 0;
+    // Set only on the event that follows the exchange with the provider
+    // (detail "completed" or "upstream_error"): how long the exchange took
+    // and, when it produced a response, its status code. The decision event
+    // (detail "allowed") is emitted before the exchange and has neither.
+    std::chrono::nanoseconds upstream_duration{0};
+    int upstream_status = 0;
 };
 
 // One request that has already been authenticated, matched to a rule, and had

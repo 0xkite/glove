@@ -1,10 +1,12 @@
 #pragma once
 
+#include "glove/audit/sink.hpp"
 #include "glove/net/credentialed_endpoint.hpp"
 #include "glove/run/pi_provider_share.hpp"
 
 #include <expected>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace glove::run::detail {
@@ -42,5 +44,14 @@ using provider_event_handler =
     std::string nonce,
     provider_event_handler on_event = {}
 ) -> std::expected<net::credentialed_endpoint_options, std::string>;
+
+// Writes one egress audit record for an endpoint event. A request the endpoint
+// forwards produces two: the decision ("allowed"), written before anything is
+// sent, and the outcome ("completed" or "upstream_error"), which alone carries
+// the exchange's duration (as the record's latency), sizes and upstream
+// status. A null sink records nothing.
+[[nodiscard]] auto
+record_endpoint_event(const std::shared_ptr<audit::sink>& sink, const net::endpoint_event& event)
+    -> std::expected<void, std::string>;
 
 } // namespace glove::run::detail

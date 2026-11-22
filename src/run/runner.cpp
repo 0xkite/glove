@@ -1379,15 +1379,7 @@ auto start_shared_pi_provider(
     }
     endpoint_options->on_event =
         [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
-        const std::string subject = event.method + " " + event.path;
-        const auto status = event.allowed ? glove::mcp::tool_call_status::ok
-                                          : glove::mcp::tool_call_status::invalid_arguments;
-        if (auto audited =
-                record(sink, glove::audit::action::egress, subject, status, event.detail);
-            !audited) {
-            return std::unexpected(audited.error());
-        }
-        return {};
+        return detail::record_endpoint_event(sink, event);
     };
     auto endpoint = glove::net::start_credentialed_endpoint(std::move(*endpoint_options));
     if (!endpoint) {
@@ -1517,15 +1509,7 @@ auto start_agent_preset(
     }
     endpoint_options->on_event =
         [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
-        const std::string subject = event.method + " " + event.path;
-        const auto status = event.allowed ? glove::mcp::tool_call_status::ok
-                                          : glove::mcp::tool_call_status::invalid_arguments;
-        if (auto audited =
-                record(sink, glove::audit::action::egress, subject, status, event.detail);
-            !audited) {
-            return std::unexpected(audited.error());
-        }
-        return {};
+        return detail::record_endpoint_event(sink, event);
     };
 
     auto endpoint = glove::net::start_credentialed_endpoint(std::move(*endpoint_options));

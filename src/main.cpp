@@ -40,6 +40,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1311,12 +1312,18 @@ void save_env_profile(
         << "}\n";
     const std::string serialized = out.str();
     const auto path = *envs_dir / (std::string{name} + ".json");
-    const int fd =
-        ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    // No O_TRUNC: a file that is not ours alone is left as it was.
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) {
         return;
     }
-    (void)::fchmod(fd, 0600);
+    struct stat existing{};
+    if (::fstat(fd, &existing) != 0 || !S_ISREG(existing.st_mode) ||
+        existing.st_uid != ::geteuid() || existing.st_nlink != 1 || ::fchmod(fd, 0600) != 0 ||
+        ::ftruncate(fd, 0) != 0) {
+        (void)::close(fd);
+        return;
+    }
     std::size_t off = 0;
     while (off < serialized.size()) {
         const ssize_t n = ::write(fd, serialized.data() + off, serialized.size() - off);
@@ -1331,6 +1338,8 @@ void save_env_profile(
     (void)::close(fd);
 }
 
+constexpr off_t max_saved_environment_bytes = 256 * 1024;
+
 auto load_env_profile(std::string_view name, glove::run::options& opts)
     -> std::expected<void, std::string> {
     if (!glove::host::is_valid_policy_name(name)) {
@@ -1341,11 +1350,32 @@ auto load_env_profile(std::string_view name, glove::run::options& opts)
         return std::unexpected(std::string{"cannot resolve XDG config directory"});
     }
     const auto path = *envs_dir / (std::string{name} + ".json");
-    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) {
         return std::unexpected(
             "saved environment '" + std::string{name} + "' not found at " + path.string()
         );
+    }
+    // A saved environment grants paths, egress and service ports to the next
+    // launch, so it is held to the same rule as a launch profile: only a file
+    // this user alone could have written is read.
+    struct stat metadata{};
+    if (::fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_uid != ::geteuid() || metadata.st_nlink != 1) {
+        (void)::close(fd);
+        return std::unexpected(
+            "saved environment must be a regular single-link file owned by you: " + path.string()
+        );
+    }
+    if ((static_cast<unsigned int>(metadata.st_mode) & 07777U) != 0600U) {
+        (void)::close(fd);
+        return std::unexpected(
+            "saved environment must have mode 0600 (chmod 600 " + path.string() + ")"
+        );
+    }
+    if (metadata.st_size > max_saved_environment_bytes) {
+        (void)::close(fd);
+        return std::unexpected("saved environment is larger than 256 KiB: " + path.string());
     }
     std::string content;
     std::array<char, 4096> buf{};
@@ -1362,6 +1392,10 @@ auto load_env_profile(std::string_view name, glove::run::options& opts)
             break;
         }
         content.append(buf.data(), static_cast<std::size_t>(n));
+        if (std::cmp_greater(content.size(), max_saved_environment_bytes)) {
+            (void)::close(fd);
+            return std::unexpected("saved environment is larger than 256 KiB: " + path.string());
+        }
     }
     (void)::close(fd);
     auto parsed = glove::reflect::detail::parse_json_object(content);
@@ -1542,6 +1576,11 @@ auto list_env_profiles() -> int {
     int count = 0;
     for (const auto& entry : std::filesystem::directory_iterator(*envs_dir, ec)) {
         if (entry.path().extension() != ".json") {
+            continue;
+        }
+        // Listing only prints, but it must not follow a link or wait on a FIFO.
+        std::error_code entry_error;
+        if (entry.is_symlink(entry_error) || !entry.is_regular_file(entry_error)) {
             continue;
         }
         std::ifstream in(entry.path(), std::ios::binary);

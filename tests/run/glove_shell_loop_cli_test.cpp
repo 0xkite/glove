@@ -11,9 +11,11 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef GLOVE_BIN
@@ -207,6 +209,56 @@ auto run() -> int {
         }
         REQUIRE(turns == 2);
     }
+
+    // 5. A saved environment is loaded only when it is a single-link regular
+    //    file, owned by this user, with mode 0600. Anything else could have
+    //    been written by someone else and would grant paths to the launch.
+    const auto config = base / "config";
+    REQUIRE(::setenv("XDG_CONFIG_HOME", config.c_str(), 1) == 0);
+    const auto saved = config / "glove" / "envs" / "envck.json";
+    const std::vector<std::string> tail{"--", "/bin/sh", "-c", "true"};
+    const auto with = [&](std::vector<std::string> arguments) {
+        arguments.insert(arguments.end(), tail.begin(), tail.end());
+        return run_glove(std::move(arguments));
+    };
+    REQUIRE(with({GLOVE_BIN, "shell", "--workspace", workspace.string(), "--save", "envck"}) == 0);
+    struct stat metadata{};
+    REQUIRE(::stat(saved.c_str(), &metadata) == 0);
+    REQUIRE((metadata.st_mode & 07777U) == 0600U);
+    const auto load = [&] { return with({GLOVE_BIN, "shell", "--load", "envck"}); };
+    REQUIRE(load() == 0);
+    for (const unsigned loose : {0640U, 0604U, 0620U, 0700U}) {
+        REQUIRE(::chmod(saved.c_str(), static_cast<::mode_t>(loose)) == 0);
+        REQUIRE(load() != 0);
+    }
+    REQUIRE(::chmod(saved.c_str(), 0600) == 0);
+    REQUIRE(load() == 0);
+    const auto second_name = base / "envck-link.json";
+    REQUIRE(::link(saved.c_str(), second_name.c_str()) == 0);
+    REQUIRE(load() != 0);
+    // Saving again must not write through the extra link either.
+    const auto before = std::filesystem::file_size(second_name, ec);
+    REQUIRE(
+        with(
+            {GLOVE_BIN,
+             "shell",
+             "--workspace",
+             workspace.string(),
+             "--read",
+             "/usr/share",
+             "--save",
+             "envck"}
+        ) == 0
+    );
+    REQUIRE(std::filesystem::file_size(second_name, ec) == before);
+    REQUIRE(::unlink(second_name.c_str()) == 0);
+    REQUIRE(load() == 0);
+    const auto moved = base / "envck-real.json";
+    std::filesystem::rename(saved, moved, ec);
+    REQUIRE(!ec);
+    REQUIRE(::symlink(moved.c_str(), saved.c_str()) == 0);
+    REQUIRE(load() != 0);
+    REQUIRE(::unsetenv("XDG_CONFIG_HOME") == 0);
 
     std::filesystem::remove_all(base, ec);
     std::filesystem::remove_all(private_audit_directory(), ec);

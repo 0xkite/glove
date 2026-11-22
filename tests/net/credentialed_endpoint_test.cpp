@@ -8,12 +8,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -99,6 +103,96 @@ auto send_and_receive(std::uint16_t port, std::string_view request) -> std::stri
     }
     ::close(fd);
     return response;
+}
+
+// A forwarded request produces two events: the decision before the exchange,
+// and the outcome after it with the exchange's duration, sizes and status. A
+// failed exchange reports its duration too. An outcome that cannot be recorded
+// is not delivered to the client.
+auto outcome_events() -> int {
+    using namespace std::chrono_literals;
+    // The endpoint's worker writes these; the test reads them between requests.
+    std::mutex mutex;
+    std::vector<glove::net::endpoint_event> seen;
+    std::atomic<bool> refuse_outcome{false};
+    std::atomic<bool> fail_upstream{false};
+    const auto take = [&] {
+        const std::lock_guard lock{mutex};
+        return std::exchange(seen, {});
+    };
+
+    glove::net::credentialed_endpoint_options options;
+    options.endpoints.push_back({
+        .provider = glove::net::endpoint_provider::anthropic,
+        .path_prefix = "/anthropic",
+        .upstream_host = "api.anthropic.com",
+        .upstream_port = 443,
+        .secret_token = "host-only-token",
+        .session_nonce = "outcome-nonce",
+        .allowed_methods = {"POST"},
+        .allowed_paths = {"/v1/messages"},
+    });
+    options.on_event =
+        [&](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
+        if (refuse_outcome && event.detail == "completed") {
+            return std::unexpected(std::string{"audit sink full"});
+        }
+        const std::lock_guard lock{mutex};
+        seen.push_back(event);
+        return {};
+    };
+    options.forward = [&](
+                          const glove::net::upstream_request&,
+                          std::stop_token,
+                          std::chrono::steady_clock::time_point
+                      ) -> std::expected<glove::net::upstream_response, std::string> {
+        std::this_thread::sleep_for(30ms);
+        if (fail_upstream) {
+            return std::unexpected(std::string{"connection reset"});
+        }
+        glove::net::upstream_response response;
+        response.status_code = 429;
+        response.body = "slow down";
+        return response;
+    };
+    auto endpoint = glove::net::start_credentialed_endpoint(std::move(options));
+    REQUIRE(endpoint.has_value());
+    const auto port = (*endpoint)->port();
+    const std::string request = "POST /anthropic/v1/messages HTTP/1.1\r\n"
+                                "Host: 127.0.0.1\r\n"
+                                "x-api-key: outcome-nonce\r\n"
+                                "Content-Length: 5\r\n\r\nhello";
+
+    auto response = send_and_receive(port, request);
+    REQUIRE(response.starts_with("HTTP/1.1 429"));
+    auto events = take();
+    REQUIRE(events.size() == 2);
+    REQUIRE(events[0].detail == "allowed");
+    REQUIRE(events[0].upstream_duration == 0ns && events[0].upstream_status == 0);
+    REQUIRE(events[1].detail == "completed" && events[1].allowed);
+    REQUIRE(events[1].upstream_status == 429);
+    REQUIRE(events[1].request_bytes == 5 && events[1].response_bytes == 9);
+    REQUIRE(events[1].upstream_duration >= 30ms && events[1].upstream_duration < 5s);
+    REQUIRE(events[1].method == "POST" && events[1].path == events[0].path);
+
+    fail_upstream = true;
+    response = send_and_receive(port, request);
+    REQUIRE(response.starts_with("HTTP/1.1 502"));
+    events = take();
+    REQUIRE(events.size() == 2);
+    REQUIRE(events[1].detail == "upstream_error");
+    REQUIRE(events[1].upstream_status == 0 && events[1].response_bytes == 0);
+    REQUIRE(events[1].request_bytes == 5);
+    REQUIRE(events[1].upstream_duration >= 30ms);
+
+    fail_upstream = false;
+    refuse_outcome = true;
+    response = send_and_receive(port, request);
+    REQUIRE(response.starts_with("HTTP/1.1 503"));
+    REQUIRE(!response.contains("slow down"));
+    events = take();
+    REQUIRE(events.size() == 1 && events[0].detail == "allowed");
+    return 0;
 }
 
 auto run() -> int {
@@ -699,5 +793,8 @@ auto run() -> int {
 } // namespace
 
 auto main() -> int {
+    if (const int failed = outcome_events(); failed != 0) {
+        return failed;
+    }
     return run();
 }

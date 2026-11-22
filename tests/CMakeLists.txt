@@ -1202,15 +1202,15 @@ if(APPLE)
     set_tests_properties(
         glove_exec_denial_trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
     )
-
-    add_executable(glove_exec_signal_test run/glove_exec_signal_test.cpp)
-    target_link_libraries(glove_exec_signal_test PRIVATE glove_options)
-    target_compile_definitions(glove_exec_signal_test PRIVATE
-        GLOVE_BIN="$<TARGET_FILE:glove>")
-    add_dependencies(glove_exec_signal_test glove)
-    add_test(NAME glove_exec_signal COMMAND glove_exec_signal_test)
-    set_tests_properties(glove_exec_signal PROPERTIES TIMEOUT 60)
 endif()
+
+add_executable(glove_exec_signal_test run/glove_exec_signal_test.cpp)
+target_link_libraries(glove_exec_signal_test PRIVATE glove_options)
+target_compile_definitions(glove_exec_signal_test PRIVATE
+    GLOVE_BIN="$<TARGET_FILE:glove>")
+add_dependencies(glove_exec_signal_test glove)
+add_test(NAME glove_exec_signal COMMAND glove_exec_signal_test)
+set_tests_properties(glove_exec_signal PROPERTIES TIMEOUT 60)
 
 add_executable(run_exit_audit_test run/exit_audit_test.cpp)
 target_link_libraries(run_exit_audit_test PRIVATE glove_run)

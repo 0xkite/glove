@@ -865,7 +865,9 @@ private:
 
         const auto upstream_deadline = std::chrono::steady_clock::now() +
                                        std::chrono::milliseconds{options_.upstream_deadline_ms};
+        const auto exchange_started = std::chrono::steady_clock::now();
         auto forwarded = options_.forward(request, stop, upstream_deadline);
+        const auto exchange_took = std::chrono::steady_clock::now() - exchange_started;
         if (!forwarded) {
             if (!audit_or_unavailable(
                     client_fd,
@@ -873,11 +875,30 @@ private:
                     head->method,
                     head->uri,
                     true,
-                    "upstream_error"
+                    "upstream_error",
+                    request.body.size(),
+                    0,
+                    exchange_took
                 )) {
                 return;
             }
             write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
+            return;
+        }
+        // Recorded before any of the response is served, like the decision:
+        // an exchange that cannot be recorded is not delivered.
+        if (!audit_or_unavailable(
+                client_fd,
+                matched_rule->provider,
+                head->method,
+                head->uri,
+                true,
+                "completed",
+                request.body.size(),
+                forwarded->body.size(),
+                exchange_took,
+                forwarded->status_code
+            )) {
             return;
         }
 
@@ -956,7 +977,9 @@ private:
         bool allowed,
         std::string_view detail,
         std::size_t req_bytes = 0,
-        std::size_t resp_bytes = 0
+        std::size_t resp_bytes = 0,
+        std::chrono::nanoseconds upstream_duration = {},
+        int upstream_status = 0
     ) -> std::expected<void, std::string> {
         if (!options_.on_event) {
             return {};
@@ -970,6 +993,8 @@ private:
                 .detail = std::string{detail},
                 .request_bytes = req_bytes,
                 .response_bytes = resp_bytes,
+                .upstream_duration = upstream_duration,
+                .upstream_status = upstream_status,
             }
         );
     }
@@ -986,10 +1011,21 @@ private:
         bool allowed,
         std::string_view detail,
         std::size_t req_bytes = 0,
-        std::size_t resp_bytes = 0
+        std::size_t resp_bytes = 0,
+        std::chrono::nanoseconds upstream_duration = {},
+        int upstream_status = 0
     ) -> bool {
-        auto recorded =
-            record_event(provider, method, path, allowed, detail, req_bytes, resp_bytes);
+        auto recorded = record_event(
+            provider,
+            method,
+            path,
+            allowed,
+            detail,
+            req_bytes,
+            resp_bytes,
+            upstream_duration,
+            upstream_status
+        );
         if (!recorded) {
             write_status(client_fd, "HTTP/1.1 503 Service Unavailable");
             return false;

@@ -128,6 +128,15 @@ capability must never be described as active before it exists.
    traversal, and enforces the rule's method and path allowlist. Forwarded
    headers and the request target are validated; hop-by-hop, routing, and
    credential fields are stripped before the transport sees them.
+   Every decision is one `egress` audit record, written before the request is
+   forwarded or the refusal is sent; its `error` field is `allowed` or the
+   reason. A forwarded request gets a second `egress` record when the exchange
+   with the provider ends, before any of the response is served: `error` is
+   `completed` or `upstream_error`, `latency_ns` is how long the exchange
+   took, and `arguments` holds `upstream_status`, `request_bytes` and
+   `response_bytes`. So a journal has two records per forwarded request, and
+   only the second has a non-zero `latency_ns`. If either record cannot be
+   written the client gets 503 and nothing else.
 
 5. **Provider transport**: Legacy `glove exec --agent` presets and the native
    Pi adapter install `make_tls_forwarder` (`src/net/tls_forwarder.cpp`). Each allowed request is
@@ -278,17 +287,27 @@ filesystem/environment exposure. Passing `--allow-loopback-listen` brings up
 the private `lo` interface and permits `127.0.0.1` `bind`/`listen`/`accept`
 inside `CLONE_NEWNET` without granting external network egress.
 
-On macOS these commands launch the agent through the owned passthrough
-(`exec_contained_owned`). While the agent runs, glove holds the SIGINT,
-SIGQUIT, SIGTERM and SIGHUP dispositions: a signal sent to glove is passed to
-the agent's process group, the group is killed if it has not exited after 1.5
-seconds, and glove then returns through its normal exit path. So a supervisor
-that stops glove with SIGTERM still gets the `agent_exit` record, the denial
-summary and trace end record, and decoy removal, and glove exits with the
-agent's code or 128 plus the signal. SIGKILL of glove leaves none of these. A
-launch whose stdin is a terminal that glove is not in the foreground of is
-refused. On Linux glove does not handle these signals yet: the default action
-ends glove without those records, and `PR_SET_PDEATHSIG` ends the agent.
+While the agent runs, glove holds the SIGINT, SIGQUIT, SIGTERM and SIGHUP
+dispositions: a signal sent to glove is passed to the agent, the agent is
+killed if it has not exited after 1.5 seconds, and glove then returns through
+its normal exit path. So a supervisor that stops glove with SIGTERM still gets
+the `agent_exit` record, the denial summary and trace end record, and decoy
+removal, and glove exits with the agent's code or 128 plus the signal. SIGKILL
+of glove leaves none of these. A signal that was ignored when glove started
+(`nohup`) stays ignored on Linux.
+
+- macOS: the launch goes through the owned passthrough
+  (`exec_contained_owned`). The signal goes to the agent's process group, and
+  the group is what is killed. A launch whose stdin is a terminal that glove
+  is not in the foreground of is refused.
+- Linux: the agent is the init process of its pid namespace. The kernel drops
+  a signal such a process has no handler for, so an agent that does not
+  install one is not stopped by the signal and is killed at the end of the
+  grace period; killing it ends every process in the namespace. If glove
+  itself is killed, `PR_SET_PDEATHSIG` ends the agent.
+
+`glove run`, the MCP kernel path, does not handle these signals on either
+platform: the default action ends glove without those records.
 
 When `--herdr` is passed inside an outer Herdr terminal pane (`HERDR_ENV=1`, `HERDR_PANE_ID`),
 Glove's host runner reports lifecycle states (`working`, `done`) and releases authority
@@ -495,6 +514,36 @@ is worked around; a default journal that is not this user's owner-only
 single-link regular file is still an error, and so is an `--audit-log` path
 that another launch is using.
 
+### Where configuration and state live
+
+Configuration is files. The `glove` CLI reads them itself; `run`, `exec`,
+`shell` and `loop` never contact `gloved`, and the control protocol has no
+method that reads or changes configuration. `gloved` loads its own
+`config.json` and the state files that file names.
+
+`<config>` is `$XDG_CONFIG_HOME/glove` (default `~/.config/glove`), `<state>`
+is `$XDG_STATE_HOME/glove` (default `~/.local/state/glove`) and `<data>` is
+`$XDG_DATA_HOME/glove` (default `~/.local/share/glove`). The runtime directory
+is `<state>/runtime`; `XDG_RUNTIME_DIR` is not used for it.
+
+| Path | What | Read by | Written by |
+|---|---|---|---|
+| `<config>/config.json` | service configuration | `gloved`, `glove status`, `doctor`, `session` | `glove setup` |
+| `<config>/policies/<name>.json` | session policies | `glove setup`, `glove policy` | `glove policy install` |
+| `<config>/path-exposure-policy.json` | path exposure policy | `gloved` | `glove setup` |
+| `<config>/profiles/<name>.yaml` | launch profiles | `--profile` | `glove profile new`, `edit` |
+| `<config>/envs/<name>.json` | saved shell environments | `glove shell --load`, `--list` | `glove shell --save`, and `last` after each launch |
+| `<state>/logs/session*.jsonl` | default audit journals | you | `run`, `exec`, `shell`, `loop` |
+| `<state>/decoys` | decoy journals | `glove` | `glove` |
+| `<state>/audit.key`, `receipts.journal`, `sessions.journal`, `path-exposures.journal`, `materializations/` | service state | `gloved` | `gloved` |
+| `<state>/runtime/gloved.sock`, `gloved.lock` | control socket and lock | `glove` | `gloved` |
+| `<data>/library-bundles` | library bundles | `gloved` | `gloved` |
+
+Profiles, saved environments and `config.json` are read only when they are a
+regular single-link file owned by the invoking user with mode 0600. A denial
+trace and a denial model have no default location; `--denial-trace` and
+`--denial-model` name them.
+
 Detailed policy and file invariants are defined in
 [session-policy.md](session-policy.md).
 
@@ -639,8 +688,12 @@ it.
   the flush barrier for the session's own denials.
 - Each accepted denial becomes one `sandbox_denial` audit record with kind,
   operation, target, process name and pid, percent-encoded and bounded (target
-  512 bytes, 16 records per second, 256 per session). One `telemetry` record is
-  written at start and one `summary` record at exit.
+  512 bytes, 16 records per second, 256 per session). A denial with the same
+  kind, operation, target and process name as one already recorded is not
+  written again; the summary counts these as `suppressed_repeat`. So the 256
+  records are distinct denials, and the time and pid of a repeat are only in a
+  `--denial-trace` file. One `telemetry` record is written at start and one
+  `summary` record at exit.
 - If the stream cannot be started or proven, one `telemetry` record says
   `unavailable` and the session runs sandboxed without telemetry.
 - An audit append failure of a telemetry record is returned as an error after

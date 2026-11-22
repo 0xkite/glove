@@ -492,8 +492,14 @@ auto main() -> int {
         request(**executor, "wd-s", remote_method::remote_start, watchdog_start, 2'000).has_value()
     );
     write_file(docker_log, {});
-    std::this_thread::sleep_for(std::chrono::milliseconds{400});
-    REQUIRE(contains_call(read_file(docker_log), "rm", "-f"));
+    // The watchdog acts on its own schedule; wait for it instead of assuming
+    // it has run after a fixed delay, which a loaded host does not guarantee.
+    bool reaped = false;
+    for (int attempt = 0; attempt != 100 && !reaped; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        reaped = contains_call(read_file(docker_log), "rm", "-f");
+    }
+    REQUIRE(reaped);
 
     // Public managed-session runtime capabilities remain non-advertised in the
     // separate remote_session_runtime test; this health surface says so too.
