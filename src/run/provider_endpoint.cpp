@@ -1,7 +1,11 @@
 #include "provider_endpoint.hpp"
 
+#include "glove/audit/event.hpp"
+#include "glove/mcp/messages.hpp"
 #include "glove/net/tls_forwarder.hpp"
 
+#include <chrono>
+#include <string>
 #include <utility>
 
 namespace glove::run::detail {
@@ -85,6 +89,31 @@ auto make_shared_provider_endpoint_options(
     options.upstream_deadline_ms = 10 * 60 * 1000;
     options.on_event = std::move(on_event);
     return options;
+}
+
+auto record_endpoint_event(
+    const std::shared_ptr<audit::sink>& sink, const net::endpoint_event& event
+) -> std::expected<void, std::string> {
+    if (!sink) {
+        return {};
+    }
+    const bool outcome = event.detail == "completed" || event.detail == "upstream_error";
+    std::string arguments;
+    if (outcome) {
+        arguments = R"({"upstream_status":)" + std::to_string(event.upstream_status) +
+                    R"(,"request_bytes":)" + std::to_string(event.request_bytes) +
+                    R"(,"response_bytes":)" + std::to_string(event.response_bytes) + "}";
+    }
+    const audit::event recorded{
+        .what = audit::action::egress,
+        .tool_name = event.method + " " + event.path,
+        .arguments_json = std::move(arguments),
+        .status =
+            event.allowed ? mcp::tool_call_status::ok : mcp::tool_call_status::invalid_arguments,
+        .error_message = event.detail,
+        .latency = outcome ? event.upstream_duration : std::chrono::nanoseconds{0},
+    };
+    return sink->record(recorded);
 }
 
 } // namespace glove::run::detail

@@ -128,6 +128,15 @@ capability must never be described as active before it exists.
    traversal, and enforces the rule's method and path allowlist. Forwarded
    headers and the request target are validated; hop-by-hop, routing, and
    credential fields are stripped before the transport sees them.
+   Every decision is one `egress` audit record, written before the request is
+   forwarded or the refusal is sent; its `error` field is `allowed` or the
+   reason. A forwarded request gets a second `egress` record when the exchange
+   with the provider ends, before any of the response is served: `error` is
+   `completed` or `upstream_error`, `latency_ns` is how long the exchange
+   took, and `arguments` holds `upstream_status`, `request_bytes` and
+   `response_bytes`. So a journal has two records per forwarded request, and
+   only the second has a non-zero `latency_ns`. If either record cannot be
+   written the client gets 503 and nothing else.
 
 5. **Provider transport**: Legacy `glove exec --agent` presets and the native
    Pi adapter install `make_tls_forwarder` (`src/net/tls_forwarder.cpp`). Each allowed request is

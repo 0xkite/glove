@@ -1,7 +1,11 @@
+#include "glove/audit/event.hpp"
+#include "glove/audit/sink.hpp"
+#include "glove/mcp/messages.hpp"
 #include "glove/run/pi_provider_share.hpp"
 
 #include "provider_endpoint.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -49,9 +53,66 @@ auto check_surface(
         options->forward(request, {}, std::chrono::steady_clock::now() + std::chrono::seconds{1});
     return !denied && denied.error() == "upstream not in the forwarder allowlist";
 }
+
+// The decision record keeps its old shape; the outcome record carries the
+// exchange's duration, sizes and upstream status.
+auto check_records() -> bool {
+    using namespace std::chrono_literals;
+    auto sink = glove::audit::make_memory_sink();
+    const glove::net::endpoint_event decision{
+        .method = "POST",
+        .path = "/p/one/chat/completions",
+        .allowed = true,
+        .detail = "allowed",
+    };
+    auto outcome = decision;
+    outcome.detail = "completed";
+    outcome.request_bytes = 120;
+    outcome.response_bytes = 4096;
+    outcome.upstream_duration = 1500ms;
+    outcome.upstream_status = 200;
+    auto failed = decision;
+    failed.detail = "upstream_error";
+    failed.request_bytes = 7;
+    failed.upstream_duration = 20ms;
+    auto denied = decision;
+    denied.allowed = false;
+    denied.detail = "invalid_session_nonce";
+    for (const auto& event : {decision, outcome, failed, denied}) {
+        if (!glove::run::detail::record_endpoint_event(sink, event)) {
+            return false;
+        }
+    }
+    const auto records = sink->take();
+    if (records.size() != 4) {
+        return false;
+    }
+    for (const auto& record : records) {
+        if (record.what != glove::audit::action::egress ||
+            record.tool_name != "POST /p/one/chat/completions") {
+            return false;
+        }
+    }
+    return records[0].arguments_json.empty() && records[0].latency == 0ns &&
+           records[0].error_message == "allowed" &&
+           records[0].status == glove::mcp::tool_call_status::ok &&
+           records[1].arguments_json ==
+               R"({"upstream_status":200,"request_bytes":120,"response_bytes":4096})" &&
+           records[1].latency == 1500ms && records[1].error_message == "completed" &&
+           records[2].arguments_json ==
+               R"({"upstream_status":0,"request_bytes":7,"response_bytes":0})" &&
+           records[2].latency == 20ms && records[2].error_message == "upstream_error" &&
+           records[3].arguments_json.empty() && records[3].latency == 0ns &&
+           records[3].status == glove::mcp::tool_call_status::invalid_arguments &&
+           glove::run::detail::record_endpoint_event(nullptr, outcome).has_value();
+}
 } // namespace
 
 auto main() -> int {
+    if (!check_records()) {
+        std::fputs("endpoint event records are wrong\n", stderr);
+        return 1;
+    }
     using glove::net::endpoint_provider;
     using glove::run::detail::make_provider_endpoint_options;
     using glove::run::detail::provider_surface;
