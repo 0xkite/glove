@@ -518,6 +518,12 @@ auto handle_frame(
         return handle_signal(state, request->id, *params);
     }
 
+    if (request->method == "pause_session" || request->method == "resume_session") {
+        return handle_pause_session(
+            state, request->id, *params, request->method == "pause_session"
+        );
+    }
+
     if (request->method == "detach") {
         return handle_detach(state, request->id, *params);
     }

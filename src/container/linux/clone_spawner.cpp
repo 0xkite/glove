@@ -3079,6 +3079,27 @@ auto linux_detail::managed_pty_session::signal(pty_session_signal requested)
     return state_->terminal->signal(requested);
 }
 
+auto linux_detail::managed_pty_session::set_frozen(bool frozen)
+    -> std::expected<void, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"managed PTY session is empty"});
+    }
+    {
+        const std::lock_guard lock{state_->state_mutex};
+        if (state_->finished) {
+            return std::unexpected(std::string{"session has finished"});
+        }
+    }
+    return state_->lifecycle->set_frozen(frozen);
+}
+
+auto linux_detail::managed_pty_session::frozen() -> std::expected<bool, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"managed PTY session is empty"});
+    }
+    return state_->lifecycle->frozen();
+}
+
 auto linux_detail::managed_pty_session::stop() -> std::expected<void, std::string> {
     if (!state_) {
         return std::unexpected(std::string{"managed PTY session is empty"});

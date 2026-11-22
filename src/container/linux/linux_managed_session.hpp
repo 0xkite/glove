@@ -71,6 +71,9 @@ public:
     [[nodiscard]] auto resize(std::uint16_t rows, std::uint16_t columns)
         -> std::expected<void, std::string>;
     [[nodiscard]] auto signal(pty_session_signal requested) -> std::expected<void, std::string>;
+    // Freezes or thaws every process of the session through its cgroup.
+    [[nodiscard]] auto set_frozen(bool frozen) -> std::expected<void, std::string>;
+    [[nodiscard]] auto frozen() -> std::expected<bool, std::string>;
     [[nodiscard]] auto stop() -> std::expected<void, std::string>;
     // Executes the durable controller transition while terminal completion is
     // excluded. The gate is skipped when the waiter has already published a

@@ -53,7 +53,22 @@ constexpr std::string_view library_bundle =
 
 class capability_test_runtime final : public glove::control::session_runtime {
 public:
-    explicit capability_test_runtime(bool operational) : operational_{operational} {}
+    explicit capability_test_runtime(bool operational, bool pausable = false)
+        : operational_{operational}, pausable_{pausable} {}
+
+    [[nodiscard]] auto pause_supported() const noexcept -> bool override { return pausable_; }
+
+    [[nodiscard]] auto pause(std::string_view session_id)
+        -> std::expected<void, std::string> override {
+        return record_pause(session_id, true);
+    }
+
+    [[nodiscard]] auto resume(std::string_view session_id)
+        -> std::expected<void, std::string> override {
+        return record_pause(session_id, false);
+    }
+
+    std::vector<std::string> pause_calls;
 
     [[nodiscard]] auto backend_id() const noexcept -> std::string_view override {
         return "capability-test";
@@ -140,7 +155,16 @@ public:
     }
 
 private:
+    auto record_pause(std::string_view session_id, bool pause) -> std::expected<void, std::string> {
+        pause_calls.push_back(std::string{pause ? "pause:" : "resume:"} + std::string{session_id});
+        if (session_id != "session-pausable") {
+            return std::unexpected(std::string{"no such session"});
+        }
+        return {};
+    }
+
     bool operational_ = false;
+    bool pausable_ = false;
 };
 
 class temporary_directory {
@@ -1708,6 +1732,80 @@ auto run() -> int {
     );
     REQUIRE(operational_protocol.has_value());
     REQUIRE(observation_capability(**operational_protocol, "operational-capabilities") == 0);
+
+    // pause_session / resume_session: offered only by a runtime that supports
+    // them, idempotent, and absent from capabilities, whose strict decoders
+    // on the Sage side reject unknown fields.
+    const auto pause_frame = [&](auto& protocol,
+                                 std::string_view id,
+                                 std::string_view method,
+                                 std::string_view payload,
+                                 std::optional<std::string_view> key) {
+        auto frame =
+            protocol.handle_frame(make_request(id, method, bootstrap_secret, payload, key), 1'000);
+        return frame ? decode_response(*frame) : std::nullopt;
+    };
+    const std::string pause_payload = R"({"session_id":"session-pausable"})";
+    auto not_offered =
+        pause_frame(**operational_protocol, "pause-none", "pause_session", pause_payload, "p-0");
+    REQUIRE(not_offered && not_offered->error && not_offered->error->code == "method_not_found");
+    REQUIRE(operational_runtime->pause_calls.empty());
+    auto pausable_runtime = std::make_shared<capability_test_runtime>(true, true);
+    auto pausable_protocol = glove::control::receipt_audit_protocol::create(
+        bootstrap_secret,
+        *recovered,
+        shared_validator,
+        shared_sessions,
+        pausable_runtime,
+        {},
+        temp.root().string()
+    );
+    REQUIRE(pausable_protocol.has_value());
+    auto paused =
+        pause_frame(**pausable_protocol, "pause-1", "pause_session", pause_payload, "p-1");
+    REQUIRE(paused && paused->result.has_value());
+    auto replayed =
+        pause_frame(**pausable_protocol, "pause-1b", "pause_session", pause_payload, "p-1");
+    REQUIRE(replayed && replayed->result.has_value());
+    REQUIRE(replayed->result->str == paused->result->str);
+    auto pause_conflict =
+        pause_frame(**pausable_protocol, "pause-1c", "resume_session", pause_payload, "p-1");
+    REQUIRE(
+        pause_conflict && pause_conflict->error &&
+        pause_conflict->error->code == "idempotency_conflict"
+    );
+    auto resumed =
+        pause_frame(**pausable_protocol, "resume-1", "resume_session", pause_payload, "r-1");
+    REQUIRE(resumed && resumed->result.has_value());
+    const std::vector<std::string> expected_pause_calls{
+        "pause:session-pausable", "resume:session-pausable"
+    };
+    REQUIRE(pausable_runtime->pause_calls == expected_pause_calls);
+    auto no_key =
+        pause_frame(**pausable_protocol, "pause-2", "pause_session", pause_payload, std::nullopt);
+    REQUIRE(no_key && no_key->error && no_key->error->code == "invalid_request");
+    auto bad_payload = pause_frame(
+        **pausable_protocol, "pause-3", "pause_session", R"({"session_id":"x","extra":1})", "p-3"
+    );
+    REQUIRE(bad_payload && bad_payload->error && bad_payload->error->code == "invalid_request");
+    auto missing = pause_frame(
+        **pausable_protocol, "pause-4", "pause_session", R"({"session_id":"session-gone"})", "p-4"
+    );
+    REQUIRE(missing && missing->error && missing->error->code == "session_pause_failed");
+    auto failed_resume = pause_frame(
+        **pausable_protocol, "resume-4", "resume_session", R"({"session_id":"session-gone"})", "r-4"
+    );
+    REQUIRE(
+        failed_resume && failed_resume->error &&
+        failed_resume->error->code == "session_resume_failed"
+    );
+    auto pausable_capabilities =
+        pause_frame(**pausable_protocol, "pause-caps", "capabilities", "null", std::nullopt);
+    REQUIRE(pausable_capabilities && pausable_capabilities->result.has_value());
+    supervisor_capabilities pausable_capability_set;
+    REQUIRE(!glz::read<glz::opts{.error_on_unknown_keys = true}>(
+        pausable_capability_set, pausable_capabilities->result->str
+    ));
 
     auto remote_runtime = glove::control::remote_session_runtime::create({
         .ssh_argv = {"/usr/bin/ssh", "-F", "/tmp/glove-remote/config", "glove-remote"},

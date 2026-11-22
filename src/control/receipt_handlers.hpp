@@ -134,6 +134,14 @@ valid_identifier(std::string_view value, std::size_t max_bytes = max_identifier_
     std::string_view request_id,
     const wire::rpc_params& params
 ) -> std::expected<std::string, std::string>;
+// pause_session / resume_session: freeze or thaw a running session's
+// processes. Offered only by a runtime whose pause_supported() is true.
+[[nodiscard]] auto handle_pause_session(
+    receipt_audit_protocol::implementation& state,
+    std::string_view request_id,
+    const wire::rpc_params& params,
+    bool pause
+) -> std::expected<std::string, std::string>;
 [[nodiscard]] auto handle_detach(
     receipt_audit_protocol::implementation& state,
     std::string_view request_id,

@@ -4,6 +4,7 @@
 
 #include <sys/types.h>
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -58,6 +59,13 @@ public:
     [[nodiscard]] auto observe() const -> std::expected<cgroup_observation, std::string>;
     [[nodiscard]] cgroup_limit_result triggered_limit(const resource_limits& limits) const;
     [[nodiscard]] auto kill_all() const -> std::expected<void, std::string>;
+    // cgroup v2 freezer. Writes cgroup.freeze and waits until cgroup.events
+    // reports the requested state, or TIMEOUT passes. Every process in the
+    // cgroup stops being scheduled while frozen; SIGKILL and cgroup.kill
+    // still end them.
+    [[nodiscard]] auto set_frozen(bool frozen, std::chrono::milliseconds timeout) const
+        -> std::expected<void, std::string>;
+    [[nodiscard]] auto frozen() const -> std::expected<bool, std::string>;
     auto cleanup() -> std::expected<void, std::string>;
 
 private:

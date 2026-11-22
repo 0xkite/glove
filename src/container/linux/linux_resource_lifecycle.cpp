@@ -19,6 +19,10 @@ namespace glove::container::linux_detail {
 
 namespace {
 
+// A frozen cgroup reports itself frozen once every task has stopped; a
+// task in uninterruptible sleep can delay that briefly.
+constexpr auto freeze_timeout = std::chrono::seconds{10};
+
 class input_fd_guard final {
 public:
     explicit input_fd_guard(int descriptor) noexcept : descriptor_{descriptor} {}
@@ -352,6 +356,30 @@ auto linux_resource_lifecycle::request_stop() -> std::expected<void, std::string
         termination_started_.store(true);
     }
     return killed;
+}
+
+auto linux_resource_lifecycle::set_frozen(bool frozen) -> std::expected<void, std::string> {
+    const std::lock_guard finish_lock{finish_mutex_};
+    if (terminal_ || pending_terminal_ || cgroup_cleaned_) {
+        return std::unexpected(std::string{"session has finished"});
+    }
+    if (!attached_) {
+        return std::unexpected(std::string{"resource lifecycle has no attached child"});
+    }
+    const std::lock_guard cgroup_lock{cgroup_mutex_};
+    if (termination_started_.load()) {
+        return std::unexpected(std::string{"session is stopping"});
+    }
+    return cgroup_.set_frozen(frozen, freeze_timeout);
+}
+
+auto linux_resource_lifecycle::frozen() -> std::expected<bool, std::string> {
+    const std::lock_guard finish_lock{finish_mutex_};
+    if (cgroup_cleaned_) {
+        return false;
+    }
+    const std::lock_guard cgroup_lock{cgroup_mutex_};
+    return cgroup_.frozen();
 }
 
 void linux_resource_lifecycle::poll_resources() noexcept {
