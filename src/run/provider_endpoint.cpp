@@ -102,7 +102,12 @@ auto record_endpoint_event(
     if (outcome) {
         arguments = R"({"upstream_status":)" + std::to_string(event.upstream_status) +
                     R"(,"request_bytes":)" + std::to_string(event.request_bytes) +
-                    R"(,"response_bytes":)" + std::to_string(event.response_bytes) + "}";
+                    R"(,"response_bytes":)" + std::to_string(event.response_bytes);
+        if (event.tokens_reported) {
+            arguments += R"(,"input_tokens":)" + std::to_string(event.input_tokens) +
+                         R"(,"output_tokens":)" + std::to_string(event.output_tokens);
+        }
+        arguments += "}";
     }
     const audit::event recorded{
         .what = audit::action::egress,

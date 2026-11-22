@@ -3,6 +3,7 @@ add_library(glove_net STATIC
     egress_proxy.cpp
     http1_client.cpp
     tls_forwarder.cpp
+    usage_tokens.cpp
 )
 add_library(glove::net ALIAS glove_net)
 
@@ -21,6 +22,8 @@ endif()
 target_link_libraries(glove_net
     PUBLIC
         glove_options
+    PRIVATE
+        glaze::glaze
 )
 target_include_directories(glove_net
     PUBLIC

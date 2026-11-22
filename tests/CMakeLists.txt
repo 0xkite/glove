@@ -323,6 +323,12 @@ target_link_libraries(net_egress_proxy_test PRIVATE glove_kernel)
 add_test(NAME net_egress_proxy COMMAND net_egress_proxy_test)
 set_tests_properties(net_egress_proxy PROPERTIES TIMEOUT 30)
 
+add_executable(net_usage_tokens_test net/usage_tokens_test.cpp)
+target_link_libraries(net_usage_tokens_test PRIVATE glove_net)
+target_include_directories(net_usage_tokens_test PRIVATE ${CMAKE_SOURCE_DIR}/src/net)
+add_test(NAME net_usage_tokens COMMAND net_usage_tokens_test)
+set_tests_properties(net_usage_tokens PROPERTIES TIMEOUT 10)
+
 add_executable(net_credentialed_endpoint_test net/credentialed_endpoint_test.cpp)
 target_link_libraries(net_credentialed_endpoint_test PRIVATE glove_kernel)
 add_test(NAME net_credentialed_endpoint COMMAND net_credentialed_endpoint_test)

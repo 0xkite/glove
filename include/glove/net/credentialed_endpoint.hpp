@@ -50,6 +50,22 @@ struct endpoint_event {
     // (detail "allowed") is emitted before the exchange and has neither.
     std::chrono::nanoseconds upstream_duration{0};
     int upstream_status = 0;
+    // Token counts the provider reported in the response (outcome event
+    // only); tokens_reported is false when the body carried none.
+    std::uint64_t input_tokens = 0;
+    std::uint64_t output_tokens = 0;
+    bool tokens_reported = false;
+};
+
+// Per-endpoint budgets; 0 means unlimited. Checked after authentication and
+// before anything is forwarded. A request over a budget is refused with 429
+// and recorded with its reason: "request_limit", "rate_limit" or
+// "token_limit". Tokens count what providers reported, so a provider that
+// reports none never reaches the token limit.
+struct endpoint_limits {
+    std::uint64_t max_requests = 0;
+    std::uint32_t max_requests_per_minute = 0;
+    std::uint64_t max_tokens = 0;
 };
 
 // One request that has already been authenticated, matched to a rule, and had
@@ -94,6 +110,7 @@ struct credentialed_endpoint_options {
     std::vector<credentialed_endpoint_rule> endpoints;
     std::function<std::expected<void, std::string>(const endpoint_event&)> on_event;
     upstream_forwarder forward;
+    endpoint_limits limits;
     // Absolute deadlines for the body and response phases. Both are bounded so a
     // client that declares a body it never sends, or stops reading the response,
     // cannot pin the endpoint's single worker or block shutdown. Configurable so

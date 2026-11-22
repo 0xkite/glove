@@ -71,6 +71,9 @@ auto check_records() -> bool {
     outcome.response_bytes = 4096;
     outcome.upstream_duration = 1500ms;
     outcome.upstream_status = 200;
+    outcome.input_tokens = 900;
+    outcome.output_tokens = 57;
+    outcome.tokens_reported = true;
     auto failed = decision;
     failed.detail = "upstream_error";
     failed.request_bytes = 7;
@@ -97,7 +100,7 @@ auto check_records() -> bool {
            records[0].error_message == "allowed" &&
            records[0].status == glove::mcp::tool_call_status::ok &&
            records[1].arguments_json ==
-               R"({"upstream_status":200,"request_bytes":120,"response_bytes":4096})" &&
+               R"({"upstream_status":200,"request_bytes":120,"response_bytes":4096,"input_tokens":900,"output_tokens":57})" &&
            records[1].latency == 1500ms && records[1].error_message == "completed" &&
            records[2].arguments_json ==
                R"({"upstream_status":0,"request_bytes":7,"response_bytes":0})" &&

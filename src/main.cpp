@@ -226,6 +226,9 @@ void print_exec_usage() {
         "  --stop-grace <seconds>  time the agent has to exit after glove passes it\n"
         "                          SIGTERM, SIGINT, SIGHUP or SIGQUIT before it is\n"
         "                          killed (0.1 to 60; default 1.5)\n"
+        "  --max-model-requests <n>, --max-model-requests-per-minute <n>,\n"
+        "  --max-model-tokens <n>  budgets for the shared model credential; a request\n"
+        "                          over one gets 429 (tokens as the provider reports)\n"
         "  --egress-allow <host>[:port]\n"
         "                          permit outbound HTTPS (repeatable; leading '.'\n"
         "                          matches subdomains; port defaults to 443). Without any,\n"
@@ -288,6 +291,9 @@ void print_shell_usage() {
         "  --stop-grace <seconds>  time the agent has to exit after glove passes it\n"
         "                          SIGTERM, SIGINT, SIGHUP or SIGQUIT before it is\n"
         "                          killed (0.1 to 60; default 1.5)\n"
+        "  --max-model-requests <n>, --max-model-requests-per-minute <n>,\n"
+        "  --max-model-tokens <n>  budgets for the shared model credential; a request\n"
+        "                          over one gets 429 (tokens as the provider reports)\n"
         "  --share-credential <pi-provider>\n"
         "                          with --agent pi: mediate the host API key for one Pi\n"
         "                          provider; the sandbox gets a session nonce, never the key\n"
@@ -477,6 +483,39 @@ auto parse_sandbox_flag(
             opts.environment_names.emplace_back(args[i + 1]);
         } else {
             opts.audit_log = std::filesystem::path{args[i + 1]};
+        }
+        i += 2;
+        return 0;
+    }
+    if ((a == "--max-model-requests" || a == "--max-model-requests-per-minute" ||
+         a == "--max-model-tokens") &&
+        (cmd_name == "exec" || cmd_name == "shell")) {
+        std::uint64_t value = 0;
+        bool parsed = i + 1 < args.size();
+        if (parsed) {
+            const std::string_view text{args[i + 1]};
+            const auto* end = text.data() + text.size();
+            const auto [ptr, ec] = std::from_chars(text.data(), end, value);
+            parsed = !text.empty() && ec == std::errc{} && ptr == end && value > 0 &&
+                     (a != "--max-model-requests-per-minute" || value <= 1000000);
+        }
+        if (!parsed) {
+            std::fprintf(
+                stderr,
+                "glove %.*s: %.*s needs a positive whole number\n",
+                static_cast<int>(cmd_name.size()),
+                cmd_name.data(),
+                static_cast<int>(a.size()),
+                a.data()
+            );
+            return 2;
+        }
+        if (a == "--max-model-requests") {
+            opts.max_model_requests = value;
+        } else if (a == "--max-model-tokens") {
+            opts.max_model_tokens = value;
+        } else {
+            opts.max_model_requests_per_minute = static_cast<std::uint32_t>(value);
         }
         i += 2;
         return 0;
@@ -1818,6 +1857,9 @@ auto shell_subcommand(std::span<char* const> args) -> int {
         loaded.denial_trace = opts.denial_trace;
         loaded.denial_model = opts.denial_model;
         loaded.stop_grace = opts.stop_grace;
+        loaded.max_model_requests = opts.max_model_requests;
+        loaded.max_model_requests_per_minute = opts.max_model_requests_per_minute;
+        loaded.max_model_tokens = opts.max_model_tokens;
         loaded.share_credential = opts.share_credential;
         loaded.share_credential_origin = opts.share_credential_origin;
         // A path given both in the profile and on the command line is one rule.

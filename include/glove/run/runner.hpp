@@ -5,6 +5,7 @@
 #include "glove/run/secret_reference.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <optional>
@@ -52,6 +53,10 @@ struct options {
     // Time a direct agent has to exit after glove passes it a termination
     // signal (`glove exec`/`shell`); unset means container::default_stop_grace.
     std::optional<std::chrono::milliseconds> stop_grace;
+    // Budgets for the credentialed model endpoint; 0 means unlimited.
+    std::uint64_t max_model_requests = 0;
+    std::uint32_t max_model_requests_per_minute = 0;
+    std::uint64_t max_model_tokens = 0;
     // Optional read-write workspace path exposed to the agent. When unset,
     // both modes use only a per-run private empty working directory.
     std::optional<std::filesystem::path> workspace;

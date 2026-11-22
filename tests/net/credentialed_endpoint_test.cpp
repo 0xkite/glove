@@ -195,6 +195,104 @@ auto outcome_events() -> int {
     return 0;
 }
 
+// Request, per-minute and token budgets refuse with 429 before forwarding,
+// and record the reason. Token counts come from the provider's response.
+auto limits() -> int {
+    std::mutex mutex;
+    std::vector<glove::net::endpoint_event> seen;
+    std::atomic<int> forwarded{0};
+    const auto take = [&] {
+        const std::lock_guard lock{mutex};
+        return std::exchange(seen, {});
+    };
+    const auto start = [&](glove::net::endpoint_limits budget) {
+        glove::net::credentialed_endpoint_options options;
+        options.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::openai,
+            .path_prefix = "/openai",
+            .upstream_host = "api.openai.com",
+            .upstream_port = 443,
+            .secret_token = "host-only-token",
+            .session_nonce = "limit-nonce",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/chat/completions"},
+        });
+        options.limits = budget;
+        options.on_event =
+            [&](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
+            const std::lock_guard lock{mutex};
+            seen.push_back(event);
+            return {};
+        };
+        options.forward = [&](
+                              const glove::net::upstream_request&,
+                              std::stop_token,
+                              std::chrono::steady_clock::time_point
+                          ) -> std::expected<glove::net::upstream_response, std::string> {
+            ++forwarded;
+            glove::net::upstream_response response;
+            response.status_code = 200;
+            response.body = R"({"usage":{"prompt_tokens":40,"completion_tokens":10}})";
+            return response;
+        };
+        return glove::net::start_credentialed_endpoint(std::move(options));
+    };
+    const std::string request = "POST /openai/v1/chat/completions HTTP/1.1\r\n"
+                                "Host: 127.0.0.1\r\n"
+                                "Authorization: Bearer limit-nonce\r\n"
+                                "Content-Length: 0\r\n\r\n";
+    const auto refused_with = [&](std::uint16_t port, std::string_view reason) -> bool {
+        const auto response = send_and_receive(port, request);
+        const auto events = take();
+        return response.starts_with("HTTP/1.1 429") && response.contains(reason) &&
+               events.size() == 1 && !events[0].allowed && events[0].detail == reason;
+    };
+
+    // Two requests, then the third is refused.
+    {
+        auto endpoint = start({.max_requests = 2});
+        REQUIRE(endpoint.has_value());
+        const auto port = (*endpoint)->port();
+        for (int index = 0; index != 2; ++index) {
+            REQUIRE(send_and_receive(port, request).starts_with("HTTP/1.1 200"));
+            const auto events = take();
+            REQUIRE(events.size() == 2 && events[1].detail == "completed");
+            REQUIRE(
+                events[1].tokens_reported && events[1].input_tokens == 40 &&
+                events[1].output_tokens == 10
+            );
+        }
+        REQUIRE(refused_with(port, "request_limit"));
+        REQUIRE(forwarded == 2);
+    }
+    // One per minute.
+    {
+        forwarded = 0;
+        auto endpoint = start({.max_requests_per_minute = 1});
+        REQUIRE(endpoint.has_value());
+        const auto port = (*endpoint)->port();
+        REQUIRE(send_and_receive(port, request).starts_with("HTTP/1.1 200"));
+        static_cast<void>(take());
+        REQUIRE(refused_with(port, "rate_limit"));
+        REQUIRE(forwarded == 1);
+    }
+    // 50 tokens per exchange against a budget of 100: two pass, the third is
+    // refused.
+    {
+        forwarded = 0;
+        auto endpoint = start({.max_tokens = 100});
+        REQUIRE(endpoint.has_value());
+        const auto port = (*endpoint)->port();
+        for (int index = 0; index != 2; ++index) {
+            REQUIRE(send_and_receive(port, request).starts_with("HTTP/1.1 200"));
+            static_cast<void>(take());
+        }
+        REQUIRE(refused_with(port, "token_limit"));
+        REQUIRE(forwarded == 2);
+    }
+    return 0;
+}
+
 auto run() -> int {
     std::vector<glove::net::endpoint_event> recorded_events;
 
@@ -794,6 +892,9 @@ auto run() -> int {
 
 auto main() -> int {
     if (const int failed = outcome_events(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = limits(); failed != 0) {
         return failed;
     }
     return run();
