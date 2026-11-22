@@ -43,6 +43,18 @@
       }
     },
     {
+      "name": "coverage",
+      "displayName": "Debug + llvm-cov source-based coverage",
+      "inherits": "_base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "GLOVE_SANITIZER": "none",
+        "GLOVE_HARDENING": "OFF",
+        "GLOVE_COVERAGE": "ON",
+        "GLOVE_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
       "name": "fuzz",
       "displayName": "RelWithDebInfo + ASan/UBSan + libFuzzer",
       "inherits": "_base",
@@ -79,6 +91,7 @@
     { "name": "dev",            "configurePreset": "dev" },
     { "name": "asan",           "configurePreset": "asan" },
     { "name": "tsan",           "configurePreset": "tsan" },
+    { "name": "coverage",       "configurePreset": "coverage" },
     { "name": "fuzz",           "configurePreset": "fuzz" },
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
     { "name": "release",        "configurePreset": "release" }
@@ -93,6 +106,7 @@
     { "name": "dev",            "configurePreset": "dev",            "inherits": "_test_base" },
     { "name": "asan",           "configurePreset": "asan",           "inherits": "_test_base" },
     { "name": "tsan",           "configurePreset": "tsan",           "inherits": "_test_base" },
+    { "name": "coverage",       "configurePreset": "coverage",       "inherits": "_test_base" },
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "inherits": "_test_base" },
     { "name": "release",        "configurePreset": "release",        "inherits": "_test_base" }
   ]

@@ -238,6 +238,14 @@ add_executable(host_runtime_snapshot_bounds_test host/runtime_snapshot_bounds_te
 target_link_libraries(host_runtime_snapshot_bounds_test PRIVATE glove_host)
 add_test(NAME host_runtime_snapshot_bounds COMMAND host_runtime_snapshot_bounds_test)
 set_tests_properties(host_runtime_snapshot_bounds PROPERTIES TIMEOUT 15)
+if(GLOVE_COVERAGE)
+    # The test lowers RLIMIT_FSIZE to 1 KiB. An instrumented child then dies
+    # writing its profile, which is not what the test is about. /dev/null is
+    # not a regular file, so the limit does not apply to it.
+    set_tests_properties(
+        host_runtime_snapshot_bounds PROPERTIES ENVIRONMENT "LLVM_PROFILE_FILE=/dev/null"
+    )
+endif()
 
 add_executable(host_snapshot_cleanup_test host/snapshot_cleanup_test.cpp)
 target_link_libraries(host_snapshot_cleanup_test PRIVATE glove_host)
@@ -1194,6 +1202,14 @@ if(APPLE)
     set_tests_properties(
         glove_exec_denial_trace PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
     )
+
+    add_executable(glove_exec_signal_test run/glove_exec_signal_test.cpp)
+    target_link_libraries(glove_exec_signal_test PRIVATE glove_options)
+    target_compile_definitions(glove_exec_signal_test PRIVATE
+        GLOVE_BIN="$<TARGET_FILE:glove>")
+    add_dependencies(glove_exec_signal_test glove)
+    add_test(NAME glove_exec_signal COMMAND glove_exec_signal_test)
+    set_tests_properties(glove_exec_signal PROPERTIES TIMEOUT 60)
 endif()
 
 add_executable(run_exit_audit_test run/exit_audit_test.cpp)

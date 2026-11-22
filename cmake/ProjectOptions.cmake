@@ -19,6 +19,10 @@ option(GLOVE_BUILD_BENCHMARKS
     "Build reproducible research-facing benchmark executables"
     OFF
 )
+option(GLOVE_COVERAGE
+    "Instrument for llvm-cov source-based coverage (Clang; see scripts/coverage.sh)"
+    OFF
+)
 option(GLOVE_BUILD_FUZZERS
     "Build sanitizer-backed libFuzzer targets"
     OFF

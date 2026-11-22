@@ -719,23 +719,9 @@ auto sandboxed_env(const profile& prof) -> std::vector<std::string> {
 // own; glove is the perimeter + egress, not an MCP counterparty).
 auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
     -> std::expected<int, std::string> {
-    if (argv.empty()) {
-        return std::unexpected(std::string{"spawner: empty argv"});
-    }
-    auto checked = validate(prof);
-    if (!checked) {
-        return std::unexpected(std::string{"profile: "} + checked.error());
-    }
-    if (auto runtime = macos_detail::validate_runtime_filesystem(checked->runtime_filesystem);
-        !runtime) {
-        return std::unexpected(runtime.error());
-    }
-    if (auto constraints = macos_detail::validate_launch_constraints(*checked); !constraints) {
-        return std::unexpected(constraints.error());
-    }
     // Inherited stdio that is a regular file needs a metadata-only grant on its
     // path (runtimes stat their stdio); nothing else about it is readable.
-    profile stdio_profile = *checked;
+    std::vector<std::string> stdio_files;
     for (const int fd : {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO}) {
         struct ::stat st{};
         if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -743,90 +729,14 @@ auto exec_passthrough(const profile& prof, const std::vector<std::string>& argv)
         }
         std::array<char, MAXPATHLEN> path_buf{};
         if (::fcntl(fd, F_GETPATH, path_buf.data()) == 0 && path_buf[0] == '/') {
-            std::string path{path_buf.data()};
-            if (std::ranges::find(stdio_profile.link_spellings, path) ==
-                stdio_profile.link_spellings.end()) {
-                stdio_profile.link_spellings.push_back(std::move(path));
-            }
+            stdio_files.emplace_back(path_buf.data());
         }
     }
-    const auto& effective = stdio_profile;
-    auto resolved = resolve_program(effective, argv.front());
-    if (!resolved) {
-        return std::unexpected(resolved.error());
-    }
-    ::posix_spawn_file_actions_t actions{};
-    if (int rc = ::posix_spawn_file_actions_init(&actions); rc != 0) {
-        return std::unexpected(std::string{"file_actions_init: "} + std::strerror(rc));
-    }
-    // CLOEXEC_DEFAULT closes everything; explicitly keep stdio so the agent
-    // owns its terminal while no other host fd leaks in.
-    ::posix_spawn_file_actions_addinherit_np(&actions, STDIN_FILENO);
-    ::posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO);
-    ::posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
-    // Start in the workspace so a coding agent operates on the project. The
-    // `_np` form is the one present across macOS versions (10.15+); macOS 26
-    // deprecates it in favour of the unsuffixed name, which older systems lack.
-    const auto& start_dir = effective.work_dir ? effective.work_dir : effective.home_dir;
-    if (start_dir && !start_dir->empty()) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        ::posix_spawn_file_actions_addchdir_np(&actions, start_dir->c_str());
-#pragma clang diagnostic pop
-    }
-
-    ::posix_spawnattr_t attr{};
-    if (int rc = ::posix_spawnattr_init(&attr); rc != 0) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        return std::unexpected(std::string{"spawnattr_init: "} + std::strerror(rc));
-    }
-    ::posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
-
-    auto command = sandboxed_argv(effective, argv, std::move(*resolved));
-    std::vector<std::string> argv_owned = std::move(command.argv);
-    // read by denial telemetry once it is wired in
-    [[maybe_unused]] const std::string denial_tag = std::move(command.denial_tag);
-    std::vector<std::string> env_owned = sandboxed_env(effective);
-    if (auto compiled = profile_compiles(argv_owned[2]); !compiled) {
-        ::posix_spawn_file_actions_destroy(&actions);
-        ::posix_spawnattr_destroy(&attr);
-        return std::unexpected(compiled.error());
-    }
-    // An interactive agent owns its terminal but not the right to open other
-    // terminal paths; mirror the session path's scoped ioctl grant.
-    if (::isatty(STDIN_FILENO) != 0) {
-        append_terminal_ioctl_rule(argv_owned[2]);
-    }
-    std::vector<char*> argv_ptrs;
-    std::vector<char*> envp;
-    argv_ptrs.reserve(argv_owned.size() + 1);
-    envp.reserve(env_owned.size() + 1);
-    for (auto& a : argv_owned) {
-        argv_ptrs.push_back(a.data());
-    }
-    argv_ptrs.push_back(nullptr);
-    for (auto& e : env_owned) {
-        envp.push_back(e.data());
-    }
-    envp.push_back(nullptr);
-
-    ::pid_t pid = -1;
-    const int rc =
-        ::posix_spawnp(&pid, argv_owned[0].c_str(), &actions, &attr, argv_ptrs.data(), envp.data());
-    ::posix_spawn_file_actions_destroy(&actions);
-    ::posix_spawnattr_destroy(&attr);
-    if (rc != 0) {
-        return std::unexpected(std::string{"posix_spawnp: "} + std::strerror(rc));
-    }
-
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
-        return std::unexpected(std::string{"waitpid: "} + std::strerror(errno));
-    }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    // The owned launch keeps the child unreaped until cleanup is decided, so a
+    // SIGTERM, SIGINT, SIGHUP or SIGQUIT sent to glove is passed to the agent,
+    // escalated to SIGKILL after a grace period, and control returns to the
+    // caller, which still has its exit record and cleanup to do.
+    return macos_detail::exec_owned_with_stdio_files(prof, argv, std::move(stdio_files));
 }
 
 auto macos_resource_capabilities() noexcept -> resource_enforcement_capabilities {
@@ -970,7 +880,10 @@ public:
 } // namespace
 
 auto macos_detail::prepare_launch_command(
-    const profile& prof, const std::vector<std::string>& argv, bool terminal_stdio
+    const profile& prof,
+    const std::vector<std::string>& argv,
+    bool terminal_stdio,
+    const std::vector<std::string>& stdio_files
 ) -> std::expected<macos_detail::launch_command, std::string> {
     if (argv.empty()) {
         return std::unexpected(std::string{"spawner: empty argv"});
@@ -989,11 +902,20 @@ auto macos_detail::prepare_launch_command(
     if (auto constraints = validate_launch_constraints(*checked); !constraints) {
         return std::unexpected(constraints.error());
     }
+    // Added after validation, which keeps only spellings that touch a grant.
+    for (const auto& path : stdio_files) {
+        if (std::ranges::find(checked->link_spellings, path) == checked->link_spellings.end()) {
+            checked->link_spellings.push_back(path);
+        }
+    }
     auto program = resolve_program(*checked, argv.front());
     if (!program) {
         return std::unexpected(program.error());
     }
     auto command = sandboxed_argv(*checked, argv, std::move(*program));
+    if (auto compiled = profile_compiles(command.argv[2]); !compiled) {
+        return std::unexpected(compiled.error());
+    }
     if (terminal_stdio) {
         append_terminal_ioctl_rule(command.argv[2]);
     }

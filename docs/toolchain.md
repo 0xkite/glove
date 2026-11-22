@@ -91,6 +91,7 @@ bitten: `std::ranges::find(strings, "literal")` does not compile as C++26
 | `fuzz` | RelWithDebInfo | as `asan`, plus libFuzzer; tests and benchmarks off | yes | gate; no test preset |
 | `relwithdebinfo` | RelWithDebInfo | `-O2 -g -DNDEBUG` | yes | profiling |
 | `release` | Release | `-O3 -DNDEBUG`, LTO (`-flto=thin` on Clang) | yes | `setup.sh`, packages |
+| `coverage` | Debug | `-g -fprofile-instr-generate -fcoverage-mapping` | yes | `scripts/coverage.sh` |
 
 `setup.sh` uses `release`; `setup.sh Debug` uses `dev`.
 
@@ -107,6 +108,7 @@ Pass with `-D<name>=<value>` at configure time.
 | `GLOVE_SANITIZER` | `none` | `none`, `address`, `address+undefined`, `thread`, `memory`. Adds `-fno-omit-frame-pointer -g`. `memory` is refused on macOS and is in no preset or gate. |
 | `GLOVE_WARNINGS_AS_ERRORS` | `OFF` | adds `-Werror` |
 | `GLOVE_HARDENING` | `ON` | see [Hardening](#hardening); the `dev` preset sets `OFF` |
+| `GLOVE_COVERAGE` | `OFF` | Clang source-based coverage; see [Test coverage](#test-coverage). Clang only, not with a sanitizer. |
 | `GLOVE_BUILD_FUZZERS` | `OFF` | builds `fuzz/`; Clang only |
 | `GLOVE_BUILD_BENCHMARKS` | `OFF` | builds `benchmarks/` |
 | `GLOVE_WITH_GHOSTTY` | `OFF` | builds the libghostty terminal frontend; needs `-DGHOSTTY_ROOT=<prefix>` |
@@ -156,6 +158,40 @@ decode was within run-to-run noise. Nothing was measured on macOS.
 
 Not included: `-fno-delete-null-pointer-checks`, `-fno-strict-overflow`,
 `-fno-strict-aliasing`, and the libc++ `EXTENSIVE` and `DEBUG` modes.
+
+## Test coverage
+
+```sh
+scripts/coverage.sh                  # whole suite
+scripts/coverage.sh -R '^audit_'     # extra arguments go to ctest
+```
+
+The script builds the `coverage` preset (`GLOVE_COVERAGE=ON`: Clang
+source-based coverage, Debug, no sanitizer, hardening off), runs CTest, and
+writes `build/coverage/report/summary.txt` (totals and one line per file) and
+`lcov.info`. It needs `llvm-profdata` and `llvm-cov` from the same LLVM as the
+compiler. Only `src/` and `include/` are reported. CI runs it on Linux in the
+`Test coverage` job and prints the totals in the job summary; no threshold is
+enforced.
+
+What the figure leaves out:
+
+- It counts executed lines, not checked behavior.
+- A process that is killed, or that a sandbox stops from writing its profile,
+  contributes nothing. Contained agents are mostly in that group. A profile
+  that is cut short is left out and counted in the script's last line.
+- Code for the other operating system is not compiled, so a Linux figure and a
+  macOS figure are not comparable.
+- A test skipped on the host lowers the figure. Without privilege, 10 Linux
+  namespace and cgroup tests skip.
+- `host_runtime_snapshot_bounds` writes no profile: it lowers `RLIMIT_FSIZE`
+  to 1 KiB, which would kill an instrumented child at exit.
+
+Measured 2026-11-21 on Linux x86-64 (Clang 23, 132 of 142 tests ran): 59.7% of
+lines, 65.3% of regions, 79.4% of functions, 50.0% of branches. By module,
+lines: `policy` 92%, `adapters` 88%, `audit` 85%, `net` 78%, `run` 76%, `mcp`
+65%, `kernel` 65%, `supervisor` 61%, `host` 55%, `control` 55%, `container`
+51%, `src/main.cpp` 28%. Nothing was measured on macOS.
 
 ## Warnings
 

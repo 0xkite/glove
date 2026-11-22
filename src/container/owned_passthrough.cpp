@@ -539,6 +539,7 @@ auto execute(
     const std::vector<std::string>& argv,
     std::stop_token stop,
     std::chrono::milliseconds grace,
+    const std::vector<std::string>& stdio_files,
     failures& errors
 ) -> std::expected<int, std::string> {
     if (argv.empty() || argv.size() > 128) {
@@ -562,7 +563,7 @@ auto execute(
         return 1;
     }
     const bool terminal_stdio = ::isatty(stdio.descriptor(0)) == 1;
-    auto prepared = macos_detail::prepare_launch_command(prof, argv, terminal_stdio);
+    auto prepared = macos_detail::prepare_launch_command(prof, argv, terminal_stdio, stdio_files);
     if (!prepared) {
         return std::unexpected(prepared.error());
     }
@@ -682,11 +683,14 @@ auto execute(
 } // namespace
 #endif
 
-auto exec_contained_owned(
+namespace {
+
+auto run_owned(
     const profile& prof,
     const std::vector<std::string>& argv,
     std::stop_token stop,
-    std::chrono::milliseconds termination_grace
+    std::chrono::milliseconds termination_grace,
+    const std::vector<std::string>& stdio_files
 ) -> std::expected<int, std::string> {
 #if defined(__APPLE__) && defined(TARGET_OS_OSX) && TARGET_OS_OSX &&                               \
     defined(POSIX_SPAWN_CLOEXEC_DEFAULT) && defined(WNOWAIT)
@@ -700,6 +704,7 @@ auto exec_contained_owned(
             std::clamp(
                 termination_grace, std::chrono::milliseconds{1}, std::chrono::milliseconds{3000}
             ),
+            stdio_files,
             errors
         );
     } catch (const std::exception& exception) {
@@ -722,11 +727,31 @@ auto exec_contained_owned(
     (void)argv;
     (void)stop;
     (void)termination_grace;
+    (void)stdio_files;
     return std::unexpected(
         std::string{"owned passthrough unsupported: native macOS CLOEXEC_DEFAULT and waitid "
                     "WNOWAIT are required"}
     );
 #endif
 }
+
+} // namespace
+
+auto exec_contained_owned(
+    const profile& prof,
+    const std::vector<std::string>& argv,
+    std::stop_token stop,
+    std::chrono::milliseconds termination_grace
+) -> std::expected<int, std::string> {
+    return run_owned(prof, argv, std::move(stop), termination_grace, {});
+}
+
+#if defined(__APPLE__)
+auto macos_detail::exec_owned_with_stdio_files(
+    const profile& prof, const std::vector<std::string>& argv, std::vector<std::string> stdio_files
+) -> std::expected<int, std::string> {
+    return run_owned(prof, argv, {}, std::chrono::milliseconds{1500}, stdio_files);
+}
+#endif
 
 } // namespace glove::container
