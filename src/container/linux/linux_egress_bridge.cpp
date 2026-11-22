@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -404,7 +405,13 @@ auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::uint16_t proxy_p
         close_descriptor(sandbox_channel_fd);
         return std::unexpected(listener.error());
     }
-    const ::pid_t forwarder = ::fork();
+    // Not fork(): this process was made by clone3 from a parent that already
+    // runs threads, so an allocator lock may have been copied in the locked
+    // state with no thread left to release it. fork() takes every allocator
+    // lock first and would then wait forever. The forwarder allocates nothing,
+    // so a bare clone that runs no fork handlers is enough for it.
+    const auto forwarder =
+        static_cast<::pid_t>(::syscall(SYS_clone, SIGCHLD, nullptr, nullptr, nullptr, nullptr));
     if (forwarder < 0) {
         const int saved = errno;
         close_descriptor(*listener);
