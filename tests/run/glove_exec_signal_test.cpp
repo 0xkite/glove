@@ -1,7 +1,13 @@
-// A termination signal sent to `glove exec` or `glove shell` on macOS reaches
-// the agent, and glove still finishes its own work: it writes the exit record,
+// A termination signal sent to `glove exec` or `glove shell` reaches the
+// agent, and glove still finishes its own work: it writes the exit record,
 // leaves no agent process behind, and exits 128 + the signal. An agent that
-// ignores the signal is killed after the grace period.
+// does not act on the signal is killed after the grace period.
+//
+// On Linux the agent is the init process of its own pid namespace. The kernel
+// drops a signal such a process has no handler for, so the cooperative agent
+// traps the signal, and an agent that merely has the default disposition is
+// the one that gets killed. A pid from inside the namespace says nothing to
+// the test, so liveness is a file the agent's child keeps appending to.
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -83,7 +89,21 @@ auto agent_pid(const std::filesystem::path& file) -> ::pid_t {
     return 0;
 }
 
-auto gone(::pid_t pid) -> bool {
+// True once FILE has stopped growing: nothing of the agent is still running.
+[[maybe_unused]] auto quiet(const std::filesystem::path& file) -> bool {
+    std::error_code ec;
+    const auto deadline = clock_type::now() + milliseconds{3000};
+    while (clock_type::now() < deadline) {
+        const auto before = std::filesystem::file_size(file, ec);
+        std::this_thread::sleep_for(milliseconds{400});
+        if (std::filesystem::file_size(file, ec) == before) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[maybe_unused]] auto gone(::pid_t pid) -> bool {
     const auto deadline = clock_type::now() + milliseconds{2000};
     while (clock_type::now() < deadline) {
         if (::kill(pid, 0) != 0 && errno == ESRCH) {
@@ -110,9 +130,14 @@ auto signalled(const char* subcommand, int signal_number, const std::string& bod
     const auto workspace = base / "workspace";
     std::filesystem::create_directories(workspace, ec);
     const auto pid_file = workspace / "agent.pid";
+    const auto heartbeat = workspace / "heartbeat";
     const auto audit = base / "audit.jsonl";
-    const ::pid_t glove =
-        start_glove(subcommand, workspace, audit, "echo $$ > '" + pid_file.string() + "'; " + body);
+    // A child of the agent that must not outlive it.
+    const std::string beat =
+        "(while :; do echo . >> '" + heartbeat.string() + "'; /bin/sleep 0.05; done) & ";
+    const ::pid_t glove = start_glove(
+        subcommand, workspace, audit, beat + "echo $$ > '" + pid_file.string() + "'; " + body
+    );
     outcome result;
     const ::pid_t agent = glove > 0 ? agent_pid(pid_file) : 0;
     if (agent <= 0) {
@@ -130,7 +155,11 @@ auto signalled(const char* subcommand, int signal_number, const std::string& bod
         result.status = -1;
     }
     result.took_ms = std::chrono::duration_cast<milliseconds>(clock_type::now() - sent).count();
-    result.agent_gone = gone(agent);
+#if defined(__linux__)
+    result.agent_gone = quiet(heartbeat);
+#else
+    result.agent_gone = gone(agent) && quiet(heartbeat);
+#endif
     result.audit = read_file(audit);
     std::filesystem::remove_all(base, ec);
     return result;
@@ -144,7 +173,13 @@ auto run() -> int {
     int number = 0;
     // The agent is the sleep itself, so its exit is the signal's default
     // action and not one shell's idea of an interrupted `wait`.
+#if defined(__linux__)
+    const std::string cooperative = "trap 'exit 0' TERM HUP INT; /bin/sleep 30 & wait";
+    const std::string stubborn_body = "/bin/sleep 30 & wait";
+#else
     const std::string cooperative = "exec /bin/sleep 30";
+    const std::string stubborn_body = "trap '' TERM; /bin/sleep 30 & wait";
+#endif
     for (const char* subcommand : {"exec", "shell"}) {
         for (const int signal_number : {SIGTERM, SIGHUP, SIGINT}) {
             const auto result = signalled(subcommand, signal_number, cooperative, ++number);
@@ -164,15 +199,16 @@ auto run() -> int {
             REQUIRE(has_exit_record(result.audit, 128 + signal_number));
         }
     }
+#if !defined(__linux__)
     // A shell agent waiting on a child: the shell handles the signal and exits.
     const auto shell = signalled("exec", SIGTERM, "/bin/sleep 30 & wait", ++number);
     REQUIRE(shell.status >= 0 && WIFEXITED(shell.status));
     REQUIRE(WEXITSTATUS(shell.status) == 128 + SIGTERM);
     REQUIRE(shell.agent_gone);
     REQUIRE(has_exit_record(shell.audit, 128 + SIGTERM));
-    // An agent that ignores SIGTERM is killed after the grace period (1.5 s).
-    const auto stubborn =
-        signalled("exec", SIGTERM, "trap '' TERM; /bin/sleep 30 & wait", ++number);
+#endif
+    // An agent that does not act on SIGTERM is killed after the grace period (1.5 s).
+    const auto stubborn = signalled("exec", SIGTERM, stubborn_body, ++number);
     std::fprintf(stderr, "ignoring agent: status %d, %lld ms\n", stubborn.status, stubborn.took_ms);
     REQUIRE(stubborn.status >= 0 && WIFEXITED(stubborn.status));
     REQUIRE(WEXITSTATUS(stubborn.status) == 128 + SIGKILL);

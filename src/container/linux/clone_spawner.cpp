@@ -23,6 +23,7 @@
 #include "linux_managed_session.hpp"
 #include "output_pump.hpp"
 #include "seccomp_monitor.hpp"
+#include "signal_mailbox.hpp"
 
 #include <fcntl.h>
 #include <linux/capability.h>
@@ -44,6 +45,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -54,6 +56,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <expected>
 #include <filesystem>
 #include <memory>
@@ -2707,6 +2710,142 @@ auto wait_for_child(::pid_t child) -> std::expected<int, std::string> {
     return status;
 }
 
+// Termination signals sent to glove while a passthrough agent runs. The
+// handler only publishes which signal arrived; the waiting thread alone sends
+// signals, and only to a child it has not reaped, so no pid is ever reused
+// under it.
+constexpr std::array termination_signal_numbers{SIGINT, SIGQUIT, SIGTERM, SIGHUP};
+std::atomic_flag termination_signals_owned = ATOMIC_FLAG_INIT;
+detail::signal_mailbox termination_mailbox;
+
+extern "C" void publish_termination_signal(int number) {
+    const int saved_errno = errno;
+    const auto captured = termination_mailbox.capture();
+    for (std::size_t index = 0; index != termination_signal_numbers.size(); ++index) {
+        if (termination_signal_numbers[index] == number) {
+            static_cast<void>(
+                termination_mailbox.publish(captured, detail::signal_mailbox::token{1} << index)
+            );
+        }
+    }
+    errno = saved_errno;
+}
+
+// Owns the four dispositions for one wait. A signal that was already ignored
+// (nohup, for one) stays ignored. A second concurrent wait in the same process
+// installs nothing and behaves as before.
+class termination_signals {
+public:
+    termination_signals() noexcept {
+        if (termination_signals_owned.test_and_set() || !termination_mailbox.arm()) {
+            return;
+        }
+        owner_ = true;
+        for (std::size_t index = 0; index != termination_signal_numbers.size(); ++index) {
+            struct sigaction current{};
+            if (::sigaction(termination_signal_numbers[index], nullptr, &current) != 0 ||
+                current.sa_handler == SIG_IGN) {
+                continue;
+            }
+            struct sigaction action{};
+            action.sa_handler = publish_termination_signal;
+            ::sigemptyset(&action.sa_mask);
+            if (::sigaction(termination_signal_numbers[index], &action, &previous_[index]) == 0) {
+                installed_[index] = true;
+            }
+        }
+    }
+
+    termination_signals(const termination_signals&) = delete;
+    auto operator=(const termination_signals&) -> termination_signals& = delete;
+    termination_signals(termination_signals&&) = delete;
+    auto operator=(termination_signals&&) -> termination_signals& = delete;
+
+    ~termination_signals() noexcept {
+        if (!owner_) {
+            return;
+        }
+        for (std::size_t index = 0; index != termination_signal_numbers.size(); ++index) {
+            if (installed_[index]) {
+                static_cast<void>(
+                    ::sigaction(termination_signal_numbers[index], &previous_[index], nullptr)
+                );
+            }
+        }
+        termination_mailbox.disarm();
+        termination_signals_owned.clear();
+    }
+
+    // The signals that arrived since the last call, as numbers.
+    auto take() noexcept -> std::vector<int> {
+        std::vector<int> arrived;
+        if (!owner_) {
+            return arrived;
+        }
+        const auto pending = termination_mailbox.take();
+        for (std::size_t index = 0; index != termination_signal_numbers.size(); ++index) {
+            if ((pending & (detail::signal_mailbox::token{1} << index)) != 0) {
+                arrived.push_back(termination_signal_numbers[index]);
+            }
+        }
+        return arrived;
+    }
+
+private:
+    bool owner_ = false;
+    std::array<bool, termination_signal_numbers.size()> installed_{};
+    std::array<struct sigaction, termination_signal_numbers.size()> previous_{};
+};
+
+constexpr auto termination_grace = std::chrono::milliseconds{1500};
+
+// Waits for CHILD and returns its exit code, 128 plus the signal that ended
+// it, or 128 plus the signal glove was asked to stop with when the child then
+// exited 0. A termination signal sent to glove is passed to the child; if the
+// child is still alive after the grace period it is killed. The child is the
+// init of its pid namespace: the kernel drops a signal it has no handler for,
+// except SIGKILL, and killing it ends every process in the namespace.
+auto wait_for_passthrough_child(::pid_t child) -> std::expected<int, std::string> {
+    termination_signals signals;
+    using clock = std::chrono::steady_clock;
+    std::optional<clock::time_point> deadline;
+    int requested = 0;
+    bool killed = false;
+    for (;;) {
+        for (const int number : signals.take()) {
+            static_cast<void>(::kill(child, number));
+            if (!deadline) {
+                requested = number;
+                deadline = clock::now() + termination_grace;
+            }
+        }
+        siginfo_t observed{};
+        if (::waitid(P_PID, static_cast<id_t>(child), &observed, WEXITED | WNOHANG | WNOWAIT) !=
+            0) {
+            if (errno != EINTR) {
+                return std::unexpected(std::string{"waitid: "} + errno_message(errno));
+            }
+        } else if (observed.si_pid == child) {
+            break;
+        }
+        if (deadline && !killed && clock::now() >= *deadline) {
+            static_cast<void>(::kill(child, SIGKILL));
+            killed = true;
+        }
+        const struct timespec tick{.tv_sec = 0, .tv_nsec = 5'000'000};
+        static_cast<void>(::nanosleep(&tick, nullptr));
+    }
+    auto status = wait_for_child(child);
+    if (!status) {
+        return std::unexpected(status.error());
+    }
+    if (WIFSIGNALED(*status)) {
+        return 128 + WTERMSIG(*status);
+    }
+    const int code = WIFEXITED(*status) ? WEXITSTATUS(*status) : -1;
+    return code == 0 && requested != 0 ? 128 + requested : code;
+}
+
 auto current_epoch_ms() -> std::uint64_t {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
@@ -3106,11 +3245,7 @@ auto exec_contained(
     if (!child) {
         return std::unexpected(child.error());
     }
-    auto status = wait_for_child(child->pid);
-    if (!status) {
-        return std::unexpected(status.error());
-    }
-    return WIFEXITED(*status) ? WEXITSTATUS(*status) : -1;
+    return wait_for_passthrough_child(child->pid);
 }
 
 auto linux_detail::bind_managed_session(

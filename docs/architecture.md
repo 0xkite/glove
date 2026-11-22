@@ -287,17 +287,27 @@ filesystem/environment exposure. Passing `--allow-loopback-listen` brings up
 the private `lo` interface and permits `127.0.0.1` `bind`/`listen`/`accept`
 inside `CLONE_NEWNET` without granting external network egress.
 
-On macOS these commands launch the agent through the owned passthrough
-(`exec_contained_owned`). While the agent runs, glove holds the SIGINT,
-SIGQUIT, SIGTERM and SIGHUP dispositions: a signal sent to glove is passed to
-the agent's process group, the group is killed if it has not exited after 1.5
-seconds, and glove then returns through its normal exit path. So a supervisor
-that stops glove with SIGTERM still gets the `agent_exit` record, the denial
-summary and trace end record, and decoy removal, and glove exits with the
-agent's code or 128 plus the signal. SIGKILL of glove leaves none of these. A
-launch whose stdin is a terminal that glove is not in the foreground of is
-refused. On Linux glove does not handle these signals yet: the default action
-ends glove without those records, and `PR_SET_PDEATHSIG` ends the agent.
+While the agent runs, glove holds the SIGINT, SIGQUIT, SIGTERM and SIGHUP
+dispositions: a signal sent to glove is passed to the agent, the agent is
+killed if it has not exited after 1.5 seconds, and glove then returns through
+its normal exit path. So a supervisor that stops glove with SIGTERM still gets
+the `agent_exit` record, the denial summary and trace end record, and decoy
+removal, and glove exits with the agent's code or 128 plus the signal. SIGKILL
+of glove leaves none of these. A signal that was ignored when glove started
+(`nohup`) stays ignored on Linux.
+
+- macOS: the launch goes through the owned passthrough
+  (`exec_contained_owned`). The signal goes to the agent's process group, and
+  the group is what is killed. A launch whose stdin is a terminal that glove
+  is not in the foreground of is refused.
+- Linux: the agent is the init process of its pid namespace. The kernel drops
+  a signal such a process has no handler for, so an agent that does not
+  install one is not stopped by the signal and is killed at the end of the
+  grace period; killing it ends every process in the namespace. If glove
+  itself is killed, `PR_SET_PDEATHSIG` ends the agent.
+
+`glove run`, the MCP kernel path, does not handle these signals on either
+platform: the default action ends glove without those records.
 
 When `--herdr` is passed inside an outer Herdr terminal pane (`HERDR_ENV=1`, `HERDR_PANE_ID`),
 Glove's host runner reports lifecycle states (`working`, `done`) and releases authority
