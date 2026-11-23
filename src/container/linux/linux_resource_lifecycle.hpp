@@ -68,6 +68,11 @@ public:
 
     [[nodiscard]] auto attach(::pid_t pid) -> std::expected<void, std::string>;
     [[nodiscard]] auto request_stop() -> std::expected<void, std::string>;
+    // Freezes or thaws the session's cgroup. Refused once termination has
+    // started or the session has finished. Resource limits keep applying
+    // while frozen; in particular wall time keeps running.
+    [[nodiscard]] auto set_frozen(bool frozen) -> std::expected<void, std::string>;
+    [[nodiscard]] auto frozen() -> std::expected<bool, std::string>;
 
     [[nodiscard]] auto monitor() const noexcept
         -> const std::shared_ptr<detail::wall_output_monitor>& {

@@ -851,6 +851,42 @@ auto handle_signal(
     );
 }
 
+auto handle_pause_session(
+    receipt_audit_protocol::implementation& state,
+    std::string_view request_id,
+    const rpc_params& params,
+    bool pause
+) -> std::expected<std::string, std::string> {
+    if (!state.runtime || !state.runtime->lifecycle_operational() ||
+        !state.runtime->pause_supported()) {
+        return error_response(request_id, "method_not_found", "control method is unavailable");
+    }
+    const auto idempotency_key = params.idempotency_key.value_or(std::string{});
+    if (!valid_identifier(idempotency_key)) {
+        return error_response(
+            request_id, "invalid_request", "session pause and resume require idempotency"
+        );
+    }
+    auto payload = decode_strict<stop_session_request>(params.payload.str);
+    if (!payload || !valid_identifier(payload->session_id)) {
+        return error_response(request_id, "invalid_request", "invalid session pause request");
+    }
+    const auto session_id = payload->session_id;
+    return handle_idempotent_session_mutation(
+        state,
+        request_id,
+        pause ? "pause_session" : "resume_session",
+        params.payload.str,
+        idempotency_key,
+        pause ? "session_pause_failed" : "session_resume_failed",
+        pause ? "session pause was rejected" : "session resume was rejected",
+        session_id,
+        [&state, &session_id, pause] {
+            return pause ? state.runtime->pause(session_id) : state.runtime->resume(session_id);
+        }
+    );
+}
+
 auto handle_detach(
     receipt_audit_protocol::implementation& state,
     std::string_view request_id,

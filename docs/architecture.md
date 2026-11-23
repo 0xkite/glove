@@ -136,7 +136,17 @@ capability must never be described as active before it exists.
    took, and `arguments` holds `upstream_status`, `request_bytes` and
    `response_bytes`. So a journal has two records per forwarded request, and
    only the second has a non-zero `latency_ns`. If either record cannot be
-   written the client gets 503 and nothing else.
+   written the client gets 503 and nothing else. When the provider's response
+   reports token usage, the outcome record also has `input_tokens` and
+   `output_tokens`, read by field name from the body or from each event of a
+   stream (`prompt_tokens`/`completion_tokens`, `input_tokens`/
+   `output_tokens`, `promptTokenCount`/`candidatesTokenCount`).
+   `--max-model-requests`, `--max-model-requests-per-minute` and
+   `--max-model-tokens` on `glove exec` and `shell` set budgets for the
+   launch's endpoint. A request over one is refused with 429 before anything
+   is forwarded and recorded with `request_limit`, `rate_limit` or
+   `token_limit`. The token budget counts only what providers report, and the
+   exchange that crosses it completes.
 
 5. **Provider transport**: Legacy `glove exec --agent` presets and the native
    Pi adapter install `make_tls_forwarder` (`src/net/tls_forwarder.cpp`). Each allowed request is
@@ -289,7 +299,8 @@ inside `CLONE_NEWNET` without granting external network egress.
 
 While the agent runs, glove holds the SIGINT, SIGQUIT, SIGTERM and SIGHUP
 dispositions: a signal sent to glove is passed to the agent, the agent is
-killed if it has not exited after 1.5 seconds, and glove then returns through
+killed if it has not exited after the stop grace (1.5 seconds; `--stop-grace
+<seconds>` sets 0.1 to 60), and glove then returns through
 its normal exit path. So a supervisor that stops glove with SIGTERM still gets
 the `agent_exit` record, the denial summary and trace end record, and decoy
 removal, and glove exits with the agent's code or 128 plus the signal. SIGKILL

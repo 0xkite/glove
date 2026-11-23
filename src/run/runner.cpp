@@ -1381,6 +1381,11 @@ auto start_shared_pi_provider(
         [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
         return detail::record_endpoint_event(sink, event);
     };
+    endpoint_options->limits = {
+        .max_requests = opts.max_model_requests,
+        .max_requests_per_minute = opts.max_model_requests_per_minute,
+        .max_tokens = opts.max_model_tokens,
+    };
     auto endpoint = glove::net::start_credentialed_endpoint(std::move(*endpoint_options));
     if (!endpoint) {
         return std::unexpected(std::string{"credentialed endpoint: "} + endpoint.error());
@@ -1510,6 +1515,11 @@ auto start_agent_preset(
     endpoint_options->on_event =
         [sink](const glove::net::endpoint_event& event) -> std::expected<void, std::string> {
         return detail::record_endpoint_event(sink, event);
+    };
+    endpoint_options->limits = {
+        .max_requests = opts.max_model_requests,
+        .max_requests_per_minute = opts.max_model_requests_per_minute,
+        .max_tokens = opts.max_model_tokens,
     };
 
     auto endpoint = glove::net::start_credentialed_endpoint(std::move(*endpoint_options));
@@ -2535,7 +2545,8 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
                 escape_event.detail.c_str(),
                 static_cast<int>(escape_event.pid)
             ));
-        }
+        },
+        opts.stop_grace.value_or(glove::container::default_stop_grace)
     );
 #if defined(__APPLE__)
     auto denial_audit =

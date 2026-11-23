@@ -2,6 +2,7 @@
 
 #include "glove/container/profile.hpp"
 
+#include <chrono>
 #include <expected>
 #include <optional>
 #include <string>
@@ -32,7 +33,10 @@ auto prepare_launch_command(
 // exec_contained_owned with the `stdio_files` grant above. For launches whose
 // stdio the operator redirected to a file.
 [[nodiscard]] auto exec_owned_with_stdio_files(
-    const profile& prof, const std::vector<std::string>& argv, std::vector<std::string> stdio_files
+    const profile& prof,
+    const std::vector<std::string>& argv,
+    std::vector<std::string> stdio_files,
+    std::chrono::milliseconds stop_grace
 ) -> std::expected<int, std::string>;
 
 } // namespace glove::container::macos_detail

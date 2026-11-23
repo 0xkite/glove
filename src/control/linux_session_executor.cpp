@@ -288,6 +288,20 @@ auto linux_pty_session::signal(container::linux_detail::pty_session_signal reque
     return state_->managed->signal(requested);
 }
 
+auto linux_pty_session::set_frozen(bool frozen) -> std::expected<void, std::string> {
+    if (!state_ || !state_->managed) {
+        return std::unexpected(std::string{"Linux PTY session is not running"});
+    }
+    return state_->managed->set_frozen(frozen);
+}
+
+auto linux_pty_session::frozen() -> std::expected<bool, std::string> {
+    if (!state_ || !state_->managed) {
+        return std::unexpected(std::string{"Linux PTY session is not running"});
+    }
+    return state_->managed->frozen();
+}
+
 auto linux_pty_session::stop() -> std::expected<void, std::string> {
     if (!state_) {
         return std::unexpected(std::string{"Linux PTY session is not running"});
@@ -488,6 +502,24 @@ auto linux_pty_session_index::signal(
     }
     auto session = indexed_session(*state_, session_id);
     return session ? (*session)->signal(requested) : std::unexpected(std::move(session.error()));
+}
+
+auto linux_pty_session_index::set_frozen(std::string_view session_id, bool frozen)
+    -> std::expected<void, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"Linux PTY live-session index is empty"});
+    }
+    auto session = indexed_session(*state_, session_id);
+    return session ? (*session)->set_frozen(frozen) : std::unexpected(std::move(session.error()));
+}
+
+auto linux_pty_session_index::frozen(std::string_view session_id)
+    -> std::expected<bool, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"Linux PTY live-session index is empty"});
+    }
+    auto session = indexed_session(*state_, session_id);
+    return session ? (*session)->frozen() : std::unexpected(std::move(session.error()));
 }
 
 auto linux_pty_session_index::stop(std::string_view session_id)
@@ -779,6 +811,27 @@ auto linux_session_runtime::signal(std::string_view session_id, session_signal r
         break;
     }
     return state_->sessions->signal(session_id, translated);
+}
+
+auto linux_session_runtime::pause_supported() const noexcept -> bool {
+    return state_ != nullptr;
+}
+
+auto linux_session_runtime::pause(std::string_view session_id) -> std::expected<void, std::string> {
+    return state_ ? state_->sessions->set_frozen(session_id, true)
+                  : std::unexpected(std::string{"Linux session runtime is empty"});
+}
+
+auto linux_session_runtime::resume(std::string_view session_id)
+    -> std::expected<void, std::string> {
+    return state_ ? state_->sessions->set_frozen(session_id, false)
+                  : std::unexpected(std::string{"Linux session runtime is empty"});
+}
+
+auto linux_session_runtime::paused(std::string_view session_id)
+    -> std::expected<bool, std::string> {
+    return state_ ? state_->sessions->frozen(session_id)
+                  : std::unexpected(std::string{"Linux session runtime is empty"});
 }
 
 auto linux_session_runtime::stop(std::string_view session_id) -> std::expected<void, std::string> {

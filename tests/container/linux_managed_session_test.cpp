@@ -1110,6 +1110,43 @@ auto interactive_pty_attach_and_stop_test(
     REQUIRE(output->bytes.find("hello from pty") != std::string::npos);
     REQUIRE(!output->truncated);
     REQUIRE((*session)->resize(48, 132).has_value());
+
+    // The cgroup freezer: cat does not copy input written while frozen until
+    // the session is thawed. The terminal's own echo is the kernel's, not
+    // cat's, so the line appears once while frozen and twice after thaw.
+    const auto occurrences = [](std::string_view text, std::string_view needle) {
+        std::size_t count = 0;
+        for (auto at = text.find(needle); at != std::string_view::npos;
+             at = text.find(needle, at + needle.size())) {
+            ++count;
+        }
+        return count;
+    };
+    REQUIRE((*session)->frozen().value_or(true) == false);
+    REQUIRE((*session)->set_frozen(true).has_value());
+    REQUIRE((*session)->frozen().value_or(false));
+    REQUIRE((*session)->set_frozen(true).has_value());
+    REQUIRE((*session)->write_input("typed while frozen\n").has_value());
+    auto while_frozen = (*session)->wait_read(output->next_cursor, page, 500);
+    REQUIRE(while_frozen.has_value());
+    REQUIRE(occurrences(while_frozen->bytes, "typed while frozen") <= 1);
+    REQUIRE((*session)->set_frozen(false).has_value());
+    REQUIRE((*session)->frozen().value_or(true) == false);
+    // Re-read from the same cursor until cat's copy arrives; a read can
+    // return at once with only the bytes already there.
+    std::string thawed;
+    for (int attempt = 0; attempt != 50 && occurrences(thawed, "typed while frozen") < 2;
+         ++attempt) {
+        auto chunk = (*session)->wait_read(output->next_cursor, page, 100);
+        REQUIRE(chunk.has_value());
+        thawed = chunk->bytes;
+        if (occurrences(thawed, "typed while frozen") < 2) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+    }
+    REQUIRE(occurrences(thawed, "typed while frozen") == 2);
+    // A frozen session can still be stopped: cgroup.kill ends frozen tasks.
+    REQUIRE((*session)->set_frozen(true).has_value());
     bool stop_gate_called = false;
     const glove::container::linux_detail::managed_session_stop_gate before_stop =
         [&]() -> std::expected<void, std::string> {
@@ -1125,6 +1162,7 @@ auto interactive_pty_attach_and_stop_test(
     REQUIRE(!terminal->exit_code.has_value());
     REQUIRE(terminal->observed.terminal_output_bytes >= output->bytes.size());
     REQUIRE((*session)->wait() == terminal);
+    REQUIRE(!(*session)->set_frozen(false).has_value());
     stop_gate_called = false;
     REQUIRE((*session)->stop(before_stop).has_value());
     REQUIRE(!stop_gate_called);

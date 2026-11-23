@@ -24,6 +24,25 @@ and no resource or verified-receipt capability. Its local lifecycle methods are
 unavailable through the protocol even though validated SSH artifacts and a
 runtime object exist.
 
+`pause_session` and `resume_session` (Linux managed runtime) freeze and thaw
+every process of a running session through its cgroup v2 freezer
+(`cgroup.freeze`, then waiting up to 10 s for `cgroup.events` to report the
+state). Both take `{"session_id":...}` and an idempotency key, like `signal`.
+Nothing is signalled and no state is lost: input written while paused is
+delivered when the session resumes. Resource limits keep applying while a
+session is paused, wall time included, so a paused session still ends at its
+wall-time limit. `stop_session` works on a paused session (`cgroup.kill` ends
+frozen tasks). Pause state is the kernel's: it is not journaled, and a `gloved`
+restart leaves a frozen cgroup frozen. A session that is finished or stopping
+refuses both (`session_pause_failed`, `session_resume_failed`); a backend
+without the freezer answers `method_not_found`.
+
+The two methods are not yet listed in `capabilities`. Sage decodes
+`session_control` and the capability object with `deny_unknown_fields`, so a
+new field would make Sage reject Glove's capabilities. They will be
+advertised once Sage's decoder accepts a pause capability field. Until then a
+client discovers them by calling them.
+
 `refinement_evaluation_protocol_schema_version` is `1` only when the Linux
 managed runtime and protected library-bundle store are both constructed.
 macOS and a Linux runtime without that store report `0`.

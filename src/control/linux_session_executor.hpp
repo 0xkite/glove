@@ -43,6 +43,8 @@ public:
         -> std::expected<void, std::string>;
     [[nodiscard]] auto signal(container::linux_detail::pty_session_signal requested)
         -> std::expected<void, std::string>;
+    [[nodiscard]] auto set_frozen(bool frozen) -> std::expected<void, std::string>;
+    [[nodiscard]] auto frozen() -> std::expected<bool, std::string>;
     [[nodiscard]] auto stop() -> std::expected<void, std::string>;
     [[nodiscard]] auto stop(std::string_view idempotency_key) -> std::expected<void, std::string>;
     [[nodiscard]] auto wait() -> std::expected<session_exited_record, std::string>;
@@ -108,6 +110,9 @@ public:
     [[nodiscard]] auto
     signal(std::string_view session_id, container::linux_detail::pty_session_signal requested)
         -> std::expected<void, std::string>;
+    [[nodiscard]] auto set_frozen(std::string_view session_id, bool frozen)
+        -> std::expected<void, std::string>;
+    [[nodiscard]] auto frozen(std::string_view session_id) -> std::expected<bool, std::string>;
     [[nodiscard]] auto stop(std::string_view session_id) -> std::expected<void, std::string>;
     [[nodiscard]] auto stop(std::string_view session_id, std::string_view idempotency_key)
         -> std::expected<void, std::string>;
@@ -192,6 +197,13 @@ public:
         -> std::expected<void, std::string> override;
     [[nodiscard]] auto signal(std::string_view session_id, session_signal requested)
         -> std::expected<void, std::string> override;
+    [[nodiscard]] auto pause_supported() const noexcept -> bool override;
+    [[nodiscard]] auto pause(std::string_view session_id)
+        -> std::expected<void, std::string> override;
+    [[nodiscard]] auto resume(std::string_view session_id)
+        -> std::expected<void, std::string> override;
+    [[nodiscard]] auto paused(std::string_view session_id)
+        -> std::expected<bool, std::string> override;
     [[nodiscard]] auto stop(std::string_view session_id)
         -> std::expected<void, std::string> override;
     [[nodiscard]] auto stop(std::string_view session_id, std::string_view idempotency_key)

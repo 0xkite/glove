@@ -19,6 +19,7 @@
 #include <cstring>
 #include <limits>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -713,6 +714,62 @@ cgroup_limit_result cgroup_v2_session::triggered_limit(const resource_limits& li
         return cgroup_limit_event::cpu_time;
     }
     return std::nullopt;
+}
+
+auto cgroup_v2_session::frozen() const -> std::expected<bool, std::string> {
+    if (directory_fd_ < 0) {
+        return std::unexpected(std::string{"cgroup session is closed"});
+    }
+    auto events = read_at(directory_fd_, "cgroup.events");
+    if (!events) {
+        return std::unexpected(events.error());
+    }
+    std::string_view rest{*events};
+    while (!rest.empty()) {
+        const auto end = rest.find('\n');
+        const auto line = rest.substr(0, end);
+        if (line == "frozen 1") {
+            return true;
+        }
+        if (line == "frozen 0") {
+            return false;
+        }
+        rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+    }
+    return std::unexpected(
+        std::string{"cgroup.events has no frozen field (cgroup freezer unavailable)"}
+    );
+}
+
+auto cgroup_v2_session::set_frozen(bool frozen_state, std::chrono::milliseconds timeout) const
+    -> std::expected<void, std::string> {
+    if (directory_fd_ < 0) {
+        return std::unexpected(std::string{"cgroup session is closed"});
+    }
+    if (auto written = write_at(directory_fd_, "cgroup.freeze", frozen_state ? "1" : "0");
+        !written) {
+        return std::unexpected(written.error());
+    }
+    // The kernel freezes asynchronously; cgroup.events flips once every task
+    // has stopped. Polling a small file keeps this independent of inotify.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        auto observed = frozen();
+        if (!observed) {
+            return std::unexpected(observed.error());
+        }
+        if (*observed == frozen_state) {
+            return {};
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return std::unexpected(
+                std::string{
+                    frozen_state ? "cgroup did not freeze in time" : "cgroup did not thaw in time"
+                }
+            );
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
 }
 
 auto cgroup_v2_session::kill_all() const -> std::expected<void, std::string> {

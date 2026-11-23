@@ -2797,15 +2797,14 @@ private:
     std::array<struct sigaction, termination_signal_numbers.size()> previous_{};
 };
 
-constexpr auto termination_grace = std::chrono::milliseconds{1500};
-
 // Waits for CHILD and returns its exit code, 128 plus the signal that ended
 // it, or 128 plus the signal glove was asked to stop with when the child then
 // exited 0. A termination signal sent to glove is passed to the child; if the
 // child is still alive after the grace period it is killed. The child is the
 // init of its pid namespace: the kernel drops a signal it has no handler for,
 // except SIGKILL, and killing it ends every process in the namespace.
-auto wait_for_passthrough_child(::pid_t child) -> std::expected<int, std::string> {
+auto wait_for_passthrough_child(::pid_t child, std::chrono::milliseconds grace)
+    -> std::expected<int, std::string> {
     termination_signals signals;
     using clock = std::chrono::steady_clock;
     std::optional<clock::time_point> deadline;
@@ -2816,7 +2815,7 @@ auto wait_for_passthrough_child(::pid_t child) -> std::expected<int, std::string
             static_cast<void>(::kill(child, number));
             if (!deadline) {
                 requested = number;
-                deadline = clock::now() + termination_grace;
+                deadline = clock::now() + grace;
             }
         }
         siginfo_t observed{};
@@ -3080,6 +3079,27 @@ auto linux_detail::managed_pty_session::signal(pty_session_signal requested)
     return state_->terminal->signal(requested);
 }
 
+auto linux_detail::managed_pty_session::set_frozen(bool frozen)
+    -> std::expected<void, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"managed PTY session is empty"});
+    }
+    {
+        const std::lock_guard lock{state_->state_mutex};
+        if (state_->finished) {
+            return std::unexpected(std::string{"session has finished"});
+        }
+    }
+    return state_->lifecycle->set_frozen(frozen);
+}
+
+auto linux_detail::managed_pty_session::frozen() -> std::expected<bool, std::string> {
+    if (!state_) {
+        return std::unexpected(std::string{"managed PTY session is empty"});
+    }
+    return state_->lifecycle->frozen();
+}
+
 auto linux_detail::managed_pty_session::stop() -> std::expected<void, std::string> {
     if (!state_) {
         return std::unexpected(std::string{"managed PTY session is empty"});
@@ -3214,6 +3234,18 @@ auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
 auto exec_contained(
     const profile& prof, const std::vector<std::string>& argv, escape_event_observer on_escape
 ) -> std::expected<int, std::string> {
+    return exec_contained(prof, argv, std::move(on_escape), default_stop_grace);
+}
+
+auto exec_contained(
+    const profile& prof,
+    const std::vector<std::string>& argv,
+    escape_event_observer on_escape,
+    std::chrono::milliseconds stop_grace
+) -> std::expected<int, std::string> {
+    if (stop_grace < min_stop_grace || stop_grace > max_stop_grace) {
+        return std::unexpected(std::string{"stop grace must be between 0.1 and 60 seconds"});
+    }
     if (argv.empty()) {
         return std::unexpected(std::string{"spawner: empty argv"});
     }
@@ -3245,7 +3277,7 @@ auto exec_contained(
     if (!child) {
         return std::unexpected(child.error());
     }
-    return wait_for_passthrough_child(child->pid);
+    return wait_for_passthrough_child(child->pid, stop_grace);
 }
 
 auto linux_detail::bind_managed_session(

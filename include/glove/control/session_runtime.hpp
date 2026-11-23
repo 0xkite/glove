@@ -137,6 +137,29 @@ public:
         -> std::expected<void, std::string> = 0;
     [[nodiscard]] virtual auto signal(std::string_view session_id, session_signal requested)
         -> std::expected<void, std::string> = 0;
+
+    // Pause stops every process of a running session from being scheduled,
+    // and resume lets them run again; nothing is signalled and no state is
+    // lost. Resource limits keep applying while paused, wall time included.
+    // A backend that cannot do this reports pause_supported() false, and
+    // the protocol does not offer the methods.
+    [[nodiscard]] virtual auto pause_supported() const noexcept -> bool { return false; }
+
+    [[nodiscard]] virtual auto pause(std::string_view /*session_id*/)
+        -> std::expected<void, std::string> {
+        return std::unexpected(std::string{"session pause is not supported by this backend"});
+    }
+
+    [[nodiscard]] virtual auto resume(std::string_view /*session_id*/)
+        -> std::expected<void, std::string> {
+        return std::unexpected(std::string{"session pause is not supported by this backend"});
+    }
+
+    [[nodiscard]] virtual auto paused(std::string_view /*session_id*/)
+        -> std::expected<bool, std::string> {
+        return false;
+    }
+
     [[nodiscard]] virtual auto stop(std::string_view session_id)
         -> std::expected<void, std::string> = 0;
     [[nodiscard]] virtual auto stop(std::string_view session_id, std::string_view idempotency_key)

@@ -1,6 +1,7 @@
 #include "glove/net/credentialed_endpoint.hpp"
 
 #include "http_syntax.hpp"
+#include "usage_tokens.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -17,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <expected>
 #include <memory>
 #include <span>
@@ -785,6 +787,32 @@ private:
             expects_continue = true;
         }
 
+        if (const auto refused = over_limit(); !refused.empty()) {
+            if (!audit_or_unavailable(
+                    client_fd, matched_rule->provider, head->method, head->uri, false, refused
+                )) {
+                return;
+            }
+            drain_body(client_fd, head->content_length, stop);
+            const std::string body = R"({"error":{"type":"rate_limit_error","message":")" +
+                                     std::string{refused} + R"("}})";
+            std::string response = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: "
+                                   "application/json\r\nContent-Length: ";
+            response += std::to_string(body.size());
+            response += "\r\nConnection: close\r\n\r\n";
+            response += body;
+            static_cast<void>(write_all_until(
+                client_fd,
+                response,
+                stop,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds{options_.response_deadline_ms}
+            ));
+            return;
+        }
+        admitted_.push_back(std::chrono::steady_clock::now());
+        ++requests_;
+
         // Audit the allow decision before any upstream work. A decision that
         // cannot be recorded is not served, so the trail can never understate
         // what the endpoint forwarded.
@@ -885,6 +913,8 @@ private:
             write_status(client_fd, "HTTP/1.1 502 Bad Gateway");
             return;
         }
+        const auto usage = detail::read_usage_tokens(forwarded->body);
+        tokens_ += usage.input + usage.output;
         // Recorded before any of the response is served, like the decision:
         // an exchange that cannot be recorded is not delivered.
         if (!audit_or_unavailable(
@@ -897,7 +927,8 @@ private:
                 request.body.size(),
                 forwarded->body.size(),
                 exchange_took,
-                forwarded->status_code
+                forwarded->status_code,
+                usage
             )) {
             return;
         }
@@ -979,7 +1010,8 @@ private:
         std::size_t req_bytes = 0,
         std::size_t resp_bytes = 0,
         std::chrono::nanoseconds upstream_duration = {},
-        int upstream_status = 0
+        int upstream_status = 0,
+        detail::usage_tokens usage = {}
     ) -> std::expected<void, std::string> {
         if (!options_.on_event) {
             return {};
@@ -995,6 +1027,9 @@ private:
                 .response_bytes = resp_bytes,
                 .upstream_duration = upstream_duration,
                 .upstream_status = upstream_status,
+                .input_tokens = usage.input,
+                .output_tokens = usage.output,
+                .tokens_reported = usage.reported,
             }
         );
     }
@@ -1013,7 +1048,8 @@ private:
         std::size_t req_bytes = 0,
         std::size_t resp_bytes = 0,
         std::chrono::nanoseconds upstream_duration = {},
-        int upstream_status = 0
+        int upstream_status = 0,
+        detail::usage_tokens usage = {}
     ) -> bool {
         auto recorded = record_event(
             provider,
@@ -1024,7 +1060,8 @@ private:
             req_bytes,
             resp_bytes,
             upstream_duration,
-            upstream_status
+            upstream_status,
+            usage
         );
         if (!recorded) {
             write_status(client_fd, "HTTP/1.1 503 Service Unavailable");
@@ -1033,7 +1070,34 @@ private:
         return true;
     }
 
+    // The reason a new request is over a budget, or empty. Only the worker
+    // thread reads or changes these counters.
+    auto over_limit() -> std::string_view {
+        const auto& limits = options_.limits;
+        if (limits.max_requests != 0 && requests_ >= limits.max_requests) {
+            return "request_limit";
+        }
+        if (limits.max_tokens != 0 && tokens_ >= limits.max_tokens) {
+            return "token_limit";
+        }
+        if (limits.max_requests_per_minute != 0) {
+            const auto window_start = std::chrono::steady_clock::now() - std::chrono::minutes{1};
+            while (!admitted_.empty() && admitted_.front() <= window_start) {
+                admitted_.pop_front();
+            }
+            if (admitted_.size() >= limits.max_requests_per_minute) {
+                return "rate_limit";
+            }
+        } else {
+            admitted_.clear();
+        }
+        return {};
+    }
+
     credentialed_endpoint_options options_;
+    std::uint64_t requests_ = 0;
+    std::uint64_t tokens_ = 0;
+    std::deque<std::chrono::steady_clock::time_point> admitted_;
     int listen_fd_ = -1;
     std::uint16_t port_ = 0;
     std::jthread worker_;

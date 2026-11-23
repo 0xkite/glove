@@ -49,13 +49,33 @@ auto start_glove(
     const char* subcommand,
     const std::filesystem::path& workspace,
     const std::filesystem::path& audit,
-    const std::string& script
+    const std::string& script,
+    const char* stop_grace = nullptr
 ) -> ::pid_t {
     const ::pid_t child = ::fork();
     if (child == 0) {
         if (std::freopen("/dev/null", "r", stdin) == nullptr ||
             std::freopen("/dev/null", "w", stderr) == nullptr) {
             std::_Exit(126);
+        }
+        if (stop_grace != nullptr) {
+            ::execl(
+                GLOVE_BIN,
+                GLOVE_BIN,
+                subcommand,
+                "--stop-grace",
+                stop_grace,
+                "--workspace",
+                workspace.c_str(),
+                "--audit-log",
+                audit.c_str(),
+                "--",
+                "/bin/sh",
+                "-c",
+                script.c_str(),
+                static_cast<char*>(nullptr)
+            );
+            std::_Exit(127);
         }
         ::execl(
             GLOVE_BIN,
@@ -121,8 +141,13 @@ struct outcome {
     bool agent_gone = false;
 };
 
-auto signalled(const char* subcommand, int signal_number, const std::string& body, int number)
-    -> outcome {
+auto signalled(
+    const char* subcommand,
+    int signal_number,
+    const std::string& body,
+    int number,
+    const char* stop_grace = nullptr
+) -> outcome {
     std::error_code ec;
     const auto base =
         std::filesystem::canonical(std::filesystem::temp_directory_path()) /
@@ -136,7 +161,11 @@ auto signalled(const char* subcommand, int signal_number, const std::string& bod
     const std::string beat =
         "(while :; do echo . >> '" + heartbeat.string() + "'; /bin/sleep 0.05; done) & ";
     const ::pid_t glove = start_glove(
-        subcommand, workspace, audit, beat + "echo $$ > '" + pid_file.string() + "'; " + body
+        subcommand,
+        workspace,
+        audit,
+        beat + "echo $$ > '" + pid_file.string() + "'; " + body,
+        stop_grace
     );
     outcome result;
     const ::pid_t agent = glove > 0 ? agent_pid(pid_file) : 0;
@@ -215,6 +244,20 @@ auto run() -> int {
     REQUIRE(stubborn.took_ms >= 1400 && stubborn.took_ms < 4500);
     REQUIRE(stubborn.agent_gone);
     REQUIRE(has_exit_record(stubborn.audit, 128 + SIGKILL));
+    // --stop-grace sets the grace: short and long, on both subcommands.
+    const auto quick = signalled("exec", SIGTERM, stubborn_body, ++number, "0.3");
+    std::fprintf(stderr, "stop-grace 0.3: status %d, %lld ms\n", quick.status, quick.took_ms);
+    REQUIRE(quick.status >= 0 && WIFEXITED(quick.status));
+    REQUIRE(WEXITSTATUS(quick.status) == 128 + SIGKILL);
+    REQUIRE(quick.took_ms >= 250 && quick.took_ms < 1300);
+    REQUIRE(quick.agent_gone);
+    const auto slow = signalled("shell", SIGTERM, stubborn_body, ++number, "4");
+    std::fprintf(stderr, "stop-grace 4: status %d, %lld ms\n", slow.status, slow.took_ms);
+    REQUIRE(slow.status >= 0 && WIFEXITED(slow.status));
+    REQUIRE(WEXITSTATUS(slow.status) == 128 + SIGKILL);
+    REQUIRE(slow.took_ms >= 3900 && slow.took_ms < 7000);
+    REQUIRE(slow.agent_gone);
+    REQUIRE(has_exit_record(slow.audit, 128 + SIGKILL));
     std::printf("exec signal ok\n");
     return 0;
 }
