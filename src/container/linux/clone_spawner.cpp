@@ -1259,7 +1259,7 @@ auto setup_seccomp(
     }
 
     // Escape-relevant surface: modern mount API, handle bypass, pidfd_getfd,
-    // userfaultfd, fanotify_init.
+    // userfaultfd, fanotify_init, perf_event_open, kcmp, syslog, quotactl, acct.
     const int escape_surface_syscalls[] = {
         SCMP_SYS(fsopen),
         SCMP_SYS(fsconfig),
@@ -1269,9 +1269,15 @@ auto setup_seccomp(
         SCMP_SYS(open_tree),
         SCMP_SYS(mount_setattr),
         SCMP_SYS(open_by_handle_at),
+        SCMP_SYS(name_to_handle_at),
         SCMP_SYS(pidfd_getfd),
         SCMP_SYS(userfaultfd),
         SCMP_SYS(fanotify_init),
+        SCMP_SYS(perf_event_open),
+        SCMP_SYS(kcmp),
+        SCMP_SYS(syslog),
+        SCMP_SYS(quotactl),
+        SCMP_SYS(acct),
     };
     for (int sc : escape_surface_syscalls) {
         if (int rc = trap_escape(sc); rc != 0) {
@@ -1282,6 +1288,35 @@ auto setup_seccomp(
             );
         }
     }
+
+    // Nested namespace creation via clone(CLONE_NEW*): unshare/setns are trapped
+    // above, so also trap clone() when namespace flags are requested and return
+    // ENOSYS for clone3() so libc falls back cleanly to clone().
+    const std::uint64_t forbidden_clone_flags[] = {
+        CLONE_NEWUSER,
+        CLONE_NEWNS,
+        CLONE_NEWNET,
+        CLONE_NEWPID,
+    };
+    for (const std::uint64_t flag : forbidden_clone_flags) {
+        const scmp_arg_cmp clone_ns_cmp{
+            .arg = 0,
+            .op = SCMP_CMP_MASKED_EQ,
+            .datum_a = flag,
+            .datum_b = flag,
+        };
+        if (int rc = ::seccomp_rule_add(ctx, escape_action, SCMP_SYS(clone), 1, clone_ns_cmp);
+            rc != 0) {
+            ::seccomp_release(ctx);
+            return std::unexpected(std::string{"trap clone(CLONE_NEW*): "} + std::strerror(-rc));
+        }
+    }
+#if defined(__NR_clone3)
+    if (int rc = ::seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), SCMP_SYS(clone3), 0); rc != 0) {
+        ::seccomp_release(ctx);
+        return std::unexpected(std::string{"fallback clone3 to clone: "} + std::strerror(-rc));
+    }
+#endif
 
     // io_uring is blocked (EPERM) to eliminate its large LPE surface while
     // allowing runtimes that benignly probe io_uring_setup to fall back to epoll.
@@ -1446,6 +1481,11 @@ auto setup_landlock(
 
     struct ::landlock_ruleset_attr ruleset_attr{};
     ruleset_attr.handled_access_fs = handled_fs;
+#    if defined(LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET) && defined(LANDLOCK_SCOPE_SIGNAL)
+    if (abi >= 6) {
+        ruleset_attr.scoped = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
+    }
+#    endif
     const owned_fd ruleset_fd{static_cast<int>(
         ::syscall(SYS_landlock_create_ruleset, &ruleset_attr, sizeof(ruleset_attr), 0)
     )};
@@ -3020,6 +3060,16 @@ struct linux_detail::managed_pty_session::implementation {
 
 auto make_default_spawner() -> std::unique_ptr<spawner> {
     return std::make_unique<linux_spawner>();
+}
+
+auto make_spawner(isolation_tier tier) -> std::expected<std::unique_ptr<spawner>, std::string> {
+    switch (tier) {
+    case isolation_tier::os_primitives:
+        return make_default_spawner();
+    case isolation_tier::microvm:
+        return std::unexpected(std::string{"microvm isolation backend is not constructed yet"});
+    }
+    return std::unexpected(std::string{"unknown isolation tier"});
 }
 
 linux_detail::managed_pty_session::managed_pty_session(

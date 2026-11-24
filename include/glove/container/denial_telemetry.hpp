@@ -50,6 +50,13 @@ struct sandbox_denial {
     std::uint32_t readings = 1;
 };
 
+// Normalize a platform escape event (for example a Linux seccomp_escape_monitor
+// trap) into a bounded, encoded sandbox_denial of kind "syscall" so Linux and
+// macOS telemetry feed the same denial_feature_builder and denial_trace schema.
+[[nodiscard]] auto
+make_escape_denial(std::string_view mechanism, std::string_view detail, std::int32_t pid = 0)
+    -> sandbox_denial;
+
 enum class denial_telemetry_state : std::uint8_t { unavailable, live, degraded };
 
 struct denial_observer {

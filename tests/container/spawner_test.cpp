@@ -40,6 +40,13 @@ auto run() -> int {
     auto sp = glove::container::make_default_spawner();
     REQUIRE(sp != nullptr);
 
+    auto os_tier = glove::container::make_spawner(glove::container::isolation_tier::os_primitives);
+    REQUIRE(os_tier.has_value() && *os_tier != nullptr);
+
+    auto vm_tier = glove::container::make_spawner(glove::container::isolation_tier::microvm);
+    REQUIRE(!vm_tier.has_value());
+    REQUIRE(vm_tier.error().find("not constructed") != std::string::npos);
+
     glove::container::profile limited;
     limited.required_limits = glove::container::resource_limits{
         .cpu_time_ms = 60'000,

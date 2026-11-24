@@ -934,6 +934,16 @@ auto make_default_spawner() -> std::unique_ptr<spawner> {
     return std::make_unique<macos_spawner>();
 }
 
+auto make_spawner(isolation_tier tier) -> std::expected<std::unique_ptr<spawner>, std::string> {
+    switch (tier) {
+    case isolation_tier::os_primitives:
+        return make_default_spawner();
+    case isolation_tier::microvm:
+        return std::unexpected(std::string{"microvm isolation backend is not constructed yet"});
+    }
+    return std::unexpected(std::string{"unknown isolation tier"});
+}
+
 auto exec_contained(const profile& prof, const std::vector<std::string>& argv)
     -> std::expected<int, std::string> {
     auto checked = validate(prof);
