@@ -5,6 +5,7 @@
 #include "sandbox_denial_log.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <expected>
@@ -69,8 +70,13 @@ auto add_link_spelling(std::vector<std::string>& links, std::string link)
 // Records every symlink among the prefixes of the raw spelling, plus symlinks
 // reached by following a link's target (at most 8 hops). Errors from the
 // filesystem are ignored; canonical_path decides whether the path is usable.
-auto collect_link_spellings(std::string_view raw, std::vector<std::string>& links)
-    -> std::expected<void, std::string> {
+// `checked_non_links` deduplicates lstat() calls on shared parent prefixes
+// within a single validate() call.
+auto collect_link_spellings(
+    std::string_view raw,
+    std::vector<std::string>& links,
+    std::vector<std::string>& checked_non_links
+) -> std::expected<void, std::string> {
     const std::filesystem::path spelling{raw};
     if (!spelling.is_absolute()) {
         return {};
@@ -78,8 +84,15 @@ auto collect_link_spellings(std::string_view raw, std::vector<std::string>& link
     std::filesystem::path prefix = spelling.root_path();
     for (const auto& part : spelling.relative_path()) {
         prefix /= part;
+        const std::string& prefix_str = prefix.native();
+        if (std::ranges::find(checked_non_links, prefix_str) != checked_non_links.end()) {
+            continue;
+        }
         std::error_code ec;
         if (!std::filesystem::is_symlink(prefix, ec) || ec) {
+            if (!ec) {
+                checked_non_links.push_back(prefix_str);
+            }
             continue;
         }
         std::filesystem::path link = prefix.lexically_normal();
@@ -109,7 +122,8 @@ auto collect_link_spellings(std::string_view raw, std::vector<std::string>& link
 // Checks the selected service names against the catalog, then replaces the
 // list with its sorted deduplicated form and derives the canonical read paths
 // the selection grants. One bad name refuses the whole list.
-auto resolve_system_services(profile& p) -> std::expected<void, std::string> {
+auto resolve_system_services(profile& p, std::vector<std::string>& checked_non_links)
+    -> std::expected<void, std::string> {
     p.system_service_read_paths.clear(); // recomputed from the catalog; never trusted
     if (p.system_services.size() > 64U) {
         return std::unexpected(std::string{"too many system services (limit 64)"});
@@ -124,7 +138,8 @@ auto resolve_system_services(profile& p) -> std::expected<void, std::string> {
     p.system_services.erase(dup.begin(), dup.end());
     for (const auto& name : p.system_services) {
         for (const auto path : find_system_service(name)->macos_read_paths) {
-            if (auto links = collect_link_spellings(path, p.link_spellings); !links) {
+            if (auto links = collect_link_spellings(path, p.link_spellings, checked_non_links);
+                !links) {
                 return std::unexpected(links.error());
             }
             auto canonical = canonical_path(path, "system service read path");
@@ -348,12 +363,32 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
     if (copy.denial_tag && !detail::is_denial_tag(*copy.denial_tag)) {
         return std::unexpected(std::string{"denial tag must be 32 lowercase hex characters"});
     }
+    std::vector<std::string> checked_non_links;
+    checked_non_links.reserve(16U);
+    std::vector<std::pair<std::string, std::string>> canonical_cache;
+    canonical_cache.reserve(copy.filesystem.size() + copy.runtime_filesystem.size() + 4U);
+    const auto canonical_cached = [&](
+                                      std::string_view raw, std::string_view label
+                                  ) -> std::expected<std::string, std::string> {
+        for (const auto& [k, v] : canonical_cache) {
+            if (k == raw) {
+                return v;
+            }
+        }
+        auto resolved = canonical_path(raw, label);
+        if (resolved) {
+            canonical_cache.emplace_back(std::string{raw}, *resolved);
+        }
+        return resolved;
+    };
+
     std::set<std::string> paths;
     for (auto& rule : copy.filesystem) {
-        if (auto links = collect_link_spellings(rule.path, copy.link_spellings); !links) {
+        if (auto links = collect_link_spellings(rule.path, copy.link_spellings, checked_non_links);
+            !links) {
             return std::unexpected(links.error());
         }
-        auto path = canonical_path(rule.path, "filesystem rule");
+        auto path = canonical_cached(rule.path, "filesystem rule");
         if (!path) {
             return std::unexpected(path.error());
         }
@@ -363,13 +398,13 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         }
     }
     if (copy.unix_socket_endpoint) {
-        auto endpoint = canonical_path(*copy.unix_socket_endpoint, "Unix socket endpoint");
+        auto endpoint = canonical_cached(*copy.unix_socket_endpoint, "Unix socket endpoint");
         if (!endpoint) {
             return std::unexpected(endpoint.error());
         }
         copy.unix_socket_endpoint = std::move(*endpoint);
     }
-    if (auto services = resolve_system_services(copy); !services) {
+    if (auto services = resolve_system_services(copy, checked_non_links); !services) {
         return std::unexpected(services.error());
     }
     std::vector<std::filesystem::path> fs_paths;
@@ -430,10 +465,11 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         if (rule.writable) {
             return std::unexpected(std::string{"runtime filesystem rule must be read-only"});
         }
-        if (auto links = collect_link_spellings(rule.path, copy.link_spellings); !links) {
+        if (auto links = collect_link_spellings(rule.path, copy.link_spellings, checked_non_links);
+            !links) {
             return std::unexpected(links.error());
         }
-        auto path = canonical_path(rule.path, "runtime filesystem rule");
+        auto path = canonical_cached(rule.path, "runtime filesystem rule");
         if (!path) {
             return std::unexpected(path.error());
         }
@@ -507,7 +543,7 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         if (!value) {
             return {};
         }
-        auto path = canonical_path(*value, label);
+        auto path = canonical_cached(*value, label);
         if (!path) {
             return std::unexpected(path.error());
         }
@@ -524,7 +560,7 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         return std::unexpected(out.error());
     }
     if (copy.managed_home_dir) {
-        auto path = canonical_path(*copy.managed_home_dir, "managed_home_dir");
+        auto path = canonical_cached(*copy.managed_home_dir, "managed_home_dir");
         if (!path) {
             return std::unexpected(path.error());
         }
@@ -537,8 +573,9 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
         return std::unexpected(out.error());
     }
 
-    std::set<std::string> environment_names;
-    const std::set<std::string> reserved_names = {
+    std::vector<std::string_view> environment_names;
+    environment_names.reserve(copy.environment.size());
+    constexpr std::array<std::string_view, 9> reserved_names{
         "ALL_PROXY",
         "GLOVE_SANDBOXED",
         "HOME",
@@ -562,16 +599,17 @@ auto validate(const profile& p) -> std::expected<profile, std::string> {
                 std::string{"invalid environment name: '"} + std::string{name} + "'"
             );
         }
-        if (reserved_names.contains(std::string{name})) {
+        if (std::ranges::find(reserved_names, name) != reserved_names.end()) {
             return std::unexpected(
                 std::string{"environment name is managed by glove: '"} + std::string{name} + "'"
             );
         }
-        if (!environment_names.insert(std::string{name}).second) {
+        if (std::ranges::find(environment_names, name) != environment_names.end()) {
             return std::unexpected(
                 std::string{"duplicate environment entry: '"} + std::string{name} + "'"
             );
         }
+        environment_names.push_back(name);
     }
 
     if (copy.proxy && (copy.proxy->port == 0 || copy.proxy->url.empty())) {
