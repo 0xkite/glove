@@ -29,6 +29,7 @@ namespace glove::container::macos_detail {
 constexpr std::size_t denial_stream_read_chunk_bytes = 4096;
 constexpr int denial_stream_poll_ms = 100;
 constexpr int denial_stream_stop_grace_ms = 2000;
+constexpr int denial_canary_initial_interval_ms = 40;
 constexpr int denial_canary_interval_ms = 250;
 
 enum class denial_stream_state : std::uint8_t { starting, live, degraded, stopped };

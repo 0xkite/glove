@@ -594,6 +594,7 @@ auto denial_stream::prove_live(std::chrono::milliseconds timeout)
     std::vector<::pid_t> spawned;
     std::string failure;
     bool observed = false;
+    int interval_ms = denial_canary_initial_interval_ms;
     for (;;) {
         if (spawned.size() < max_canaries_per_proof) {
             auto next = self.spawn_canary();
@@ -606,9 +607,9 @@ auto denial_stream::prove_live(std::chrono::milliseconds timeout)
             self.pending.push_back(std::move(*next));
         }
         const auto wake = std::min(
-            deadline,
-            std::chrono::steady_clock::now() + std::chrono::milliseconds{denial_canary_interval_ms}
+            deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds{interval_ms}
         );
+        interval_ms = std::min(interval_ms * 2, denial_canary_interval_ms);
         {
             std::unique_lock lock{self.canary_mutex};
             self.canary_seen.wait_until(lock, wake, [&] {
