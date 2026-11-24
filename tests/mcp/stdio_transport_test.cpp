@@ -60,6 +60,18 @@ auto run() -> int {
     REQUIRE(*environment_result == "scrubbed");
     REQUIRE(::unsetenv("GLOVE_TEST_HOST_SECRET") == 0);
 
+    // Unexpected EOF reports the child's exit status when available.
+    glove::mcp::stdio_child_options failing_child{
+        .program = "/bin/sh",
+        .args = {"sh", "-c", "exit 42"},
+    };
+    auto failing_or = glove::mcp::make_stdio_transport(failing_child);
+    REQUIRE(failing_or.has_value());
+    auto failing_recv = (*failing_or)->recv();
+    REQUIRE(!failing_recv.has_value());
+    REQUIRE(failing_recv.error().find("unexpected eof from child") != std::string::npos);
+    REQUIRE(failing_recv.error().find("exit status 42") != std::string::npos);
+
     // Destruction signals the child and reaps it; sanitizers will catch leaks
     // or use-after-close on the pipes.
     return 0;

@@ -1,6 +1,8 @@
 #if defined(__linux__)
 #    include "glove/mcp/stdio_transport.hpp"
 
+#    include <unistd.h>
+
 #    include <cstdio>
 #    include <string>
 #    include <string_view>
@@ -45,7 +47,9 @@ int main() {
     glove::mcp::stdio_child_options opts{
         .program = "/bin/sh",
         .args =
-            {"/bin/sh", "-c", "grep '^NoNewPrivs:' /proc/self/status; readlink /proc/self/ns/net"},
+            {"/bin/sh",
+             "-c",
+             "grep '^NoNewPrivs:' /proc/self/status; readlink /proc/self/ns/net; id -u"},
         .environment = {"PATH=/usr/bin:/bin"},
         .sandbox = {.enabled = true, .allow_network = false},
     };
@@ -71,6 +75,10 @@ int main() {
     auto ns_line = (*transport)->recv();
     REQUIRE(ns_line.has_value());
     REQUIRE(ns_line->find("net:[") != std::string::npos);
+
+    auto uid_line = (*transport)->recv();
+    REQUIRE(uid_line.has_value());
+    REQUIRE(*uid_line == std::to_string(::geteuid()));
     return 0;
 }
 #else

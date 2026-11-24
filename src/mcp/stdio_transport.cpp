@@ -9,8 +9,11 @@
 
 #if defined(__linux__)
 #    include <linux/capability.h>
+#    include <net/if.h>
 #    include <sched.h>
+#    include <sys/ioctl.h>
 #    include <sys/prctl.h>
+#    include <sys/socket.h>
 #    include <sys/syscall.h>
 #endif
 
@@ -63,7 +66,7 @@ public:
             const ::pid_t process_group = pid_;
             (void)::kill(-process_group, SIGTERM);
             int status = 0;
-            bool leader_reaped = false;
+            bool leader_reaped = leader_reaped_;
             for (int attempts = 0; attempts < 50; ++attempts) {
                 if (!leader_reaped) {
                     const ::pid_t result = ::waitpid(pid_, &status, WNOHANG);
@@ -145,7 +148,7 @@ public:
                 return std::unexpected(std::string{"read: "} + std::strerror(errno));
             }
             if (got == 0) {
-                return std::unexpected(std::string{"unexpected eof from child"});
+                return std::unexpected(format_eof_error());
             }
             if (buffer_.size() + static_cast<std::size_t>(got) > max_frame_bytes) {
                 return std::unexpected(std::string{"frame exceeds max_frame_bytes"});
@@ -156,9 +159,38 @@ public:
     }
 
 private:
+    auto format_eof_error() -> std::string {
+        std::string message{"unexpected eof from child"};
+        if (pid_ <= 0 || leader_reaped_) {
+            return message;
+        }
+        int status = 0;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            const ::pid_t waited = ::waitpid(pid_, &status, WNOHANG);
+            if (waited == pid_) {
+                leader_reaped_ = true;
+                if (WIFEXITED(status)) {
+                    message += " (exit status " + std::to_string(WEXITSTATUS(status)) + ")";
+                } else if (WIFSIGNALED(status)) {
+                    message += " (signal " + std::to_string(WTERMSIG(status)) + ")";
+                }
+                return message;
+            }
+            if (waited < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            ::usleep(10 * 1000);
+        }
+        return message;
+    }
+
     int write_fd_;
     int read_fd_;
     ::pid_t pid_;
+    bool leader_reaped_ = false;
     std::string buffer_;
 };
 
@@ -269,10 +301,17 @@ auto make_stdio_transport(const stdio_child_options& opts)
             return std::unexpected(std::string{"fcntl(FD_CLOEXEC): "} + std::strerror(saved));
         }
 
+        // Identity-map host_uid/host_gid into the user namespace instead of
+        // fake-root 0: stdio_transport does not create a mount namespace, and
+        // mapping to UID 0 causes runtimes like Python (when HOME is unset) to
+        // resolve /root via getpwuid(0), breaking ~/.local site-packages and
+        // failing with PermissionError.
         char uid_map_buf[64]{};
         char gid_map_buf[64]{};
-        const int uid_len = std::snprintf(uid_map_buf, sizeof(uid_map_buf), "0 %u 1\n", host_uid);
-        const int gid_len = std::snprintf(gid_map_buf, sizeof(gid_map_buf), "0 %u 1\n", host_gid);
+        const int uid_len =
+            std::snprintf(uid_map_buf, sizeof(uid_map_buf), "%u %u 1\n", host_uid, host_uid);
+        const int gid_len =
+            std::snprintf(gid_map_buf, sizeof(gid_map_buf), "%u %u 1\n", host_gid, host_gid);
         if (uid_len <= 0 || static_cast<std::size_t>(uid_len) >= sizeof(uid_map_buf) ||
             gid_len <= 0 || static_cast<std::size_t>(gid_len) >= sizeof(gid_map_buf)) {
             close_pipe_pair(err_pipe);
@@ -354,6 +393,21 @@ auto make_stdio_transport(const stdio_child_options& opts)
                 )) {
                 static constexpr char kErr[] = "write /proc/self/gid_map failed";
                 fail_child(kErr, sizeof(kErr) - 1U);
+            }
+            if (!opts.sandbox.allow_network) {
+                // Bring private loopback up while CAP_NET_ADMIN is still held
+                // in the new netns so local-only sockets (e.g. Python asyncio
+                // self-pipes) work with zero external routes.
+                const int lo_sock = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+                if (lo_sock >= 0) {
+                    struct ::ifreq req{};
+                    std::memcpy(req.ifr_name, "lo", 3U);
+                    if (::ioctl(lo_sock, SIOCGIFFLAGS, &req) == 0) {
+                        req.ifr_flags = static_cast<short>(req.ifr_flags | IFF_UP | IFF_RUNNING);
+                        (void)::ioctl(lo_sock, SIOCSIFFLAGS, &req);
+                    }
+                    ::close(lo_sock);
+                }
             }
 #    ifdef PR_CAP_AMBIENT_CLEAR_ALL
             if (::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) != 0 &&
