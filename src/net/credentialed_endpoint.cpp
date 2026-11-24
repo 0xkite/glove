@@ -1,11 +1,13 @@
 #include "glove/net/credentialed_endpoint.hpp"
 
+#include "canary_scanner.hpp"
 #include "http_syntax.hpp"
 #include "usage_tokens.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -100,7 +102,7 @@ auto write_all_until(
     const char* cursor = data.data();
     std::size_t remaining = data.size();
     while (remaining > 0) {
-        if (!wait_ready(fd, POLLOUT, stop, deadline)) {
+        if (stop.stop_requested() || std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
 #if defined(MSG_NOSIGNAL)
@@ -112,7 +114,13 @@ auto write_all_until(
         const auto written = ::write(fd, cursor, remaining);
 #endif
         if (written < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!wait_ready(fd, POLLOUT, stop, deadline)) {
+                    return false;
+                }
                 continue;
             }
             // A disconnected peer is the end of this connection, not an error.
@@ -124,22 +132,29 @@ auto write_all_until(
     return true;
 }
 
-auto read_exact_until(
+auto append_exact_until(
     int fd,
     std::size_t wanted,
     std::string& out,
     std::stop_token stop,
     std::chrono::steady_clock::time_point deadline
 ) -> bool {
-    out.clear();
-    while (out.size() < wanted) {
-        if (!wait_ready(fd, POLLIN, stop, deadline)) {
+    const std::size_t target_size = out.size() + wanted;
+    out.reserve(target_size);
+    while (out.size() < target_size) {
+        if (stop.stop_requested() || std::chrono::steady_clock::now() >= deadline) {
             return false;
         }
-        std::array<char, 4096> chunk{};
-        const auto got = ::read(fd, chunk.data(), std::min(chunk.size(), wanted - out.size()));
+        std::array<char, 16384> chunk{};
+        const auto got = ::read(fd, chunk.data(), std::min(chunk.size(), target_size - out.size()));
         if (got < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!wait_ready(fd, POLLIN, stop, deadline)) {
+                    return false;
+                }
                 continue;
             }
             return false;
@@ -461,9 +476,15 @@ auto parse_http_head(std::string_view raw) -> std::expected<parsed_request_head,
 class credentialed_endpoint_impl final : public credentialed_endpoint {
 public:
     explicit credentialed_endpoint_impl(
-        credentialed_endpoint_options options, int listen_fd, std::uint16_t port
+        credentialed_endpoint_options options,
+        detail::canary_scanner canary_scanner,
+        int listen_fd,
+        std::uint16_t port
     )
-        : options_{std::move(options)}, listen_fd_{listen_fd}, port_{port} {
+        : options_{std::move(options)},
+          canary_scanner_{std::move(canary_scanner)},
+          listen_fd_{listen_fd},
+          port_{port} {
         worker_ = std::jthread([this](std::stop_token st) { run(std::move(st)); });
     }
 
@@ -525,13 +546,16 @@ private:
             if (client_fd < 0) {
                 continue;
             }
+            const int enabled = 1;
 #if defined(SO_NOSIGPIPE)
             // The counterpart of MSG_NOSIGNAL on platforms that lack it.
-            const int enabled = 1;
             static_cast<void>(
                 ::setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled))
             );
 #endif
+            static_cast<void>(
+                ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled))
+            );
             // Nonblocking, so every later read and write is bounded by an
             // absolute deadline rather than blocking the single worker.
             static_cast<void>(set_nonblocking(client_fd));
@@ -583,6 +607,7 @@ private:
 
     void handle_client(int client_fd, std::stop_token stop) {
         std::string buffer;
+        buffer.reserve(4096U);
         std::size_t header_end = std::string::npos;
         // One absolute deadline for the whole head. Without it a peer that
         // trickles one byte per poll interval holds the single worker (and
@@ -593,16 +618,16 @@ private:
             if (stop.stop_requested() || std::chrono::steady_clock::now() >= head_deadline) {
                 break;
             }
-            ::pollfd pfd{.fd = client_fd, .events = POLLIN, .revents = 0};
-            if (::poll(&pfd, 1, poll_tick_ms) <= 0) {
-                continue;
-            }
-            std::array<char, 1024> chunk{};
+            std::array<char, 4096> chunk{};
             const auto n = ::read(client_fd, chunk.data(), chunk.size());
             if (n < 0) {
-                // The descriptor is nonblocking, so a spurious readiness event
-                // must not be mistaken for a truncated request.
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (!wait_ready(client_fd, POLLIN, stop, head_deadline)) {
+                        break;
+                    }
                     continue;
                 }
                 break;
@@ -610,8 +635,9 @@ private:
             if (n == 0) {
                 break;
             }
+            const std::size_t scan_from = buffer.size() >= 3U ? buffer.size() - 3U : 0U;
             buffer.append(chunk.data(), static_cast<std::size_t>(n));
-            header_end = buffer.find("\r\n\r\n");
+            header_end = buffer.find("\r\n\r\n", scan_from);
             if (header_end != std::string::npos) {
                 break;
             }
@@ -624,7 +650,7 @@ private:
             return;
         }
 
-        auto head = parse_http_head(buffer.substr(0, header_end + 2));
+        auto head = parse_http_head(std::string_view{buffer.data(), header_end + 2U});
         if (!head || !is_valid_request_target(head->uri)) {
             write_status(client_fd, "HTTP/1.1 400 Bad Request");
             return;
@@ -838,17 +864,16 @@ private:
         // stall the single worker or block shutdown in the destructor's join().
         std::string body;
         if (options_.forward && head->content_length > 0) {
-            body = buffer.substr(header_end + 4U);
-            if (body.size() > head->content_length) {
-                body.resize(head->content_length);
-            }
+            body.reserve(head->content_length);
+            const std::size_t buffered = buffer.size() - (header_end + 4U);
+            const std::size_t take = std::min(buffered, head->content_length);
+            body.append(buffer.data() + header_end + 4U, take);
             const std::size_t remaining = head->content_length - body.size();
             if (remaining > 0) {
-                std::string rest;
-                if (!read_exact_until(
+                if (!append_exact_until(
                         client_fd,
                         remaining,
-                        rest,
+                        body,
                         stop,
                         std::chrono::steady_clock::now() +
                             std::chrono::milliseconds{options_.body_deadline_ms}
@@ -857,7 +882,6 @@ private:
                     write_status(client_fd, "HTTP/1.1 400 Bad Request");
                     return;
                 }
-                body += rest;
             }
         } else {
             drain_body(client_fd, head->content_length, stop);
@@ -888,6 +912,34 @@ private:
                 std::ranges::find(request_connection_named, name) ==
                     request_connection_named.end()) {
                 request.headers.emplace_back(name, value);
+            }
+        }
+
+        if (!canary_scanner_.empty()) {
+            bool leaked = canary_scanner_.contains_any(request.target) ||
+                          canary_scanner_.contains_any(request.body);
+            if (!leaked) {
+                for (const auto& [name, value] : request.headers) {
+                    if (canary_scanner_.contains_any(name) || canary_scanner_.contains_any(value)) {
+                        leaked = true;
+                        break;
+                    }
+                }
+            }
+            if (leaked) {
+                if (!audit_or_unavailable(
+                        client_fd,
+                        matched_rule->provider,
+                        head->method,
+                        head->uri,
+                        false,
+                        "canary_exfiltration",
+                        request.body.size()
+                    )) {
+                    return;
+                }
+                write_status(client_fd, "HTTP/1.1 403 Forbidden");
+                return;
             }
         }
 
@@ -975,8 +1027,13 @@ private:
                              forwarded->status_code == 304;
         const auto connection_named = connection_named_fields(forwarded->headers);
 
-        std::string response = "HTTP/1.1 " + std::to_string(forwarded->status_code) + " " +
-                               std::string{reason_phrase(forwarded->status_code)} + "\r\n";
+        std::string response;
+        response.reserve(256U + (no_body ? 0U : forwarded->body.size()));
+        response += "HTTP/1.1 ";
+        response += std::to_string(forwarded->status_code);
+        response += ' ';
+        response += reason_phrase(forwarded->status_code);
+        response += "\r\n";
         for (const auto& [name, value] : forwarded->headers) {
             const auto lowered = lower_ascii(name);
             if (!is_forwardable_response_header(lowered) ||
@@ -1095,6 +1152,7 @@ private:
     }
 
     credentialed_endpoint_options options_;
+    detail::canary_scanner canary_scanner_;
     std::uint64_t requests_ = 0;
     std::uint64_t tokens_ = 0;
     std::deque<std::chrono::steady_clock::time_point> admitted_;
@@ -1107,6 +1165,21 @@ private:
 
 auto start_credentialed_endpoint(credentialed_endpoint_options opts)
     -> std::expected<std::unique_ptr<credentialed_endpoint>, std::string> {
+    std::vector<std::string> patterns = opts.canary_tokens;
+    if (opts.scan_rule_secrets) {
+        for (const auto& rule : opts.endpoints) {
+            if (rule.secret_token.size() >= detail::min_canary_token_bytes &&
+                rule.secret_token.size() <= detail::max_canary_token_bytes &&
+                patterns.size() < detail::max_canary_tokens) {
+                patterns.push_back(rule.secret_token);
+            }
+        }
+    }
+    auto scanner = detail::canary_scanner::build(patterns);
+    if (!scanner) {
+        return std::unexpected(scanner.error());
+    }
+
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return std::unexpected(std::string{"socket: "} + std::strerror(errno));
@@ -1139,7 +1212,7 @@ auto start_credentialed_endpoint(credentialed_endpoint_options opts)
 
     const auto assigned_port = ntohs(addr.sin_port);
     return std::unique_ptr<credentialed_endpoint>{
-        new credentialed_endpoint_impl(std::move(opts), fd, assigned_port)
+        new credentialed_endpoint_impl(std::move(opts), std::move(*scanner), fd, assigned_port)
     };
 }
 
