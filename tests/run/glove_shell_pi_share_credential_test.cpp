@@ -9,7 +9,6 @@
 // 3. Subscription logins, unknown providers, raw egress, forwarded key
 //    variables, and a driver other than pi are refused before launch.
 
-#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -63,13 +62,7 @@ constexpr std::array<provider_case, 3> providers{{
      "google-host-fixture"},
 }};
 
-// STDERR_TO, when given, receives the child's stderr so a refusal's reason can
-// be checked.
-auto run_glove(
-    std::vector<std::string> argv_owned,
-    std::vector<std::string> env_owned,
-    const fs::path* stderr_to = nullptr
-) -> int {
+auto run_glove(std::vector<std::string> argv_owned, std::vector<std::string> env_owned) -> int {
     std::vector<char*> argv;
     for (auto& value : argv_owned) {
         argv.push_back(value.data());
@@ -85,13 +78,6 @@ auto run_glove(
         return -1;
     }
     if (child == 0) {
-        if (stderr_to != nullptr) {
-            const int fd =
-                ::open(stderr_to->c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-            if (fd < 0 || ::dup2(fd, STDERR_FILENO) != STDERR_FILENO) {
-                std::_Exit(126);
-            }
-        }
         ::execve(GLOVE_BIN, argv.data(), envp.data());
         std::_Exit(127);
     }
@@ -241,12 +227,9 @@ auto run() -> int {
     REQUIRE(
         refused("service-port-zero", {"--share-credential", "deepseek", "--service-port", "0"})
     );
-    // Plain loopback service ports are accepted next to the credential bridge
-    // on macOS. They are not built for Linux yet, where the launch is refused
-    // before the agent starts.
+    // Plain loopback service ports are accepted next to the credential bridge.
     {
         fs::remove(fx.out / "env.txt", ec);
-        const auto service_port_stderr = fx.out / "service-port.stderr";
         const int service_port_rc = run_glove(
             fx.argv(
                 "service-port",
@@ -257,19 +240,10 @@ auto run() -> int {
                  "--service-port",
                  "18001"}
             ),
-            fx.env(),
-            &service_port_stderr
+            fx.env()
         );
-#if defined(__linux__)
-        REQUIRE(service_port_rc != 0);
-        REQUIRE(!fs::exists(fx.out / "env.txt"));
-        REQUIRE(
-            slurp(service_port_stderr).contains("service ports are not supported on Linux yet")
-        );
-#else
         REQUIRE(service_port_rc == 0);
         REQUIRE(fs::exists(fx.out / "env.txt"));
-#endif
     }
     // A writable mount of host Pi data could redirect a later shared key.
     REQUIRE(refused("write-pi", {"--share-credential", "deepseek", "--write", pi_agent.string()}));
@@ -353,22 +327,13 @@ auto run() -> int {
     {
         const auto envs = fx.base / "config" / "glove" / "envs";
         fs::remove(fx.out / "env.txt", ec);
-        const auto svc_save_stderr = fx.out / "svc-save.stderr";
         const int svc_save_rc = run_glove(
             fx.argv(
                 "svc-save",
                 {"--save", "svcenv", "--service-port", "18000", "--service-port", "18001"}
             ),
-            fx.env(),
-            &svc_save_stderr
+            fx.env()
         );
-#if defined(__linux__)
-        // Not built for Linux yet: the launch that would save them is refused.
-        REQUIRE(svc_save_rc != 0);
-        REQUIRE(!fs::exists(fx.out / "env.txt"));
-        REQUIRE(slurp(svc_save_stderr).contains("service ports are not supported on Linux yet"));
-        fs::create_directories(envs, ec);
-#else
         REQUIRE(svc_save_rc == 0);
         const auto saved = slurp(envs / "svcenv.json");
         REQUIRE(saved.find("\"service_ports\": [\"18000\", \"18001\"]") != std::string::npos);
@@ -381,7 +346,6 @@ auto run() -> int {
             slurp(envs / "last.json").find("\"service_ports\": [\"18000\", \"18001\"]") !=
             std::string::npos
         );
-#endif
         for (const char* bad : {"0", "abc", "70000", ""}) {
             std::ofstream(envs / "badports.json")
                 << "{\n  \"service_ports\": [\"" << bad << "\"]\n}\n";

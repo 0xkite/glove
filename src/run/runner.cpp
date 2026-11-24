@@ -19,6 +19,7 @@
 #include "glove/run/launch_profile.hpp"
 #include "glove/run/pi_host_config.hpp"
 #include "glove/run/pi_provider_share.hpp"
+#include "glove/version.hpp"
 
 #include "audit_journal.hpp"
 #include "decoys.hpp"
@@ -1016,7 +1017,9 @@ auto build_registry(
             );
         }
         auto client = glove::mcp::make_client(std::move(*transport));
-        auto lazy = glove::mcp::make_lazy_init_client(std::move(client), "glove", "0.0.1");
+        auto lazy = glove::mcp::make_lazy_init_client(
+            std::move(client), "glove", std::string{glove::version}
+        );
         auto extension = glove::kernel::make_mcp_extension(upstream.name, std::move(lazy));
         if (auto added = registry->add(std::move(extension)); !added) {
             return std::unexpected(added.error());
@@ -1889,7 +1892,7 @@ private:
             (void)::fcntl(client_fd, F_SETFD, FD_CLOEXEC);
             socket_mcp_transport transport{client_fd, stopping_};
             glove::kernel::server::options server_options{
-                .identity = {.name = "glove", .version = "0.0.1"},
+                .identity = {.name = "glove", .version = std::string{glove::version}},
                 .policy = policy_,
                 .audit = sink_,
             };
@@ -2317,7 +2320,7 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
         return std::unexpected(std::string{"spawn: "} + handle.error());
     }
     glove::kernel::server::options server_options{
-        .identity = {.name = "glove", .version = "0.0.1"},
+        .identity = {.name = "glove", .version = std::string{glove::version}},
         .policy = std::move(policy),
         .audit = *sink,
     };

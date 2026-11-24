@@ -7,10 +7,11 @@ target=""
 binary_dir=""
 output_dir=""
 source_revision="${GITHUB_SHA:-unknown}"
+smoke_test=0
 
 usage() {
     cat <<'EOF'
-usage: scripts/package-release.sh --target <target> --binary-dir <dir> --output-dir <dir>
+usage: scripts/package-release.sh --target <target> --binary-dir <dir> --output-dir <dir> [--smoke-test]
 
 Packages prebuilt glove and gloved binaries with compatibility metadata,
 service templates, documentation, checksums, and source identity.
@@ -38,6 +39,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { usage >&2; exit 2; }
             source_revision="$2"
             shift 2
+            ;;
+        --smoke-test)
+            smoke_test=1
+            shift
             ;;
         -h|--help)
             usage
@@ -141,6 +146,20 @@ verified_bundle="$verification_root/$(basename "$bundle")"
 )
 [[ "$("$verified_bundle/bin/glove" --version)" == "glove $version" ]]
 [[ "$("$verified_bundle/bin/gloved" --version)" == "gloved $version" ]]
+if [[ "$smoke_test" -eq 1 ]]; then
+    if command -v ldd >/dev/null 2>&1; then
+        for executable in glove gloved; do
+            ldd_out="$(ldd "$verified_bundle/bin/$executable")"
+            if printf '%s\n' "$ldd_out" | grep -q 'not found'; then
+                printf 'missing shared library in packaged %s:\n%s\n' "$executable" "$ldd_out" >&2
+                exit 1
+            fi
+        done
+    fi
+    true_bin="/usr/bin/true"
+    [[ -x "$true_bin" ]] || true_bin="/bin/true"
+    "$verified_bundle/bin/glove" exec -- "$true_bin"
+fi
 python3 - "$verified_bundle/share/glove/compatibility.json" "$target" <<'PY'
 import json
 import sys

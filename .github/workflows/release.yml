@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to verify and publish (for example v0.1.0)"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
 
 permissions:
@@ -14,12 +21,15 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.target }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
@@ -27,6 +37,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Linux build requirements
         if: runner.os == 'Linux'
@@ -50,10 +62,17 @@ jobs:
       - name: Build
         run: cmake --build --preset release --parallel 2
 
+      - name: Allow Linux unprivileged user namespaces for release test gate
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Run release test gate
+        run: ctest --preset release --output-on-failure
+
       - name: Verify release tag identity
-        if: startsWith(github.ref, 'refs/tags/')
+        if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           version="$(build/release/src/glove --version)"
@@ -65,14 +84,15 @@ jobs:
           }
           [[ "$(build/release/src/gloved --version)" == "gloved $version" ]]
 
-      - name: Package
+      - name: Package and smoke-test
         run: |
           chmod +x scripts/package-release.sh
           scripts/package-release.sh \
             --target "${{ matrix.target }}" \
             --binary-dir build/release/src \
             --output-dir dist \
-            --source-revision "$GITHUB_SHA"
+            --source-revision "$GITHUB_SHA" \
+            --smoke-test
 
       - name: Attest release archive
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
@@ -90,9 +110,10 @@ jobs:
 
   publish:
     name: Publish immutable assets
-    if: startsWith(github.ref, 'refs/tags/')
+    if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
       - name: Download builds
@@ -103,7 +124,7 @@ jobs:
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           mapfile -t assets < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) | sort)

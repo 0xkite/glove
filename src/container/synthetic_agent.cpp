@@ -15,6 +15,8 @@
 // test launches retain a small self-sandbox fallback so the fixture is never
 // accidentally exercised with ambient host access.
 
+#include "glove/version.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -97,7 +99,9 @@ void respond_initialize(long long id) {
     std::string out = R"({"jsonrpc":"2.0","id":)";
     out.append(std::to_string(id));
     out.append(R"(,"result":{"protocolVersion":"2025-06-18",)");
-    out.append(R"("serverInfo":{"name":"glove-synthetic-agent","version":"0.0.1"},)");
+    out.append(R"("serverInfo":{"name":"glove-synthetic-agent","version":")");
+    out.append(glove::version);
+    out.append(R"("},)");
     out.append(R"("capabilities":{"tools":{}}}})");
     write_line(out);
 }
@@ -182,12 +186,13 @@ auto contains_substring(std::string_view haystack, std::string_view needle) -> b
 // yams.mcp.echo because that's what Phase 4's end-to-end test exercises.
 // Future phases can parameterise via CLI args if more agents need this.
 auto run_client_mode() -> int {
-    write_line(
-        R"({"jsonrpc":"2.0","id":1,"method":"initialize",)"
-        R"("params":{"protocolVersion":"2025-06-18",)"
-        R"("capabilities":{},)"
-        R"("clientInfo":{"name":"glove-synthetic","version":"0.0.1"}}})"
-    );
+    std::string init_req = R"({"jsonrpc":"2.0","id":1,"method":"initialize",)"
+                           R"("params":{"protocolVersion":"2025-06-18",)"
+                           R"("capabilities":{},)"
+                           R"("clientInfo":{"name":"glove-synthetic","version":")";
+    init_req.append(glove::version);
+    init_req.append(R"("}}})");
+    write_line(init_req);
     auto reply = read_response();
     if (reply.empty() || !contains_substring(reply, "\"id\":1")) {
         std::fprintf(stderr, "synthetic_agent: bad initialize reply: %s\n", reply.c_str());
