@@ -4,6 +4,6 @@
 
 namespace glove {
 
-inline constexpr std::string_view version = "0.0.1"; // x-release-please-version
+inline constexpr std::string_view version = "0.0.2"; // x-release-please-version
 
 } // namespace glove
