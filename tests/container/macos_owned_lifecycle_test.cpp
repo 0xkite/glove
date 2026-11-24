@@ -55,6 +55,15 @@ auto scenario(const std::string& probe, const std::string& root, const std::stri
         glove::container::exec_contained_owned(profile, arguments, cancellation.get_token(), 50ms);
     trigger.request_stop();
     trigger.join();
+    if (!ready.load() && mode == "descendant") {
+        // In descendant mode the probe writes `marker` and exits immediately;
+        // `exec_contained_owned` can reap the parent and kill the descendant
+        // before the 5ms polling thread wakes up to observe `marker`.
+        std::error_code marker_ec;
+        if (std::filesystem::exists(marker, marker_ec) && !marker_ec) {
+            ready.store(true);
+        }
+    }
     if (!result) {
         std::fprintf(stderr, "owned lifecycle mode=%s: %s\n", mode.c_str(), result.error().c_str());
     }
