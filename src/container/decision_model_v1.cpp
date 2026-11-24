@@ -1,5 +1,8 @@
 #include "glove/container/decision_model_v1.hpp"
+
 #include "glove/container/digest.hpp"
+
+#include <glaze/glaze.hpp>
 
 #include <algorithm>
 #include <array>
@@ -8,7 +11,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <glaze/glaze.hpp>
 #include <limits>
 #include <span>
 #include <string>
@@ -157,14 +159,16 @@ auto parse_gbdt_tree(const glz::generic& tree_val, std::size_t n_features)
             *right > std::numeric_limits<std::uint32_t>::max()) {
             return std::unexpected("gbdt node child index exceeds uint32 range");
         }
-        tree.nodes.push_back(gbdt_node_v1{
-            .feature_index = *feat,
-            .threshold = *thr,
-            .left = static_cast<std::uint32_t>(*left),
-            .right = static_cast<std::uint32_t>(*right),
-            .value = *val,
-            .missing_left = missing_left,
-        });
+        tree.nodes.push_back(
+            gbdt_node_v1{
+                .feature_index = *feat,
+                .threshold = *thr,
+                .left = static_cast<std::uint32_t>(*left),
+                .right = static_cast<std::uint32_t>(*right),
+                .value = *val,
+                .missing_left = missing_left,
+            }
+        );
     }
 
     std::vector<std::size_t> depths(n_nodes, 0U);
@@ -244,11 +248,13 @@ auto parse_model_spec(const json_object& obj, std::size_t n_features)
                     return std::unexpected("piecewise_linear knots must be strictly increasing");
                 }
             }
-            spec.terms.push_back(piecewise_linear_term_v1{
-                .feature_index = static_cast<std::size_t>(*fi),
-                .knots = std::move(*knots),
-                .values = std::move(*values),
-            });
+            spec.terms.push_back(
+                piecewise_linear_term_v1{
+                    .feature_index = static_cast<std::size_t>(*fi),
+                    .knots = std::move(*knots),
+                    .values = std::move(*values),
+                }
+            );
         }
         return spec;
     }
@@ -444,8 +450,7 @@ void append_string_array(std::string& out, const std::vector<std::string>& vals)
 }
 
 auto compute_canonical_content_digest(
-    const decision_model_artifact_v1& art,
-    const glz::generic* metadata
+    const decision_model_artifact_v1& art, const glz::generic* metadata
 ) -> std::expected<std::string, std::string> {
     std::string out;
     out.reserve(1024U);
@@ -568,8 +573,7 @@ auto compute_canonical_content_digest(
     out += format_rust_f64(art.policy.refinement_score_ceiling);
     out.push_back('}');
 
-    if (metadata != nullptr && metadata->is_object() &&
-        !metadata->get<json_object>().empty()) {
+    if (metadata != nullptr && metadata->is_object() && !metadata->get<json_object>().empty()) {
         std::string meta_json;
         if (const auto err = glz::write_json(*metadata, meta_json); err) {
             return std::unexpected("failed to serialize metadata for digest");
@@ -586,9 +590,10 @@ auto compute_canonical_content_digest(
 } // namespace
 
 auto evidence_counts_v1::effective_samples() const noexcept -> double {
-    const std::uint64_t resolved = failures > (std::numeric_limits<std::uint64_t>::max() - successes)
-                                       ? std::numeric_limits<std::uint64_t>::max()
-                                       : (successes + failures);
+    const std::uint64_t resolved =
+        failures > (std::numeric_limits<std::uint64_t>::max() - successes)
+            ? std::numeric_limits<std::uint64_t>::max()
+            : (successes + failures);
     const std::uint64_t unobserved_skips = exposures > resolved ? (exposures - resolved) : 0U;
     const double w = std::isfinite(skip_weight) ? std::max(0.0, skip_weight) : 0.0;
     return static_cast<double>(resolved) + w * static_cast<double>(unobserved_skips);
@@ -777,7 +782,8 @@ auto evaluate_decision_model_v1(
         calibrated_prob = stable_sigmoid(raw_score);
         break;
     case calibration_kind_v1::platt:
-        calibrated_prob = stable_sigmoid(artifact.calibration.a * raw_score + artifact.calibration.b);
+        calibrated_prob =
+            stable_sigmoid(artifact.calibration.a * raw_score + artifact.calibration.b);
         break;
     case calibration_kind_v1::raw_clamped:
         calibrated_prob = std::clamp(raw_score, 0.0, 1.0);
@@ -800,7 +806,8 @@ auto evaluate_decision_model_v1(
         decision = decision_kind_v1::reject;
     }
 
-    const bool has_min_samples = eff_n >= static_cast<double>(artifact.policy.refinement_min_samples);
+    const bool has_min_samples =
+        eff_n >= static_cast<double>(artifact.policy.refinement_min_samples);
     const bool trigger_refinement =
         has_min_samples && (w_hi < artifact.policy.refinement_wilson_upper_max ||
                             calibrated_prob < artifact.policy.refinement_score_ceiling);
@@ -808,22 +815,25 @@ auto evaluate_decision_model_v1(
     std::vector<feature_contribution_v1> contributions;
     for (std::size_t i = 0; i < n; ++i) {
         if (per_feature[i] != 0.0) {
-            contributions.push_back(feature_contribution_v1{
-                .feature = artifact.feature_schema.numeric_features[i],
-                .value = features[i],
-                .contribution = per_feature[i],
-            });
+            contributions.push_back(
+                feature_contribution_v1{
+                    .feature = artifact.feature_schema.numeric_features[i],
+                    .value = features[i],
+                    .contribution = per_feature[i],
+                }
+            );
         }
     }
-    std::ranges::sort(contributions, [](const feature_contribution_v1& a,
-                                        const feature_contribution_v1& b) {
-        const double abs_a = std::abs(a.contribution);
-        const double abs_b = std::abs(b.contribution);
-        if (abs_a != abs_b) {
-            return abs_a > abs_b;
+    std::ranges::sort(
+        contributions, [](const feature_contribution_v1& a, const feature_contribution_v1& b) {
+            const double abs_a = std::abs(a.contribution);
+            const double abs_b = std::abs(b.contribution);
+            if (abs_a != abs_b) {
+                return abs_a > abs_b;
+            }
+            return a.feature < b.feature;
         }
-        return a.feature < b.feature;
-    });
+    );
     if (contributions.size() > top_n) {
         contributions.resize(top_n);
     }

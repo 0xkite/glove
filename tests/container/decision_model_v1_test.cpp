@@ -3,10 +3,11 @@
 
 #include "glove/container/decision_model_v1.hpp"
 
+#include <glaze/glaze.hpp>
+
 #include <cmath>
 #include <cstdio>
 #include <fstream>
-#include <glaze/glaze.hpp>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -146,7 +147,8 @@ auto test_fail_closed(const std::string& fixture_path) -> int {
     })";
     REQUIRE(!glove::container::load_decision_model_v1(cyclic).has_value());
 
-    // Load verified golden linear artifact, then fail closed on wrong pin, NaN input, and short vector.
+    // Load verified golden linear artifact, then fail closed on wrong pin, NaN input, and short
+    // vector.
     std::ifstream ifs{fixture_path};
     REQUIRE(ifs.good());
     std::ostringstream ss;
