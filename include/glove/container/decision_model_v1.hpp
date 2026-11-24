@@ -147,10 +147,9 @@ struct decision_output_v1 {
 
 // Parse and validate a `sage.decision-model.v1` JSON artifact.
 // When `pinned_digest` is non-empty, requires `artifact.content_digest == pinned_digest`.
-[[nodiscard]] auto load_decision_model_v1(
-    std::string_view json_text,
-    std::string_view pinned_digest = {}
-) -> std::expected<decision_model_artifact_v1, std::string>;
+[[nodiscard]] auto
+load_decision_model_v1(std::string_view json_text, std::string_view pinned_digest = {})
+    -> std::expected<decision_model_artifact_v1, std::string>;
 
 // Evaluate a validated `sage.decision-model.v1` artifact on one feature vector
 // and observed evidence counts. Fails closed on length mismatch or non-finite inputs.
