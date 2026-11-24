@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(glove
-    VERSION 0.0.1 # x-release-please-version
+    VERSION 0.0.2 # x-release-please-version
     DESCRIPTION "Reflection-driven LLM agent sandbox"
     LANGUAGES CXX
 )
