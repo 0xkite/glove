@@ -1,4 +1,5 @@
 add_library(glove_net STATIC
+    canary_scanner.cpp
     credentialed_endpoint.cpp
     egress_proxy.cpp
     http1_client.cpp

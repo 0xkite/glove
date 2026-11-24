@@ -111,6 +111,15 @@ struct credentialed_endpoint_options {
     std::function<std::expected<void, std::string>(const endpoint_event&)> on_event;
     upstream_forwarder forward;
     endpoint_limits limits;
+    // Planted canary / decoy tokens that must never leave the sandbox in an
+    // outbound request target, header, or body. Each token must be 8..256 bytes
+    // (at most 64 tokens). Matches are refused fail-closed with 403 Forbidden
+    // and audited as "canary_exfiltration" without echoing the token.
+    std::vector<std::string> canary_tokens;
+    // When true, each rule's secret_token (if >= 8 bytes) is also added to the
+    // outbound canary scanner so a leaked host credential cannot be exfiltrated
+    // back out through the proxy.
+    bool scan_rule_secrets = true;
     // Absolute deadlines for the body and response phases. Both are bounded so a
     // client that declares a body it never sends, or stops reading the response,
     // cannot pin the endpoint's single worker or block shutdown. Configurable so

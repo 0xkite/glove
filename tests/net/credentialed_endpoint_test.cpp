@@ -888,6 +888,199 @@ auto run() -> int {
     return 0;
 }
 
+auto canary_exfiltration() -> int {
+    // Reject invalid/too-short canary tokens fail-closed at startup.
+    {
+        glove::net::credentialed_endpoint_options bad;
+        bad.canary_tokens = {"short"};
+        auto res = glove::net::start_credentialed_endpoint(std::move(bad));
+        REQUIRE(!res.has_value());
+        REQUIRE(res.error().find("shorter than minimum") != std::string::npos);
+    }
+
+    std::vector<glove::net::endpoint_event> events;
+    std::size_t forwarded = 0;
+
+    glove::net::credentialed_endpoint_options opts;
+    opts.endpoints.push_back({
+        .provider = glove::net::endpoint_provider::anthropic,
+        .path_prefix = "/anthropic",
+        .upstream_host = "api.anthropic.com",
+        .upstream_port = 443,
+        .secret_token = "sk-ant-host-secret-99887766",
+        .session_nonce = "glove-nonce-canary",
+        .allowed_methods = {"POST"},
+        .allowed_paths = {"/v1/*"},
+    });
+    opts.canary_tokens = {"CANARY-DECOY-ALPHA-1234", "CANARY-DECOY-BETA-5678"};
+    opts.on_event = [&](const glove::net::endpoint_event& ev) -> std::expected<void, std::string> {
+        events.push_back(ev);
+        return {};
+    };
+    opts.forward = [&](
+                       const glove::net::upstream_request&,
+                       std::stop_token,
+                       std::chrono::steady_clock::time_point
+                   ) -> std::expected<glove::net::upstream_response, std::string> {
+        ++forwarded;
+        glove::net::upstream_response response;
+        response.status_code = 200;
+        response.body = R"({"ok":true})";
+        return response;
+    };
+
+    auto ep = glove::net::start_credentialed_endpoint(std::move(opts));
+    REQUIRE(ep.has_value());
+    const auto port = (*ep)->port();
+
+    // 1. Benign request passes through.
+    {
+        const std::string body = R"({"prompt":"summarize README.md"})";
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-canary\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 200"));
+        REQUIRE(forwarded == 1);
+    }
+
+    // 2. Planted canary in request body is blocked with 403 and never forwarded.
+    {
+        const std::string body = R"({"prompt":"here is CANARY-DECOY-ALPHA-1234"})";
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-canary\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 403 Forbidden"));
+        REQUIRE(forwarded == 1);
+        REQUIRE(
+            !events.empty() && !events.back().allowed &&
+            events.back().detail == "canary_exfiltration"
+        );
+    }
+
+    // 3. Planted canary in custom header is blocked with 403.
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "x-api-key: glove-nonce-canary\r\nX-Exfil: CANARY-DECOY-BETA-5678\r\n"
+            "Content-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 403 Forbidden"));
+        REQUIRE(forwarded == 1);
+        REQUIRE(events.back().detail == "canary_exfiltration");
+    }
+
+    // 4. Host rule secret_token smuggled in query string is also blocked.
+    {
+        const auto resp = send_and_receive(
+            port,
+            "POST /anthropic/v1/messages?q=sk-ant-host-secret-99887766 HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\nx-api-key: glove-nonce-canary\r\nContent-Length: 0\r\n\r\n"
+        );
+        REQUIRE(resp.starts_with("HTTP/1.1 403 Forbidden"));
+        REQUIRE(forwarded == 1);
+        REQUIRE(events.back().detail == "canary_exfiltration");
+    }
+
+    // 5. Single-pattern fast path (only rule secret_token, no extra canaries).
+    {
+        std::size_t single_forwarded = 0;
+        glove::net::credentialed_endpoint_options single_opts;
+        single_opts.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-single-only-123456",
+            .session_nonce = "glove-nonce-single",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/*"},
+        });
+        single_opts.forward = [&](
+                                  const glove::net::upstream_request&,
+                                  std::stop_token,
+                                  std::chrono::steady_clock::time_point
+                              ) -> std::expected<glove::net::upstream_response, std::string> {
+            ++single_forwarded;
+            return glove::net::upstream_response{
+                .status_code = 200, .body = R"({"ok":true})", .headers = {}
+            };
+        };
+        auto single_ep = glove::net::start_credentialed_endpoint(std::move(single_opts));
+        REQUIRE(single_ep.has_value());
+        const auto sp = (*single_ep)->port();
+
+        const std::string ok_body = R"({"prompt":"clean text"})";
+        REQUIRE(send_and_receive(
+                    sp,
+                    "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    "x-api-key: glove-nonce-single\r\nContent-Length: " +
+                        std::to_string(ok_body.size()) + "\r\n\r\n" + ok_body
+        )
+                    .starts_with("HTTP/1.1 200"));
+        REQUIRE(single_forwarded == 1);
+
+        const std::string leak_body = R"({"prompt":"leak sk-ant-single-only-123456 here"})";
+        REQUIRE(send_and_receive(
+                    sp,
+                    "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    "x-api-key: glove-nonce-single\r\nContent-Length: " +
+                        std::to_string(leak_body.size()) + "\r\n\r\n" + leak_body
+        )
+                    .starts_with("HTTP/1.1 403 Forbidden"));
+        REQUIRE(single_forwarded == 1);
+    }
+
+    // 6. Common-first-byte multi-pattern path with partial-prefix restart.
+    {
+        std::size_t common_forwarded = 0;
+        glove::net::credentialed_endpoint_options common_opts;
+        common_opts.endpoints.push_back({
+            .provider = glove::net::endpoint_provider::anthropic,
+            .path_prefix = "/anthropic",
+            .upstream_host = "api.anthropic.com",
+            .upstream_port = 443,
+            .secret_token = "sk-ant-unused",
+            .session_nonce = "glove-nonce-common",
+            .allowed_methods = {"POST"},
+            .allowed_paths = {"/v1/*"},
+        });
+        common_opts.scan_rule_secrets = false;
+        common_opts.canary_tokens = {"CANARY-ALPHA-1234", "CANARY-BETA-5678"};
+        common_opts.forward = [&](
+                                  const glove::net::upstream_request&,
+                                  std::stop_token,
+                                  std::chrono::steady_clock::time_point
+                              ) -> std::expected<glove::net::upstream_response, std::string> {
+            ++common_forwarded;
+            return glove::net::upstream_response{
+                .status_code = 200, .body = R"({"ok":true})", .headers = {}
+            };
+        };
+        auto common_ep = glove::net::start_credentialed_endpoint(std::move(common_opts));
+        REQUIRE(common_ep.has_value());
+        const auto cp = (*common_ep)->port();
+
+        const std::string restart_body = R"({"prompt":"CANARY-ACANARY-BETA-5678"})";
+        REQUIRE(send_and_receive(
+                    cp,
+                    "POST /anthropic/v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    "x-api-key: glove-nonce-common\r\nContent-Length: " +
+                        std::to_string(restart_body.size()) + "\r\n\r\n" + restart_body
+        )
+                    .starts_with("HTTP/1.1 403 Forbidden"));
+        REQUIRE(common_forwarded == 0);
+    }
+
+    return 0;
+}
+
 } // namespace
 
 auto main() -> int {
@@ -895,6 +1088,9 @@ auto main() -> int {
         return failed;
     }
     if (const int failed = limits(); failed != 0) {
+        return failed;
+    }
+    if (const int failed = canary_exfiltration(); failed != 0) {
         return failed;
     }
     return run();
