@@ -88,4 +88,5 @@ endif()
 # stdout. The platform spawner contains it; direct macOS test launches retain
 # a deny-all-except-pipe fallback.
 add_executable(glove_synthetic_agent synthetic_agent.cpp)
+target_include_directories(glove_synthetic_agent PRIVATE $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>)
 target_link_libraries(glove_synthetic_agent PRIVATE glove_options)

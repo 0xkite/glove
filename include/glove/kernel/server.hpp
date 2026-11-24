@@ -5,6 +5,7 @@
 #include "glove/mcp/messages.hpp"
 #include "glove/mcp/transport.hpp"
 #include "glove/policy/engine.hpp"
+#include "glove/version.hpp"
 
 #include <expected>
 #include <memory>
@@ -16,7 +17,7 @@ namespace glove::kernel {
 // hard-coded in server.cpp) so callers can override per-deployment.
 struct server_identity {
     std::string name = "glove";
-    std::string version = "0.0.1";
+    std::string version{glove::version};
 };
 
 // MCP server loop driven by a transport. Reads frames from the agent,
