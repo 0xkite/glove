@@ -709,6 +709,14 @@ auto sandboxed_env(const profile& prof) -> std::vector<std::string> {
              {"HTTPS_PROXY=", "https_proxy=", "HTTP_PROXY=", "http_proxy=", "ALL_PROXY="}) {
             env.emplace_back(std::string{key} + prof.proxy->url);
         }
+        if (!prof.service_ports.empty()) {
+            if (!has_environment_name(env, "NO_PROXY")) {
+                env.emplace_back("NO_PROXY=127.0.0.1,localhost");
+            }
+            if (!has_environment_name(env, "no_proxy")) {
+                env.emplace_back("no_proxy=127.0.0.1,localhost");
+            }
+        }
     }
     return env;
 }

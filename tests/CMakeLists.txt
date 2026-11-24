@@ -995,6 +995,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(container_linux_loopback_listen_test container/linux_loopback_listen_test.cpp)
     target_link_libraries(container_linux_loopback_listen_test PRIVATE glove_kernel)
     add_test(NAME container_linux_loopback_listen COMMAND container_linux_loopback_listen_test)
+
+    add_executable(container_linux_service_ports_test container/linux_service_ports_test.cpp)
+    target_link_libraries(container_linux_service_ports_test PRIVATE glove_container)
+    add_test(NAME container_linux_service_ports COMMAND container_linux_service_ports_test)
+    set_tests_properties(container_linux_service_ports PROPERTIES TIMEOUT 60)
     set_tests_properties(container_linux_loopback_listen PROPERTIES TIMEOUT 30)
 endif()
 

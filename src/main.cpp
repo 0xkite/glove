@@ -87,6 +87,9 @@ void print_run_usage() {
         "                                       leading '.' matches subdomains; port defaults\n"
         "                                       to 443). Without any,\n"
         "                                       the agent has no network.\n"
+        "  --service-port <port>                allow a plain host 127.0.0.1 TCP service\n"
+        "                                       (repeatable; forwarded to agent and\n"
+        "                                       --upstream children; no credential)\n"
         "  --system-service <name>              opt in to a host system service from the\n"
         "                                       catalog (%s; may be\n"
         "                                       repeated; default none)\n"
@@ -2445,6 +2448,26 @@ auto run_subcommand(std::span<char* const> args) -> int {
                 return 2;
             }
             opts.system_services.emplace_back(args[i + 1]);
+            i += 2;
+            continue;
+        }
+        if (a == "--service-port") {
+            if (i + 1 >= args.size()) {
+                std::fprintf(stderr, "glove run: --service-port needs an argument\n");
+                return 2;
+            }
+            unsigned long port_val = 0;
+            const std::string_view port_str = args[i + 1];
+            const auto [ptr, ec] =
+                std::from_chars(port_str.data(), port_str.data() + port_str.size(), port_val);
+            if (ec != std::errc{} || ptr != port_str.data() + port_str.size() || port_val == 0 ||
+                port_val > 65535) {
+                std::fprintf(
+                    stderr, "glove run: --service-port must be an integer in [1, 65535]\n"
+                );
+                return 2;
+            }
+            opts.service_ports.push_back(static_cast<std::uint16_t>(port_val));
             i += 2;
             continue;
         }
