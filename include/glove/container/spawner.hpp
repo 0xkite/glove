@@ -79,9 +79,23 @@ public:
         -> std::expected<std::unique_ptr<agent_handle>, std::string> = 0;
 };
 
+// Isolation tier requested for a local spawner. `os_primitives` uses the host
+// kernel's own sandbox (namespaces + seccomp + Landlock on Linux, SBPL on
+// macOS). `microvm` reserves the pluggable strong-isolation tier (e.g.
+// Firecracker / Lima) for threat models that do not trust the shared host
+// kernel; callers must check `make_spawner` rather than assuming it exists.
+enum class isolation_tier : std::uint8_t {
+    os_primitives,
+    microvm,
+};
+
 // Build the spawner appropriate for the current platform. Returns nullptr if
 // no platform impl is compiled in (e.g. Linux build before Phase 4 lands).
 auto make_default_spawner() -> std::unique_ptr<spawner>;
+
+// Build a spawner for the requested isolation tier. Fails closed when a tier
+// is not constructed on this host.
+auto make_spawner(isolation_tier tier) -> std::expected<std::unique_ptr<spawner>, std::string>;
 
 // Synchronously run `argv` contained under `prof` with the parent's stdio
 // (fd 0/1/2) inherited — no MCP pipe and no kernel. Blocks until the agent

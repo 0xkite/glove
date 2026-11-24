@@ -110,6 +110,17 @@ auto conversion_cases() -> int {
     for (const auto& [kind, name] : names) {
         REQUIRE(denial_kind_name(kind) == name);
     }
+
+    const auto escaped =
+        glove::container::make_escape_denial("seccomp_user_notif", "ioctl(TIOCSTI)\n", 777);
+    REQUIRE(escaped.kind == "syscall");
+    REQUIRE(escaped.operation == "seccomp_user_notif");
+    REQUIRE(escaped.target == "ioctl(TIOCSTI)%0A");
+    REQUIRE(!escaped.target_truncated);
+    REQUIRE(escaped.pid == 777 && escaped.readings == 1);
+
+    const auto neg_pid = glove::container::make_escape_denial("seccomp", std::string(700, 'z'), -5);
+    REQUIRE(neg_pid.pid == 0 && neg_pid.target.size() == 512 && neg_pid.target_truncated);
     return 0;
 }
 

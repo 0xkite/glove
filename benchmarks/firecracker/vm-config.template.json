@@ -1,0 +1,19 @@
+{
+  "boot-source": {
+    "kernel_image_path": "__KERNEL_PATH__",
+    "boot_args": "__BOOT_ARGS__"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "path_on_host": "__ROOTFS_PATH__",
+      "is_root_device": true,
+      "is_read_only": false
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": __VCPU_COUNT__,
+    "mem_size_mib": __MEM_SIZE_MIB__,
+    "smt": false
+  }
+}

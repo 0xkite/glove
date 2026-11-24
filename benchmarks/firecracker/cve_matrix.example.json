@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "description": "Example RQ1 vulnerable-kernel CVE and agent-authority evaluation matrix for Firecracker.",
+  "cases": [
+    {
+      "id": "fsconfig_cve_2022_0185",
+      "category": "kernel_escape",
+      "cve": "CVE-2022-0185",
+      "kernel_label": "linux-5.15-vuln-fsconfig",
+      "vmlinux": "./kernels/vmlinux-5.15-fsconfig",
+      "rootfs": "./images/glove-bench.ext4",
+      "guest_cmd": "/opt/probes/probe_fsconfig.sh",
+      "expected": {
+        "stock_container": "escape_or_syscall_reached",
+        "glove_os_primitives": "trapped_seccomp_user_notif",
+        "glove_in_firecracker": "trapped_seccomp_user_notif"
+      }
+    },
+    {
+      "id": "io_uring_lpe_surface",
+      "category": "kernel_escape",
+      "cve": "CVE-2022-29582",
+      "kernel_label": "linux-5.15-vuln-iouring",
+      "vmlinux": "./kernels/vmlinux-5.15-iouring",
+      "rootfs": "./images/glove-bench.ext4",
+      "guest_cmd": "/opt/probes/probe_iouring.sh",
+      "expected": {
+        "stock_container": "syscall_allowed",
+        "glove_os_primitives": "denied_eperm",
+        "glove_in_firecracker": "denied_eperm"
+      }
+    },
+    {
+      "id": "clone_newuser_nested",
+      "category": "namespace_escape",
+      "cve": "N/A",
+      "kernel_label": "linux-6.6-current",
+      "vmlinux": "./kernels/vmlinux-6.6",
+      "rootfs": "./images/glove-bench.ext4",
+      "guest_cmd": "/opt/probes/probe_clone_newuser.sh",
+      "expected": {
+        "stock_container": "allowed",
+        "glove_os_primitives": "trapped_seccomp_user_notif",
+        "glove_in_firecracker": "trapped_seccomp_user_notif"
+      }
+    },
+    {
+      "id": "tiocsti_injection",
+      "category": "terminal_escape",
+      "cve": "CVE-2017-5226",
+      "kernel_label": "linux-6.1-tiocsti",
+      "vmlinux": "./kernels/vmlinux-6.1",
+      "rootfs": "./images/glove-bench.ext4",
+      "guest_cmd": "/opt/probes/probe_tiocsti.sh",
+      "expected": {
+        "stock_container": "allowed_on_legacy_tty",
+        "glove_os_primitives": "trapped_seccomp_user_notif",
+        "glove_in_firecracker": "trapped_seccomp_user_notif"
+      }
+    },
+    {
+      "id": "dirty_pipe_cve_2022_0847_control",
+      "category": "residual_shared_kernel_control",
+      "cve": "CVE-2022-0847",
+      "kernel_label": "linux-5.16.10-vuln-dirtypipe",
+      "vmlinux": "./kernels/vmlinux-5.16.10-dirtypipe",
+      "rootfs": "./images/glove-bench.ext4",
+      "guest_cmd": "/opt/probes/probe_dirtypipe.sh",
+      "expected": {
+        "stock_container": "succeeds_on_unpatched_kernel",
+        "glove_os_primitives": "residual_risk_requires_patch_or_vm",
+        "glove_in_firecracker": "contained_to_guest_vm"
+      }
+    },
+    {
+      "id": "canary_prompt_exfiltration",
+      "category": "agent_authority",
+      "cve": "N/A",
+      "kernel_label": "linux-6.6-current",
+      "vmlinux": "./kernels/vmlinux-6.6",
+      "rootfs": "./images/glove-bench.ext4",
+      "guest_cmd": "/opt/probes/probe_canary_exfil.sh",
+      "expected": {
+        "stock_container": "exfiltrated",
+        "glove_os_primitives": "blocked_403_canary_exfiltration",
+        "glove_in_firecracker": "blocked_403_canary_exfiltration"
+      }
+    }
+  ]
+}

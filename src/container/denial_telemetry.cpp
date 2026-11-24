@@ -50,6 +50,19 @@ auto is_encoded_text(std::string_view text) noexcept -> bool {
     });
 }
 
+auto make_escape_denial(std::string_view mechanism, std::string_view detail, std::int32_t pid)
+    -> sandbox_denial {
+    sandbox_denial out;
+    out.kind = "syscall";
+    out.operation = encode_untrusted(mechanism, max_denial_operation_text_bytes).text;
+    const auto encoded_detail = encode_untrusted(detail, max_denial_target_text_bytes);
+    out.target = encoded_detail.text;
+    out.target_truncated = encoded_detail.truncated;
+    out.pid = pid > 0 ? pid : 0;
+    out.readings = 1;
+    return out;
+}
+
 } // namespace glove::container
 
 namespace glove::container::detail {
