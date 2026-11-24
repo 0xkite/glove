@@ -1,0 +1,431 @@
+{
+  "schema": "sage.decision-model.v1",
+  "description": "Cross-language golden test vectors for sage.decision-model.v1 (Rust sage-core <-> C++20 packages/glove parity).",
+  "cases": [
+    {
+      "name": "linear_platt_accept",
+      "artifact": {
+        "schema": "sage.decision-model.v1",
+        "artifact_version": 1,
+        "model_id": "golden-linear-v1",
+        "task_domain": "skill_routing",
+        "feature_schema": {
+          "version": "sage.decision.test.v1",
+          "digest": "test-schema-4-blake3",
+          "numeric_features": [
+            "bm25_name",
+            "denial_rate",
+            "outcome_used",
+            "negative_scope"
+          ]
+        },
+        "model": {
+          "kind": "linear",
+          "weights": [
+            1.5,
+            -2.0,
+            0.8,
+            -1.2
+          ],
+          "bias": 0.1
+        },
+        "calibration": {
+          "kind": "platt",
+          "a": 1.1,
+          "b": -0.05
+        },
+        "policy": {
+          "accept_threshold": 0.6,
+          "reject_threshold": 0.35,
+          "wilson_z": 1.96,
+          "pseudo_count": 5.0,
+          "refinement_wilson_upper_max": 0.45,
+          "refinement_min_samples": 5,
+          "refinement_score_ceiling": 0.45
+        },
+        "content_digest": "037e8697126f95191518f92d1a024c9e08536d786f4074e4fcccea1de3d1829c"
+      },
+      "expected_content_digest": "037e8697126f95191518f92d1a024c9e08536d786f4074e4fcccea1de3d1829c",
+      "expected_semantic_digest": "7c2417f04ef23601d59e6c6d3c5bdd8239ce5fae625d0fe2c96cb6ad3a1041b8",
+      "features": [
+        0.8,
+        0.1,
+        0.7,
+        0.0
+      ],
+      "evidence": {
+        "successes": 8,
+        "failures": 1,
+        "exposures": 11,
+        "skip_weight": 0.15
+      },
+      "top_n": 3,
+      "expected_raw_score": 1.6600000000000001,
+      "expected_calibrated_prob": 0.8552022438686094,
+      "expected_blended_score": 0.6501354118742726,
+      "expected_wilson_lower": 0.5398844269310807,
+      "expected_wilson_upper": 0.9699469482439359,
+      "expected_evidence_weight": 0.6503496503496504,
+      "expected_decision": "accept",
+      "expected_trigger_refinement": false,
+      "expected_top_contributions": [
+        {
+          "feature": "bm25_name",
+          "value": 0.8,
+          "contribution": 1.2000000000000002
+        },
+        {
+          "feature": "outcome_used",
+          "value": 0.7,
+          "contribution": 0.5599999999999999
+        },
+        {
+          "feature": "denial_rate",
+          "value": 0.1,
+          "contribution": -0.2
+        }
+      ]
+    },
+    {
+      "name": "piecewise_linear_refinement_trigger",
+      "artifact": {
+        "schema": "sage.decision-model.v1",
+        "artifact_version": 1,
+        "model_id": "golden-piecewise-v1",
+        "task_domain": "skill_refinement",
+        "feature_schema": {
+          "version": "sage.decision.test.v1",
+          "digest": "test-schema-4-blake3",
+          "numeric_features": [
+            "bm25_name",
+            "denial_rate",
+            "outcome_used",
+            "negative_scope"
+          ]
+        },
+        "model": {
+          "kind": "piecewise_linear",
+          "bias": -0.2,
+          "terms": [
+            {
+              "feature_index": 0,
+              "knots": [
+                0.0,
+                0.5,
+                1.0
+              ],
+              "values": [
+                -0.4,
+                0.2,
+                1.0
+              ]
+            },
+            {
+              "feature_index": 1,
+              "knots": [
+                0.0,
+                0.25,
+                0.75,
+                1.0
+              ],
+              "values": [
+                0.5,
+                0.1,
+                -0.8,
+                -1.5
+              ]
+            }
+          ]
+        },
+        "calibration": {
+          "kind": "identity"
+        },
+        "policy": {
+          "accept_threshold": 0.6,
+          "reject_threshold": 0.35,
+          "wilson_z": 1.96,
+          "pseudo_count": 5.0,
+          "refinement_wilson_upper_max": 0.45,
+          "refinement_min_samples": 5,
+          "refinement_score_ceiling": 0.45
+        },
+        "content_digest": "c0b33d8ef68311982e109ea7e5ed5cbaa713462e160a135ee02957dc187b0687"
+      },
+      "expected_content_digest": "c0b33d8ef68311982e109ea7e5ed5cbaa713462e160a135ee02957dc187b0687",
+      "expected_semantic_digest": "0d46ff42e737ee88cfef0acc7d92aec6431a454ce2da3a1451ab266aba7e3f80",
+      "features": [
+        0.25,
+        0.6,
+        0.1,
+        0.0
+      ],
+      "evidence": {
+        "successes": 1,
+        "failures": 8,
+        "exposures": 12,
+        "skip_weight": 0.15
+      },
+      "top_n": 2,
+      "expected_raw_score": -0.8300000000000001,
+      "expected_calibrated_prob": 0.3036450701761659,
+      "expected_blended_score": 0.1174475207032752,
+      "expected_wilson_lower": 0.01893029875994681,
+      "expected_wilson_upper": 0.42056532253470547,
+      "expected_evidence_weight": 0.6539792387543253,
+      "expected_decision": "reject",
+      "expected_trigger_refinement": true,
+      "expected_top_contributions": [
+        {
+          "feature": "denial_rate",
+          "value": 0.6,
+          "contribution": -0.53
+        },
+        {
+          "feature": "bm25_name",
+          "value": 0.25,
+          "contribution": -0.09999999999999998
+        }
+      ]
+    },
+    {
+      "name": "gbdt_glove_denial_reject",
+      "artifact": {
+        "schema": "sage.decision-model.v1",
+        "artifact_version": 1,
+        "model_id": "golden-gbdt-v1",
+        "task_domain": "glove_denial",
+        "feature_schema": {
+          "version": "sage.decision.test.v1",
+          "digest": "test-schema-4-blake3",
+          "numeric_features": [
+            "bm25_name",
+            "denial_rate",
+            "outcome_used",
+            "negative_scope"
+          ]
+        },
+        "model": {
+          "kind": "gbdt",
+          "base_score": 0.0,
+          "learning_rate": 0.5,
+          "trees": [
+            {
+              "nodes": [
+                {
+                  "feature_index": 1,
+                  "threshold": 0.3,
+                  "left": 1,
+                  "right": 2,
+                  "value": 0.0,
+                  "missing_left": true
+                },
+                {
+                  "feature_index": -1,
+                  "threshold": 0.0,
+                  "left": 0,
+                  "right": 0,
+                  "value": 1.2,
+                  "missing_left": true
+                },
+                {
+                  "feature_index": 3,
+                  "threshold": 0.5,
+                  "left": 3,
+                  "right": 4,
+                  "value": 0.0,
+                  "missing_left": true
+                },
+                {
+                  "feature_index": -1,
+                  "threshold": 0.0,
+                  "left": 0,
+                  "right": 0,
+                  "value": -0.4,
+                  "missing_left": true
+                },
+                {
+                  "feature_index": -1,
+                  "threshold": 0.0,
+                  "left": 0,
+                  "right": 0,
+                  "value": -1.6,
+                  "missing_left": true
+                }
+              ]
+            },
+            {
+              "nodes": [
+                {
+                  "feature_index": 0,
+                  "threshold": 0.6,
+                  "left": 1,
+                  "right": 2,
+                  "value": 0.0,
+                  "missing_left": true
+                },
+                {
+                  "feature_index": -1,
+                  "threshold": 0.0,
+                  "left": 0,
+                  "right": 0,
+                  "value": -0.3,
+                  "missing_left": true
+                },
+                {
+                  "feature_index": -1,
+                  "threshold": 0.0,
+                  "left": 0,
+                  "right": 0,
+                  "value": 0.9,
+                  "missing_left": true
+                }
+              ]
+            }
+          ]
+        },
+        "calibration": {
+          "kind": "identity"
+        },
+        "policy": {
+          "accept_threshold": 0.6,
+          "reject_threshold": 0.35,
+          "wilson_z": 1.96,
+          "pseudo_count": 5.0,
+          "refinement_wilson_upper_max": 0.45,
+          "refinement_min_samples": 5,
+          "refinement_score_ceiling": 0.45
+        },
+        "content_digest": "09118186c80f619cdf17121dde42ded9eadc7b2fde28887c16afec228e54cd20"
+      },
+      "expected_content_digest": "09118186c80f619cdf17121dde42ded9eadc7b2fde28887c16afec228e54cd20",
+      "expected_semantic_digest": "8d0299be8eb3dff1a1c11427e9bc55169f77b783dd0077c267e3d554c393b5f0",
+      "features": [
+        0.4,
+        0.55,
+        0.1,
+        0.8
+      ],
+      "evidence": {
+        "successes": 0,
+        "failures": 6,
+        "exposures": 6,
+        "skip_weight": 0.15
+      },
+      "top_n": 3,
+      "expected_raw_score": -0.9500000000000001,
+      "expected_calibrated_prob": 0.2788848219771369,
+      "expected_blended_score": 0.12676582817142587,
+      "expected_wilson_lower": 0.0,
+      "expected_wilson_upper": 0.3903430336530645,
+      "expected_evidence_weight": 0.5454545454545454,
+      "expected_decision": "reject",
+      "expected_trigger_refinement": true,
+      "expected_top_contributions": [
+        {
+          "feature": "denial_rate",
+          "value": 0.55,
+          "contribution": -0.4
+        },
+        {
+          "feature": "negative_scope",
+          "value": 0.8,
+          "contribution": -0.4
+        },
+        {
+          "feature": "bm25_name",
+          "value": 0.4,
+          "contribution": -0.15
+        }
+      ]
+    },
+    {
+      "name": "linucb_cold_start_abstain_or_accept",
+      "artifact": {
+        "schema": "sage.decision-model.v1",
+        "artifact_version": 1,
+        "model_id": "golden-linucb-v1",
+        "task_domain": "skill_routing",
+        "feature_schema": {
+          "version": "sage.decision.test.v1",
+          "digest": "test-schema-4-blake3",
+          "numeric_features": [
+            "bm25_name",
+            "denial_rate",
+            "outcome_used",
+            "negative_scope"
+          ]
+        },
+        "model": {
+          "kind": "lin_ucb",
+          "weights": [
+            0.6,
+            -0.4,
+            0.5,
+            -0.8
+          ],
+          "bias": -0.1,
+          "a_inv_diag": [
+            0.25,
+            0.16,
+            0.36,
+            0.09
+          ],
+          "alpha": 0.75
+        },
+        "calibration": {
+          "kind": "identity"
+        },
+        "policy": {
+          "accept_threshold": 0.6,
+          "reject_threshold": 0.35,
+          "wilson_z": 1.96,
+          "pseudo_count": 5.0,
+          "refinement_wilson_upper_max": 0.45,
+          "refinement_min_samples": 5,
+          "refinement_score_ceiling": 0.45
+        },
+        "content_digest": "48a6e03ec84828ea60e9b524faff5d52157f07482aa8ad9c0c3484443dac5e59"
+      },
+      "expected_content_digest": "48a6e03ec84828ea60e9b524faff5d52157f07482aa8ad9c0c3484443dac5e59",
+      "expected_semantic_digest": "94702da5a76dce28b02a9a207cd23b52f70eb993424a77555065537588580bf4",
+      "features": [
+        0.6,
+        0.2,
+        0.4,
+        0.0
+      ],
+      "evidence": {
+        "successes": 0,
+        "failures": 0,
+        "exposures": 0,
+        "skip_weight": 0.15
+      },
+      "top_n": 3,
+      "expected_raw_score": 0.6743212530552287,
+      "expected_calibrated_prob": 0.6624700837372952,
+      "expected_blended_score": 0.6624700837372952,
+      "expected_wilson_lower": 0.0,
+      "expected_wilson_upper": 1.0,
+      "expected_evidence_weight": 0.0,
+      "expected_decision": "accept",
+      "expected_trigger_refinement": false,
+      "expected_top_contributions": [
+        {
+          "feature": "bm25_name",
+          "value": 0.6,
+          "contribution": 0.36
+        },
+        {
+          "feature": "outcome_used",
+          "value": 0.4,
+          "contribution": 0.2
+        },
+        {
+          "feature": "denial_rate",
+          "value": 0.2,
+          "contribution": -0.08000000000000002
+        }
+      ]
+    }
+  ]
+}
