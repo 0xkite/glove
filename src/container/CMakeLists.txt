@@ -11,6 +11,7 @@ add_library(glove_container STATIC
     system_services.cpp
     denial_telemetry.cpp
     denial_decision.cpp
+    decision_model_v1.cpp
     denial_trace.cpp
 )
 add_library(glove::container ALIAS glove_container)

@@ -414,6 +414,14 @@ target_link_libraries(container_denial_decision_test PRIVATE glove_container)
 add_test(NAME container_denial_decision COMMAND container_denial_decision_test)
 set_tests_properties(container_denial_decision PROPERTIES TIMEOUT 10)
 
+add_executable(container_decision_model_v1_test container/decision_model_v1_test.cpp)
+target_link_libraries(container_decision_model_v1_test PRIVATE glove_container glaze::glaze)
+add_test(
+    NAME container_decision_model_v1
+    COMMAND container_decision_model_v1_test ${CMAKE_SOURCE_DIR}/tests/fixtures/decision_model_v1_vectors.json
+)
+set_tests_properties(container_decision_model_v1 PROPERTIES TIMEOUT 10)
+
 add_executable(container_denial_trace_test container/denial_trace_test.cpp)
 target_link_libraries(container_denial_trace_test PRIVATE glove_container)
 add_test(NAME container_denial_trace COMMAND container_denial_trace_test)
