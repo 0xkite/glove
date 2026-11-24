@@ -2,6 +2,7 @@
 
 #include "glove/mcp/transport.hpp"
 
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <string>
@@ -12,6 +13,8 @@ namespace glove::mcp {
 struct stdio_sandbox_options {
     bool enabled = false;
     bool allow_network = false;
+    // Plain host 127.0.0.1 TCP ports forwarded into CLONE_NEWNET (Linux).
+    std::vector<std::uint16_t> service_ports{};
 };
 
 // Options for spawning an MCP server (or any line-framed peer) as a child

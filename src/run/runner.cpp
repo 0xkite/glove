@@ -946,8 +946,10 @@ struct[[= glove::reflect::tool_meta{
 };
 #endif
 
-auto build_registry(const std::vector<upstream_spec>& upstreams)
-    -> std::expected<std::unique_ptr<glove::kernel::registry>, std::string> {
+auto build_registry(
+    const std::vector<upstream_spec>& upstreams,
+    [[maybe_unused]] std::span<const std::uint16_t> service_ports
+) -> std::expected<std::unique_ptr<glove::kernel::registry>, std::string> {
     auto registry = std::make_unique<glove::kernel::registry>();
     auto reflected = std::make_unique<glove::reflect::reflected_extension>("glove");
     const std::size_t upstream_count = upstreams.size();
@@ -1000,7 +1002,11 @@ auto build_registry(const std::vector<upstream_spec>& upstreams)
             .args = upstream.argv,
             .environment = {},
 #if defined(__linux__)
-            .sandbox = {.enabled = true, .allow_network = false},
+            .sandbox = {
+                .enabled = true,
+                .allow_network = false,
+                .service_ports = {service_ports.begin(), service_ports.end()}
+            },
 #endif
         };
         auto transport = glove::mcp::make_stdio_transport(child);
@@ -2250,7 +2256,7 @@ auto execute(const options& opts) -> std::expected<int, std::string> {
     if (!profile) {
         return std::unexpected(profile.error());
     }
-    auto registry = build_registry(opts.upstreams);
+    auto registry = build_registry(opts.upstreams, profile->service_ports);
     if (!registry) {
         return std::unexpected(registry.error());
     }
@@ -2431,7 +2437,7 @@ auto exec(const options& opts) -> std::expected<int, std::string> {
             return std::unexpected(created_mcp_dir.error());
         }
         mcp_runtime.emplace(std::move(*created_mcp_dir));
-        auto built_reg = build_registry(opts.upstreams);
+        auto built_reg = build_registry(opts.upstreams, profile->service_ports);
         if (!built_reg) {
             return std::unexpected(built_reg.error());
         }

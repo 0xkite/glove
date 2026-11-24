@@ -955,17 +955,43 @@ auto resolve_program(const profile& prof, std::string_view program)
     return std::unexpected(std::string{"cannot resolve executable: "} + std::string{program});
 }
 
-// The single host-loopback destination the egress bridge may reach for this
-// profile. A credentialed reverse endpoint and a raw CONNECT proxy are
-// mutually exclusive by construction, so at most one applies.
-auto bridged_loopback_port(const profile& prof) -> std::optional<std::uint16_t> {
+// Stack-allocated list of host-loopback ports bridged into CLONE_NEWNET
+// (optional proxy or credential bridge port plus validated service_ports).
+// Fixed-capacity so child paths after clone3() never touch the heap.
+struct bridged_port_list {
+    std::array<std::uint16_t, linux_detail::max_bridged_loopback_ports> ports{};
+    std::size_t count = 0;
+
+    [[nodiscard]] auto empty() const noexcept -> bool { return count == 0; }
+
+    [[nodiscard]] auto span() const noexcept -> std::span<const std::uint16_t> {
+        return {ports.data(), count};
+    }
+
+    void push_unique(std::uint16_t port) noexcept {
+        if (port == 0 || count >= ports.size()) {
+            return;
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+            if (ports[i] == port) {
+                return;
+            }
+        }
+        ports[count++] = port;
+    }
+};
+
+auto bridged_loopback_ports(const profile& prof) noexcept -> bridged_port_list {
+    bridged_port_list out;
     if (prof.proxy) {
-        return prof.proxy->port;
+        out.push_unique(prof.proxy->port);
+    } else if (prof.bridge_endpoint) {
+        out.push_unique(prof.bridge_endpoint->port);
     }
-    if (prof.bridge_endpoint) {
-        return prof.bridge_endpoint->port;
+    for (const std::uint16_t port : prof.service_ports) {
+        out.push_unique(port);
     }
-    return std::nullopt;
+    return out;
 }
 
 auto install_environment(const profile& prof) -> std::expected<void, std::string> {
@@ -1003,6 +1029,15 @@ auto install_environment(const profile& prof) -> std::expected<void, std::string
             return std::unexpected(
                 std::string{"setenv NODE_USE_ENV_PROXY: "} + std::strerror(errno)
             );
+        }
+        if (!prof.service_ports.empty()) {
+            for (const char* name : {"NO_PROXY", "no_proxy"}) {
+                if (::setenv(name, "127.0.0.1,localhost", 0) != 0) {
+                    return std::unexpected(
+                        std::string{"setenv "} + name + ": " + std::strerror(errno)
+                    );
+                }
+            }
         }
     }
     return {};
@@ -1612,7 +1647,7 @@ auto install_child_containment_and_notify(
     }
     int seccomp_notif_fd = -1;
     if (auto r = setup_seccomp(
-            bridged_loopback_port(prof).has_value(),
+            !bridged_loopback_ports(prof).empty(),
             prof.allow_loopback_listen,
             inherited_streams,
             prof.escape_policy,
@@ -1716,9 +1751,9 @@ auto install_child_containment_and_notify(
         std::fprintf(stderr, "glove child: pivot: %s\n", r.error().c_str());
         std::_Exit(124);
     }
-    if (const auto bridged = bridged_loopback_port(prof)) {
+    if (const auto bridged = bridged_loopback_ports(prof); !bridged.empty()) {
         if (auto installed =
-                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, *bridged);
+                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, bridged.span());
             !installed) {
             std::fprintf(stderr, "glove child: egress bridge: %s\n", installed.error().c_str());
             std::_Exit(125);
@@ -1868,9 +1903,9 @@ auto install_child_containment_and_notify(
         std::_Exit(126);
     }
 
-    if (const auto bridged = bridged_loopback_port(prof)) {
+    if (const auto bridged = bridged_loopback_ports(prof); !bridged.empty()) {
         if (auto installed =
-                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, *bridged);
+                linux_detail::install_sandbox_egress_bridge(egress_channel_fd, bridged.span());
             !installed) {
             std::fprintf(stderr, "glove child: egress bridge: %s\n", installed.error().c_str());
             std::_Exit(125);
@@ -1999,9 +2034,6 @@ public:
         if (!checked) {
             return std::unexpected(std::string{"profile: "} + checked.error());
         }
-        if (!checked->service_ports.empty()) {
-            return std::unexpected(std::string{service_ports_unsupported_on_linux});
-        }
         if (auto limits = require_resource_enforcement(*checked, resource_capabilities());
             !limits) {
             return std::unexpected(limits.error());
@@ -2051,7 +2083,7 @@ public:
                 return std::unexpected(created.error());
             }
         }
-        if (bridged_loopback_port(*checked)) {
+        if (!bridged_loopback_ports(*checked).empty()) {
             auto channel = linux_detail::create_egress_channel();
             if (!channel) {
                 close_pipe_pair(pipe_in);
@@ -2133,8 +2165,8 @@ public:
         }
 
         std::unique_ptr<linux_detail::host_egress_bridge> egress;
-        if (const auto bridged = bridged_loopback_port(*checked)) {
-            auto started = linux_detail::start_host_egress_bridge(egress_host_fd, *bridged);
+        if (const auto bridged = bridged_loopback_ports(*checked); !bridged.empty()) {
+            auto started = linux_detail::start_host_egress_bridge(egress_host_fd, bridged.span());
             egress_host_fd = -1;
             if (!started) {
                 ::close(pipe_in[1]);
@@ -2401,7 +2433,7 @@ auto launch_passthrough_child(
         close_pipe_pair(pipe_out);
         return std::unexpected(std::string{"pipe2(managed stderr): "} + errno_message(saved));
     }
-    if (bridged_loopback_port(prof)) {
+    if (!bridged_loopback_ports(prof).empty()) {
         auto channel = linux_detail::create_egress_channel();
         if (!channel) {
             close_pipe_pair(sync_pipe);
@@ -2500,8 +2532,8 @@ auto launch_passthrough_child(
             return fail(attached.error());
         }
     }
-    if (const auto bridged = bridged_loopback_port(prof)) {
-        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, *bridged);
+    if (const auto bridged = bridged_loopback_ports(prof); !bridged.empty()) {
+        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, bridged.span());
         egress_host_fd = -1;
         if (!started) {
             return fail(started.error());
@@ -2600,7 +2632,7 @@ auto launch_pty_child(
     }
     int egress_host_fd = -1;
     int egress_sandbox_fd = -1;
-    if (bridged_loopback_port(prof)) {
+    if (!bridged_loopback_ports(prof).empty()) {
         auto channel = linux_detail::create_egress_channel();
         if (!channel) {
             close_pipe_pair(sync_pipe);
@@ -2676,8 +2708,8 @@ auto launch_pty_child(
     if (auto attached = lifecycle.attach(child); !attached) {
         return fail(attached.error());
     }
-    if (const auto bridged = bridged_loopback_port(prof)) {
-        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, *bridged);
+    if (const auto bridged = bridged_loopback_ports(prof); !bridged.empty()) {
+        auto started = linux_detail::start_host_egress_bridge(egress_host_fd, bridged.span());
         egress_host_fd = -1;
         if (!started) {
             return fail(started.error());
@@ -3307,9 +3339,6 @@ auto exec_contained(
     auto checked = validate(prof);
     if (!checked) {
         return std::unexpected(std::string{"profile: "} + checked.error());
-    }
-    if (!checked->service_ports.empty()) {
-        return std::unexpected(std::string{service_ports_unsupported_on_linux});
     }
     if (auto limits = require_resource_enforcement(*checked, linux_resource_capabilities());
         !limits) {

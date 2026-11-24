@@ -42,9 +42,8 @@ void close_descriptor(int descriptor) noexcept {
     }
 }
 
-auto send_descriptor(int channel, int descriptor) -> bool {
-    char marker = 'C';
-    ::iovec payload{.iov_base = &marker, .iov_len = 1};
+auto send_descriptor(int channel, std::uint16_t target_port, int descriptor) -> bool {
+    ::iovec payload{.iov_base = &target_port, .iov_len = sizeof(target_port)};
     std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
     ::msghdr message{};
     message.msg_iov = &payload;
@@ -65,9 +64,9 @@ auto send_descriptor(int channel, int descriptor) -> bool {
     return true;
 }
 
-auto receive_descriptor(int channel) -> int {
-    char marker = 0;
-    ::iovec payload{.iov_base = &marker, .iov_len = 1};
+auto receive_descriptor(int channel, std::uint16_t& target_port) -> int {
+    target_port = 0;
+    ::iovec payload{.iov_base = &target_port, .iov_len = sizeof(target_port)};
     std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
     ::msghdr message{};
     message.msg_iov = &payload;
@@ -78,7 +77,8 @@ auto receive_descriptor(int channel) -> int {
     do {
         received = ::recvmsg(channel, &message, MSG_CMSG_CLOEXEC);
     } while (received < 0 && errno == EINTR);
-    if (received <= 0 || (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+    if (received != static_cast<::ssize_t>(sizeof(target_port)) ||
+        (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
         return -1;
     }
     for (auto* header = CMSG_FIRSTHDR(&message); header != nullptr;
@@ -189,7 +189,8 @@ void relay(int left, int right, const std::atomic<bool>& stopping) noexcept {
 
 class bridge_impl final : public host_egress_bridge {
 public:
-    bridge_impl(int channel, std::uint16_t port) : channel_{channel}, proxy_port_{port} {}
+    bridge_impl(int channel, std::vector<std::uint16_t> allowed_ports)
+        : channel_{channel}, allowed_ports_{std::move(allowed_ports)} {}
 
     auto start() -> std::expected<void, std::string> {
         try {
@@ -241,9 +242,14 @@ private:
     void receive_loop() noexcept {
         constexpr std::size_t maximum_concurrent_relays = 64;
         while (!stopping_.load(std::memory_order_relaxed)) {
-            const int client = receive_descriptor(channel_);
+            std::uint16_t target_port = 0;
+            const int client = receive_descriptor(channel_, target_port);
             if (client < 0) {
                 break;
+            }
+            if (std::ranges::find(allowed_ports_, target_port) == allowed_ports_.end()) {
+                close_descriptor(client);
+                continue;
             }
             reap_workers();
             {
@@ -253,7 +259,7 @@ private:
                     continue;
                 }
             }
-            const int proxy = connect_host_proxy(proxy_port_);
+            const int proxy = connect_host_proxy(target_port);
             if (proxy < 0) {
                 close_descriptor(client);
                 continue;
@@ -277,7 +283,7 @@ private:
     }
 
     int channel_ = -1;
-    std::uint16_t proxy_port_ = 0;
+    std::vector<std::uint16_t> allowed_ports_;
     std::atomic<bool> stopping_{false};
     std::thread receiver_;
     std::mutex workers_mutex_;
@@ -328,41 +334,91 @@ auto open_private_listener(std::uint16_t port) -> std::expected<int, std::string
     return descriptor;
 }
 
-void close_except(int first, int second) noexcept {
-    const int lower = std::min(first, second);
-    const int upper = std::max(first, second);
+void close_except_set(
+    int channel, const std::array<int, max_bridged_loopback_ports>& listeners, std::size_t count
+) noexcept {
+    std::array<int, max_bridged_loopback_ports + 1U> keep{};
+    std::size_t keep_count = 0;
+    if (channel > STDERR_FILENO) {
+        keep[keep_count++] = channel;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (listeners[i] > STDERR_FILENO) {
+            keep[keep_count++] = listeners[i];
+        }
+    }
+    std::sort(keep.begin(), keep.begin() + static_cast<std::ptrdiff_t>(keep_count));
 #if defined(SYS_close_range)
-    if (lower > STDERR_FILENO + 1) {
-        static_cast<void>(::syscall(SYS_close_range, STDERR_FILENO + 1, lower - 1, 0));
+    int cursor = STDERR_FILENO + 1;
+    for (std::size_t i = 0; i < keep_count; ++i) {
+        if (keep[i] > cursor) {
+            static_cast<void>(::syscall(SYS_close_range, cursor, keep[i] - 1, 0));
+        }
+        cursor = std::max(cursor, keep[i] + 1);
     }
-    if (upper > lower + 1) {
-        static_cast<void>(::syscall(SYS_close_range, lower + 1, upper - 1, 0));
-    }
-    static_cast<void>(::syscall(SYS_close_range, upper + 1, ~0U, 0));
+    static_cast<void>(::syscall(SYS_close_range, cursor, ~0U, 0));
 #else
     const long maximum = ::sysconf(_SC_OPEN_MAX);
     for (int descriptor = STDERR_FILENO + 1; descriptor < maximum; ++descriptor) {
-        if (descriptor != first && descriptor != second) {
+        bool retained = false;
+        for (std::size_t i = 0; i < keep_count; ++i) {
+            if (keep[i] == descriptor) {
+                retained = true;
+                break;
+            }
+        }
+        if (!retained) {
             close_descriptor(descriptor);
         }
     }
 #endif
 }
 
-[[noreturn]] void sandbox_forwarder(int listener, int channel) noexcept {
-    close_except(listener, channel);
+[[noreturn]] void sandbox_forwarder(
+    const std::array<int, max_bridged_loopback_ports>& listeners,
+    const std::array<std::uint16_t, max_bridged_loopback_ports>& ports,
+    std::size_t count,
+    int channel
+) noexcept {
+    close_except_set(channel, listeners, count);
+    std::array<::pollfd, max_bridged_loopback_ports + 1U> pfds{};
+    for (std::size_t i = 0; i < count; ++i) {
+        pfds[i] = {.fd = listeners[i], .events = POLLIN, .revents = 0};
+    }
+    pfds[count] = {.fd = channel, .events = POLLHUP | POLLERR, .revents = 0};
     while (true) {
-        int client = -1;
-        do {
-            client = ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
-        } while (client < 0 && errno == EINTR);
-        if (client < 0) {
+        const int ready = ::poll(pfds.data(), count + 1U, -1);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             std::_Exit(0);
         }
-        const bool sent = send_descriptor(channel, client);
-        close_descriptor(client);
-        if (!sent) {
+        if ((pfds[count].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
             std::_Exit(0);
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+            if ((pfds[i].revents & (POLLERR | POLLNVAL)) != 0) {
+                std::_Exit(0);
+            }
+            if ((pfds[i].revents & POLLIN) == 0) {
+                continue;
+            }
+            int client = -1;
+            do {
+                client = ::accept4(listeners[i], nullptr, nullptr, SOCK_CLOEXEC);
+            } while (client < 0 && errno == EINTR);
+            if (client < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
+                    continue;
+                }
+                std::_Exit(0);
+            }
+            const bool sent = send_descriptor(channel, ports[i], client);
+            close_descriptor(client);
+            if (!sent) {
+                std::_Exit(0);
+            }
         }
     }
 }
@@ -377,22 +433,34 @@ auto create_egress_channel() -> std::expected<egress_channel_pair, std::string> 
     return egress_channel_pair{.host_fd = descriptors[0], .sandbox_fd = descriptors[1]};
 }
 
-auto start_host_egress_bridge(int host_channel_fd, std::uint16_t proxy_port)
+auto start_host_egress_bridge(int host_channel_fd, std::span<const std::uint16_t> allowed_ports)
     -> std::expected<std::unique_ptr<host_egress_bridge>, std::string> {
-    if (host_channel_fd < 0 || proxy_port == 0) {
+    if (host_channel_fd < 0 || allowed_ports.empty() ||
+        allowed_ports.size() > max_bridged_loopback_ports) {
         close_descriptor(host_channel_fd);
         return std::unexpected(std::string{"invalid host egress bridge configuration"});
     }
-    auto bridge = std::make_unique<bridge_impl>(host_channel_fd, proxy_port);
+    std::vector<std::uint16_t> ports;
+    ports.reserve(allowed_ports.size());
+    for (const std::uint16_t port : allowed_ports) {
+        if (port == 0) {
+            close_descriptor(host_channel_fd);
+            return std::unexpected(std::string{"invalid host egress bridge port 0"});
+        }
+        if (std::ranges::find(ports, port) == ports.end()) {
+            ports.push_back(port);
+        }
+    }
+    auto bridge = std::make_unique<bridge_impl>(host_channel_fd, std::move(ports));
     if (auto started = bridge->start(); !started) {
         return std::unexpected(started.error());
     }
     return bridge;
 }
 
-auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::uint16_t proxy_port)
+auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::span<const std::uint16_t> ports)
     -> std::expected<void, std::string> {
-    if (sandbox_channel_fd < 0 || proxy_port == 0) {
+    if (sandbox_channel_fd < 0 || ports.empty() || ports.size() > max_bridged_loopback_ports) {
         close_descriptor(sandbox_channel_fd);
         return std::unexpected(std::string{"invalid sandbox egress bridge configuration"});
     }
@@ -400,10 +468,41 @@ auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::uint16_t proxy_p
         close_descriptor(sandbox_channel_fd);
         return loopback;
     }
-    auto listener = open_private_listener(proxy_port);
-    if (!listener) {
-        close_descriptor(sandbox_channel_fd);
-        return std::unexpected(listener.error());
+    std::array<int, max_bridged_loopback_ports> listeners{};
+    listeners.fill(-1);
+    std::array<std::uint16_t, max_bridged_loopback_ports> port_table{};
+    std::size_t count = 0;
+    auto close_all_listeners = [&]() noexcept {
+        for (std::size_t i = 0; i < count; ++i) {
+            close_descriptor(listeners[i]);
+            listeners[i] = -1;
+        }
+    };
+    for (const std::uint16_t port : ports) {
+        if (port == 0) {
+            close_all_listeners();
+            close_descriptor(sandbox_channel_fd);
+            return std::unexpected(std::string{"invalid sandbox egress bridge port 0"});
+        }
+        bool duplicate = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (port_table[i] == port) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        auto listener = open_private_listener(port);
+        if (!listener) {
+            close_all_listeners();
+            close_descriptor(sandbox_channel_fd);
+            return std::unexpected(listener.error());
+        }
+        listeners[count] = *listener;
+        port_table[count] = port;
+        ++count;
     }
     // Not fork(): this process was made by clone3 from a parent that already
     // runs threads, so an allocator lock may have been copied in the locked
@@ -414,14 +513,14 @@ auto install_sandbox_egress_bridge(int sandbox_channel_fd, std::uint16_t proxy_p
         static_cast<::pid_t>(::syscall(SYS_clone, SIGCHLD, nullptr, nullptr, nullptr, nullptr));
     if (forwarder < 0) {
         const int saved = errno;
-        close_descriptor(*listener);
+        close_all_listeners();
         close_descriptor(sandbox_channel_fd);
         return std::unexpected(error_text("fork sandbox egress forwarder", saved));
     }
     if (forwarder == 0) {
-        sandbox_forwarder(*listener, sandbox_channel_fd);
+        sandbox_forwarder(listeners, port_table, count, sandbox_channel_fd);
     }
-    close_descriptor(*listener);
+    close_all_listeners();
     close_descriptor(sandbox_channel_fd);
     return {};
 }
